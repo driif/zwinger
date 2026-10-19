@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@driif/motiv':
+        specifier: ^0.1.0
+        version: 0.1.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@tauri-apps/api':
         specifier: ^2
         version: 2.12.4
@@ -41,6 +44,12 @@ importers:
         version: 8.3.4
 
 packages:
+
+  '@driif/motiv@0.1.0':
+    resolution: {integrity: sha512-x9o3oBrsf5+n9/Cr7S1vmy4yvgB7RWX8rBkgCdQ1XPqaAbxld270jpVckIc4pjDCbFLUEthcJu/eFb+lo4v1uw==}
+    peerDependencies:
+      react: '>=19'
+      react-dom: '>=19'
 
   '@oxc-project/types@0.154.0':
     resolution: {integrity: sha512-KYOUGQFlLWR+s4QMV2Q9ko38TZm7EdO87Qm7rvZLqk/webse/cDjtyxKhg/47l0byCbs/k46LT8qc4PKjAikzA==}
@@ -435,6 +444,11 @@ packages:
         optional: true
 
 snapshots:
+
+  '@driif/motiv@0.1.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
+    dependencies:
+      react: 19.3.1
+      react-dom: 19.3.1(react@19.3.1)
 
   '@oxc-project/types@0.154.0': {}
 
