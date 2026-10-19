@@ -1,19 +1,21 @@
 ---
 name: building-ui-with-motiv
-description: Use when adding, changing or styling any UI element in this app, or when a component, prop or variant seems missing from @driif/motiv.
+description: Use when you add, change or style a UI element in this app. Also use when a component, prop or variant is not available in @driif/motiv.
 ---
 
 # Building UI with motiv
 
-UI comes from `@driif/motiv` (repo `~/Documents/dev/my/motiv`). This app only composes motiv
-components, holds app logic and sets `--motiv-*` theme tokens.
+All UI comes from `@driif/motiv` (repo `~/Documents/dev/my/motiv`).
+This app only does three things: it combines motiv components, it contains the app logic, and it sets `--motiv-*` theme tokens.
 
-A missing control, prop or variant, or a wrong look, is fixed in motiv, not here — even under
-time pressure. No app-side control components or CSS for buttons, inputs, switches, etc.
+Fix a missing control, prop or variant in motiv, not in this app. Also fix an incorrect appearance in motiv.
+Apply this rule also when there is little time.
+Do not make control components or CSS for buttons, inputs, switches or other controls in this app.
 
 ## Workflow
 
-1. Check motiv's exports (`src/index.ts`); use existing props first.
-2. Missing → follow motiv's `AGENTS.md`. New public API needs the user's decision first.
-3. Try locally with `pnpm add @driif/motiv@link:../motiv`; never commit the `link:`.
-4. After release, `pnpm up @driif/motiv@latest`.
+1. Read the motiv exports (`src/index.ts`). Use the existing props first.
+2. If a control, prop or variant is missing, follow `AGENTS.md` in motiv.
+   Get a decision from the user before you add a new public API.
+3. Test locally with `pnpm add @driif/motiv@link:../motiv`. Never commit the `link:` dependency.
+4. After the motiv release, run `pnpm up @driif/motiv@latest`.
