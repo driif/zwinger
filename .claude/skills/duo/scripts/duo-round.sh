@@ -6,6 +6,12 @@
 # Exit:   0 done · 2 tool error · 3 stopped on questions only the user can answer
 set -uo pipefail
 
+# A round takes 20-50 minutes. Idle sleep freezes the agents and the timeouts
+# then mark them degraded, so the round keeps the Mac awake.
+if [ -z "${DUO_CAFFEINATED:-}" ] && command -v caffeinate >/dev/null; then
+  DUO_CAFFEINATED=1 exec caffeinate -i "$0" "$@"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)"
 SKILL="$ROOT/.claude/skills/duo"
 PROMPTS="$SKILL/prompts"
