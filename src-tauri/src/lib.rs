@@ -1,14 +1,128 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+mod commands;
+mod error;
+mod runtime;
+mod sessions;
+mod shield;
+mod store;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+use tauri::{AppHandle, Manager as _, RunEvent, Wry};
+
+use crate::runtime::{Microsandbox, SandboxRuntime as _};
+
+const REAP_LIMIT: Duration = Duration::from_secs(10);
+const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
+
+/// Has no Close Window item, so ⌘W reaches the webview and closes a session.
+fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
+    Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                "zwinger",
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Window",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(app, None)?,
+                    &PredefinedMenuItem::fullscreen(app, None)?,
+                ],
+            )?,
+        ],
+    )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .plugin(tauri_plugin_dialog::init())
+        .menu(menu)
+        .setup(|app| {
+            // VMs from an earlier run that did not exit cleanly. The manager
+            // starts with no VMs, so every shield shows as stopped.
+            let reaped = tauri::async_runtime::block_on(tokio::time::timeout(
+                REAP_LIMIT,
+                Microsandbox.reap(),
+            ));
+            match reaped {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("reap failed: {e}"),
+                Err(_) => eprintln!("reap timed out"),
+            }
+            let path = app.path().app_data_dir()?.join("shields.json");
+            let manager = sessions::Manager::new(Microsandbox, store::Store::new(path))?;
+            app.manage(manager);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::list_shields,
+            commands::create_shield,
+            commands::delete_shield,
+            commands::add_mount,
+            commands::remove_mount,
+            commands::set_mount_readonly,
+            commands::set_network_policy,
+            commands::start_shield,
+            commands::stop_shield,
+            commands::open_session,
+            commands::write_session,
+            commands::resize_session,
+            commands::close_session,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // The first exit request stops the VMs and then exits again. The second
+    // request passes, so a slow stop cannot keep the app open.
+    let exiting = AtomicBool::new(false);
+    app.run(move |app, event| match event {
+        RunEvent::ExitRequested { api, .. } if !exiting.swap(true, Ordering::SeqCst) => {
+            api.prevent_exit();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                app.state::<sessions::Manager<Microsandbox>>()
+                    .stop_all(STOP_ALL_LIMIT)
+                    .await;
+                app.exit(0);
+            });
+        }
+        // ⌘Q on macOS ends the loop without ExitRequested. Stop the VMs here,
+        // before the process exits.
+        RunEvent::Exit => {
+            tauri::async_runtime::block_on(
+                app.state::<sessions::Manager<Microsandbox>>()
+                    .stop_all(STOP_ALL_LIMIT),
+            );
+        }
+        _ => {}
+    });
 }

@@ -1,116 +1,164 @@
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafb);
-}
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+  --motiv-color-primary: #7dd3fc;
+  --motiv-color-on-primary: #082f49;
+  --motiv-radius: 0.375rem;
+  --motiv-font-size: 0.8125rem;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.container {
+html,
+body,
+#root {
+  height: 100%;
   margin: 0;
-  padding-top: 10vh;
+}
+
+body {
+  background: var(--motiv-color-bg);
+  color: var(--motiv-color-text);
+  font-family: var(--motiv-font-body);
+  font-size: var(--motiv-font-size);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 15rem 1fr auto;
+  height: 100%;
+}
+
+.sidebar {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  justify-content: space-between;
+  padding: calc(var(--motiv-space) * 2);
+  border-right: 1px solid var(--motiv-color-border);
+  overflow-y: auto;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+.tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--motiv-space);
 }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
+.tree.nested {
+  padding-left: calc(var(--motiv-space) * 4);
+  margin-top: var(--motiv-space);
 }
 
 .row {
   display: flex;
-  justify-content: center;
+  align-items: center;
+  gap: calc(var(--motiv-space) * 2);
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+.grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-a:hover {
-  color: #535bf2;
+.mono {
+  font-family: var(--font-mono);
 }
 
-h1 {
-  text-align: center;
+.muted {
+  color: var(--motiv-color-text-muted);
 }
 
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+.ok {
+  color: var(--motiv-color-success);
 }
 
-button {
-  cursor: pointer;
+.warn {
+  color: var(--motiv-color-warning);
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.danger {
+  color: var(--motiv-color-danger);
 }
 
-input,
-button {
-  outline: none;
+.spin {
+  animation: spin 1s linear infinite;
 }
 
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
+}
 
-  a:hover {
-    color: #24c8db;
-  }
+.shortcuts {
+  margin: 0;
+  display: grid;
+  gap: var(--motiv-space);
+  color: var(--motiv-color-text-muted);
+}
 
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.shortcuts div {
+  display: flex;
+  gap: calc(var(--motiv-space) * 2);
+}
+
+.shortcuts dt {
+  width: 2.5rem;
+}
+
+.shortcuts dd {
+  margin: 0;
+}
+
+.main {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.terminal {
+  flex: 1;
+  min-height: 0;
+  padding: calc(var(--motiv-space) * 2);
+}
+
+.terminal[hidden] {
+  display: none;
+}
+
+.empty {
+  margin: auto;
+}
+
+.status {
+  margin: 0;
+  padding: calc(var(--motiv-space) * 2);
+  border-top: 1px solid var(--motiv-color-border);
+}
+
+.inspector {
+  width: 20rem;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 2);
+  padding: calc(var(--motiv-space) * 2);
+  border-left: 1px solid var(--motiv-color-border);
+  overflow-y: auto;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--motiv-space);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--motiv-space);
 }

@@ -10,9 +10,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@driif/motiv": "^0.1.0",
+    "@driif/motiv": "^0.6.0",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.8.3",
     "@tauri-apps/plugin-opener": "^2",
+    "ghostty-web": "0.4.0",
+    "lucide-react": "^1.59.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

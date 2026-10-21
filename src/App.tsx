@@ -1,52 +1,125 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import { Button } from "@driif/motiv";
+import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { closeSession, createShield, listShields, SessionKind, ShieldView, startShield } from "./api";
+import { Inspector } from "./Inspector";
+import { Pane, Sidebar } from "./Sidebar";
+import { TerminalPane } from "./TerminalPane";
+import { useShortcuts } from "./useShortcuts";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+export default function App() {
+  const [shields, setShields] = useState<ShieldView[]>([]);
+  const [panes, setPanes] = useState<Pane[]>([]);
+  const [selectedShield, setSelectedShield] = useState<string>();
+  const [selectedPane, setSelectedPane] = useState<string>();
+  const [error, setError] = useState<string>();
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  const refresh = () => listShields().then(setShields, (e) => setError(String(e)));
+
+  function run(action: () => Promise<unknown>) {
+    setError(undefined);
+    const done = action().then(refresh, (e) => {
+      setError(String(e));
+      return refresh();
+    });
+    refresh();
+    return done;
   }
 
+  useEffect(() => {
+    listShields().then((loaded) => {
+      setShields(loaded);
+      setSelectedShield((current) => current ?? loaded[0]?.id);
+    }, (e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    setPanes((current) => current.filter((p) => shields.some((s) => s.id === p.shieldId)));
+  }, [shields]);
+
+  const shield = shields.find((s) => s.id === selectedShield);
+
+  function selectPane(key: string | undefined) {
+    setSelectedPane(key);
+    const pane = panes.find((p) => p.key === key);
+    if (pane) setSelectedShield(pane.shieldId);
+  }
+
+  async function newShield() {
+    const folder = await open({ directory: true, title: "Choose the shield folder" });
+    if (folder === null) return;
+    setSelectedShield(await createShield(folder));
+  }
+
+  async function newSession(kind: SessionKind) {
+    if (!shield) return;
+    if (shield.status.state !== "running") await startShield(shield.id);
+    const key = crypto.randomUUID();
+    setPanes((current) => [...current, { key, shieldId: shield.id, kind }]);
+    setSelectedPane(key);
+  }
+
+  function cycle(step: number) {
+    if (panes.length === 0) return;
+    const index = panes.findIndex((p) => p.key === selectedPane);
+    selectPane(panes[(index + step + panes.length) % panes.length].key);
+  }
+
+  function closePane() {
+    const pane = panes.find((p) => p.key === selectedPane);
+    if (!pane) return;
+    const { sessionId } = pane;
+    if (sessionId) run(() => closeSession(sessionId));
+    const rest = panes.filter((p) => p !== pane);
+    setPanes(rest);
+    setSelectedPane(rest[rest.length - 1]?.key);
+  }
+
+  useShortcuts({
+    newShield: () => run(newShield),
+    newShell: () => run(() => newSession("shell")),
+    newPi: () => run(() => newSession("pi")),
+    close: closePane,
+    next: () => cycle(1),
+    previous: () => cycle(-1),
+  });
+
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <Button type="submit">Greet</Button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+    <div className="app">
+      <Sidebar
+        shields={shields}
+        panes={panes}
+        selectedShield={selectedShield}
+        selectedPane={selectedPane}
+        onSelectShield={setSelectedShield}
+        onSelectPane={selectPane}
+      />
+      <main className="main">
+        {panes.map((pane) => (
+          <TerminalPane
+            key={pane.key}
+            shieldId={pane.shieldId}
+            kind={pane.kind}
+            active={pane.key === selectedPane}
+            onOpen={(sessionId) => {
+              setPanes((current) => current.map((p) => (p.key === pane.key ? { ...p, sessionId } : p)));
+              refresh();
+            }}
+            onExit={refresh}
+            onError={(e) => {
+              setError(String(e));
+              setPanes((current) => current.filter((p) => p.key !== pane.key));
+            }}
+          />
+        ))}
+        {panes.length === 0 && (
+          <p className="empty muted">
+            {shield ? "⌘T opens a shell, ⌘P opens pi in this shield." : "⌘N creates a shield from a folder."}
+          </p>
+        )}
+        {error && <p className="status danger mono">{error}</p>}
+      </main>
+      {shield && <Inspector shield={shield} run={run} />}
+    </div>
   );
 }
-
-export default App;
