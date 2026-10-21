@@ -4,17 +4,24 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Button, Card } from "@driif/motiv";
 import { Plus, RotateCw, Shield } from "lucide-react";
 import {
+  AgentKind,
   Chat,
   closeSession,
   createShield,
   deleteChat,
+  InstallProgress,
+  installRuntime,
   isBlocked,
   listChats,
   listNetEvents,
+  listRuntimes,
   listShields,
   NetEvent,
   onNetEvent,
+  renameChat,
   resolveFolder,
+  RuntimeName,
+  RuntimeView,
   SessionKind,
   ShieldView,
   startShield,
@@ -34,8 +41,8 @@ export type TabView = "overview" | "network" | "settings";
 /** What the main area shows for the selected shield. */
 export type View =
   | { kind: TabView }
-  /** No `chat` keeps pi's current chat. */
-  | { kind: "chat"; chat?: string }
+  /** No `agent` is pi. No `chat` keeps the agent's current chat. */
+  | { kind: "chat"; agent?: AgentKind; chat?: string }
   /** No `key` shows the empty terminal view. */
   | { kind: "terminal"; key?: string }
   | { kind: "app"; appId: string };
@@ -67,8 +74,19 @@ export interface DroppedFolder {
   folder: string;
 }
 
-/** A rail action on a chat that pi does in the shield's Agents view. */
-export type ChatAction = { chat: string; at: number } & ({ kind: "rename"; name: string } | { kind: "delete" });
+/** A rail action on a chat. pi does it in the shield's Agents view; the host does it for the other agents. */
+export type ChatAction = { agent: AgentKind; chat: string; at: number } & (
+  | { kind: "rename"; name: string }
+  | { kind: "delete" }
+);
+
+/** The runtimes and their installs, for the views that offer Install. */
+export interface Runtimes {
+  list: RuntimeView[];
+  /** The installs that run now. */
+  installs: Partial<Record<RuntimeName, InstallProgress>>;
+  onInstall: (name: RuntimeName) => void;
+}
 
 export default function App() {
   const [shields, setShields] = useState<ShieldView[]>([]);
@@ -88,6 +106,8 @@ export default function App() {
   const [chats, setChats] = useState<Record<string, Chat[]>>({});
   const [dropFolder, setDropFolder] = useState<DroppedFolder>();
   const [chatAction, setChatAction] = useState<{ shieldId: string; action: ChatAction }>();
+  const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
+  const [installs, setInstalls] = useState<Runtimes["installs"]>({});
 
   // Replies can arrive out of order. Only the reply to the latest request is used.
   const refresh = () => {
@@ -108,9 +128,27 @@ export default function App() {
     return done;
   };
 
+  const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => setError(String(e)));
+
   useEffect(() => {
     refresh();
+    reloadRuntimes();
   }, []);
+
+  const runtimes: Runtimes = {
+    list: runtimeList,
+    installs,
+    onInstall: (name) =>
+      run(async () => {
+        setInstalls((current) => ({ ...current, [name]: { stage: "download", received: 0, total: null } }));
+        try {
+          await installRuntime(name, (progress) => setInstalls((current) => ({ ...current, [name]: progress })));
+        } finally {
+          setInstalls((current) => ({ ...current, [name]: undefined }));
+          await reloadRuntimes();
+        }
+      }),
+  };
 
   // Merged by seq: the live events and the backfill can overlap.
   const addNet = (shieldId: string, events: NetEvent[]) =>
@@ -232,13 +270,24 @@ export default function App() {
       setIntent({ kind: "mount", host, dropped, at: Date.now() });
     });
 
-  /** pi renames a chat, so it must run. A running pi checks its current chat before a delete. */
+  /**
+   * pi renames a chat, so it must run. A running pi checks its current chat before a delete.
+   * The chats of the other agents are host files, so they need no running shield.
+   */
   async function startChatAction(target: ShieldView, action: ChatAction) {
     const running = target.status.state === "running";
-    if (action.kind === "delete" && !running) {
-      await deleteChat(target.id, action.chat);
+    if (action.agent !== "pi" && action.kind === "rename") {
+      await renameChat(target.id, action.agent, action.chat, action.name);
+      return reloadChats(target.id);
+    }
+    if (action.agent !== "pi" || (action.kind === "delete" && !running)) {
+      await deleteChat(target.id, action.agent, action.chat);
       if (target.id === shield?.id)
-        setView((current) => (current.kind === "chat" && current.chat === action.chat ? { kind: "chat" } : current));
+        setView((current) =>
+          current.kind === "chat" && current.chat === action.chat && (current.agent ?? "pi") === action.agent
+            ? { kind: "chat", agent: action.agent }
+            : current,
+        );
       return reloadChats(target.id);
     }
     if (!running) await startShield(target.id);
@@ -287,7 +336,7 @@ export default function App() {
     newShell: () => run(() => newSession("shell")),
     newPi: () =>
       run(async () => {
-        setView({ kind: "chat" });
+        setView({ kind: "chat", agent: "pi" });
         if (shield && shield.status.state !== "running") await startShield(shield.id);
       }),
     close: () => view.kind === "terminal" && activePane && closePane(activePane),
@@ -368,7 +417,7 @@ export default function App() {
               intent={intent}
               onIntentDone={() => setIntent(undefined)}
               onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [shield.id]: seq }))}
-              onChat={(chat) => setView((current) => (current.kind === "chat" ? { kind: "chat", chat } : current))}
+              onChat={(agent, chat) => setView((current) => (current.kind === "chat" ? { kind: "chat", agent, chat } : current))}
               onChatsChange={() => reloadChats(shield.id)}
               chatAction={chatAction?.shieldId === shield.id ? chatAction.action : undefined}
               onChatActionDone={(work) => {
@@ -377,6 +426,8 @@ export default function App() {
                 run(() => work.finally(() => reloadChats(id)));
               }}
               onDropFolder={dropMount}
+              runtimes={runtimes}
+              onRestart={() => restart(shield.id)}
               panes={panes}
               activePanes={activePanes}
               run={run}

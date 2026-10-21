@@ -8850,14 +8850,19 @@ dependencies = [
 name = "zwinger"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
+ "flate2",
  "keyring",
  "microsandbox",
  "psl",
+ "reqwest",
  "rustix",
  "security-framework 3.7.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

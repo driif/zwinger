@@ -5,10 +5,11 @@ use tauri::ipc::Channel;
 
 use serde_json::Value;
 
-use crate::agent::{AgentCommand, Chat};
+use crate::agent::{AgentCommand, AgentKind, Chat};
 use crate::error::Result;
 use crate::netlog::NetEvent;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
+use crate::runtimes::{Progress, RuntimeView, Runtimes};
 use crate::secrets::{Secret, SecretValue};
 use crate::sessions::{Manager, SecretView, ShieldView};
 use crate::shield::{self, AppDraft, NetworkMode, Pos};
@@ -224,10 +225,16 @@ pub fn close_session(shields: Shields<'_>, id: String) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn open_agent(shields: Shields<'_>, shield_id: String, on_event: Channel<Value>) -> Result<String> {
+pub async fn open_agent(
+    shields: Shields<'_>,
+    shield_id: String,
+    agent: AgentKind,
+    on_event: Channel<Value>,
+) -> Result<String> {
     shields
         .open_agent(
             &shield_id,
+            agent,
             Box::new(move |record| {
                 // The webview may have closed the channel; the agent keeps running.
                 let _ = on_event.send(record);
@@ -253,6 +260,37 @@ pub async fn list_chats(shields: Shields<'_>, shield_id: String) -> Result<Vec<C
 }
 
 #[tauri::command]
-pub async fn delete_chat(shields: Shields<'_>, shield_id: String, chat: String) -> Result<()> {
-    shields.delete_chat(&shield_id, &chat).await
+pub async fn delete_chat(shields: Shields<'_>, shield_id: String, agent: AgentKind, chat: String) -> Result<()> {
+    shields.delete_chat(&shield_id, agent, &chat).await
+}
+
+#[tauri::command]
+pub async fn rename_chat(
+    shields: Shields<'_>,
+    shield_id: String,
+    agent: AgentKind,
+    chat: String,
+    title: String,
+) -> Result<()> {
+    shields.rename_chat(&shield_id, agent, &chat, &title).await
+}
+
+#[tauri::command]
+pub fn list_runtimes(runtimes: State<'_, Runtimes>) -> Result<Vec<RuntimeView>> {
+    runtimes.list()
+}
+
+#[tauri::command]
+pub async fn install_runtime(runtimes: State<'_, Runtimes>, name: String, on_progress: Channel<Progress>) -> Result<()> {
+    runtimes
+        .install(&name, move |progress| {
+            // The webview may have closed the channel; the install goes on.
+            let _ = on_progress.send(progress);
+        })
+        .await
+}
+
+#[tauri::command]
+pub fn cancel_runtime_install(runtimes: State<'_, Runtimes>, name: String) {
+    runtimes.cancel(&name);
 }

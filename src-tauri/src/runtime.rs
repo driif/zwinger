@@ -8,9 +8,11 @@ use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
-use crate::agent::{self, AGENT_DIR, PI_DIR, STATE_DIR};
+use crate::agent::pi::{self, AGENT_DIR, PI_DIR};
+use crate::agent::{RESERVED, STATE_DIR};
 use crate::error::{Error, Result};
 use crate::netlog;
+use crate::runtimes::Installed;
 use crate::secrets::{Secret, SecretValue};
 use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
@@ -22,6 +24,20 @@ const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
+/// Runs `process.argv[1..]` in its own process group, with the same stdio.
+/// On SIGTERM it kills the whole group, so the tool processes of an agent
+/// die with it. It exits with the code of the process, or 128 + its signal.
+const GROUP_WRAPPER: &str = r#"const { spawn } = require("child_process");
+const { signals } = require("os").constants;
+const [command, ...args] = process.argv.slice(1);
+const child = spawn(command, args, { detached: true, stdio: "inherit" });
+process.on("SIGTERM", () => {
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+});
+child.on("error", (e) => { console.error(e.message); process.exit(127); });
+child.on("exit", (code, signal) => process.exit(code ?? 128 + signals[signal]));
+"#;
+const SIGTERM: i32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,7 +50,7 @@ impl SessionKind {
     pub fn argv(self) -> Vec<String> {
         match self {
             Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
-            Self::Pi => agent::pi_argv(false),
+            Self::Pi => pi::pi_argv(false),
         }
     }
 }
@@ -82,16 +98,18 @@ pub struct Pipe {
 }
 
 /// The seam between the shield manager and the VM backend, so tests do not boot VMs.
-pub trait SandboxRuntime: Send + Sync + 'static {
+pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
     /// `secrets` comes from [`secret_entries`]. `state` is the host dir of the
-    /// shield's pi state.
+    /// shield's agent state. Each runtime in `runtimes` is mounted read-only
+    /// at `/opt/zwinger/<name>`.
     fn start(
         &self,
         shield: &Shield,
         secrets: Vec<SecretBuilder>,
         state: &Path,
+        runtimes: &[Installed],
     ) -> impl Future<Output = Result<Self::Vm>> + Send;
     fn stop(&self, vm: &Self::Vm) -> impl Future<Output = Result<()>> + Send;
     fn open_pty(
@@ -173,7 +191,8 @@ pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Ve
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-/// `pi` is the host copy of the pi bundle, from [`agent::install_pi`].
+/// `pi` is the host copy of the pi bundle, from [`pi::install_pi`].
+#[derive(Clone)]
 pub struct Microsandbox {
     pub pi: PathBuf,
 }
@@ -181,7 +200,13 @@ pub struct Microsandbox {
 impl SandboxRuntime for Microsandbox {
     type Vm = Sandbox;
 
-    async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>, state: &Path) -> Result<Sandbox> {
+    async fn start(
+        &self,
+        shield: &Shield,
+        secrets: Vec<SecretBuilder>,
+        state: &Path,
+        runtimes: &[Installed],
+    ) -> Result<Sandbox> {
         let policy = sandbox_policy(&shield.network)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", shield.id))
             .image(IMAGE)
@@ -204,6 +229,9 @@ impl SandboxRuntime for Microsandbox {
             .volume(STATE_DIR, |m| m.bind(state))
             .env("PI_CODING_AGENT_DIR", AGENT_DIR)
             .network(|n| n.policy(policy));
+        for runtime in runtimes {
+            builder = builder.volume(format!("{RESERVED}/{}", runtime.name), |m| m.bind(&runtime.dir).readonly());
+        }
         // Secrets turn on TLS interception. Node does not read the system
         // trust store, so it gets the interception CA explicitly.
         if !secrets.is_empty() {
@@ -322,7 +350,9 @@ impl SandboxRuntime for Microsandbox {
         Ok(Pty { input, events })
     }
 
+    /// Each process runs in the group wrapper, so a kill also ends its children.
     async fn open_pipe(&self, vm: &Sandbox, argv: &[String], cwd: &str) -> Result<Pipe> {
+        let argv = group_argv(argv);
         let mut handle = vm
             .exec_stream_with(&argv[0], |e| e.args(&argv[1..]).cwd(cwd).stdin_pipe())
             .await?;
@@ -331,6 +361,7 @@ impl SandboxRuntime for Microsandbox {
 
         let (input, mut input_rx) = mpsc::channel(PIPE_QUEUE);
         let (events_tx, events) = mpsc::channel(PIPE_QUEUE);
+        let (exited_tx, exited) = tokio::sync::watch::channel(false);
 
         tokio::spawn(async move {
             while let Some(msg) = input_rx.recv().await {
@@ -339,7 +370,19 @@ impl SandboxRuntime for Microsandbox {
                 let _ = match msg {
                     PipeInput::Data(data) => sink.write(data).await,
                     PipeInput::Close => sink.close().await,
-                    PipeInput::Kill => control.kill().await,
+                    PipeInput::Kill => {
+                        // The wrapper kills the group. If it does not exit, it is killed alone.
+                        let (fallback, mut exited) = (control.clone(), exited.clone());
+                        tokio::spawn(async move {
+                            if tokio::time::timeout(KILL_LIMIT, exited.wait_for(|e| *e)).await.is_err() {
+                                let _ = fallback.kill().await;
+                            }
+                        });
+                        match control.signal(SIGTERM).await {
+                            Ok(()) => Ok(()),
+                            Err(_) => control.kill().await,
+                        }
+                    }
                 };
             }
         });
@@ -366,11 +409,19 @@ impl SandboxRuntime for Microsandbox {
                     ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
                 }
             }
+            exited_tx.send_replace(true);
             let _ = events_tx.send(PipeEvent::Exit(code)).await;
         });
 
         Ok(Pipe { input, events })
     }
+}
+
+/// `argv` in the group wrapper. `--` ends the options of node.
+fn group_argv(argv: &[String]) -> Vec<String> {
+    let mut wrapped = ["node", "-e", GROUP_WRAPPER, "--"].map(str::to_owned).to_vec();
+    wrapped.extend_from_slice(argv);
+    wrapped
 }
 
 #[cfg(test)]
@@ -399,6 +450,8 @@ pub mod fake {
         pub kill_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// The names and hosts of the secrets of the last start, never the values.
         pub secrets: Arc<Mutex<Vec<StartedSecret>>>,
+        /// The runtime names of the last start.
+        pub runtimes: Arc<Mutex<Vec<String>>>,
         /// What `node --version` prints. `None` prints a supported version.
         pub node_version: Arc<Mutex<Option<String>>>,
         /// The other ends of the pipes from `open_pipe`, except the Node
@@ -434,7 +487,14 @@ pub mod fake {
     impl SandboxRuntime for FakeRuntime {
         type Vm = FakeVm;
 
-        async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>, _: &Path) -> Result<FakeVm> {
+        async fn start(
+            &self,
+            shield: &Shield,
+            secrets: Vec<SecretBuilder>,
+            _: &Path,
+            runtimes: &[Installed],
+        ) -> Result<FakeVm> {
+            *self.runtimes.lock().unwrap() = runtimes.iter().map(|r| r.name.to_owned()).collect();
             let gate = self.start_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
@@ -721,6 +781,53 @@ mod tests {
         for entry in &entries {
             assert!(entry.require_tls_identity);
             assert!(entry.passthrough_hosts.is_empty());
+        }
+    }
+
+    #[test]
+    fn pipes_run_in_the_group_wrapper() {
+        let argv = group_argv(&["claude".to_owned(), "-p".to_owned()]);
+        assert_eq!(argv, ["node", "-e", GROUP_WRAPPER, "--", "claude", "-p"]);
+    }
+
+    /// Runs the wrapper with the host node, as the guest does.
+    #[cfg(unix)]
+    #[test]
+    fn group_wrapper_keeps_stdio_and_codes_and_kills_the_group() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        let run = |script: &str| {
+            let argv = group_argv(&["sh".to_owned(), "-c".to_owned(), script.to_owned()]);
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let mut echo = run("read line; echo \"got $line\"; exit 3");
+        echo.stdin.take().unwrap().write_all(b"hi\n").unwrap();
+        let out = echo.wait_with_output().unwrap();
+        assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(3), b"got hi\n".as_slice()));
+
+        // A grandchild, as a tool process of an agent is.
+        let mut wrapper = run("sleep 30 & echo $!; wait");
+        let mut line = String::new();
+        BufReader::new(wrapper.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let sleep = line.trim().to_owned();
+        let alive = || {
+            let ps = Command::new("ps").args(["-o", "stat=", "-p", &sleep]).output().unwrap();
+            let stat = String::from_utf8_lossy(&ps.stdout).trim().to_owned();
+            !stat.is_empty() && !stat.starts_with('Z')
+        };
+        assert!(alive());
+        assert!(Command::new("kill").args(["-TERM", &wrapper.id().to_string()]).status().unwrap().success());
+        assert_eq!(wrapper.wait().unwrap().code(), Some(137));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive() {
+            assert!(std::time::Instant::now() < deadline, "the grandchild is still running");
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 

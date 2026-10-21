@@ -9,12 +9,15 @@ use tokio::sync::mpsc::{Receiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
-use crate::agent::{self, Agent, AgentCommand, Chat, Sink};
+use crate::agent::cli::{self, CliAgent, Spawn};
+use crate::agent::pi::{self, Agent};
+use crate::agent::{AgentCommand, AgentKind, Chat, Handle, Sink};
 use crate::error::{Error, Result};
 use crate::netlog::{self, Dedupe, NetEvent};
 use crate::runtime::{
     PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
 };
+use crate::runtimes;
 use crate::secrets::{self, Places, Secret, SecretValue, Vault};
 use crate::shield::{self, AppDraft, NetworkMode, NetworkPolicy, Pos, Shield, WORKSPACE};
 use crate::store::Store;
@@ -38,8 +41,9 @@ pub type NetSink = Box<dyn Fn(&str, &NetEvent) + Send + Sync>;
 pub struct Manager<R: SandboxRuntime> {
     runtime: R,
     store: Store,
-    /// The app data dir. It holds the pi runtime and `shields/<id>`, the pi
-    /// state of each shield.
+    /// The app data dir. It holds the agent runtimes, `shields/<id>`, the
+    /// agent state of each shield, and `chats/<id>`, the host-only chats of
+    /// Claude Code and Codex.
     data: PathBuf,
     vault: Arc<dyn Vault>,
     /// Serializes the secret edits, so that a rollback cannot undo a later edit.
@@ -53,7 +57,7 @@ struct State<V> {
     shields: Vec<Shield>,
     vms: HashMap<String, Vm<V>>,
     sessions: Vec<Session>,
-    /// At most one per shield.
+    /// At most one per shield and agent kind.
     agents: Vec<AgentEntry>,
     /// Per shield, counts the secret value changes. The config does not hold
     /// the values, so a running VM compares this count instead.
@@ -72,12 +76,14 @@ enum Vm<V> {
     /// config after an edit, until the next start. `applied_rev` is the
     /// `secrets_rev` that the start read before it read the values.
     /// `net` follows the VM's network events. It is `None` if the runtime
-    /// log could not be opened.
+    /// log could not be opened. `runtimes` are the agent runtimes that the
+    /// start mounted.
     Running {
         vm: Arc<V>,
         applied: Box<Shield>,
         applied_rev: u64,
         net: Option<AbortHandle>,
+        runtimes: Vec<&'static str>,
     },
     /// Shutdown is in progress. If it fails, the VM goes back to `Running`.
     Stopping,
@@ -132,9 +138,10 @@ impl AppOutput {
 struct AgentEntry {
     id: String,
     shield_id: String,
-    agent: Arc<Agent>,
-    /// `close_agent` asked pi to exit. The entry stays until pi has exited,
-    /// so no second pi starts on the same state meanwhile.
+    kind: AgentKind,
+    agent: Handle,
+    /// `close_agent` asked the agent to exit. The entry stays until it has
+    /// exited, so no second agent starts on the same state meanwhile.
     closing: bool,
 }
 
@@ -148,6 +155,8 @@ pub struct ShieldView {
     pub sessions: Vec<SessionView>,
     /// The apps that run or have exited. An app with no entry is stopped.
     pub app_runs: Vec<AppRunView>,
+    /// The agent runtimes that the running VM has mounted.
+    pub runtimes: Vec<&'static str>,
 }
 
 /// A secret as the UI sees it. It has no value, only if the vault has one.
@@ -308,6 +317,10 @@ impl<R: SandboxRuntime> Manager<R> {
                     Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
                 };
                 let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
+                let runtimes = match state.vms.get(&shield.id) {
+                    Some(Vm::Running { runtimes, .. }) => runtimes.clone(),
+                    _ => Vec::new(),
+                };
                 ShieldView {
                     shield: shield.clone(),
                     status,
@@ -330,9 +343,14 @@ impl<R: SandboxRuntime> Manager<R> {
                             })
                         })
                         .collect(),
+                    runtimes,
                 }
             })
             .collect()
+    }
+
+    fn chat_dir(&self, id: &str, kind: AgentKind) -> PathBuf {
+        self.data.join("chats").join(id).join(kind.name())
     }
 
     fn state_dir(&self, id: &str) -> PathBuf {
@@ -553,8 +571,8 @@ impl<R: SandboxRuntime> Manager<R> {
             .collect())
     }
 
-    /// Saves the config first, then deletes the secret values and the pi
-    /// state. The first error is returned after all deletes ran.
+    /// Saves the config first, then deletes the secret values, the agent
+    /// state and the chats. The first error is returned after all deletes ran.
     pub async fn delete(&self, id: &str) -> Result<()> {
         self.stop(id).await.or_else(|e| match e {
             Error::NotRunning => Ok(()),
@@ -587,10 +605,15 @@ impl<R: SandboxRuntime> Manager<R> {
                 result = Err(e);
             }
         }
-        match std::fs::remove_dir_all(self.state_dir(id)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound && result.is_ok() => Err(e.into()),
-            _ => result,
+        for dir in [self.state_dir(id), self.data.join("chats").join(id)] {
+            if let Err(e) = std::fs::remove_dir_all(dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+                && result.is_ok()
+            {
+                result = Err(e.into());
+            }
         }
+        result
     }
 
     /// The config snapshot and the vault reads hold `secret_edit`, so a start
@@ -604,7 +627,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 .secret_values(&shield)
                 .and_then(|values| secret_entries(&shield.secrets, values))
                 .and_then(|entries| {
-                    std::fs::create_dir_all(self.state_dir(id))?;
+                    // Claude Code's HOME and CODEX_HOME. Codex needs its dir to exist.
+                    for kind in [AgentKind::Claude, AgentKind::Codex] {
+                        std::fs::create_dir_all(self.state_dir(id).join(kind.name()))?;
+                    }
                     Ok(entries)
                 }) {
                 Ok(entries) => (shield, applied_rev, entries),
@@ -614,7 +640,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             }
         };
-        let result = match self.runtime.start(&shield, entries, &self.state_dir(id)).await {
+        let installed = runtimes::installed(&self.data);
+        let result = match self.runtime.start(&shield, entries, &self.state_dir(id), &installed).await {
             Ok(vm) => match self.check_node(&vm).await {
                 Ok(()) => Ok(vm),
                 Err(e) => {
@@ -647,6 +674,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             applied: Box::new(shield),
                             applied_rev,
                             net,
+                            runtimes: installed.iter().map(|r| r.name).collect(),
                         },
                     );
                     let apps = state.shield_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
@@ -728,7 +756,7 @@ impl<R: SandboxRuntime> Manager<R> {
         if tokio::time::timeout(NODE_LIMIT, read).await.is_err() {
             let _ = pipe.input.try_send(PipeInput::Kill);
         }
-        agent::check_node(&String::from_utf8_lossy(&out))
+        pi::check_node(&String::from_utf8_lossy(&out))
     }
 
     fn secret_values(&self, shield: &Shield) -> Result<Vec<SecretValue>> {
@@ -746,7 +774,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The VM stays tracked until the runtime confirms shutdown, so a failed
     /// stop leaves the shield running and the user can retry.
     pub async fn stop(&self, id: &str) -> Result<()> {
-        let (vm, applied, applied_rev, net) = {
+        let (vm, applied, applied_rev, net, runtimes) = {
             let mut state = lock(&self.state);
             state.shield_mut(id)?;
             match state.vms.get(id) {
@@ -760,6 +788,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 applied,
                 applied_rev,
                 net,
+                runtimes,
             }) = state.vms.insert(id.to_owned(), Vm::Stopping)
             else {
                 unreachable!("checked above");
@@ -777,7 +806,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
                 a.shield_id != id
             });
-            (vm, applied, applied_rev, net)
+            (vm, applied, applied_rev, net, runtimes)
         };
 
         let result = self.runtime.stop(&vm).await;
@@ -799,6 +828,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         applied,
                         applied_rev,
                         net,
+                        runtimes,
                     },
                 );
             }
@@ -1071,16 +1101,25 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Returns the id of the shield's agent and sends its records to `sink`.
-    /// A running agent gets the new sink, so a reopened tab takes it over;
-    /// else a new pi starts in the applied harness, after a closing pi has exited.
-    pub async fn open_agent(&self, shield_id: &str, sink: Sink) -> Result<String> {
+    /// Returns the id of the shield's agent of `kind` and sends its records
+    /// to `sink`. A running agent gets the new sink, so a reopened tab takes
+    /// it over; else a new agent starts, after a closing one has exited.
+    pub async fn open_agent(&self, shield_id: &str, kind: AgentKind, sink: Sink) -> Result<String> {
+        match kind {
+            AgentKind::Pi => self.open_pi(shield_id, sink).await,
+            _ => self.open_cli(shield_id, kind, sink).await,
+        }
+    }
+
+    /// Starts pi in the applied harness.
+    async fn open_pi(&self, shield_id: &str, sink: Sink) -> Result<String> {
         // Taken by the branch that uses it; each such branch returns.
         let mut sink = Some(sink);
+        let find = |a: &&AgentEntry| a.shield_id == shield_id && a.kind == AgentKind::Pi;
         loop {
             let found = {
                 let state = lock(&self.state);
-                match state.agents.iter().find(|a| a.shield_id == shield_id) {
+                match state.agents.iter().find(find) {
                     Some(entry) if entry.closing => Err(entry.agent.clone()),
                     Some(entry) => {
                         entry.agent.set_sink(sink.take().expect("sink"));
@@ -1101,7 +1140,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     continue;
                 }
             };
-            let pipe = self.runtime.open_pipe(&vm, &agent::pi_argv(true), &cwd).await?;
+            let pipe = self.runtime.open_pipe(&vm, &pi::pi_argv(true), &cwd).await?;
             let id = uuid::Uuid::new_v4().to_string();
             let added = {
                 let mut state = lock(&self.state);
@@ -1114,7 +1153,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     let _ = pipe.input.try_send(PipeInput::Kill);
                     return Err(Error::NotRunning);
                 }
-                match state.agents.iter().find(|a| a.shield_id == shield_id) {
+                match state.agents.iter().find(find) {
                     // A second open that ran at the same time won. If that
                     // agent is closing already, wait for it and try again.
                     Some(entry) => {
@@ -1130,7 +1169,8 @@ impl<R: SandboxRuntime> Manager<R> {
                         state.agents.push(AgentEntry {
                             id: id.clone(),
                             shield_id: shield_id.to_owned(),
-                            agent: agent.clone(),
+                            kind: AgentKind::Pi,
+                            agent: Handle::Pi(agent.clone()),
                             closing: false,
                         });
                         Ok(agent)
@@ -1149,10 +1189,71 @@ impl<R: SandboxRuntime> Manager<R> {
             let events = pipe.events;
             tokio::spawn(async move {
                 let exit = agent.run(events).await;
-                lock(&state).agents.retain(|a| !Arc::ptr_eq(&a.agent, &agent));
+                lock(&state)
+                    .agents
+                    .retain(|a| !matches!(&a.agent, Handle::Pi(p) if Arc::ptr_eq(p, &agent)));
                 agent.finish(exit);
             });
             return Ok(id);
+        }
+    }
+
+    /// Makes the Claude Code or Codex agent. It starts its processes itself,
+    /// in the applied harness, so no process starts here.
+    async fn open_cli(&self, shield_id: &str, kind: AgentKind, sink: Sink) -> Result<String> {
+        loop {
+            let closing = {
+                let mut state = lock(&self.state);
+                match state.agents.iter().find(|a| a.shield_id == shield_id && a.kind == kind) {
+                    Some(entry) if entry.closing => entry.agent.clone(),
+                    Some(entry) => {
+                        entry.agent.set_sink(sink);
+                        return Ok(entry.id.clone());
+                    }
+                    None => {
+                        let (vm, cwd) = match state.vms.get(shield_id) {
+                            Some(Vm::Running { runtimes, .. }) if !runtimes.contains(&kind.name()) => {
+                                let installed = runtimes::installed(&self.data).iter().any(|r| r.name == kind.name());
+                                let name = kind.name().to_owned();
+                                return Err(if installed {
+                                    Error::RuntimeNotMounted(name)
+                                } else {
+                                    Error::RuntimeMissing(name)
+                                });
+                            }
+                            Some(Vm::Running { vm, applied, .. }) => {
+                                (vm.clone(), applied.harness.as_deref().unwrap_or(WORKSPACE).to_owned())
+                            }
+                            _ => return Err(Error::NotRunning),
+                        };
+                        let id = uuid::Uuid::new_v4().to_string();
+                        // A stop ends the agent first, so no process opens in a stopped VM.
+                        let runtime = self.runtime.clone();
+                        let spawn: Spawn = Box::new(move |argv, at| {
+                            let (runtime, vm) = (runtime.clone(), vm.clone());
+                            let cwd = at.unwrap_or_else(|| cwd.clone());
+                            Box::pin(async move {
+                                let pipe = runtime.open_pipe(&vm, &argv, &cwd).await?;
+                                Ok((pipe, cwd))
+                            })
+                        });
+                        let on_finish = {
+                            let (state, id) = (self.state.clone(), id.clone());
+                            Box::new(move || lock(&state).agents.retain(|a| a.id != id))
+                        };
+                        let agent = CliAgent::new(kind, self.chat_dir(shield_id, kind), spawn, sink, on_finish);
+                        state.agents.push(AgentEntry {
+                            id: id.clone(),
+                            shield_id: shield_id.to_owned(),
+                            kind,
+                            agent: Handle::Cli(Arc::new(agent)),
+                            closing: false,
+                        });
+                        return Ok(id);
+                    }
+                }
+            };
+            closing.exited().await;
         }
     }
 
@@ -1166,13 +1267,18 @@ impl<R: SandboxRuntime> Manager<R> {
                 .ok_or(Error::AgentNotFound)?;
             (entry.agent.clone(), entry.shield_id.clone())
         };
-        let state = self.state_dir(&shield_id);
-        let wire = blocking(move || command.wire(&state)).await?;
-        agent.call(wire).await
+        match agent {
+            Handle::Pi(agent) => {
+                let state = self.state_dir(&shield_id);
+                let wire = blocking(move || command.wire(&state)).await?;
+                agent.call(wire).await
+            }
+            Handle::Cli(agent) => agent.call(command).await,
+        }
     }
 
-    /// Closes pi's stdin and returns when pi has exited. Kills pi if it has
-    /// not exited after `CLOSE_LIMIT`. An unknown id is not an error.
+    /// Asks the agent to exit and returns when it has exited. Kills it if it
+    /// has not exited after `CLOSE_LIMIT`. An unknown id is not an error.
     pub async fn close_agent(&self, id: &str) {
         let agent = {
             let mut state = lock(&self.state);
@@ -1190,18 +1296,55 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Reads the chat files on the host, so the list also works while the
-    /// shield is stopped.
+    /// shield is stopped. Newest first, of all agents.
     pub async fn list_chats(&self, shield_id: &str) -> Result<Vec<Chat>> {
         lock(&self.state).shield_mut(shield_id)?;
         let state = self.state_dir(shield_id);
-        blocking(move || Ok(agent::list_chats(&state))).await
+        let dirs = [AgentKind::Claude, AgentKind::Codex].map(|kind| (kind, self.chat_dir(shield_id, kind)));
+        blocking(move || {
+            let mut chats = pi::list_chats(&state);
+            for (kind, dir) in &dirs {
+                chats.extend(cli::list_chats(dir, *kind));
+            }
+            chats.sort_by(|a, b| b.started.cmp(&a.started));
+            Ok(chats)
+        })
+        .await
     }
 
-    pub async fn delete_chat(&self, shield_id: &str, chat: &str) -> Result<()> {
+    fn cli_agent(&self, shield_id: &str, kind: AgentKind) -> Option<Arc<CliAgent>> {
+        let state = lock(&self.state);
+        let entry = state.agents.iter().find(|a| a.shield_id == shield_id && a.kind == kind)?;
+        match &entry.agent {
+            Handle::Cli(agent) => Some(agent.clone()),
+            Handle::Pi(_) => None,
+        }
+    }
+
+    /// A Claude Code or Codex chat that its agent holds is let go first; that
+    /// fails while it runs.
+    pub async fn delete_chat(&self, shield_id: &str, kind: AgentKind, chat: &str) -> Result<()> {
         lock(&self.state).shield_mut(shield_id)?;
-        let state = self.state_dir(shield_id);
         let chat = chat.to_owned();
-        blocking(move || agent::delete_chat(&state, &chat)).await
+        if kind == AgentKind::Pi {
+            let state = self.state_dir(shield_id);
+            return blocking(move || pi::delete_chat(&state, &chat)).await;
+        }
+        if let Some(agent) = self.cli_agent(shield_id, kind) {
+            agent.forget(&chat)?;
+        }
+        let dir = self.chat_dir(shield_id, kind);
+        blocking(move || cli::delete_chat(&dir, &chat)).await
+    }
+
+    /// Renames a Claude Code or Codex chat. pi renames its chats itself.
+    pub async fn rename_chat(&self, shield_id: &str, kind: AgentKind, chat: &str, title: &str) -> Result<()> {
+        lock(&self.state).shield_mut(shield_id)?;
+        if kind == AgentKind::Pi {
+            return Err(Error::Unsupported("a rename without pi"));
+        }
+        let (dir, chat, title) = (self.chat_dir(shield_id, kind), chat.to_owned(), title.to_owned());
+        blocking(move || cli::rename_chat(&dir, kind, &chat, &title)).await
     }
 }
 
@@ -1387,15 +1530,15 @@ mod tests {
     async fn agent_lifecycle() {
         let (manager, runtime, id) = manager();
         let (first, _first_rx) = sink();
-        assert!(matches!(manager.open_agent(&id, first).await, Err(Error::NotRunning)));
+        assert!(matches!(manager.open_agent(&id, AgentKind::Pi, first).await, Err(Error::NotRunning)));
         manager.start(&id).await.unwrap();
         assert!(manager.state_dir(&id).is_dir());
 
         let manager = Arc::new(manager);
         let (first, mut first_rx) = sink();
-        let agent = manager.open_agent(&id, first).await.unwrap();
+        let agent = manager.open_agent(&id, AgentKind::Pi, first).await.unwrap();
         let mut pipe = take_pipe(&runtime);
-        assert_eq!(pipe.argv, agent::pi_argv(true));
+        assert_eq!(pipe.argv, pi::pi_argv(true));
         assert_eq!(pipe.cwd, "/workspace");
 
         let call = tokio::spawn({
@@ -1417,7 +1560,7 @@ mod tests {
 
         // A reopened tab takes the agent over; no second pi starts.
         let (second, mut second_rx) = sink();
-        assert_eq!(manager.open_agent(&id, second).await.unwrap(), agent);
+        assert_eq!(manager.open_agent(&id, AgentKind::Pi, second).await.unwrap(), agent);
         assert!(runtime.pipes.lock().unwrap().is_empty());
         pipe.out.send(PipeEvent::Stdout(b"{\"type\":\"turn_start\"}\n".to_vec())).await.unwrap();
         assert_eq!(record(&mut second_rx).await["type"], "turn_start");
@@ -1453,7 +1596,7 @@ mod tests {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
         let (first, mut rx) = sink();
-        let agent = manager.open_agent(&id, first).await.unwrap();
+        let agent = manager.open_agent(&id, AgentKind::Pi, first).await.unwrap();
         let pipe = take_pipe(&runtime);
         pipe.out.send(PipeEvent::Stderr(b"Error: no API key\n".to_vec())).await.unwrap();
         pipe.out.send(PipeEvent::Exit(1)).await.unwrap();
@@ -1463,7 +1606,7 @@ mod tests {
         );
 
         let (second, _rx) = sink();
-        assert_ne!(manager.open_agent(&id, second).await.unwrap(), agent);
+        assert_ne!(manager.open_agent(&id, AgentKind::Pi, second).await.unwrap(), agent);
         take_pipe(&runtime);
     }
 
@@ -1472,7 +1615,7 @@ mod tests {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
         let (first, _rx) = sink();
-        let agent = manager.open_agent(&id, first).await.unwrap();
+        let agent = manager.open_agent(&id, AgentKind::Pi, first).await.unwrap();
         let mut pipe = take_pipe(&runtime);
         let manager = Arc::new(manager);
         let closing = tokio::spawn({
@@ -1488,7 +1631,7 @@ mod tests {
         // An open during the close waits for the old pi to exit.
         let opening = tokio::spawn({
             let (manager, id) = (manager.clone(), id.clone());
-            async move { manager.open_agent(&id, sink().0).await }
+            async move { manager.open_agent(&id, AgentKind::Pi, sink().0).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!closing.is_finished() && !opening.is_finished());
@@ -1511,7 +1654,7 @@ mod tests {
         let manager = Arc::new(manager);
         let opening = tokio::spawn({
             let (manager, id) = (manager.clone(), id.clone());
-            async move { manager.open_agent(&id, sink().0).await }
+            async move { manager.open_agent(&id, AgentKind::Pi, sink().0).await }
         });
         gate.entered.notified().await;
         manager.stop(&id).await.unwrap();
@@ -1521,6 +1664,115 @@ mod tests {
         let mut pipe = take_pipe(&runtime);
         assert!(matches!(stdin(&mut pipe).await, PipeInput::Kill));
         assert!(lock(&manager.state).agents.is_empty());
+    }
+
+    async fn record_of(rx: &mut mpsc::UnboundedReceiver<Value>, kind: &str) -> Value {
+        loop {
+            let next = record(rx).await;
+            if next["type"] == kind {
+                return next;
+            }
+        }
+    }
+
+    fn prompt(message: &str) -> AgentCommand {
+        AgentCommand::Prompt { message: message.into() }
+    }
+
+    #[tokio::test]
+    async fn stop_ends_the_agents_of_all_kinds() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        assert!(matches!(
+            manager.open_agent(&id, AgentKind::Claude, sink().0).await,
+            Err(Error::RuntimeMissing(name)) if name == "claude"
+        ));
+        runtimes::fake_install(&manager.data, "claude");
+        runtimes::fake_install(&manager.data, "codex");
+        // Installed after the start: the VM has not mounted it.
+        assert!(matches!(
+            manager.open_agent(&id, AgentKind::Codex, sink().0).await,
+            Err(Error::RuntimeNotMounted(_))
+        ));
+        manager.stop(&id).await.unwrap();
+        manager.start(&id).await.unwrap();
+        assert_eq!(manager.list()[0].runtimes, ["claude", "codex"]);
+        assert_eq!(*runtime.runtimes.lock().unwrap(), ["claude", "codex"]);
+        assert!(manager.state_dir(&id).join("codex").is_dir() && manager.state_dir(&id).join("claude").is_dir());
+
+        let manager = Arc::new(manager);
+        manager.open_agent(&id, AgentKind::Pi, sink().0).await.unwrap();
+        let mut pi_pipe = take_pipe(&runtime);
+        let claude = manager.open_agent(&id, AgentKind::Claude, sink().0).await.unwrap();
+        // One agent per kind: a reopen takes it over.
+        let (claude_sink, mut claude_rx) = sink();
+        assert_eq!(manager.open_agent(&id, AgentKind::Claude, claude_sink).await.unwrap(), claude);
+        assert!(runtime.pipes.lock().unwrap().is_empty());
+        manager.agent_call(&claude, prompt("hi")).await.unwrap();
+        let mut claude_pipe = take_pipe(&runtime);
+        assert_eq!(claude_pipe.argv, crate::agent::claude::argv(None, None));
+        assert_eq!(claude_pipe.cwd, "/workspace");
+        assert!(matches!(stdin(&mut claude_pipe).await, PipeInput::Data(_)));
+        let (codex_sink, mut codex_rx) = sink();
+        let codex = manager.open_agent(&id, AgentKind::Codex, codex_sink).await.unwrap();
+        assert_eq!(lock(&manager.state).agents.len(), 3);
+
+        manager.stop(&id).await.unwrap();
+        assert!(matches!(stdin(&mut pi_pipe).await, PipeInput::Close));
+        assert!(matches!(stdin(&mut pi_pipe).await, PipeInput::Kill));
+        assert!(matches!(stdin(&mut claude_pipe).await, PipeInput::Close));
+        assert!(matches!(stdin(&mut claude_pipe).await, PipeInput::Kill));
+        assert_eq!(record_of(&mut codex_rx, "agent_exit").await["code"], 0);
+        claude_pipe.out.send(PipeEvent::Exit(137)).await.unwrap();
+        assert_eq!(record_of(&mut claude_rx, "message_end").await["message"]["role"], "user");
+        assert_eq!(record_of(&mut claude_rx, "message_end").await["message"]["stopReason"], "error");
+        record_of(&mut claude_rx, "agent_exit").await;
+        pi_pipe.out.send(PipeEvent::Exit(137)).await.unwrap();
+        assert!(matches!(manager.agent_call(&codex, AgentCommand::GetState).await, Err(Error::AgentNotFound)));
+        assert!(lock(&manager.state).agents.is_empty());
+        assert!(manager.list()[0].runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chats_of_all_agents_are_listed_and_deleted_by_kind() {
+        let (manager, runtime, id) = manager();
+        runtimes::fake_install(&manager.data, "claude");
+        manager.start(&id).await.unwrap();
+        let sessions = manager.state_dir(&id).join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(sessions.join("a.jsonl"), "{\"type\":\"session\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"}\n").unwrap();
+
+        let (claude_sink, mut rx) = sink();
+        let claude = manager.open_agent(&id, AgentKind::Claude, claude_sink).await.unwrap();
+        manager.agent_call(&claude, prompt("Claude chat")).await.unwrap();
+        let pipe = take_pipe(&runtime);
+        pipe.out
+            .send(PipeEvent::Stdout(b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\n".to_vec()))
+            .await
+            .unwrap();
+        record_of(&mut rx, "agent_settled").await;
+
+        let chats = manager.list_chats(&id).await.unwrap();
+        let got: Vec<(AgentKind, &str)> = chats.iter().map(|c| (c.agent, c.title.as_str())).collect();
+        assert_eq!(got, [(AgentKind::Claude, "Claude chat"), (AgentKind::Pi, "New chat")]);
+        let chat = chats[0].id.clone();
+        manager.rename_chat(&id, AgentKind::Claude, &chat, "Renamed").await.unwrap();
+        assert_eq!(manager.list_chats(&id).await.unwrap()[0].title, "Renamed");
+        assert!(matches!(manager.delete_chat(&id, AgentKind::Pi, &chat).await, Err(Error::ChatNotFound)));
+        assert!(matches!(manager.rename_chat(&id, AgentKind::Pi, "a.jsonl", "x").await, Err(Error::Unsupported(_))));
+
+        // The agent lets the chat go, and its process.
+        manager.delete_chat(&id, AgentKind::Claude, &chat).await.unwrap();
+        pipe.out.send(PipeEvent::Exit(0)).await.unwrap();
+        let state = manager.agent_call(&claude, AgentCommand::GetState).await.unwrap();
+        assert_eq!(state["sessionFile"], Value::Null);
+        assert_eq!(manager.list_chats(&id).await.unwrap().len(), 1);
+
+        manager.agent_call(&claude, prompt("Second")).await.unwrap();
+        record_of(&mut rx, "agent_start").await;
+        manager.stop(&id).await.unwrap();
+        manager.delete(&id).await.unwrap();
+        assert!(!manager.data.join("chats").join(&id).exists());
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ mod commands;
 mod error;
 mod netlog;
 mod runtime;
+mod runtimes;
 mod secrets;
 mod sessions;
 mod shield;
@@ -75,7 +76,7 @@ pub fn run() {
             std::fs::create_dir_all(&data)?;
             // Canonical, like the host paths of the shields it is compared with.
             let data = data.canonicalize()?;
-            let pi = agent::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
+            let pi = agent::pi::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
             let runtime = Microsandbox { pi };
             // VMs from an earlier run that did not exit cleanly. The manager
             // starts with no VMs, so every shield shows as stopped.
@@ -89,6 +90,7 @@ pub fn run() {
                 Err(_) => eprintln!("reap timed out"),
             }
             let store = store::Store::new(data.join("shields.json"));
+            let data_dir = data.clone();
             let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data)?;
             // One app-wide event, so the rail and the map update while the
             // Network tab is closed.
@@ -97,6 +99,7 @@ pub fn run() {
                 let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
             }));
             app.manage(manager);
+            app.manage(runtimes::Runtimes::new(data_dir));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -140,6 +143,10 @@ pub fn run() {
             commands::close_agent,
             commands::list_chats,
             commands::delete_chat,
+            commands::rename_chat,
+            commands::list_runtimes,
+            commands::install_runtime,
+            commands::cancel_runtime_install,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

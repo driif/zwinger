@@ -3,34 +3,24 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{oneshot, watch};
 
+use super::{AgentCommand, AgentKind, Chat, Framer, Line, STATE_DIR, Sink, TITLE_CHARS, cut, keep, lock, send_now};
 use crate::error::{Error, Result};
 use crate::runtime::{PipeEvent, PipeInput};
 
-/// The guest prefix that belongs to zwinger. User mounts may not use it.
-pub const RESERVED: &str = "/opt/zwinger";
 /// The pi bundle, mounted read-only.
 pub const PI_DIR: &str = "/opt/zwinger/pi";
-/// The per-shield pi state (`<app_data>/shields/<id>`), mounted read-write.
-pub const STATE_DIR: &str = "/opt/zwinger/state";
 pub const AGENT_DIR: &str = "/opt/zwinger/state/agent";
 const SESSIONS: &str = "sessions";
 /// pi 1.3 needs at least this Node version.
 const NODE_MIN: (u32, u32) = (22, 19);
-const STDERR_LINES: usize = 20;
-/// The longest record that pi may write, and the longest stderr line.
-const MAX_LINE: usize = 16 << 20;
-/// A kept stderr line, or the copy of unreadable output, is cut to this size.
-const STDERR_LINE: usize = 2 << 10;
 /// Chat files are listed only up to this size.
 const CHAT_FILE: u64 = 64 << 20;
 /// Only this start of a chat file is read for its title.
@@ -39,7 +29,6 @@ const CHAT_HEAD: u64 = 1 << 20;
 const CHAT_TAIL: u64 = 1 << 20;
 /// A longer line of a chat file is skipped.
 const CHAT_LINE: usize = 64 << 10;
-const TITLE_CHARS: usize = 80;
 
 /// The argv of the terminal pi (`rpc` false) or the agent pi (`rpc` true).
 pub fn pi_argv(rpc: bool) -> Vec<String> {
@@ -48,98 +37,6 @@ pub fn pi_argv(rpc: bool) -> Vec<String> {
         argv.extend(["--mode", "rpc"]);
     }
     argv.into_iter().map(str::to_owned).collect()
-}
-
-/// Splits a byte stream into records on LF only, as pi's protocol asks:
-/// U+2028 and U+2029 are valid inside JSON strings. A CR before the LF is
-/// dropped. An incomplete last line waits for the next push. A line over
-/// `MAX_LINE` becomes one `TooLong`, and its bytes up to the next LF are dropped.
-#[derive(Default)]
-pub struct Framer {
-    partial: Vec<u8>,
-    /// The bytes of `partial` that have no LF.
-    scanned: usize,
-    dropping: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Line {
-    Record(Vec<u8>),
-    TooLong,
-}
-
-impl Framer {
-    pub fn push(&mut self, mut bytes: &[u8]) -> Vec<Line> {
-        let mut lines = Vec::new();
-        if self.dropping {
-            let Some(end) = bytes.iter().position(|&b| b == b'\n') else {
-                return lines;
-            };
-            bytes = &bytes[end + 1..];
-            self.dropping = false;
-        }
-        self.partial.extend_from_slice(bytes);
-        let mut start = 0;
-        while let Some(i) = self.partial[self.scanned..].iter().position(|&b| b == b'\n') {
-            let end = self.scanned + i;
-            if end - start > MAX_LINE {
-                lines.push(Line::TooLong);
-            } else {
-                let mut line = self.partial[start..end].to_vec();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                lines.push(Line::Record(line));
-            }
-            start = end + 1;
-            self.scanned = start;
-        }
-        self.partial.drain(..start);
-        self.scanned = self.partial.len();
-        if self.partial.len() > MAX_LINE {
-            self.partial = Vec::new();
-            self.scanned = 0;
-            self.dropping = true;
-            lines.push(Line::TooLong);
-        }
-        lines
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingLevel {
-    Off,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-/// The RPC commands that the UI may send. Rust builds the JSON that pi gets,
-/// so fields that are not listed here never reach pi.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
-pub enum AgentCommand {
-    Prompt { message: String },
-    Steer { message: String },
-    FollowUp { message: String },
-    Abort,
-    GetState,
-    GetMessages,
-    SetModel { provider: String, model_id: String },
-    GetAvailableModels,
-    SetThinkingLevel { level: ThinkingLevel },
-    NewSession,
-    /// `chat` is a chat id from [`list_chats`], never a path.
-    SwitchSession {
-        #[serde(skip_serializing)]
-        chat: String,
-    },
-    GetSessionStats,
-    SetSessionName { name: String },
 }
 
 impl AgentCommand {
@@ -158,8 +55,6 @@ impl AgentCommand {
     }
 }
 
-pub type Sink = Box<dyn Fn(Value) + Send + Sync>;
-
 struct Pending {
     /// Set when pi ended. A call after that fails at once.
     closed: bool,
@@ -175,10 +70,6 @@ pub struct Agent {
     next: AtomicU64,
     /// Set by [`Agent::finish`].
     done: watch::Sender<bool>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// What [`Agent::run`] saw when pi ended.
@@ -216,13 +107,8 @@ impl Agent {
         Ok(PipeInput::Data(line))
     }
 
-    /// Queues `input` without a wait. If the queue is full, a task sends it
-    /// when there is space.
     fn send_now(&self, input: PipeInput) {
-        if let Err(TrySendError::Full(input)) = self.input.try_send(input) {
-            let queue = self.input.clone();
-            tokio::spawn(async move { queue.send(input).await });
-        }
+        send_now(&self.input, input);
     }
 
     /// Sends the command and waits for its response. Returns the response
@@ -355,18 +241,6 @@ impl Agent {
     }
 }
 
-fn keep(lines: &mut VecDeque<String>, line: String) {
-    if lines.len() == STDERR_LINES {
-        lines.pop_front();
-    }
-    lines.push_back(line);
-}
-
-/// The first `STDERR_LINE` bytes of `line` as text.
-fn cut(line: &[u8]) -> String {
-    String::from_utf8_lossy(&line[..line.len().min(STDERR_LINE)]).into_owned()
-}
-
 /// Accepts `v22.19.0` and newer.
 pub fn check_node(version: &str) -> Result<()> {
     let version = version.trim();
@@ -375,18 +249,6 @@ pub fn check_node(version: &str) -> Result<()> {
         (Some(Ok(major)), Some(Ok(minor))) if (major, minor) >= NODE_MIN => Ok(()),
         _ => Err(Error::NodeTooOld(version.to_owned())),
     }
-}
-
-/// A pi chat file of a shield.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Chat {
-    /// The file name.
-    pub id: String,
-    /// The ISO timestamp of the session header.
-    pub started: String,
-    /// The session name, else the start of the first user message.
-    pub title: String,
 }
 
 /// Lists the chats, newest first. The guest can write the state dir, so only
@@ -410,7 +272,12 @@ pub fn list_chats(state: &Path) -> Vec<Chat> {
             }
             // NONBLOCK, so a FIFO does not block the open.
             let file = rustix::fs::openat(&dir, entry.file_name(), nofollow | OFlags::NONBLOCK, Mode::empty()).ok()?;
-            read_chat(std::fs::File::from(file)).map(|(started, title)| Chat { id, started, title })
+            read_chat(std::fs::File::from(file)).map(|(started, title)| Chat {
+                agent: AgentKind::Pi,
+                id,
+                started,
+                title,
+            })
         })
         .collect();
     chats.sort_by(|a, b| b.started.cmp(&a.started));
@@ -575,55 +442,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::agent::STDERR_LINE;
     use crate::runtime::PIPE_QUEUE;
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-agent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn text(lines: Vec<Line>) -> Vec<String> {
-        lines
-            .into_iter()
-            .map(|l| match l {
-                Line::Record(l) => String::from_utf8(l).unwrap(),
-                Line::TooLong => "<too long>".to_owned(),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn framer_splits_on_lf_only_and_keeps_partial_lines() {
-        let mut framer = Framer::default();
-        assert!(framer.push(b"{\"a\":").is_empty());
-        assert_eq!(text(framer.push(b"1}\r\n{\"b\":2}\n{\"c\"")), ["{\"a\":1}", "{\"b\":2}"]);
-        let separators = "{\"t\":\"x\u{2028}y\u{2029}z\"}\n";
-        assert_eq!(text(framer.push(b":3}\n")), ["{\"c\":3}"]);
-        assert_eq!(text(framer.push(separators.as_bytes())), [separators.trim_end()]);
-        // A multi-byte character split across two reads.
-        let bytes = "{\"e\":\"é\"}\n".as_bytes();
-        assert!(framer.push(&bytes[..7]).is_empty());
-        assert_eq!(text(framer.push(&bytes[7..])), ["{\"e\":\"é\"}"]);
-    }
-
-    #[test]
-    fn framer_drops_a_line_over_the_limit() {
-        let mut framer = Framer::default();
-        let chunk = vec![b'x'; 1 << 20];
-        for _ in 0..16 {
-            assert!(framer.push(&chunk).is_empty());
-        }
-        assert_eq!(text(framer.push(b"x")), ["<too long>"]);
-        assert!(framer.push(&chunk).is_empty());
-        assert_eq!(text(framer.push(b"x\nok\n")), ["ok"]);
-
-        let mut long = vec![b'y'; MAX_LINE + 1];
-        long.extend_from_slice(b"\nnext\n");
-        assert_eq!(text(framer.push(&long)), ["<too long>", "next"]);
-        let mut fits = vec![b'z'; MAX_LINE];
-        fits.push(b'\n');
-        assert_eq!(framer.push(&fits), [Line::Record(vec![b'z'; MAX_LINE])]);
     }
 
     fn command(json: Value) -> Result<Value> {

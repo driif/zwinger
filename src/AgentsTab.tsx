@@ -1,12 +1,88 @@
-import { Accordion, Button, Card, CommandMenu, IconButton, SegmentedControl, Textarea } from "@driif/motiv";
-import { ArrowUp, Bot, KeyRound, MessageSquarePlus, RotateCw, Square, TriangleAlert, Wrench } from "lucide-react";
+import {
+  Accordion,
+  Button,
+  Card,
+  CommandMenu,
+  FloatingField,
+  IconButton,
+  ProgressRing,
+  SegmentedControl,
+  Textarea,
+} from "@driif/motiv";
+import {
+  ArrowUp,
+  Bot,
+  Braces,
+  Download,
+  KeyRound,
+  LucideIcon,
+  RotateCw,
+  Sparkles,
+  Square,
+  TriangleAlert,
+  Wrench,
+} from "lucide-react";
 import { KeyboardEvent, useEffect, useReducer, useRef, useState } from "react";
-import { agentCall, AgentCommand, closeAgent, deleteChat, openAgent, ShieldView, ThinkingLevel } from "./api";
-import type { ChatAction, TabView } from "./App";
+import {
+  AGENT_NAMES,
+  agentCall,
+  AgentCommand,
+  AgentKind,
+  cancelRuntimeInstall,
+  closeAgent,
+  deleteChat,
+  openAgent,
+  RuntimeName,
+  RuntimeView,
+  ShieldView,
+  ThinkingLevel,
+} from "./api";
+import type { ChatAction, Runtimes, TabView } from "./App";
 import { Block, chatReducer, initialChat, Message, textOf, ToolRun } from "./agentChat";
 import { Markdown } from "./Markdown";
 import { reachable } from "./SecretsSection";
-import { PROVIDER_KEYS } from "./providers";
+import { AGENT_KEYS, PROVIDER_KEYS } from "./providers";
+
+export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces };
+
+const KINDS: AgentKind[] = ["pi", "claude", "codex"];
+
+/** Suggestions only: the model field takes any name that the CLI knows. */
+const MODEL_PRESETS: Record<RuntimeName, string[]> = {
+  claude: ["sonnet", "opus", "haiku"],
+  codex: ["gpt-5-codex", "gpt-5"],
+};
+
+/** Install, or the progress of the install that runs. Only the download can be cancelled. */
+export function InstallControl({ runtime, runtimes }: { runtime: RuntimeView; runtimes: Runtimes }) {
+  const progress = runtimes.installs[runtime.name];
+  const name = AGENT_NAMES[runtime.name];
+  if (!progress)
+    return (
+      <Button size="sm" variant="outline" iconLeft={<Download size={14} />} onClick={() => runtimes.onInstall(runtime.name)}>
+        Install
+      </Button>
+    );
+  if (progress.stage === "extract") return <span className="muted">Checking and unpacking {name}…</span>;
+  const mb = Math.round(progress.received / 1e6);
+  return (
+    <span className="row">
+      {progress.total ? (
+        <>
+          <ProgressRing value={Math.min(99, Math.floor((progress.received / progress.total) * 100))} label={`${name} download`} size={32} />
+          <span className="muted">
+            {mb} of {Math.round(progress.total / 1e6)} MB
+          </span>
+        </>
+      ) : (
+        <span className="muted">Downloading {name}: {mb} MB</span>
+      )}
+      <Button size="sm" variant="ghost" onClick={() => cancelRuntimeInstall(runtime.name)}>
+        Cancel
+      </Button>
+    </span>
+  );
+}
 
 interface Model {
   id: string;
@@ -66,6 +142,7 @@ function MessageView({ message, results, tools }: { message: Message; results: M
         <Markdown text={textOf(message.content)} />
       </div>
     );
+  if (message.role === "notice") return <p className="muted">{textOf(message.content)}</p>;
   if (message.role !== "assistant") return null;
   return (
     <div className="msg assistant">
@@ -91,29 +168,55 @@ function MessageView({ message, results, tools }: { message: Message; results: M
 
 interface Props {
   shield: ShieldView;
-  /** The chat that the tree selected. `undefined` keeps pi's current chat. */
+  agent: AgentKind;
+  /** The chat of `agent` that the tree selected. `undefined` keeps the agent's current chat. */
   chat?: string;
+  /** Shows the chat of another agent. */
+  onAgent: (agent: AgentKind) => void;
+  runtimes: Runtimes;
+  onRestart: () => void;
   onJump: (tab: TabView) => void;
-  /** Gets pi's current chat when it changes. */
-  onChat: (chat: string) => void;
+  /** Gets the agent's current chat when it changes; `undefined` after a new chat that has no message yet. */
+  onChat: (agent: AgentKind, chat?: string) => void;
   /** The chat files may have changed. */
   onChatsChange: () => void;
-  /** A rename or delete from the tree, which needs pi. */
+  /** A rename or delete of a pi chat from the tree, which needs pi. */
   chatAction?: ChatAction;
   /** Gets the work of `chatAction` when it starts. */
   onChatActionDone: (work: Promise<unknown>) => void;
 }
 
-/** The chat with the shield's pi agent. pi runs in the shield, in its harness. */
-export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange, chatAction, onChatActionDone }: Props) {
+/** The chat with an agent of the shield. The agent runs in the shield, in its harness. */
+export function AgentsTab({
+  shield,
+  agent,
+  chat: wanted,
+  onAgent,
+  runtimes,
+  onRestart,
+  onJump,
+  onChat,
+  onChatsChange,
+  chatAction,
+  onChatActionDone,
+}: Props) {
   const running = shield.status.state === "running";
-  const [agentId, setAgentId] = useState<string>();
+  const isPi = agent === "pi";
+  const name = AGENT_NAMES[agent];
+  const Icon = AGENT_ICONS[agent];
+  const runtime = isPi ? undefined : runtimes.list.find((r) => r.name === agent);
+  const installed = isPi || runtime?.installed === true;
+  const mounted = isPi || shield.runtimes.includes(agent);
+  const [opened, setOpened] = useState<{ kind: AgentKind; id: string }>();
+  // The tab stays mounted across agents: the ID of another agent is no ID.
+  const agentId = opened?.kind === agent ? opened.id : undefined;
   const [opens, setOpens] = useState(0);
   const [chat, dispatch] = useReducer(chatReducer, initialChat);
   const [state, setState] = useState<AgentState>();
   const [stats, setStats] = useState<Stats>();
   const [models, setModels] = useState<Model[]>([]);
   const [draft, setDraft] = useState("");
+  const [model, setModel] = useState("");
   const [mode, setMode] = useState<"steer" | "follow_up">("steer");
   const [error, setError] = useState<string>();
   const log = useRef<HTMLDivElement>(null);
@@ -121,14 +224,19 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
   /** The agent that the chat shows. A load for an earlier agent is dropped. */
   const current = useRef<string | undefined>(undefined);
   const stick = useRef(true);
+  /** The agent whose chat shows. Another agent starts with an empty chat. */
+  const shownAgent = useRef(agent);
+  /** The agent that gets a new chat when it is open. */
+  const newFor = useRef<AgentKind | undefined>(undefined);
 
   const fail = (e: unknown) => setError(String(e));
   const reloadChats = onChatsChange;
 
+  // Claude Code and Codex have no stats, model list or thinking levels.
   async function refresh(id: string) {
     const [next, nextStats] = await Promise.all([
       agentCall<AgentState>(id, { type: "get_state" }),
-      agentCall<Stats>(id, { type: "get_session_stats" }),
+      isPi ? agentCall<Stats>(id, { type: "get_session_stats" }) : undefined,
     ]);
     setState(next);
     setStats(nextStats);
@@ -153,35 +261,56 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
 
   useEffect(() => {
     reloadChats();
-    if (!running) {
-      setAgentId(undefined);
+    if (shownAgent.current !== agent) {
+      shownAgent.current = agent;
+      current.current = undefined;
+      dispatch({ type: "reset" });
+      setState(undefined);
+      setStats(undefined);
+      setModels([]);
+    }
+    if (!running || !mounted) {
+      setOpened(undefined);
       return;
     }
     let live = true;
     let id: string | undefined;
     current.current = undefined;
     dispatch({ type: "reset" });
-    openAgent(shield.id, (record) => {
+    openAgent(shield.id, agent, (record) => {
       if (!live) return;
       dispatch({ type: "record", record });
       if (record.type === "agent_settled" && id) {
         refresh(id).catch(fail);
         reloadChats();
       }
+      // The current chat was deleted.
+      if (record.type === "chat_reset" && id) {
+        onChat(agent, undefined);
+        load(id).catch(fail);
+      }
     })
       .then(async (opened) => {
         if (!live) return;
         id = opened;
         current.current = opened;
-        setAgentId(opened);
+        setOpened({ kind: agent, id: opened });
         await load(opened);
-        setModels((await agentCall<{ models: Model[] }>(opened, { type: "get_available_models" })).models);
+        if (newFor.current === agent) {
+          newFor.current = undefined;
+          await agentCall(opened, { type: "new_session" });
+          onChat(agent, undefined);
+          await load(opened);
+        }
+        if (isPi) setModels((await agentCall<{ models: Model[] }>(opened, { type: "get_available_models" })).models);
       })
       .catch((e) => live && fail(e));
     return () => {
       live = false;
     };
-  }, [shield.id, running, opens]);
+  }, [shield.id, running, opens, agent, mounted]);
+
+  useEffect(() => setModel(state?.model?.id ?? ""), [state?.model?.id]);
 
   useEffect(() => {
     if (stick.current) log.current?.scrollTo({ top: log.current.scrollHeight });
@@ -199,15 +328,41 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
       .then(reloadChats)
       .catch(fail);
 
+  // Claude Code and Codex take no message while they work.
+  const canSend = ready && (isPi || !chat.running);
+
   function send() {
     const message = draft.trim();
-    if (!message || !ready) return;
+    if (!message || !canSend) return;
     setDraft("");
     stick.current = true;
-    call({ type: chat.running ? mode : "prompt", message }).catch((e) => {
-      setDraft(message);
-      fail(e);
-    });
+    call({ type: chat.running ? mode : "prompt", message }).then(
+      // Their chat file starts with the first message.
+      () => {
+        if (!isPi) {
+          reloadChats();
+          refresh(agentId!).catch(fail);
+        }
+      },
+      (e) => {
+        setDraft(message);
+        fail(e);
+      },
+    );
+  }
+
+  function newChat(kind: AgentKind) {
+    if (kind !== agent) {
+      newFor.current = kind;
+      onAgent(kind);
+    } else if (ready && !chat.running)
+      call({ type: "new_session" })
+        .then(() => {
+          onChat(agent, undefined);
+          return load(agentId!);
+        })
+        .then(reloadChats)
+        .catch(fail);
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -218,7 +373,7 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
 
   async function restart() {
     current.current = undefined;
-    setAgentId(undefined);
+    setOpened(undefined);
     if (agentId) await closeAgent(agentId).catch(fail);
     setOpens((n) => n + 1);
   }
@@ -228,8 +383,8 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
   const currentChat = state?.sessionFile?.split("/").pop();
 
   useEffect(() => {
-    if (currentChat) onChat(currentChat);
-  }, [currentChat]);
+    if (currentChat) onChat(agent, currentChat);
+  }, [currentChat, agent]);
 
   useEffect(() => {
     if (wanted && ready && !chat.running && wanted !== currentChat) thenLoad({ type: "switch_session", chat: wanted });
@@ -245,18 +400,17 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
       await agentCall(id, { type: "set_session_name", name: action.name });
     } else {
       if (holds) await agentCall(id, { type: "new_session" });
-      await deleteChat(shield.id, action.chat);
+      await deleteChat(shield.id, "pi", action.chat);
     }
     await load(id);
   }
 
   useEffect(() => {
-    if (chatAction && ready) onChatActionDone(doChatAction(agentId, chatAction));
-  }, [chatAction, ready]);
+    if (chatAction && ready && isPi) onChatActionDone(doChatAction(agentId, chatAction));
+  }, [chatAction, ready, isPi]);
 
-  const providerReady = shield.secrets.some(
-    (s) => PROVIDER_KEYS.has(s.name) && s.hosts.some((h) => reachable(shield.network, h)),
-  );
+  const keys = isPi ? PROVIDER_KEYS : new Set(AGENT_KEYS[agent]);
+  const providerReady = shield.secrets.some((s) => keys.has(s.name) && s.hosts.some((h) => reachable(shield.network, h)));
   const hosts =
     shield.network.mode === "public"
       ? "the public internet"
@@ -268,25 +422,64 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
     <div className="agents">
       <section className="chat">
         <header className="chat-header row">
-          <Button
-            variant="outline"
-            size="sm"
-            iconLeft={<MessageSquarePlus size={14} />}
-            disabled={!ready || chat.running}
-            onClick={() => thenLoad({ type: "new_session" })}
-          >
-            New chat
-          </Button>
           <CommandMenu
             className="model-picker"
-            menuLabel="Models"
-            placeholder={state?.model ? state.model.name : "Choose a model"}
-            commands={models.map((m) => ({
-              id: `${m.provider}/${m.id}`,
-              label: `${m.name} · ${m.provider}`,
-              onSelect: () => thenRefresh({ type: "set_model", provider: m.provider, modelId: m.id }),
+            menuLabel="New chat"
+            placeholder="New chat"
+            commands={KINDS.map((kind) => ({
+              id: kind,
+              label: `New ${AGENT_NAMES[kind]} chat`,
+              onSelect: () => newChat(kind),
             }))}
           />
+          <span className="row" title={name}>
+            <Icon size={16} aria-hidden />
+            <strong>{name}</strong>
+          </span>
+          {isPi ? (
+            <CommandMenu
+              className="model-picker"
+              menuLabel="Models"
+              placeholder={state?.model ? state.model.name : "Choose a model"}
+              commands={models.map((m) => ({
+                id: `${m.provider}/${m.id}`,
+                label: `${m.name} · ${m.provider}`,
+                onSelect: () => thenRefresh({ type: "set_model", provider: m.provider, modelId: m.id }),
+              }))}
+            />
+          ) : (
+            <form
+              className="row"
+              onSubmit={(e) => {
+                e.preventDefault();
+                thenRefresh({ type: "set_model", provider: agent, modelId: model });
+              }}
+            >
+              <FloatingField
+                label="Model"
+                className="model-picker mono"
+                value={model}
+                hint={model ? undefined : "Empty uses the default model"}
+                showValidity={false}
+                disabled={!ready || chat.running}
+                onChange={(e) => setModel(e.target.value)}
+                onBlur={() => model !== (state?.model?.id ?? "") && thenRefresh({ type: "set_model", provider: agent, modelId: model })}
+              />
+              <CommandMenu
+                className="model-picker"
+                menuLabel="Model presets"
+                placeholder="Presets"
+                commands={MODEL_PRESETS[agent].map((preset) => ({
+                  id: preset,
+                  label: preset,
+                  onSelect: () => {
+                    setModel(preset);
+                    thenRefresh({ type: "set_model", provider: agent, modelId: preset });
+                  },
+                }))}
+              />
+            </form>
+          )}
           {state?.model?.reasoning && (
             <SegmentedControl
               label="Thinking level"
@@ -302,11 +495,32 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
           </span>
           <IconButton icon={<RotateCw size={14} />} label="Restart agent" disabled={!running} onClick={restart} />
         </header>
+        {runtime && !installed && (
+          <Card variant="outlined" padding="sm" className="row">
+            <Download size={16} className="warn" />
+            <span className="grow">
+              {name} is not installed. zwinger downloads version {runtime.version} from npm, checks it and mounts it
+              read-only in the shields.
+            </span>
+            <InstallControl runtime={runtime} runtimes={runtimes} />
+          </Card>
+        )}
+        {installed && running && !mounted && (
+          <Card variant="outlined" padding="sm" className="row">
+            <RotateCw size={16} className="warn" />
+            <span className="grow">{name} was installed after the shield started. Restart the shield to use it.</span>
+            <Button size="sm" variant="outline" onClick={onRestart}>
+              Restart
+            </Button>
+          </Card>
+        )}
         {!providerReady && (
           <Card variant="outlined" padding="sm" className="row">
             <KeyRound size={16} className="warn" />
             <span className="grow">
-              No LLM provider is set up. Add a provider key, such as ANTHROPIC_API_KEY, as a secret, and allow its host.
+              {isPi
+                ? "No LLM provider is set up. Add a provider key, such as ANTHROPIC_API_KEY, as a secret, and allow its host."
+                : `No key for ${name} is set up. Add ${AGENT_KEYS[agent].join(" or ")} as a secret, and allow its host.`}
             </span>
             <Button size="sm" variant="outline" onClick={() => onJump("network")}>
               Open Network
@@ -325,7 +539,8 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
             <div className="empty">
               <Bot size={32} className="muted" />
               <p>
-                {running ? "pi" : "When the shield runs, pi"} works in <span className="mono">{shield.harness ?? "/workspace"}</span>.
+                {running ? name : `When the shield runs, ${name}`} works in{" "}
+                <span className="mono">{shield.harness ?? "/workspace"}</span>.
               </p>
               <p className="muted">
                 It sees <span className="mono">/workspace</span> (read-write)
@@ -378,14 +593,22 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
             hideLabel
             rows={1}
             maxRows={8}
-            placeholder={!running ? "Start the shield to talk to pi" : chat.running ? "Send a message to pi while it works" : "Ask pi"}
+            placeholder={
+              !running
+                ? `Start the shield to talk to ${name}`
+                : chat.running
+                  ? isPi
+                    ? "Send a message to pi while it works"
+                    : `${name} works. Wait, or stop it.`
+                  : `Ask ${name}`
+            }
             value={draft}
-            disabled={!ready}
+            disabled={!canSend}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
           />
           <div className="row">
-            {chat.running && (
+            {chat.running && isPi && (
               <SegmentedControl
                 label="Deliver"
                 options={[
@@ -402,7 +625,7 @@ export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange,
                 Stop
               </Button>
             )}
-            <Button type="submit" iconLeft={<ArrowUp size={14} />} disabled={!ready || draft.trim() === ""}>
+            <Button type="submit" iconLeft={<ArrowUp size={14} />} disabled={!canSend || draft.trim() === ""}>
               Send
             </Button>
           </div>

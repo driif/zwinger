@@ -88,6 +88,8 @@ export interface ShieldView {
   pendingRestart: boolean;
   sessions: SessionView[];
   appRuns: AppRun[];
+  /** The agent runtimes that the running VM has mounted. */
+  runtimes: RuntimeName[];
 }
 
 export type PtyEvent = { event: "output"; data: number[] } | { event: "exit"; data: number };
@@ -219,8 +221,13 @@ export type AgentCommand =
   | { type: "switch_session"; chat: string }
   | { type: "set_session_name"; name: string };
 
-/** A pi chat file of a shield. `id` is the file name. */
+export type AgentKind = "pi" | "claude" | "codex";
+
+export const AGENT_NAMES: Record<AgentKind, string> = { pi: "pi", claude: "Claude Code", codex: "Codex" };
+
+/** A chat of a shield. `id` is a file name, unique per agent. */
 export interface Chat {
+  agent: AgentKind;
   id: string;
   started: string;
   title: string;
@@ -229,10 +236,10 @@ export interface Chat {
 /** A pi stdout record, passed through as is, or the backend's `agent_exit`. */
 export type AgentRecord = { type: string } & Record<string, unknown>;
 
-/** Opens the shield's agent, or takes over the running one. */
-export function openAgent(shieldId: string, onEvent: (record: AgentRecord) => void) {
+/** Opens the shield's agent of this kind, or takes over the running one. */
+export function openAgent(shieldId: string, agent: AgentKind, onEvent: (record: AgentRecord) => void) {
   const channel = new Channel<AgentRecord>(onEvent);
-  return invoke<string>("open_agent", { shieldId, onEvent: channel });
+  return invoke<string>("open_agent", { shieldId, agent, onEvent: channel });
 }
 
 /** Resolves to the `data` of pi's response. */
@@ -243,4 +250,30 @@ export const closeAgent = (id: string) => invoke<void>("close_agent", { id });
 export const listChats = (shieldId: string) => invoke<Chat[]>("list_chats", { shieldId });
 
 /** Only a listed chat; a link or another file is refused. */
-export const deleteChat = (shieldId: string, chat: string) => invoke<void>("delete_chat", { shieldId, chat });
+export const deleteChat = (shieldId: string, agent: AgentKind, chat: string) =>
+  invoke<void>("delete_chat", { shieldId, agent, chat });
+
+/** Claude Code and Codex chats only: pi renames its chats itself. */
+export const renameChat = (shieldId: string, agent: AgentKind, chat: string, title: string) =>
+  invoke<void>("rename_chat", { shieldId, agent, chat, title });
+
+/** The agents that zwinger downloads on first use. pi is bundled. */
+export type RuntimeName = "claude" | "codex";
+
+export interface RuntimeView {
+  name: RuntimeName;
+  version: string;
+  installed: boolean;
+}
+
+export type InstallProgress = { stage: "download"; received: number; total: number | null } | { stage: "extract" };
+
+export const listRuntimes = () => invoke<RuntimeView[]>("list_runtimes");
+
+/** Downloads the pinned version and checks its integrity. Resolves when it is installed. */
+export function installRuntime(name: RuntimeName, onProgress: (progress: InstallProgress) => void) {
+  return invoke<void>("install_runtime", { name, onProgress: new Channel<InstallProgress>(onProgress) });
+}
+
+/** Stops the download. The install then fails with a cancel error. */
+export const cancelRuntimeInstall = (name: RuntimeName) => invoke<void>("cancel_runtime_install", { name });

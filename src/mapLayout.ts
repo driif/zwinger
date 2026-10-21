@@ -1,6 +1,6 @@
 import type { Edge, Node } from "@xyflow/react";
 import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package } from "lucide-react";
-import { isBlocked, NetEvent, ShieldView } from "./api";
+import { AGENT_NAMES, isBlocked, NetEvent, ShieldView } from "./api";
 import { coveredBy, reachable } from "./SecretsSection";
 
 const HOST_X = 16;
@@ -162,15 +162,21 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
     });
     edge(`source:${mount.guest}`, `mount:${mount.guest}`);
   }
-  // Not a user mount: zwinger binds its own copy of pi, and the agent cannot change it.
-  y += GAP + ROW;
-  inner("agent:pi", NODE_X, y, NODE_W, {
-    icon: Package,
-    label: "agent runtime",
-    title: "/opt/zwinger/pi, the pi bundled with zwinger, read-only",
-    tone: "muted",
-    badges: ["ro"],
-  });
+  // Not user mounts: zwinger binds its own copy of each agent runtime, and the agent cannot change it.
+  y += GAP;
+  for (const [name, origin] of [
+    ["pi", "bundled with zwinger"],
+    ...shield.runtimes.map((r) => [r, "downloaded by zwinger"] as const),
+  ] as const) {
+    y += ROW;
+    inner(`agent:${name}`, NODE_X, y, NODE_W, {
+      icon: Package,
+      label: `agent runtime · ${AGENT_NAMES[name]}`,
+      title: `/opt/zwinger/${name}, ${AGENT_NAMES[name]} ${origin}, read-only`,
+      tone: "muted",
+      badges: ["ro"],
+    });
+  }
   // The boundary is first, so React Flow knows the parent before its children.
   nodes.unshift({
     id: "boundary",

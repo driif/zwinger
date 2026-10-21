@@ -11,6 +11,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, Trash2, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import {
+  AGENT_NAMES,
   addMount,
   deleteShield,
   removeMount,
@@ -19,7 +20,8 @@ import {
   setMountReadonly,
   ShieldView,
 } from "./api";
-import type { Intent, Run } from "./App";
+import type { Intent, Run, Runtimes } from "./App";
+import { InstallControl } from "./AgentsTab";
 import { AppsSection } from "./AppsSection";
 
 const WORKSPACE = "/workspace";
@@ -45,12 +47,13 @@ interface MountDraft {
 interface Props {
   shield: ShieldView;
   folders: string[];
+  runtimes: Runtimes;
   run: Run;
   intent?: Intent;
   onIntentDone: () => void;
 }
 
-export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Props) {
+export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDone }: Props) {
   const { id, status } = shield;
   const [name, setName] = useState(shield.name);
   const [nameError, setNameError] = useState<string>();
@@ -248,6 +251,34 @@ export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Prop
             value={shield.harness ?? ""}
             onChange={(value) => run(() => setHarness(id, value || null))}
           />
+        </CardBody>
+      </Card>
+
+      <Card variant="outlined" padding="md">
+        <CardHeader
+          title="Agent runtimes"
+          titleAs="h2"
+          description="For all shields. A shield mounts the installed runtimes read-only when it starts."
+        />
+        <CardBody>
+          <ul className="list">
+            <li className="row">
+              <strong>pi</strong>
+              <span className="grow muted">Bundled with zwinger</span>
+            </li>
+            {runtimes.list.map((runtime) => (
+              <li key={runtime.name} className="row">
+                <strong>{AGENT_NAMES[runtime.name]}</strong>
+                <span className="grow muted">
+                  {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
+                  {runtime.installed && status.state === "running" && !shield.runtimes.includes(runtime.name)
+                    ? " · restart the shield to use it"
+                    : ""}
+                </span>
+                {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
+              </li>
+            ))}
+          </ul>
         </CardBody>
       </Card>
 

@@ -86,6 +86,28 @@ pub enum Error {
     ChatNotFound,
     #[error("pi: {0}")]
     Agent(String),
+    #[error("the agent is busy; wait until it is done, or stop it")]
+    AgentBusy,
+    #[error("this agent does not support {0}")]
+    Unsupported(&'static str),
+    #[error("unknown runtime: {0}")]
+    UnknownRuntime(String),
+    #[error("{0} is not installed")]
+    RuntimeMissing(String),
+    #[error("{0} was installed after the shield started; restart the shield")]
+    RuntimeNotMounted(String),
+    #[error("{0} is being installed")]
+    RuntimeInstalling(String),
+    #[error("the install of {0} was cancelled")]
+    InstallCancelled(String),
+    #[error("no agent runtime for this computer ({0})")]
+    UnsupportedArch(String),
+    #[error("the download of {0} does not match its integrity hash")]
+    IntegrityMismatch(String),
+    #[error("invalid package of {0}: {1}")]
+    BadPackage(String, String),
+    #[error("download: {0}")]
+    Download(#[from] reqwest::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

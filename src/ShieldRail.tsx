@@ -31,7 +31,8 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import { Chat, removeApp, reorderApps, reorderShields, restartApp, ShieldView, startApp, stopApp } from "./api";
+import { AGENT_NAMES, Chat, removeApp, reorderApps, reorderShields, restartApp, ShieldView, startApp, stopApp } from "./api";
+import { AGENT_ICONS } from "./AgentsTab";
 import type { ChatAction, DroppedFolder, Intent, Pane, Run, View } from "./App";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
@@ -309,30 +310,35 @@ export function ShieldRail({
     if (group === "agents") {
       const list = chats[sid] ?? [];
       const order = chatOrder[sid] ?? [];
-      const rank = (c: Chat) => order.indexOf(c.id);
+      // Chat ids are unique per agent only.
+      const key = (c: Chat) => `${c.agent}:${c.id}`;
+      const rank = (c: Chat) => order.indexOf(key(c));
       return [...list.filter((c) => rank(c) < 0), ...list.filter((c) => rank(c) >= 0).sort((a, b) => rank(a) - rank(b))].map(
-        (c) => ({
-          entity: c.id,
-          label: <span className="grow">{c.title}</span>,
-          name: c.title,
-          title: `${c.title} · ${new Date(c.started).toLocaleString()}`,
-          icon: <MessageSquare size={14} />,
-          view: { kind: "chat", chat: c.id },
-          menu: [
-            {
-              label: "Rename",
-              icon: <Pencil size={14} />,
-              rename: c.title,
-              onRename: (name) => onChatAction(sid, { kind: "rename", chat: c.id, name, at: Date.now() }),
-            },
-            {
-              label: "Delete",
-              icon: <Trash2 size={14} />,
-              confirm: `Delete the chat ${c.title}?`,
-              run: () => onChatAction(sid, { kind: "delete", chat: c.id, at: Date.now() }),
-            },
-          ],
-        }),
+        (c) => {
+          const Icon = AGENT_ICONS[c.agent];
+          return {
+            entity: key(c),
+            label: <span className="grow">{c.title}</span>,
+            name: c.title,
+            title: `${c.title} · ${AGENT_NAMES[c.agent]} · ${new Date(c.started).toLocaleString()}`,
+            icon: <Icon size={14} aria-label={AGENT_NAMES[c.agent]} />,
+            view: { kind: "chat", agent: c.agent, chat: c.id },
+            menu: [
+              {
+                label: "Rename",
+                icon: <Pencil size={14} />,
+                rename: c.title,
+                onRename: (name) => onChatAction(sid, { kind: "rename", agent: c.agent, chat: c.id, name, at: Date.now() }),
+              },
+              {
+                label: "Delete",
+                icon: <Trash2 size={14} />,
+                confirm: `Delete the chat ${c.title}?`,
+                run: () => onChatAction(sid, { kind: "delete", agent: c.agent, chat: c.id, at: Date.now() }),
+              },
+            ],
+          };
+        },
       );
     }
     if (group === "terminals")
@@ -438,7 +444,7 @@ export function ShieldRail({
   const selectedRow =
     view.kind === "chat"
       ? view.chat
-        ? `i|${selectedId}|agents|${view.chat}`
+        ? `i|${selectedId}|agents|${view.agent ?? "pi"}:${view.chat}`
         : `g|${selectedId}|agents`
       : view.kind === "terminal"
         ? `i|${selectedId}|terminals|${view.key}`

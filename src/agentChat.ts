@@ -167,6 +167,8 @@ function apply(state: ChatState, record: AgentRecord): ChatState {
       return { ...state, status: "Compacting the context…" };
     case "auto_retry_start":
       return { ...state, status: `Retry ${r.attempt} of ${r.maxAttempts}: ${r.errorMessage}` };
+    case "status":
+      return { ...state, status: r.message };
     case "compaction_end":
     case "auto_retry_end":
       return { ...state, status: undefined };

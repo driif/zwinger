@@ -1,4 +1,4 @@
-/** The env names pi reads for LLM provider keys (docs/reference/pi/providers.md). */
+/** The env names pi reads for LLM provider keys (docs/reference/pi/providers.md), and those of Claude Code and Codex. */
 export const PROVIDER_KEYS = new Set([
   "AI_GATEWAY_API_KEY",
   "ANT_LING_API_KEY",
@@ -7,7 +7,9 @@ export const PROVIDER_KEYS = new Set([
   "ANTHROPIC_OAUTH_TOKEN",
   "BASETEN_API_KEY",
   "CEREBRAS_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
   "CLOUDFLARE_API_KEY",
+  "CODEX_API_KEY",
   "COPILOT_GITHUB_TOKEN",
   "DEEPSEEK_API_KEY",
   "FIREWORKS_API_KEY",
@@ -37,3 +39,9 @@ export const PROVIDER_KEYS = new Set([
   "ZAI_API_KEY",
   "ZAI_CODING_CN_API_KEY",
 ]);
+
+/** The keys that each agent reads. pi reads all of them. */
+export const AGENT_KEYS: Record<"claude" | "codex", string[]> = {
+  claude: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+  codex: ["OPENAI_API_KEY", "CODEX_API_KEY"],
+};

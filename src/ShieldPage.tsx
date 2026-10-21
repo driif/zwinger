@@ -1,9 +1,9 @@
 import { Button, ElasticTabs } from "@driif/motiv";
 import { Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
-import { listFolders, NetEvent, SessionKind, ShieldView } from "./api";
+import { AgentKind, listFolders, NetEvent, SessionKind, ShieldView } from "./api";
 import { AgentsTab } from "./AgentsTab";
-import type { ChatAction, Intent, Pane, Run, TabView, View } from "./App";
+import type { ChatAction, Intent, Pane, Run, Runtimes, TabView, View } from "./App";
 import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
@@ -26,12 +26,14 @@ interface Props {
   intent?: Intent;
   onIntentDone: () => void;
   onNetSeen: (seq: number) => void;
-  onChat: (chat: string) => void;
+  onChat: (agent: AgentKind, chat?: string) => void;
   onChatsChange: () => void;
   chatAction?: ChatAction;
   onChatActionDone: (work: Promise<unknown>) => void;
   /** A folder from Finder was dropped on the shield boundary of the map. */
   onDropFolder: (path: string) => void;
+  runtimes: Runtimes;
+  onRestart: () => void;
   panes: Pane[];
   activePanes: Record<string, string>;
   run: Run;
@@ -56,6 +58,8 @@ export function ShieldPage({
   chatAction,
   onChatActionDone,
   onDropFolder,
+  runtimes,
+  onRestart,
   panes,
   activePanes,
   run,
@@ -71,6 +75,13 @@ export function ShieldPage({
   const [tab, setTab] = useState<TabView>("overview");
   const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
   if (isTab && view.kind !== tab) setTab(view.kind);
+  // Per shield, the agent that the chat view shows. A chat view with no agent keeps it.
+  const [agents, setAgents] = useState<Record<string, AgentKind>>({});
+  const agent = agents[shield.id] ?? "pi";
+  // A rail action on a pi chat needs the pi agent, also while another agent's chat
+  // shows. The view returns to that agent when the action is done.
+  const wantedAgent = chatAction?.agent === "pi" ? "pi" : view.kind === "chat" ? view.agent : undefined;
+  if (wantedAgent && wantedAgent !== agent) setAgents((current) => ({ ...current, [shield.id]: wantedAgent }));
 
   // Folders change outside the app, so the list reloads on focus and after each edit.
   useEffect(() => {
@@ -186,6 +197,7 @@ export function ShieldPage({
                 key={shield.id}
                 shield={shield}
                 folders={folders ?? []}
+                runtimes={runtimes}
                 run={edit}
                 intent={tab === "settings" ? intent : undefined}
                 onIntentDone={onIntentDone}
@@ -198,7 +210,11 @@ export function ShieldPage({
         <AgentsTab
           key={shield.id}
           shield={shield}
+          agent={agent}
           chat={view.kind === "chat" ? view.chat : undefined}
+          onAgent={(agent) => onView({ kind: "chat", agent })}
+          runtimes={runtimes}
+          onRestart={onRestart}
           onJump={jump}
           onChat={onChat}
           onChatsChange={onChatsChange}
