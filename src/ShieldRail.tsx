@@ -20,8 +20,8 @@ import {
   Bot,
   ChevronRight,
   Ellipsis,
+  History,
   ListChecks,
-  MessageSquare,
   Pencil,
   Play,
   Plus,
@@ -34,7 +34,7 @@ import {
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
   AGENT_NAMES,
-  Chat,
+  AgentKind,
   isLive,
   removeApp,
   removeTask,
@@ -42,13 +42,14 @@ import {
   reorderShields,
   restartApp,
   RunSummary,
+  SessionKind,
   ShieldView,
   startApp,
   startTaskRun,
   stopApp,
 } from "./api";
-import { AGENT_ICONS } from "./AgentsTab";
-import type { ChatAction, DroppedFolder, Intent, Pane, Run, View } from "./App";
+import type { DroppedFolder, Intent, Pane, Run, View } from "./App";
+import { AGENT_ICONS } from "./roomParts";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
 const FORBIDDEN = "Not allowed: a shield is a security boundary. Items stay in their shield.";
@@ -60,6 +61,27 @@ const GROUPS: { group: Group; label: string }[] = [
   { group: "apps", label: "Apps" },
   { group: "tasks", label: "Tasks" },
 ];
+
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
+
+/**
+ * The agents of the shield, host agents first. A running shield has pi and its mounted runtimes. A stopped shield
+ * lists the agents that a start can mount; Gemini CLI runs only from this Mac.
+ */
+export function agentsOf(shield: ShieldView): AgentKind[] {
+  const host = shield.hostAgents.map((a) => a.kind);
+  const available: AgentKind[] =
+    shield.status.state === "running" ? ["pi", ...shield.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
+  return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
+}
+
+const kindName = (kind: SessionKind) => (kind.type === "shell" ? "shell" : AGENT_NAMES[kind.agent]);
+
+/** The name of a pane: its shell or agent, and its number among the shield's panes of that kind. */
+export function paneName(pane: Pane, panes: Pane[]) {
+  const same = panes.filter((p) => p.shieldId === pane.shieldId && kindName(p.kind) === kindName(pane.kind));
+  return `${kindName(pane.kind)} ${same.indexOf(pane) + 1}`;
+}
 
 /** The badge of a task: its latest run. */
 function runBadge(run: RunSummary | undefined) {
@@ -256,7 +278,6 @@ interface Props {
   view: View;
   /** Per shield, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
-  chats: Record<string, Chat[]>;
   /** Per shield, the runs of its tasks. */
   runs: Record<string, RunSummary[]>;
   panes: Pane[];
@@ -264,10 +285,9 @@ interface Props {
   onSelect: (id: string) => void;
   onOpen: (shieldId: string, view: View) => void;
   onIntent: (shieldId: string, kind: Intent["kind"], appId?: string) => void;
-  onChatAction: (shieldId: string, action: ChatAction) => void;
   onRunsChange: (shieldId: string) => void;
   onToggle: (shield: ShieldView) => void;
-  onNewShell: (shieldId: string) => void;
+  onNewSession: (shieldId: string, kind: SessionKind) => void;
   onClosePane: (key: string) => void;
   onMovePanes: (shieldId: string, keys: string[]) => void;
   onNew: () => void;
@@ -285,17 +305,15 @@ export function ShieldRail({
   selectedId,
   view,
   blocked,
-  chats,
   runs,
   panes,
   run,
   onSelect,
   onOpen,
   onIntent,
-  onChatAction,
   onRunsChange,
   onToggle,
-  onNewShell,
+  onNewSession,
   onClosePane,
   onMovePanes,
   onNew,
@@ -309,8 +327,6 @@ export function ShieldRail({
     () => new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]),
   );
   const [focused, setFocused] = useState<string>();
-  /** Per shield, the chat order of this app session. */
-  const [chatOrder, setChatOrder] = useState<Record<string, string[]>>({});
   const [dragging, setDragging] = useState(false);
   /** The other shield that a dragged item is over. */
   const [forbidden, setForbidden] = useState<string>();
@@ -339,44 +355,11 @@ export function ShieldRail({
 
   function leaves(shield: ShieldView, group: Group): Leaf[] {
     const sid = shield.id;
-    if (group === "agents") {
-      const list = chats[sid] ?? [];
-      const order = chatOrder[sid] ?? [];
-      // Chat ids are unique per agent only.
-      const key = (c: Chat) => `${c.agent}:${c.id}`;
-      const rank = (c: Chat) => order.indexOf(key(c));
-      return [...list.filter((c) => rank(c) < 0), ...list.filter((c) => rank(c) >= 0).sort((a, b) => rank(a) - rank(b))].map(
-        (c) => {
-          const Icon = AGENT_ICONS[c.agent];
-          return {
-            entity: key(c),
-            label: <span className="grow">{c.title}</span>,
-            name: c.title,
-            title: `${c.title} · ${AGENT_NAMES[c.agent]} · ${new Date(c.started).toLocaleString()}`,
-            icon: <Icon size={14} aria-label={AGENT_NAMES[c.agent]} />,
-            view: { kind: "chat", agent: c.agent, chat: c.id },
-            menu: [
-              {
-                label: "Rename",
-                icon: <Pencil size={14} />,
-                rename: c.title,
-                onRename: (name) => onChatAction(sid, { kind: "rename", agent: c.agent, chat: c.id, name, at: Date.now() }),
-              },
-              {
-                label: "Delete",
-                icon: <Trash2 size={14} />,
-                confirm: `Delete the chat ${c.title}?`,
-                run: () => onChatAction(sid, { kind: "delete", agent: c.agent, chat: c.id, at: Date.now() }),
-              },
-            ],
-          };
-        },
-      );
-    }
-    if (group === "terminals")
+    if (group === "agents" || group === "terminals")
       return panes
-        .filter((p) => p.shieldId === sid)
-        .map((pane, index) => {
+        .filter((p) => p.shieldId === sid && (p.kind.type === "agent") === (group === "agents"))
+        .map((pane) => {
+          const { kind } = pane;
           const session = shield.sessions.find((s) => s.id === pane.sessionId);
           const state =
             pane.sessionId === undefined
@@ -386,7 +369,9 @@ export function ShieldRail({
                 : session.exitCode !== null
                   ? `exited ${session.exitCode}`
                   : undefined;
-          const name = `${pane.kind} ${index + 1}`;
+          const name = paneName(pane, panes);
+          const Icon = kind.type === "agent" ? AGENT_ICONS[kind.agent] : SquareTerminal;
+          const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
           return {
             entity: pane.key,
             label: (
@@ -396,9 +381,19 @@ export function ShieldRail({
               </span>
             ),
             name,
-            icon: pane.kind === "pi" ? <Bot size={14} /> : <SquareTerminal size={14} />,
+            icon: <Icon size={14} aria-hidden />,
             view: { kind: "terminal", key: pane.key },
-            menu: [{ label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) }],
+            menu:
+              kind.type === "agent"
+                ? [
+                    {
+                      label: "Continue last session",
+                      icon: <History size={14} />,
+                      run: () => onNewSession(sid, { ...kind, resume: true }),
+                    },
+                    close,
+                  ]
+                : [close],
           };
         });
     const shieldRunning = shield.status.state === "running";
@@ -514,14 +509,11 @@ export function ShieldRail({
   });
   const tabStop = focused && visible.includes(focused) ? focused : (visible.find((id) => id === `s|${selectedId}`) ?? visible[0]);
 
+  const selectedPane = view.kind === "terminal" ? panes.find((p) => p.key === view.key) : undefined;
   const selectedRow =
-    view.kind === "chat"
-      ? view.chat
-        ? `i|${selectedId}|agents|${view.agent ?? "pi"}:${view.chat}`
-        : `g|${selectedId}|agents`
-      : view.kind === "terminal"
-        ? `i|${selectedId}|terminals|${view.key}`
-        : view.kind === "app"
+    view.kind === "terminal"
+      ? `i|${selectedId}|${selectedPane?.kind.type === "agent" ? "agents" : "terminals"}|${view.key}`
+      : view.kind === "app"
           ? `i|${selectedId}|apps|${view.appId}`
           : view.kind === "task" || (view.kind === "taskEdit" && view.taskId)
             ? `i|${selectedId}|tasks|${view.taskId}`
@@ -619,8 +611,11 @@ export function ShieldRail({
     const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
     if (container === "shields") run(() => reorderShields(next));
     else if (container.endsWith("|apps")) run(() => reorderApps(shieldId, next));
-    else if (container.endsWith("|terminals")) onMovePanes(shieldId, next);
-    else setChatOrder((current) => ({ ...current, [shieldId]: next }));
+    else {
+      // Agents and terminals are both panes: the other group keeps its order.
+      const others = panes.filter((p) => p.shieldId === shieldId && !next.includes(p.key)).map((p) => p.key);
+      onMovePanes(shieldId, [...next, ...others]);
+    }
   }
 
   const announcements: Announcements = {
@@ -631,11 +626,12 @@ export function ShieldRail({
   };
 
   function groupAction(shield: ShieldView, group: Group) {
+    const id = `g|${shield.id}|agents`;
     const [icon, label, action] =
       group === "agents"
-        ? [<MessageSquare size={12} />, "Open agent", () => onOpen(shield.id, { kind: "chat" })]
+        ? [<Plus size={12} />, "New agent", () => setMenu(id)]
         : group === "terminals"
-          ? [<Plus size={12} />, "New shell", () => onNewShell(shield.id)]
+          ? [<Plus size={12} />, "New shell", () => onNewSession(shield.id, { type: "shell" })]
           : group === "apps"
             ? [<Plus size={12} />, "Add app", () => onIntent(shield.id, "app")]
             : [<Plus size={12} />, "New task", () => onOpen(shield.id, { kind: "taskEdit" })];
@@ -643,6 +639,8 @@ export function ShieldRail({
       <IconButton
         icon={icon}
         label={label}
+        aria-haspopup={group === "agents" ? "menu" : undefined}
+        aria-expanded={group === "agents" ? menu === id : undefined}
         tabIndex={-1}
         onClick={(e) => {
           e.stopPropagation();
@@ -785,6 +783,20 @@ export function ShieldRail({
                               </>
                             }
                           >
+                            {menu === id && (
+                              <RowMenu
+                                label="New agent"
+                                actions={agentsOf(shield).map((agent) => {
+                                  const Icon = AGENT_ICONS[agent];
+                                  return {
+                                    label: AGENT_NAMES[agent],
+                                    icon: <Icon size={14} />,
+                                    run: () => onNewSession(shield.id, { type: "agent", agent, resume: false }),
+                                  };
+                                })}
+                                onClose={closeMenu}
+                              />
+                            )}
                             {open && (
                               <ul role="group">
                                 <SortableContext

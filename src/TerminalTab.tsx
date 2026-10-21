@@ -9,7 +9,8 @@ interface Props {
   panes: Pane[];
   activePane?: string;
   visible: boolean;
-  onNewSession: (kind: SessionKind) => void;
+  /** `agent` opens the shield's first agent. */
+  onNewSession: (kind: SessionKind | "agent") => void;
   onPaneOpen: (key: string, sessionId: string) => void;
   onPaneExit: () => void;
   onPaneError: (key: string, error: unknown) => void;
@@ -23,14 +24,14 @@ export function TerminalTab({ shield, panes, activePane, visible, onNewSession, 
       {!shown && (
         <div className="empty">
           <p className="muted">
-            No terminal. A shell starts in /workspace. pi starts in {shield.harness ?? "/workspace"}.
+            No terminal. A shell starts in /workspace. An agent starts in {shield.harness ?? "/workspace"}.
           </p>
           <div className="row">
-            <Button variant="outline" iconLeft={<SquareTerminal size={14} />} onClick={() => onNewSession("shell")}>
+            <Button variant="outline" iconLeft={<SquareTerminal size={14} />} onClick={() => onNewSession({ type: "shell" })}>
               New shell <kbd className="muted">⌘T</kbd>
             </Button>
-            <Button variant="outline" iconLeft={<Bot size={14} />} onClick={() => onNewSession("pi")}>
-              New pi terminal
+            <Button variant="outline" iconLeft={<Bot size={14} />} onClick={() => onNewSession("agent")}>
+              New agent <kbd className="muted">⌘P</kbd>
             </Button>
           </div>
         </div>

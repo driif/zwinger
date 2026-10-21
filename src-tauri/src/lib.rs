@@ -173,12 +173,6 @@ pub fn run() {
             commands::write_session,
             commands::resize_session,
             commands::close_session,
-            commands::open_agent,
-            commands::agent_call,
-            commands::close_agent,
-            commands::list_chats,
-            commands::delete_chat,
-            commands::rename_chat,
             commands::list_runtimes,
             commands::install_runtime,
             commands::cancel_runtime_install,
@@ -186,6 +180,7 @@ pub fn run() {
             commands::detect_host_agents,
             commands::put_host_agent,
             commands::remove_host_agent,
+            commands::set_agents_unprompted,
             commands::set_auto_renew,
             commands::put_task,
             commands::remove_task,
@@ -224,4 +219,19 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_chat_commands_are_gone() {
+        let source = include_str!("lib.rs");
+        let handler = &source[source.find("generate_handler![").unwrap()..];
+        let handler = &handler[..handler.find("])").unwrap()];
+        assert!(handler.contains("commands::open_session,"));
+        assert!(handler.contains("commands::set_agents_unprompted,"));
+        for gone in ["open_agent", "agent_call", "close_agent", "list_chats", "delete_chat", "rename_chat"] {
+            assert!(!handler.contains(&format!("commands::{gone},")), "{gone}");
+        }
+    }
 }

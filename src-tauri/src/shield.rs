@@ -45,6 +45,13 @@ pub struct Shield {
     /// works in it then.
     #[serde(default)]
     pub auto_renew: bool,
+    /// The agent commands skip their permission prompts: the shield is the sandbox.
+    #[serde(default = "yes")]
+    pub agents_unprompted: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A host agent of a shield: its runtime, and if the shield also gets the
@@ -208,6 +215,7 @@ impl Shield {
             tasks: Vec::new(),
             host_agents: Vec::new(),
             auto_renew: false,
+            agents_unprompted: true,
         })
     }
 
@@ -596,7 +604,7 @@ impl Shield {
     }
 
     /// No host path may nest with the app data dir, in either direction, even
-    /// read-only: it holds the pi runtime and the chats of every shield.
+    /// read-only: it holds the pi runtime and the agent state of every shield.
     pub fn check_app_data(&self, data: &Path) -> Result<()> {
         let paths = std::iter::once(&self.folder).chain(self.mounts.iter().map(|m| &m.host));
         for path in paths {

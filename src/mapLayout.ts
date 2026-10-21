@@ -170,12 +170,17 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
     ...shield.runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
   ] as const) {
     y += ROW;
+    // pi has no permission prompts; the setting applies to the other agents.
+    const prompts = name === "pi" ? undefined : shield.agentsUnprompted ? "no prompts" : "prompts";
     inner(`agent:${name}`, NODE_X, y, NODE_W, {
       icon: Package,
       label: `agent runtime · ${AGENT_NAMES[name]}`,
-      title: `/opt/zwinger/${name}, ${AGENT_NAMES[name]} ${origin}, read-only`,
+      title: `/opt/zwinger/${name}, ${AGENT_NAMES[name]} ${origin}, read-only${
+        prompts ? `; it runs ${shield.agentsUnprompted ? "without" : "with"} permission prompts` : ""
+      }`,
       tone: "muted",
-      badges: ["ro"],
+      badges: prompts ? ["ro", prompts] : ["ro"],
+      jump: "settings",
     });
   }
   // A host agent's profile is a read-only copy of its config dir on this Mac; its login stays on the Mac.

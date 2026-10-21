@@ -3,7 +3,7 @@ import { Download, RefreshCw, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import { AGENT_NAMES, Detection, GEMINI_NO_LOGIN, HostAgent, RuntimeName, ShieldView } from "./api";
 import type { Run, Runtimes } from "./App";
-import { InstallControl } from "./AgentsTab";
+import { InstallControl } from "./roomParts";
 
 const CONFIG_DIRS: Record<HostAgent["kind"], string> = {
   claude: "~/.claude",

@@ -1,4 +1,4 @@
-//! Codex: one `codex exec --json` per turn; a later turn resumes the thread.
+//! Codex: its paths in the VM, and the mapper of `codex exec --json` output.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,37 +9,6 @@ pub const DIR: &str = "/opt/zwinger/codex";
 /// Its `CODEX_HOME`, so `~/.codex` is in the shield's state and never the
 /// host's. Codex refuses to make its helper binaries below `/tmp`.
 pub const HOME: &str = "/opt/zwinger/state/codex";
-
-/// `thread` resumes an earlier chat. The prompt comes on stdin (`-`), so
-/// its size has no argv limit.
-pub fn argv(thread: Option<&str>, model: Option<&str>) -> Vec<String> {
-    let mut argv = vec![
-        "env".to_owned(),
-        format!("CODEX_HOME={HOME}"),
-        format!("{DIR}/bin/codex"),
-        "exec".to_owned(),
-    ];
-    if let Some(thread) = thread {
-        argv.extend(["resume".to_owned(), thread.to_owned()]);
-    }
-    // `--dangerously-bypass-approvals-and-sandbox` is acceptable only because
-    // the agent runs inside the shield: the VM is the sandbox, with only the
-    // shield's mounts and allowed hosts. Codex's own sandbox does not work in
-    // the VM.
-    argv.extend(
-        ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"].map(str::to_owned),
-    );
-    if let Some(model) = model {
-        argv.extend(["-m".to_owned(), model.to_owned()]);
-    }
-    argv.push("-".to_owned());
-    argv
-}
-
-/// The thread id of the chat, from the `thread.started` event.
-pub fn session_id(event: &Value) -> Option<&str> {
-    (event["type"] == "thread.started").then(|| event["thread_id"].as_str()).flatten()
-}
 
 /// The tool name and arguments of an item that is a tool call.
 fn call(item: &Value) -> Option<(String, Value)> {
@@ -219,29 +188,12 @@ mod tests {
         serde_json::from_str(line).unwrap()
     }
 
-    #[test]
-    fn argv_starts_and_resumes() {
-        let tail = ["--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"];
-        let head = ["env", "CODEX_HOME=/opt/zwinger/state/codex", "/opt/zwinger/codex/bin/codex", "exec"];
-        let mut first: Vec<&str> = head.to_vec();
-        first.extend(tail);
-        first.push("-");
-        assert_eq!(argv(None, None), first);
-
-        let mut resumed: Vec<&str> = head.to_vec();
-        resumed.extend(["resume", "01a1"]);
-        resumed.extend(tail);
-        resumed.extend(["-m", "gpt-5", "-"]);
-        assert_eq!(argv(Some("01a1"), Some("gpt-5")), resumed);
-    }
-
     // Hand-written fixtures in the format of `codex exec --json`; the first
     // lines follow docs/reference/agent-cli-samples.txt.
     #[test]
     fn maps_a_turn_with_a_command() {
         let mut mapper = Mapper::default();
         let thread = event(r#"{"type":"thread.started","thread_id":"01a15e33-dab4-72d1-b5e4-ce21c97cd698"}"#);
-        assert_eq!(session_id(&thread), Some("01a15e33-dab4-72d1-b5e4-ce21c97cd698"));
         assert!(mapper.map(&thread).is_empty());
         assert!(mapper.map(&event(r#"{"type":"turn.started"}"#)).is_empty());
 

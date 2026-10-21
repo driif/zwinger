@@ -17,8 +17,7 @@ import {
 } from "./api";
 import { time } from "./HostAgentsSettings";
 import { reachable } from "./SecretsSection";
-import { AgentsTab } from "./AgentsTab";
-import type { ChatAction, Intent, Pane, Run, Runtimes, TabView, View } from "./App";
+import type { Intent, Pane, Run, Runtimes, TabView, View } from "./App";
 import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
@@ -106,7 +105,7 @@ function AddAgent({ shield, detection, kind, run, onDone }: {
   );
 }
 
-// Agents and Terminal are no tabs: the tree names each chat and terminal, so tabs would show them twice.
+// Agents and Terminal are no tabs: the tree names each agent and terminal, so tabs would show them twice.
 const TABS = [
   { value: "overview", label: "Overview" },
   { value: "network", label: "Network" },
@@ -122,10 +121,6 @@ interface Props {
   intent?: Intent;
   onIntentDone: () => void;
   onNetSeen: (seq: number) => void;
-  onChat: (agent: AgentKind, chat?: string) => void;
-  onChatsChange: () => void;
-  chatAction?: ChatAction;
-  onChatActionDone: (work: Promise<unknown>) => void;
   /** A folder from Finder was dropped on the shield boundary of the map. */
   onDropFolder: (path: string) => void;
   runtimes: Runtimes;
@@ -144,7 +139,8 @@ interface Props {
   activePanes: Record<string, string>;
   run: Run;
   onToggle: () => void;
-  onNewSession: (kind: SessionKind) => void;
+  /** `agent` opens the shield's first agent. */
+  onNewSession: (kind: SessionKind | "agent") => void;
   onPaneOpen: (key: string, sessionId: string) => void;
   onPaneExit: () => void;
   onPaneError: (key: string, error: unknown) => void;
@@ -159,10 +155,6 @@ export function ShieldPage({
   intent,
   onIntentDone,
   onNetSeen,
-  onChat,
-  onChatsChange,
-  chatAction,
-  onChatActionDone,
   onDropFolder,
   runtimes,
   detection,
@@ -182,18 +174,11 @@ export function ShieldPage({
   const [listed, setListed] = useState<{ id: string; folders: string[] }>();
   const [reloads, setReloads] = useState(0);
   const folders = listed?.id === shield.id ? listed.folders : undefined;
-  // The tab that shows again after a chat, terminal or app view. The tabs stay
+  // The tab that shows again after a terminal, app or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
   const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
   if (isTab && view.kind !== tab) setTab(view.kind);
-  // Per shield, the agent that the chat view shows. A chat view with no agent keeps it.
-  const [agents, setAgents] = useState<Record<string, AgentKind>>({});
-  const agent = agents[shield.id] ?? "pi";
-  // A rail action on a pi chat needs the pi agent, also while another agent's chat
-  // shows. The view returns to that agent when the action is done.
-  const wantedAgent = chatAction?.agent === "pi" ? "pi" : view.kind === "chat" ? view.agent : undefined;
-  if (wantedAgent && wantedAgent !== agent) setAgents((current) => ({ ...current, [shield.id]: wantedAgent }));
 
   // Folders change outside the app, so the list reloads on focus and after each edit.
   useEffect(() => {
@@ -372,23 +357,6 @@ export function ShieldPage({
             ),
           }}
         />
-      {/* Stays mounted, so the chat keeps its state while another view shows. */}
-      <div className="view" hidden={view.kind !== "chat"}>
-        <AgentsTab
-          key={shield.id}
-          shield={shield}
-          agent={agent}
-          chat={view.kind === "chat" ? view.chat : undefined}
-          onAgent={(agent) => onView({ kind: "chat", agent })}
-          runtimes={runtimes}
-          onRestart={onRestart}
-          onJump={jump}
-          onChat={onChat}
-          onChatsChange={onChatsChange}
-          chatAction={chatAction}
-          onChatActionDone={onChatActionDone}
-        />
-      </div>
       {app && (
         <div className="view">
           <AppView

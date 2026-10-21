@@ -1,5 +1,4 @@
-//! Gemini CLI: one `gemini --output-format stream-json` per turn; a later
-//! turn resumes the session. It runs from the host install, which the shield
+//! Gemini CLI: one `gemini --output-format stream-json` per task call. It runs from the host install, which the shield
 //! mounts read-only: Gemini CLI has no pinned runtime. It authenticates
 //! with a `GEMINI_API_KEY` secret only: its subscription login is not
 //! supported yet (ADR 0002, issue #16).
@@ -10,37 +9,6 @@ use serde_json::{Value, json};
 pub const DIR: &str = "/opt/zwinger/host/gemini";
 /// Its `HOME`, so `~/.gemini` is in the shield's state and never the host's.
 pub const HOME: &str = "/opt/zwinger/state/gemini";
-
-/// `entry` is the guest path of the entry point that detection found in
-/// the package. `session` resumes an earlier chat. The prompt comes on stdin, so its size
-/// has no argv limit. `yolo` approves each tool call: acceptable only because
-/// the agent runs inside the shield. With no `yolo`, headless Gemini CLI
-/// refuses the tools that need an approval, such as edits.
-pub fn argv(entry: &str, session: Option<&str>, model: Option<&str>, yolo: bool) -> Vec<String> {
-    let mut argv = vec![
-        "env".to_owned(),
-        format!("HOME={HOME}"),
-        "node".to_owned(),
-        entry.to_owned(),
-        "--output-format".to_owned(),
-        "stream-json".to_owned(),
-    ];
-    if yolo {
-        argv.push("--yolo".to_owned());
-    }
-    if let Some(session) = session {
-        argv.extend(["--resume".to_owned(), session.to_owned()]);
-    }
-    if let Some(model) = model {
-        argv.extend(["-m".to_owned(), model.to_owned()]);
-    }
-    argv
-}
-
-/// The session id of the chat, from the `init` event.
-pub fn session_id(event: &Value) -> Option<&str> {
-    (event["type"] == "init").then(|| event["session_id"].as_str()).flatten()
-}
 
 fn assistant(content: Value) -> Value {
     json!({ "type": "message_end", "message": { "role": "assistant", "content": [content] } })
@@ -144,25 +112,12 @@ mod tests {
         serde_json::from_str(line).unwrap()
     }
 
-    #[test]
-    fn argv_starts_resumes_and_has_a_read_only_form() {
-        let entry = "/opt/zwinger/host/gemini/bundle/gemini.js";
-        let head = ["env", "HOME=/opt/zwinger/state/gemini", "node", entry];
-        let mut first: Vec<&str> = head.to_vec();
-        first.extend(["--output-format", "stream-json", "--yolo"]);
-        assert_eq!(argv(entry, None, None, true), first);
-        let mut resumed: Vec<&str> = head.to_vec();
-        resumed.extend(["--output-format", "stream-json", "--resume", "s-1", "-m", "gemini-2.5-pro"]);
-        assert_eq!(argv(entry, Some("s-1"), Some("gemini-2.5-pro"), false), resumed);
-    }
-
     // Hand-written fixtures in the documented `stream-json` format of
     // Gemini CLI's headless mode; no run with a real login has shown them yet.
     #[test]
     fn maps_a_turn_with_a_tool_call() {
         let mut mapper = Mapper::default();
         let init = event(r#"{"type":"init","timestamp":"t","session_id":"5f1c","model":"gemini-2.5-pro"}"#);
-        assert_eq!(session_id(&init), Some("5f1c"));
         assert!(mapper.map(&init).is_empty());
         assert!(mapper.map(&event(r#"{"type":"message","role":"user","content":"List the files"}"#)).is_empty());
 

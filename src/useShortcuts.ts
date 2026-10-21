@@ -4,7 +4,7 @@ export const SHORTCUTS = [
   { key: "k", label: "⌘K", action: "commands" },
   { key: "n", label: "⌘N", action: "newShield" },
   { key: "t", label: "⌘T", action: "newShell" },
-  { key: "p", label: "⌘P", action: "newPi" },
+  { key: "p", label: "⌘P", action: "newAgent" },
   { key: "w", label: "⌘W", action: "close" },
   { key: "]", label: "⌘]", action: "next" },
   { key: "[", label: "⌘[", action: "previous" },
@@ -22,8 +22,10 @@ export const shortcutLabel = (action: ShortcutAction) => SHORTCUTS.find((s) => s
 export function useShortcuts(handlers: Record<ShortcutAction, () => void>) {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      // Only plain ⌘ chords: Ctrl, Option and Shift keys go to the terminal and its agent.
+      if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
       const shortcut = SHORTCUTS.find((s) => s.key === event.key);
-      if (!event.metaKey || event.shiftKey || event.altKey || !shortcut) return;
+      if (!shortcut) return;
       event.preventDefault();
       event.stopPropagation();
       handlers[shortcut.action]();

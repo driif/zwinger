@@ -8,8 +8,8 @@ use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
-use crate::agent::pi::{self, AGENT_DIR, PI_DIR};
-use crate::agent::{RESERVED, STATE_DIR};
+use crate::agent::pi::{AGENT_DIR, PI_DIR};
+use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
 use crate::error::{Error, Result};
 use crate::host_agents::login;
 use crate::netlog;
@@ -41,21 +41,32 @@ child.on("exit", (code, signal) => process.exit(code ?? 128 + signals[signal]));
 const SIGTERM: i32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum SessionKind {
     Shell,
-    Pi,
+    /// The agent's own TUI, through its wrapper. `resume` continues the
+    /// agent's last session.
+    Agent { agent: AgentKind, resume: bool },
 }
 
 impl SessionKind {
-    /// `pi_host` runs the host pi that the shield mounts.
-    pub fn argv(self, pi_host: bool) -> Vec<String> {
+    pub fn argv(self) -> Vec<String> {
         match self {
             Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
-            Self::Pi => pi::pi_argv(false, pi_host),
+            Self::Agent { agent, resume } => {
+                let mut argv = vec![format!("{}/{}", launch::BIN_DIR, agent.name())];
+                if resume {
+                    argv.extend(launch::continue_args(agent).iter().map(|a| (*a).to_owned()));
+                }
+                argv
+            }
         }
     }
 }
+
+/// The env of each PTY exec. A login shell resets `PATH`; the profile file
+/// of [`launch::PROFILE`] puts the wrappers back.
+pub const PTY_ENV: [(&str, &str); 3] = [("PATH", launch::PATH), ("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
 
 /// A host folder that a start mounts read-only, such as a host agent's
 /// package or profile snapshot.
@@ -209,7 +220,7 @@ pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Ve
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-/// `pi` is the host copy of the pi bundle, from [`pi::install_pi`].
+/// `pi` is the host copy of the pi bundle, from [`crate::agent::pi::install_pi`].
 #[derive(Clone)]
 pub struct Microsandbox {
     pub pi: PathBuf,
@@ -322,9 +333,9 @@ impl SandboxRuntime for Microsandbox {
     async fn open_pty(&self, vm: &Sandbox, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
         let mut handle = vm
             .exec_stream_with(&argv[0], |e| {
-                e.args(&argv[1..])
-                    .cwd(cwd)
-                    .env("TERM", "xterm-256color")
+                PTY_ENV
+                    .iter()
+                    .fold(e.args(&argv[1..]).cwd(cwd), |e, (name, value)| e.env(*name, *value))
                     .tty(true)
                     .stdin_pipe()
             })
@@ -478,8 +489,11 @@ pub mod fake {
         pub binds: Arc<Mutex<Vec<Bind>>>,
         /// What `node --version` prints. `None` prints a supported version.
         pub node_version: Arc<Mutex<Option<String>>>,
-        /// The scripts whose `node <script> --version` probe fails.
+        /// The scripts whose probe fails: `node <script> --version`, or the
+        /// start of the pi TUI.
         pub probe_fail: Arc<Mutex<Vec<String>>>,
+        /// The root execs that wrote the profile file.
+        pub profiles: Arc<Mutex<Vec<Vec<String>>>>,
         /// The other ends of the pipes from `open_pipe`, except the Node
         /// check. The test plays the process: it reads stdin, and sends output
         /// in chunks of its choice and the exit when it wants.
@@ -493,7 +507,6 @@ pub mod fake {
 
     pub struct FakePipe {
         pub argv: Vec<String>,
-        pub cwd: String,
         pub stdin: Receiver<PipeInput>,
         pub out: Sender<PipeEvent>,
     }
@@ -566,6 +579,18 @@ pub mod fake {
         async fn open_pty(&self, _: &FakeVm, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
             self.cwds.lock().unwrap().push(cwd.to_owned());
             self.argvs.lock().unwrap().push(argv.to_vec());
+            // The TUI probe of the host pi ends at once: with an error, or as if pi had started.
+            if argv.last().is_some_and(|a| a == "--no-session") {
+                let (input, _) = mpsc::unbounded_channel();
+                let (tx, events) = mpsc::unbounded_channel();
+                if argv.iter().any(|a| self.probe_fail.lock().unwrap().contains(a)) {
+                    let _ = tx.send(PtyEvent::Output(b"Error: Cannot find module './darwin-arm64.node'\r\n".to_vec()));
+                    let _ = tx.send(PtyEvent::Exit(1));
+                } else {
+                    let _ = tx.send(PtyEvent::Exit(0));
+                }
+                return Ok(Pty { input, events });
+            }
             let gate = self.pty_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
@@ -601,13 +626,18 @@ pub mod fake {
             Ok(Pty { input, events })
         }
 
-        async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str) -> Result<Pipe> {
+        async fn open_pipe(&self, _: &FakeVm, argv: &[String], _: &str) -> Result<Pipe> {
             let (input, stdin) = mpsc::channel(PIPE_QUEUE);
             let (out, events) = mpsc::channel(PIPE_QUEUE);
             if argv == ["node", "--version"] {
                 let version = self.node_version.lock().unwrap().clone();
                 let version = version.unwrap_or_else(|| "v22.19.0\n".into());
                 let _ = out.try_send(PipeEvent::Stdout(version.into_bytes()));
+                let _ = out.try_send(PipeEvent::Exit(0));
+                return Ok(Pipe { input, events });
+            }
+            if argv == launch::profile_argv() {
+                self.profiles.lock().unwrap().push(argv.to_vec());
                 let _ = out.try_send(PipeEvent::Exit(0));
                 return Ok(Pipe { input, events });
             }
@@ -628,7 +658,6 @@ pub mod fake {
             }
             self.pipes.lock().unwrap().push(FakePipe {
                 argv: argv.to_vec(),
-                cwd: cwd.to_owned(),
                 stdin,
                 out,
             });
@@ -829,6 +858,29 @@ mod tests {
             assert!(entry.require_tls_identity);
             assert!(entry.passthrough_hosts.is_empty());
         }
+    }
+
+    #[test]
+    fn sessions_run_a_login_shell_or_an_agent_wrapper() {
+        assert_eq!(SessionKind::Shell.argv(), ["/bin/bash", "-l"]);
+        let claude = SessionKind::Agent { agent: AgentKind::Claude, resume: false };
+        assert_eq!(claude.argv(), ["/opt/zwinger/bin/claude"]);
+        let codex = SessionKind::Agent { agent: AgentKind::Codex, resume: true };
+        assert_eq!(codex.argv(), ["/opt/zwinger/bin/codex", "resume", "--last"]);
+        let gemini = SessionKind::Agent { agent: AgentKind::Gemini, resume: true };
+        assert_eq!(gemini.argv(), ["/opt/zwinger/bin/gemini", "--resume", "latest"]);
+        let pi = SessionKind::Agent { agent: AgentKind::Pi, resume: true };
+        assert_eq!(pi.argv(), ["/opt/zwinger/bin/pi", "-c"]);
+        assert_eq!(serde_json::to_value(codex).unwrap(), json!({ "type": "agent", "agent": "codex", "resume": true }));
+        assert_eq!(serde_json::from_value::<SessionKind>(json!({ "type": "shell" })).unwrap(), SessionKind::Shell);
+    }
+
+    #[test]
+    fn pty_execs_get_the_wrappers_on_path_and_true_colour() {
+        let env: BTreeMap<_, _> = PTY_ENV.into_iter().collect();
+        assert!(env["PATH"].starts_with("/opt/zwinger/bin:"));
+        assert!(env["PATH"].split(':').any(|d| d == "/usr/local/bin"), "node is in /usr/local/bin");
+        assert_eq!((env["TERM"], env["COLORTERM"]), ("xterm-256color", "truecolor"));
     }
 
     #[test]

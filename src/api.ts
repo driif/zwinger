@@ -1,7 +1,8 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-export type SessionKind = "shell" | "pi";
+/** A login shell in /workspace, or an agent's own TUI in the harness. `resume` continues the agent's last session. */
+export type SessionKind = { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
 
 export interface Mount {
   host: string;
@@ -124,6 +125,8 @@ export interface ShieldView {
   hostAgents: HostAgentUse[];
   /** Restart when this Mac has a newer host login than the VM, if nothing works in the shield. */
   autoRenew: boolean;
+  /** The agent commands skip their permission prompts: the shield is the sandbox. */
+  agentsUnprompted: boolean;
   /** The earliest expiry of the running VM's host logins, in ms since the epoch. */
   loginExpiresAt: number | null;
   /** A host login is due and this Mac has a newer one: a restart reads it. */
@@ -250,52 +253,12 @@ export const resizeSession = (id: string, rows: number, cols: number) =>
 
 export const closeSession = (id: string) => invoke<void>("close_session", { id });
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-/** The pi RPC commands that the backend accepts. It builds the JSON for pi from these fields. */
-export type AgentCommand =
-  | { type: "prompt" | "steer" | "follow_up"; message: string }
-  | { type: "abort" | "get_state" | "get_messages" | "get_available_models" | "new_session" | "get_session_stats" }
-  | { type: "set_model"; provider: string; modelId: string }
-  | { type: "set_thinking_level"; level: ThinkingLevel }
-  | { type: "switch_session"; chat: string }
-  | { type: "set_session_name"; name: string };
-
 export type AgentKind = "pi" | "claude" | "codex" | "gemini";
 
 export const AGENT_NAMES: Record<AgentKind, string> = { pi: "pi", claude: "Claude Code", codex: "Codex", gemini: "Gemini CLI" };
 
-/** A chat of a shield. `id` is a file name, unique per agent. */
-export interface Chat {
-  agent: AgentKind;
-  id: string;
-  started: string;
-  title: string;
-}
-
-/** A pi stdout record, passed through as is, or the backend's `agent_exit`. */
+/** A pi-shaped record of a task run's live agent output. */
 export type AgentRecord = { type: string } & Record<string, unknown>;
-
-/** Opens the shield's agent of this kind, or takes over the running one. */
-export function openAgent(shieldId: string, agent: AgentKind, onEvent: (record: AgentRecord) => void) {
-  const channel = new Channel<AgentRecord>(onEvent);
-  return invoke<string>("open_agent", { shieldId, agent, onEvent: channel });
-}
-
-/** Resolves to the `data` of pi's response. */
-export const agentCall = <T>(id: string, command: AgentCommand) => invoke<T>("agent_call", { id, command });
-
-export const closeAgent = (id: string) => invoke<void>("close_agent", { id });
-
-export const listChats = (shieldId: string) => invoke<Chat[]>("list_chats", { shieldId });
-
-/** Only a listed chat; a link or another file is refused. */
-export const deleteChat = (shieldId: string, agent: AgentKind, chat: string) =>
-  invoke<void>("delete_chat", { shieldId, agent, chat });
-
-/** Claude Code and Codex chats only: pi renames its chats itself. */
-export const renameChat = (shieldId: string, agent: AgentKind, chat: string, title: string) =>
-  invoke<void>("rename_chat", { shieldId, agent, chat, title });
 
 /** The agents that zwinger downloads on first use. pi is bundled. */
 export type RuntimeName = "claude" | "codex";
@@ -363,6 +326,9 @@ export const putHostAgent = (id: string, agent: HostAgentUse, allowHosts: boolea
 
 /** Also removes its host login. */
 export const removeHostAgent = (id: string, agent: AgentKind) => invoke<void>("remove_host_agent", { id, agent });
+
+/** Needs no restart: the running shield gets new agent commands at once. */
+export const setAgentsUnprompted = (id: string, on: boolean) => invoke<void>("set_agents_unprompted", { id, on });
 
 export const setAutoRenew = (id: string, on: boolean) => invoke<void>("set_auto_renew", { id, on });
 

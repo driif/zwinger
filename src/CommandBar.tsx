@@ -11,6 +11,7 @@ import {
   stopApp,
 } from "./api";
 import type { Intent, Pane, Run, View } from "./App";
+import { paneName } from "./ShieldRail";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
 interface Props {
@@ -71,11 +72,11 @@ export function CommandBar({
       });
     if (shield.pendingRestart)
       commands.push({ id: "restart", label: `Restart ${shield.name}`, onSelect: () => onRestart(shield.id) });
-    commands.push(action("newPi", "Open pi agent"), action("newShell", "New shell"));
-    panes.forEach((pane, index) =>
+    commands.push(action("newAgent", "New agent"), action("newShell", "New shell"));
+    panes.forEach((pane) =>
       commands.push({
         id: `pane-${pane.key}`,
-        label: `Show ${pane.kind} ${index + 1}`,
+        label: `Show ${paneName(pane, panes)}`,
         onSelect: () => onShowPane(pane.key),
       }),
     );
@@ -83,7 +84,7 @@ export function CommandBar({
     if (panes.length > 1) commands.push(action("next", "Next session"), action("previous", "Previous session"));
     commands.push(
       action("overview", "Overview"),
-      action("agents", "Agent chat"),
+      action("agents", "Agent"),
       action("terminal", "Terminal"),
       action("network", "Network"),
       action("settings", "Settings"),

@@ -4,6 +4,7 @@ import {
   CardBody,
   CardHeader,
   FloatingField,
+  LiquidSwitch,
   RadioGroup,
   SegmentedControl,
 } from "@driif/motiv";
@@ -16,12 +17,13 @@ import {
   deleteShield,
   removeMount,
   renameShield,
+  setAgentsUnprompted,
   setHarness,
   setMountReadonly,
   ShieldView,
 } from "./api";
 import type { Intent, Run, Runtimes } from "./App";
-import { InstallControl } from "./AgentsTab";
+import { InstallControl } from "./roomParts";
 import { AppsSection } from "./AppsSection";
 
 const WORKSPACE = "/workspace";
@@ -260,7 +262,17 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
           titleAs="h2"
           description="For all shields. A shield mounts the installed runtimes read-only when it starts."
         />
-        <CardBody>
+        <CardBody className="stack">
+          <LiquidSwitch
+            label="Agents run without permission prompts"
+            checked={shield.agentsUnprompted}
+            onChange={(on) => run(() => setAgentsUnprompted(id, on))}
+          />
+          <p className="muted">
+            For this shield: the shield is the sandbox. Run the agents from the Agents group or as claude, codex, pi and
+            gemini in a shield terminal. With no login from this Mac, log in with the agent's own /login: allow its
+            provider hosts first.
+          </p>
           <ul className="list">
             <li className="row">
               <strong>pi</strong>

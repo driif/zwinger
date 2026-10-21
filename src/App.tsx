@@ -4,11 +4,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Button, Card } from "@driif/motiv";
 import { Plus, RotateCw, Shield } from "lucide-react";
 import {
+  AGENT_NAMES,
   AgentKind,
-  Chat,
   closeSession,
   createShield,
-  deleteChat,
   Detection,
   detectHostAgents,
   hostAgents,
@@ -17,7 +16,6 @@ import {
   isBlocked,
   isLive,
   isRoundFolder,
-  listChats,
   listNetEvents,
   listRuntimes,
   listShields,
@@ -25,7 +23,6 @@ import {
   NetEvent,
   onNetEvent,
   onRenewDue,
-  renameChat,
   resolveFolder,
   RuntimeName,
   RuntimeView,
@@ -38,7 +35,7 @@ import {
 import { CommandBar } from "./CommandBar";
 import { HostAgentsSettings } from "./HostAgentsSettings";
 import { ShieldPage } from "./ShieldPage";
-import { ShieldRail } from "./ShieldRail";
+import { agentsOf, ShieldRail } from "./ShieldRail";
 import { TaskRoom } from "./TaskRoom";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
@@ -51,8 +48,6 @@ export type TabView = "overview" | "network" | "settings";
 /** What the main area shows for the selected shield. */
 export type View =
   | { kind: TabView }
-  /** No `agent` is pi. No `chat` keeps the agent's current chat. */
-  | { kind: "chat"; agent?: AgentKind; chat?: string }
   /** No `key` shows the empty terminal view. */
   | { kind: "terminal"; key?: string }
   | { kind: "app"; appId: string }
@@ -88,12 +83,6 @@ export interface DroppedFolder {
   folder: string;
 }
 
-/** A rail action on a chat. pi does it in the shield's Agents view; the host does it for the other agents. */
-export type ChatAction = { agent: AgentKind; chat: string; at: number } & (
-  | { kind: "rename"; name: string }
-  | { kind: "delete" }
-);
-
 /** The runtimes and their installs, for the views that offer Install. */
 export interface Runtimes {
   list: RuntimeView[];
@@ -118,12 +107,10 @@ export default function App() {
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
-  const [chats, setChats] = useState<Record<string, Chat[]>>({});
   const [runs, setRuns] = useState<Record<string, RunSummary[]>>({});
   /** A duo round folder on the host that the main area shows instead of a shield. */
   const [roundFolder, setRoundFolder] = useState<string>();
   const [dropFolder, setDropFolder] = useState<DroppedFolder>();
-  const [chatAction, setChatAction] = useState<{ shieldId: string; action: ChatAction }>();
   const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
@@ -226,15 +213,11 @@ export default function App() {
     setPanes((current) => current.filter((p) => shields.some((s) => s.id === p.shieldId)));
   }, [shields]);
 
-  const reloadChats = (id: string) =>
-    listChats(id).then((list) => setChats((current) => ({ ...current, [id]: list })), () => {});
-
   const reloadRuns = (id: string) =>
     listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
 
   const shieldIds = shields.map((s) => s.id).join(" ");
   useEffect(() => {
-    for (const { id } of shields) if (!(id in chats)) reloadChats(id);
     for (const { id } of shields) if (!(id in runs)) reloadRuns(id);
   }, [shieldIds]);
 
@@ -306,11 +289,20 @@ export default function App() {
     if (folder !== null) await addShield(folder);
   }
 
-  async function newSession(kind: SessionKind, target = shield) {
+  /** Opens a shell, or the first agent of the shield: host agents come first. */
+  async function newSession(kind: SessionKind | "agent", target = shield) {
     if (!target) return;
-    if (target.status.state !== "running") await startShield(target.id);
+    // A stopped shield does not know its mounted agents. Read them after the start.
+    if (target.status.state !== "running") {
+      await startShield(target.id);
+      target = (await listShields()).find((s) => s.id === target!.id) ?? target;
+    }
+    const mounted = agentsOf(target);
+    const session: SessionKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
+    if (session.type === "agent" && !mounted.includes(session.agent))
+      throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this shield.`);
     const key = crypto.randomUUID();
-    setPanes((current) => [...current, { key, shieldId: target.id, kind }]);
+    setPanes((current) => [...current, { key, shieldId: target.id, kind: session }]);
     setSelectedId(target.id);
     showPane(key, target.id);
   }
@@ -342,31 +334,6 @@ export default function App() {
       setView({ kind: "settings" });
       setIntent({ kind: "mount", host, dropped, at: Date.now() });
     });
-
-  /**
-   * pi renames a chat, so it must run. A running pi checks its current chat before a delete.
-   * The chats of the other agents are host files, so they need no running shield.
-   */
-  async function startChatAction(target: ShieldView, action: ChatAction) {
-    const running = target.status.state === "running";
-    if (action.agent !== "pi" && action.kind === "rename") {
-      await renameChat(target.id, action.agent, action.chat, action.name);
-      return reloadChats(target.id);
-    }
-    if (action.agent !== "pi" || (action.kind === "delete" && !running)) {
-      await deleteChat(target.id, action.agent, action.chat);
-      if (target.id === shield?.id)
-        setView((current) =>
-          current.kind === "chat" && current.chat === action.chat && (current.agent ?? "pi") === action.agent
-            ? { kind: "chat", agent: action.agent }
-            : current,
-        );
-      return reloadChats(target.id);
-    }
-    if (!running) await startShield(target.id);
-    if (target.id !== shield?.id) select(target.id);
-    setChatAction({ shieldId: target.id, action });
-  }
 
   function cycle(step: number) {
     if (shieldPanes.length === 0) return;
@@ -406,17 +373,17 @@ export default function App() {
     // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
     commands: () => commandBar.current?.querySelector("button")?.click(),
     newShield: () => run(newShield),
-    newShell: () => run(() => newSession("shell")),
-    newPi: () =>
-      run(async () => {
-        setView({ kind: "chat", agent: "pi" });
-        if (shield && shield.status.state !== "running") await startShield(shield.id);
-      }),
+    newShell: () => run(() => newSession({ type: "shell" })),
+    newAgent: () => run(() => newSession("agent")),
     close: () => view.kind === "terminal" && activePane && closePane(activePane),
     next: () => cycle(1),
     previous: () => cycle(-1),
     overview: () => setView({ kind: "overview" }),
-    agents: () => setView({ kind: "chat" }),
+    agents: () => {
+      const agents = shieldPanes.filter((p) => p.kind.type === "agent");
+      if (agents.length > 0) showPane(agents[agents.length - 1].key);
+      else run(() => newSession("agent"));
+    },
     terminal: () => showPane(activePane || shieldPanes[shieldPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
@@ -430,7 +397,6 @@ export default function App() {
         selectedId={shield?.id}
         view={view}
         blocked={blocked}
-        chats={chats}
         runs={runs}
         panes={panes}
         run={run}
@@ -440,13 +406,9 @@ export default function App() {
           setSelectedId(id);
           startIntent(kind, appId);
         }}
-        onChatAction={(id, action) => {
-          const target = shields.find((s) => s.id === id);
-          if (target) run(() => startChatAction(target, action));
-        }}
         onRunsChange={reloadRuns}
         onToggle={toggle}
-        onNewShell={(id) => run(() => newSession("shell", shields.find((s) => s.id === id)))}
+        onNewSession={(id, kind) => run(() => newSession(kind, shields.find((s) => s.id === id)))}
         onClosePane={closePane}
         onMovePanes={movePanes}
         onNew={actions.newShield}
@@ -516,14 +478,6 @@ export default function App() {
               intent={intent}
               onIntentDone={() => setIntent(undefined)}
               onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [shield.id]: seq }))}
-              onChat={(agent, chat) => setView((current) => (current.kind === "chat" ? { kind: "chat", agent, chat } : current))}
-              onChatsChange={() => reloadChats(shield.id)}
-              chatAction={chatAction?.shieldId === shield.id ? chatAction.action : undefined}
-              onChatActionDone={(work) => {
-                setChatAction(undefined);
-                const id = shield.id;
-                run(() => work.finally(() => reloadChats(id)));
-              }}
               onDropFolder={dropMount}
               runtimes={runtimes}
               detection={detection}

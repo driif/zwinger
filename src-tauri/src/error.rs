@@ -94,18 +94,8 @@ pub enum Error {
     SessionClosed,
     #[error("the shield image has Node {0}, but pi needs Node 22.19 or newer")]
     NodeTooOld(String),
-    #[error("agent not found")]
-    AgentNotFound,
     #[error("the agent process ended")]
     AgentClosed,
-    #[error("chat not found")]
-    ChatNotFound,
-    #[error("pi: {0}")]
-    Agent(String),
-    #[error("the agent is busy; wait until it is done, or stop it")]
-    AgentBusy,
-    #[error("this agent does not support {0}")]
-    Unsupported(&'static str),
     #[error("unknown runtime: {0}")]
     UnknownRuntime(String),
     #[error("{0} is not installed")]

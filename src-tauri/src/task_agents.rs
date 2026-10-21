@@ -1,6 +1,6 @@
 //! One-shot agent calls for task runs: one process per stage call, with the
 //! prompt on stdin and the reply at the end. The live output goes through the
-//! same mappers as the Agents tab, so the room shows pi-shaped records.
+//! agent mappers, so the room shows pi-shaped records.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, pi};
+use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::shield::TaskAgent;
 
@@ -114,59 +114,42 @@ impl std::fmt::Display for Failure {
 /// Gemini CLI's entry point, if the shield mounts it.
 pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&str>) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
-    Ok(match agent.kind {
+    let Some(mut argv) = launch::command(agent.kind, launch::Found { pi_host, gemini }) else {
+        return Err(Failure::Start("Gemini CLI is not mounted in the shield".to_owned()));
+    };
+    match agent.kind {
         AgentKind::Claude => {
-            // `--dangerously-skip-permissions` as in the Agents tab: the shield is the sandbox.
-            let mut argv: Vec<String> = [
-                "env",
-                "IS_SANDBOX=1",
-                &format!("HOME={}", claude::HOME),
-                &format!("{}/claude", claude::DIR),
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--dangerously-skip-permissions",
-            ]
-            .map(str::to_owned)
-            .into();
+            // `--dangerously-skip-permissions` as in the agent sessions: the shield is the sandbox.
+            argv.extend(
+                ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--dangerously-skip-permissions"]
+                    .map(str::to_owned),
+            );
             if access == Access::Read {
                 argv.extend(["--disallowedTools".to_owned(), "Edit,Write,NotebookEdit".to_owned()]);
             }
             if let Some(model) = model {
                 argv.extend(["--model".to_owned(), model.to_owned()]);
             }
-            argv
         }
         AgentKind::Codex => {
-            let mut argv = vec![
-                "env".to_owned(),
-                format!("CODEX_HOME={}", codex::HOME),
-                format!("{}/bin/codex", codex::DIR),
-                "exec".to_owned(),
-                "--json".to_owned(),
-                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                "--skip-git-repo-check".to_owned(),
-            ];
+            argv.extend(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"].map(str::to_owned));
             if let Some(model) = model {
                 argv.extend(["-m".to_owned(), model.to_owned()]);
             }
             argv.push("-".to_owned());
-            argv
         }
         AgentKind::Gemini => {
-            let entry = gemini.ok_or_else(|| Failure::Start("Gemini CLI is not mounted in the shield".to_owned()))?;
-            gemini::argv(entry, None, model, access == Access::Write)
+            argv.extend(["--output-format".to_owned(), "stream-json".to_owned()]);
+            // `--yolo` approves each tool call: acceptable only because the agent runs inside the shield.
+            if access == Access::Write {
+                argv.push("--yolo".to_owned());
+            }
+            if let Some(model) = model {
+                argv.extend(["-m".to_owned(), model.to_owned()]);
+            }
         }
         AgentKind::Pi => {
-            let mut argv = vec![
-                "node".to_owned(),
-                pi::cli(pi_host),
-                "--no-session".to_owned(),
-                "--mode".to_owned(),
-                "json".to_owned(),
-            ];
+            argv.extend(["--no-session", "--mode", "json"].map(str::to_owned));
             if access == Access::Read {
                 argv.extend(["--tools".to_owned(), PI_READ_TOOLS.to_owned()]);
             }
@@ -175,9 +158,9 @@ pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&st
             }
             // Last, so pi does not take the next argument as the message.
             argv.push("-p".to_owned());
-            argv
         }
-    })
+    }
+    Ok(argv)
 }
 
 /// The end of `text`: at most `limit` bytes, cut at a char boundary.
@@ -750,8 +733,8 @@ mod tests {
         assert!(matches!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, None), Err(Failure::Start(_))));
 
         let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, true, GEMINI).unwrap();
-        assert_eq!(host_pi[1], "/opt/zwinger/host/pi/dist/cli.js");
-        assert_eq!(pi[1], "/opt/zwinger/pi/cli.js");
+        assert_eq!(host_pi[2..4], ["node", "/opt/zwinger/host/pi/dist/cli.js"]);
+        assert_eq!(pi[..4], ["env", "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/pi/cli.js"]);
     }
 
     #[test]

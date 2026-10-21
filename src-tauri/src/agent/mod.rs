@@ -1,32 +1,22 @@
-//! The agents of a shield: pi, Claude Code, Codex and Gemini CLI. Each one runs in the VM
-//! and talks JSONL over pipes. The Agents tab gets pi-shaped records from each.
+//! The agents of a shield: pi, Claude Code, Codex and Gemini CLI. Each one
+//! runs in the VM: as its own TUI in an agent session, or headless in a task
+//! run, where its JSONL output becomes pi-shaped records.
 
 pub mod claude;
 pub mod cli;
 pub mod codex;
 pub mod gemini;
+pub mod launch;
 pub mod pi;
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
-
-use crate::runtime::PipeInput;
 
 /// The guest prefix that belongs to zwinger. User mounts may not use it.
 pub const RESERVED: &str = "/opt/zwinger";
 /// The per-shield agent state (`<app_data>/shields/<id>`), mounted read-write.
 pub const STATE_DIR: &str = "/opt/zwinger/state";
-const STDERR_LINES: usize = 20;
-/// The longest record that an agent may write, and the longest stderr line.
+/// The longest record that an agent may write.
 const MAX_LINE: usize = 16 << 20;
-/// A kept stderr line, or the copy of unreadable output, is cut to this size.
-const STDERR_LINE: usize = 2 << 10;
-const TITLE_CHARS: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,7 +28,7 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
-    /// Also the name of its runtime and of its chat dir.
+    /// Also the name of its runtime and of its command in the VM.
     pub fn name(self) -> &'static str {
         match self {
             Self::Pi => "pi",
@@ -113,131 +103,6 @@ impl Framer {
         }
         lines
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingLevel {
-    Off,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-/// The commands that the UI may send. Rust builds the JSON that pi gets,
-/// so fields that are not listed here never reach pi. Claude Code, Codex
-/// and Gemini CLI get no JSON: [`cli::CliAgent`] does the command.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
-pub enum AgentCommand {
-    Prompt { message: String },
-    Steer { message: String },
-    FollowUp { message: String },
-    Abort,
-    GetState,
-    GetMessages,
-    SetModel { provider: String, model_id: String },
-    GetAvailableModels,
-    SetThinkingLevel { level: ThinkingLevel },
-    NewSession,
-    /// `chat` is a chat id from the chat list, never a path.
-    SwitchSession {
-        #[serde(skip_serializing)]
-        chat: String,
-    },
-    GetSessionStats,
-    SetSessionName { name: String },
-}
-
-pub type Sink = Box<dyn Fn(Value) + Send + Sync>;
-
-/// A chat of a shield.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Chat {
-    pub agent: AgentKind,
-    /// The file name. It is unique only per agent.
-    pub id: String,
-    /// The ISO timestamp of the chat start.
-    pub started: String,
-    /// The chat name, else the start of the first user message.
-    pub title: String,
-}
-
-/// A running agent of a shield.
-#[derive(Clone)]
-pub enum Handle {
-    Pi(Arc<pi::Agent>),
-    Cli(Arc<cli::CliAgent>),
-}
-
-impl Handle {
-    /// A reopened Agents tab gets the records from now on.
-    pub fn set_sink(&self, sink: Sink) {
-        match self {
-            Self::Pi(agent) => agent.set_sink(sink),
-            Self::Cli(agent) => agent.set_sink(sink),
-        }
-    }
-
-    /// A turn runs.
-    pub fn is_busy(&self) -> bool {
-        match self {
-            Self::Pi(agent) => agent.is_busy(),
-            Self::Cli(agent) => agent.is_busy(),
-        }
-    }
-
-    /// Asks the agent to exit.
-    pub fn close(&self) {
-        match self {
-            Self::Pi(agent) => agent.close(),
-            Self::Cli(agent) => agent.close(),
-        }
-    }
-
-    pub fn kill(&self) {
-        match self {
-            Self::Pi(agent) => agent.kill(),
-            Self::Cli(agent) => agent.kill(),
-        }
-    }
-
-    /// Waits until the agent has ended and sent `agent_exit`.
-    pub async fn exited(&self) {
-        match self {
-            Self::Pi(agent) => agent.exited().await,
-            Self::Cli(agent) => agent.exited().await,
-        }
-    }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Queues `input` without a wait. If the queue is full, a task sends it
-/// when there is space.
-fn send_now(queue: &Sender<PipeInput>, input: PipeInput) {
-    if let Err(TrySendError::Full(input)) = queue.try_send(input) {
-        let queue = queue.clone();
-        tokio::spawn(async move { queue.send(input).await });
-    }
-}
-
-fn keep(lines: &mut VecDeque<String>, line: String) {
-    if lines.len() == STDERR_LINES {
-        lines.pop_front();
-    }
-    lines.push_back(line);
-}
-
-/// The first `STDERR_LINE` bytes of `line` as text.
-fn cut(line: &[u8]) -> String {
-    String::from_utf8_lossy(&line[..line.len().min(STDERR_LINE)]).into_owned()
 }
 
 #[cfg(test)]

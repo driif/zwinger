@@ -7,9 +7,8 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tokio::task::AbortHandle;
 
-use serde_json::Value;
 
-use crate::agent::{AgentCommand, AgentKind, Chat};
+use crate::agent::AgentKind;
 use crate::error::Result;
 use crate::host_agents::HostAgents;
 use crate::host_agents::detect::Detection;
@@ -233,57 +232,6 @@ pub fn close_session(shields: Shields<'_>, id: String) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn open_agent(
-    shields: Shields<'_>,
-    shield_id: String,
-    agent: AgentKind,
-    on_event: Channel<Value>,
-) -> Result<String> {
-    shields
-        .open_agent(
-            &shield_id,
-            agent,
-            Box::new(move |record| {
-                // The webview may have closed the channel; the agent keeps running.
-                let _ = on_event.send(record);
-            }),
-        )
-        .await
-}
-
-#[tauri::command]
-pub async fn agent_call(shields: Shields<'_>, id: String, command: AgentCommand) -> Result<Value> {
-    shields.agent_call(&id, command).await
-}
-
-#[tauri::command]
-pub async fn close_agent(shields: Shields<'_>, id: String) -> Result<()> {
-    shields.close_agent(&id).await;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn list_chats(shields: Shields<'_>, shield_id: String) -> Result<Vec<Chat>> {
-    shields.list_chats(&shield_id).await
-}
-
-#[tauri::command]
-pub async fn delete_chat(shields: Shields<'_>, shield_id: String, agent: AgentKind, chat: String) -> Result<()> {
-    shields.delete_chat(&shield_id, agent, &chat).await
-}
-
-#[tauri::command]
-pub async fn rename_chat(
-    shields: Shields<'_>,
-    shield_id: String,
-    agent: AgentKind,
-    chat: String,
-    title: String,
-) -> Result<()> {
-    shields.rename_chat(&shield_id, agent, &chat, &title).await
-}
-
-#[tauri::command]
 pub fn list_runtimes(runtimes: State<'_, Runtimes>) -> Result<Vec<RuntimeView>> {
     runtimes.list()
 }
@@ -339,6 +287,11 @@ pub async fn put_host_agent(shields: Shields<'_>, id: String, agent: HostAgentUs
 #[tauri::command]
 pub fn remove_host_agent(shields: Shields<'_>, id: String, agent: AgentKind) -> Result<()> {
     shields.remove_host_agent(&id, agent)
+}
+
+#[tauri::command]
+pub fn set_agents_unprompted(shields: Shields<'_>, id: String, on: bool) -> Result<()> {
+    shields.set_agents_unprompted(&id, on)
 }
 
 #[tauri::command]

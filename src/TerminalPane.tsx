@@ -4,6 +4,109 @@ import { attachApp, closeSession, detachApp, openSession, PtyEvent, resizeSessio
 
 const ready = init();
 
+/** The keys that Option sends with ESC first, besides letters and digits. */
+const META_KEYS: Record<string, string> = {
+  Backspace: "\x7f",
+  Enter: "\r",
+  Space: " ",
+  Period: ".",
+  Comma: ",",
+  Slash: "/",
+  Backslash: "\\",
+  Minus: "-",
+  Equal: "=",
+  Semicolon: ";",
+  Quote: "'",
+  Backquote: "`",
+  BracketLeft: "[",
+  BracketRight: "]",
+};
+
+/**
+ * Paste with bracketed-paste markers, and mouse reports to the PTY while the TUI asks for them. ghostty-web 0.4 sends
+ * pasted text raw and handles the mouse only locally. Returns the cleanup.
+ */
+function tuiInput(t: Terminal, el: HTMLElement, send: (data: string) => void) {
+  const surface = () => el.querySelector("canvas") ?? el;
+  const cell = (e: MouseEvent) => {
+    const r = surface().getBoundingClientRect();
+    const clamp = (n: number, max: number) => Math.min(max, Math.max(1, n));
+    return [
+      clamp(Math.floor(((e.clientX - r.left) * t.cols) / r.width) + 1, t.cols),
+      clamp(Math.floor(((e.clientY - r.top) * t.rows) / r.height) + 1, t.rows),
+    ];
+  };
+  const report = (button: number, e: MouseEvent, release: boolean) => {
+    const [x, y] = cell(e);
+    const code = button | (e.shiftKey ? 4 : 0) | (e.altKey ? 8 : 0) | (e.ctrlKey ? 16 : 0);
+    if (t.getMode(1006)) send(`\x1b[<${code};${x};${y}${release ? "m" : "M"}`);
+    else if (x <= 223 && y <= 223) send(`\x1b[M${String.fromCharCode(32 + (release ? 3 : code), 32 + x, 32 + y)}`);
+  };
+  const take = (e: Event) => {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+  let held = -1;
+  const onPaste = (e: ClipboardEvent) => {
+    const text = e.clipboardData?.getData("text/plain");
+    if (!text) return;
+    take(e);
+    t.paste(text);
+  };
+  const onDown = (e: MouseEvent) => {
+    if (!t.hasMouseTracking() || e.button > 2) return;
+    take(e);
+    held = e.button;
+    report(held, e, false);
+  };
+  const onUp = (e: MouseEvent) => {
+    if (held < 0) return;
+    take(e);
+    report(held, e, true);
+    held = -1;
+  };
+  const onMove = (e: MouseEvent) => {
+    if (!t.hasMouseTracking()) return;
+    if (held >= 0 && (t.getMode(1002) || t.getMode(1003))) report(held + 32, e, false);
+    else if (held < 0 && t.getMode(1003)) report(35, e, false);
+  };
+  const onWheel = (e: WheelEvent) => {
+    if (!t.hasMouseTracking() || e.deltaY === 0) return;
+    take(e);
+    report(e.deltaY < 0 ? 64 : 65, e, false);
+  };
+  el.addEventListener("paste", onPaste, true);
+  el.addEventListener("mousedown", onDown, true);
+  window.addEventListener("mouseup", onUp, true);
+  el.addEventListener("mousemove", onMove, true);
+  el.addEventListener("wheel", onWheel, { capture: true, passive: false });
+  return () => {
+    el.removeEventListener("paste", onPaste, true);
+    el.removeEventListener("mousedown", onDown, true);
+    window.removeEventListener("mouseup", onUp, true);
+    el.removeEventListener("mousemove", onMove, true);
+    el.removeEventListener("wheel", onWheel, true);
+  };
+}
+
+/**
+ * The input of a key that agent TUIs need and ghostty-web does not send: Shift+Enter is ESC CR (a new line in the
+ * prompt), and Option acts as Meta (ESC, then the key; macOS would type a special character). `undefined`: ghostty-web
+ * handles the key.
+ */
+function agentKey(event: KeyboardEvent): string | undefined {
+  if (event.metaKey || event.ctrlKey) return;
+  if (event.key === "Enter" && event.shiftKey && !event.altKey) return "\x1b\r";
+  if (!event.altKey) return;
+  const { code } = event;
+  if (code.startsWith("Key")) {
+    const letter = code.slice(3).toLowerCase();
+    return `\x1b${event.shiftKey ? letter.toUpperCase() : letter}`;
+  }
+  if (code.startsWith("Digit")) return `\x1b${code.slice(5)}`;
+  if (code in META_KEYS) return `\x1b${META_KEYS[code]}`;
+}
+
 interface Props {
   /** A new session that the pane owns, or the run of an app, which the backend owns. */
   session: { shieldId: string; kind: SessionKind } | { attach: string };
@@ -16,12 +119,15 @@ interface Props {
 export function TerminalPane({ session, active, onOpen, onExit, onError }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal>(null);
+  const fitter = useRef<FitAddon>(null);
 
   // Runs once per pane: the pane owns its terminal, and its session unless it attaches, for its whole life.
   useEffect(() => {
     let disposed = false;
     let term: Terminal | undefined;
     let detach: (() => void) | undefined;
+    let stopInput: (() => void) | undefined;
+    let id: string | undefined;
     ready
       .then(async () => {
         if (disposed) return;
@@ -36,40 +142,58 @@ export function TerminalPane({ session, active, onOpen, onExit, onError }: Props
         fit.fit();
         fit.observeResize();
         terminal.current = term;
+        fitter.current = fit;
         const t = term;
+        // Returns true when the pane sent the key itself.
+        t.attachCustomKeyEventHandler((event) => {
+          const text = agentKey(event);
+          if (text === undefined) return false;
+          if (id) writeSession(id, text).catch(() => {});
+          return true;
+        });
         const onEvent = (event: PtyEvent) => {
           if (disposed) return;
           if (event.event === "output") t.write(new Uint8Array(event.data));
           else onExit();
         };
-        let id: string;
         if ("attach" in session) {
-          id = session.attach;
-          const token = await attachApp(id, onEvent);
-          detach = () => detachApp(id, token).catch(() => {});
+          const attach = session.attach;
+          const token = await attachApp(attach, onEvent);
+          detach = () => detachApp(attach, token).catch(() => {});
           if (disposed) return detach();
           // An exited run takes no input.
-          await resizeSession(id, t.rows, t.cols).catch(() => {});
+          await resizeSession(attach, t.rows, t.cols).catch(() => {});
           if (disposed) return;
+          id = attach;
         } else {
-          id = await openSession(session.shieldId, session.kind, t.rows, t.cols, onEvent);
-          if (disposed) return closeSession(id);
+          const opened = await openSession(session.shieldId, session.kind, t.rows, t.cols, onEvent);
+          if (disposed) return closeSession(opened);
+          // Again at once: the PTY can open at 24x80 before the size arrives, and an agent TUI draws its first frame then.
+          fit.fit();
+          await resizeSession(opened, t.rows, t.cols).catch(() => {});
+          id = opened;
         }
-        t.onData((data) => writeSession(id, data).catch(() => {}));
-        t.onResize(({ rows, cols }) => resizeSession(id, rows, cols).catch(() => {}));
+        const live = id;
+        t.onData((data) => writeSession(live, data).catch(() => {}));
+        stopInput = tuiInput(t, container.current!, (data) => writeSession(live, data).catch(() => {}));
+        t.onResize(({ rows, cols }) => resizeSession(live, rows, cols).catch(() => {}));
         t.focus();
-        onOpen?.(id);
+        onOpen?.(live);
       })
       .catch(onError);
     return () => {
       disposed = true;
+      stopInput?.();
       detach?.();
       term?.dispose();
     };
   }, []);
 
+  // A hidden pane cannot measure itself, so it fits when it shows.
   useEffect(() => {
-    if (active) terminal.current?.focus();
+    if (!active) return;
+    fitter.current?.fit();
+    terminal.current?.focus();
   }, [active]);
 
   return <div ref={container} className="terminal" hidden={!active} />;

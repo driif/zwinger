@@ -104,6 +104,7 @@ mod tests {
             }],
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             auto_renew: true,
+            agents_unprompted: false,
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
@@ -128,5 +129,6 @@ mod tests {
         assert!(shield.apps.is_empty());
         assert!(shield.tasks.is_empty());
         assert!(shield.host_agents.is_empty() && !shield.auto_renew);
+        assert!(shield.agents_unprompted);
     }
 }

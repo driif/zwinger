@@ -1,4 +1,4 @@
-//! Claude Code: one long-lived `claude -p` per chat, stream-json in and out.
+//! Claude Code: its paths in the VM, and the mapper of its stream-json output.
 
 use serde_json::{Value, json};
 
@@ -6,66 +6,6 @@ use serde_json::{Value, json};
 pub const DIR: &str = "/opt/zwinger/claude";
 /// Its `HOME`, so `~/.claude` is in the shield's state and never the host's.
 pub const HOME: &str = "/opt/zwinger/state/claude";
-
-/// `session` resumes an earlier chat.
-pub fn argv(session: Option<&str>, model: Option<&str>) -> Vec<String> {
-    let home = format!("HOME={HOME}");
-    let bin = format!("{DIR}/claude");
-    // `--dangerously-skip-permissions` is acceptable only because the agent
-    // runs inside the shield: the VM is the sandbox, with only the shield's
-    // mounts and allowed hosts. The guest runs as root, and Claude Code
-    // refuses the flag as root unless IS_SANDBOX=1 is set.
-    let mut argv: Vec<String> = [
-        "env",
-        "IS_SANDBOX=1",
-        &home,
-        &bin,
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--dangerously-skip-permissions",
-    ]
-    .map(str::to_owned)
-    .into();
-    if let Some(session) = session {
-        argv.extend(["--resume".to_owned(), session.to_owned()]);
-    }
-    if let Some(model) = model {
-        argv.extend(["--model".to_owned(), model.to_owned()]);
-    }
-    argv
-}
-
-fn line(record: &Value) -> Vec<u8> {
-    let mut line = record.to_string().into_bytes();
-    line.push(b'\n');
-    line
-}
-
-/// A user message for stdin.
-pub fn user_line(message: &str) -> Vec<u8> {
-    line(&json!({ "type": "user", "message": { "role": "user", "content": message } }))
-}
-
-/// The control message that ends the current turn.
-pub fn interrupt_line(number: u64) -> Vec<u8> {
-    line(&json!({
-        "type": "control_request",
-        "request_id": format!("zw-{number}"),
-        "request": { "subtype": "interrupt" },
-    }))
-}
-
-/// The session id of the chat, from the `init` event.
-pub fn session_id(event: &Value) -> Option<&str> {
-    (event["type"] == "system" && event["subtype"] == "init")
-        .then(|| event["session_id"].as_str())
-        .flatten()
-}
 
 fn text_of(content: &Value) -> String {
     match content {
@@ -79,7 +19,7 @@ fn text_of(content: &Value) -> String {
 /// the message timestamps. An unknown event passes through as it is.
 ///
 /// Claude Code can send one `assistant` event per content block, and the
-/// chat ends its streamed message at each one. So a delta's index counts
+/// room ends its streamed message at each one. So a delta's index counts
 /// from the first block that no `assistant` event has ended yet.
 #[derive(Default)]
 pub struct Mapper {
@@ -102,7 +42,7 @@ impl Mapper {
     }
 
     fn stream(&mut self, event: &Value) -> Vec<Value> {
-        // The stream of a subagent: the chat shows only its tool result.
+        // The stream of a subagent: the room shows only its tool result.
         if !event["parent_tool_use_id"].is_null() {
             return Vec::new();
         }
@@ -204,47 +144,10 @@ mod tests {
         serde_json::from_str(line).unwrap()
     }
 
-    #[test]
-    fn argv_resumes_and_sets_the_model() {
-        let base = [
-            "env",
-            "IS_SANDBOX=1",
-            "HOME=/opt/zwinger/state/claude",
-            "/opt/zwinger/claude/claude",
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--dangerously-skip-permissions",
-        ];
-        assert_eq!(argv(None, None), base);
-        let mut resumed: Vec<&str> = base.to_vec();
-        resumed.extend(["--resume", "s-1", "--model", "opus"]);
-        assert_eq!(argv(Some("s-1"), Some("opus")), resumed);
-    }
-
-    #[test]
-    fn stdin_lines() {
-        assert_eq!(
-            event(std::str::from_utf8(&user_line("hi\nthere")).unwrap()),
-            json!({ "type": "user", "message": { "role": "user", "content": "hi\nthere" } })
-        );
-        let interrupt = interrupt_line(3);
-        assert_eq!(interrupt.last(), Some(&b'\n'));
-        assert_eq!(
-            event(std::str::from_utf8(&interrupt).unwrap()),
-            json!({ "type": "control_request", "request_id": "zw-3", "request": { "subtype": "interrupt" } })
-        );
-    }
-
     // Hand-written fixtures in the stream-json format of Claude Code.
     #[test]
     fn maps_a_turn_with_a_tool_call() {
         let init = event(r#"{"type":"system","subtype":"init","session_id":"0b1c","model":"claude-opus","tools":["Bash"],"cwd":"/workspace"}"#);
-        assert_eq!(session_id(&init), Some("0b1c"));
         assert!(map(&init).is_empty());
 
         let thinking = event(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"Look first."}]},"session_id":"0b1c"}"#);
@@ -252,7 +155,6 @@ mod tests {
             map(&thinking),
             [json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "Look first." }] } })]
         );
-        assert_eq!(session_id(&thinking), None);
 
         let tool = event(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":"0b1c"}"#);
         assert_eq!(

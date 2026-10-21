@@ -1,9 +1,116 @@
-import { Accordion, Card, CardBody, CardHeader } from "@driif/motiv";
-import { Activity, Bot, CircleCheck, CircleX, LucideIcon, TriangleAlert, User } from "lucide-react";
-import { AgentKind, Blocking, Room, RoomMessage } from "./api";
-import { ChatState, Message } from "./agentChat";
-import { AGENT_ICONS, MessageView } from "./AgentsTab";
+import { Accordion, Button, Card, CardBody, CardHeader, ProgressRing } from "@driif/motiv";
+import {
+  Activity,
+  Bot,
+  Braces,
+  CircleCheck,
+  CircleX,
+  Download,
+  Gem,
+  LucideIcon,
+  Sparkles,
+  TriangleAlert,
+  User,
+  Wrench,
+} from "lucide-react";
+import { AGENT_NAMES, AgentKind, Blocking, cancelRuntimeInstall, Room, RoomMessage, RuntimeView } from "./api";
+import type { Runtimes } from "./App";
+import { Block, ChatState, Message, textOf, ToolRun } from "./agentChat";
 import { Markdown } from "./Markdown";
+
+export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces, gemini: Gem };
+
+/** Install, or the progress of the install that runs. Only the download can be cancelled. */
+export function InstallControl({ runtime, runtimes }: { runtime: RuntimeView; runtimes: Runtimes }) {
+  const progress = runtimes.installs[runtime.name];
+  const name = AGENT_NAMES[runtime.name];
+  if (!progress)
+    return (
+      <Button size="sm" variant="outline" iconLeft={<Download size={14} />} onClick={() => runtimes.onInstall(runtime.name)}>
+        Install
+      </Button>
+    );
+  if (progress.stage === "extract") return <span className="muted">Checking and unpacking {name}…</span>;
+  const mb = Math.round(progress.received / 1e6);
+  return (
+    <span className="row">
+      {progress.total ? (
+        <>
+          <ProgressRing value={Math.min(99, Math.floor((progress.received / progress.total) * 100))} label={`${name} download`} size={32} />
+          <span className="muted">
+            {mb} of {Math.round(progress.total / 1e6)} MB
+          </span>
+        </>
+      ) : (
+        <span className="muted">Downloading {name}: {mb} MB</span>
+      )}
+      <Button size="sm" variant="ghost" onClick={() => cancelRuntimeInstall(runtime.name)}>
+        Cancel
+      </Button>
+    </span>
+  );
+}
+
+/** The values that tell one tool call from another. */
+function summary(args: Record<string, unknown>) {
+  const main = args.command ?? args.path ?? args.file_path ?? args.pattern ?? args.url;
+  return typeof main === "string" ? main : JSON.stringify(args);
+}
+
+function ToolCard({ call, result, run }: { call: Extract<Block, { type: "toolCall" }>; result?: Message; run?: ToolRun }) {
+  const status = result ? (result.isError ? "error" : "done") : (run?.status ?? "running");
+  const output = result ? textOf(result.content) : (run?.output ?? "");
+  return (
+    <Accordion
+      headingLevel={4}
+      items={[
+        {
+          id: call.id,
+          title: (
+            <span className="row">
+              <Wrench size={14} />
+              <strong>{call.name}</strong>
+              <span className="grow mono muted">{summary(call.arguments)}</span>
+              <span className={status === "error" ? "danger" : "muted"}>{status}</span>
+            </span>
+          ),
+          content: <pre className="tool-output mono">{output || "No output."}</pre>,
+        },
+      ]}
+    />
+  );
+}
+
+export function MessageView({ message, results, tools }: { message: Message; results: Map<string, Message>; tools: Record<string, ToolRun> }) {
+  if (message.role === "user")
+    return (
+      <div className="msg user">
+        <Markdown text={textOf(message.content)} />
+      </div>
+    );
+  if (message.role === "notice") return <p className="muted">{textOf(message.content)}</p>;
+  if (message.role !== "assistant") return null;
+  return (
+    <div className="msg assistant">
+      {(message.content as Block[]).map((block, i) => {
+        if (block?.type === "text") return <Markdown key={i} text={block.text} />;
+        if (block?.type === "thinking")
+          return (
+            <Accordion
+              key={i}
+              headingLevel={4}
+              items={[{ id: "thinking", title: <span className="muted">Thinking</span>, content: <Markdown text={block.thinking} /> }]}
+            />
+          );
+        if (block?.type === "toolCall")
+          return <ToolCard key={block.id} call={block} result={results.get(block.id)} run={tools[block.id]} />;
+        return null;
+      })}
+      {message.stopReason === "error" && <p className="danger">{message.errorMessage ?? "The model request failed."}</p>}
+      {message.stopReason === "aborted" && <p className="muted">Stopped.</p>}
+    </div>
+  );
+}
 
 /** In-app runs name agents by kind; duo rounds use their own names. */
 function iconOf(name: string): LucideIcon {
