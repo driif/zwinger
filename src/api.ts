@@ -8,8 +8,11 @@ export interface Mount {
   readonly: boolean;
 }
 
+export type NetworkMode = "deny" | "list" | "public";
+
+/** The allow list is kept in every mode. */
 export interface NetworkPolicy {
-  allowAll: boolean;
+  mode: NetworkMode;
   domains: string[];
 }
 
@@ -32,6 +35,7 @@ export interface ShieldView {
   folder: string;
   mounts: Mount[];
   network: NetworkPolicy;
+  harness: string | null;
   status: ShieldStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
@@ -45,6 +49,12 @@ export const createShield = (folder: string) => invoke<string>("create_shield", 
 
 export const deleteShield = (id: string) => invoke<void>("delete_shield", { id });
 
+export const renameShield = (id: string, name: string) => invoke<void>("rename_shield", { id, name });
+
+export const setHarness = (id: string, harness: string | null) => invoke<void>("set_harness", { id, harness });
+
+export const listFolders = (id: string) => invoke<string[]>("list_folders", { id });
+
 export const addMount = (id: string, host: string, guest: string, readonly: boolean) =>
   invoke<void>("add_mount", { id, host, guest, readonly });
 
@@ -54,8 +64,11 @@ export const removeMount = (id: string, guest: string) =>
 export const setMountReadonly = (id: string, guest: string, readonly: boolean) =>
   invoke<void>("set_mount_readonly", { id, guest, readonly });
 
-export const setNetworkPolicy = (id: string, policy: NetworkPolicy) =>
-  invoke<void>("set_network_policy", { id, policy });
+export const setNetworkMode = (id: string, mode: NetworkMode) => invoke<void>("set_network_mode", { id, mode });
+
+export const addDomain = (id: string, domain: string) => invoke<void>("add_domain", { id, domain });
+
+export const removeDomain = (id: string, domain: string) => invoke<void>("remove_domain", { id, domain });
 
 export const startShield = (id: string) => invoke<void>("start_shield", { id });
 

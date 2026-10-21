@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::{Error, Result};
 use crate::runtime::{PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy};
-use crate::shield::{self, NetworkPolicy, Shield};
+use crate::shield::{self, NetworkMode, NetworkPolicy, Shield, WORKSPACE};
 use crate::store::Store;
 
 /// Owns the shield configs, the running VMs and their terminal sessions.
@@ -112,7 +112,14 @@ impl<R: SandboxRuntime> Manager<R> {
                 let (status, pending_restart) = match state.vms.get(&shield.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting) => (Status::Starting, false),
-                    Some(Vm::Running { applied, .. }) => (Status::Running, applied != shield),
+                    // A new name is visible at once, so it needs no restart.
+                    Some(Vm::Running { applied, .. }) => (
+                        Status::Running,
+                        Shield {
+                            name: shield.name.clone(),
+                            ..applied.clone()
+                        } != *shield,
+                    ),
                     Some(Vm::Stopping) => (Status::Stopping, false),
                     Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
                 };
@@ -150,6 +157,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let mut state = lock(&self.state);
         let mut shield = state.shield_mut(id)?.clone();
         edit(&mut shield)?;
+        shield.check()?;
         *state.shield_mut(id)? = shield;
         self.store.save(&state.shields)
     }
@@ -159,35 +167,52 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn remove_mount(&self, id: &str, guest: &str) -> Result<()> {
-        self.edit(id, |s| {
-            s.mount_mut(guest)?;
-            s.mounts.retain(|m| m.guest != guest);
-            Ok(())
-        })
+        self.edit(id, |s| s.remove_mount(guest))
     }
 
     pub fn set_mount_readonly(&self, id: &str, guest: &str, readonly: bool) -> Result<()> {
         self.edit(id, |s| {
             s.mount_mut(guest)?.readonly = readonly;
-            s.check_overlap()
+            Ok(())
         })
     }
 
-    pub fn set_network(&self, id: &str, mut policy: NetworkPolicy) -> Result<()> {
-        let mut domains: Vec<String> = Vec::new();
-        for domain in &policy.domains {
-            if domain.trim().is_empty() {
-                continue;
-            }
-            let domain = shield::domain(domain)?;
-            if !domains.contains(&domain) {
-                domains.push(domain);
-            }
-        }
-        policy.domains = domains;
-        sandbox_policy(&policy)?;
+    pub fn rename(&self, id: &str, name: &str) -> Result<()> {
+        self.edit(id, |s| s.rename(name))
+    }
+
+    pub fn set_harness(&self, id: &str, harness: Option<&str>) -> Result<()> {
+        self.edit(id, |s| s.set_harness(harness))
+    }
+
+    pub fn list_folders(&self, id: &str) -> Result<Vec<String>> {
+        let folder = lock(&self.state).shield_mut(id)?.folder.clone();
+        shield::list_folders(&folder)
+    }
+
+    pub fn set_network_mode(&self, id: &str, mode: NetworkMode) -> Result<()> {
         self.edit(id, |s| {
-            s.network = policy;
+            s.network.mode = mode;
+            Ok(())
+        })
+    }
+
+    /// The domain must also be valid for the sandbox, so that a later start
+    /// in List mode cannot fail on it.
+    pub fn add_domain(&self, id: &str, domain: &str) -> Result<()> {
+        self.edit(id, |s| {
+            s.network.add_domain(domain)?;
+            sandbox_policy(&NetworkPolicy {
+                mode: NetworkMode::List,
+                domains: s.network.domains.clone(),
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn remove_domain(&self, id: &str, domain: &str) -> Result<()> {
+        self.edit(id, |s| {
+            s.network.remove_domain(domain);
             Ok(())
         })
     }
@@ -304,11 +329,17 @@ impl<R: SandboxRuntime> Manager<R> {
         cols: u16,
         on_event: impl Fn(PtyEvent) + Send + 'static,
     ) -> Result<String> {
-        let vm = match lock(&self.state).vms.get(shield_id) {
-            Some(Vm::Running { vm, .. }) => vm.clone(),
+        let (vm, cwd) = match lock(&self.state).vms.get(shield_id) {
+            Some(Vm::Running { vm, applied }) => {
+                let cwd = match kind {
+                    SessionKind::Pi => applied.harness.as_deref(),
+                    SessionKind::Shell => None,
+                };
+                (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
+            }
             _ => return Err(Error::NotRunning),
         };
-        let mut pty = self.runtime.open_pty(&vm, kind, rows, cols).await?;
+        let mut pty = self.runtime.open_pty(&vm, kind, &cwd, rows, cols).await?;
         let id = uuid::Uuid::new_v4().to_string();
         {
             // The shield may have stopped, or stopped and started again, while
@@ -362,9 +393,12 @@ impl<R: SandboxRuntime> Manager<R> {
             .map_err(|_| Error::SessionClosed)
     }
 
+    /// An unknown id is not an error: a stop already removed the session.
     pub fn close_session(&self, id: &str) -> Result<()> {
         let mut state = lock(&self.state);
-        let _ = state.session(id)?.input.send(PtyInput::Kill);
+        if let Ok(session) = state.session(id) {
+            let _ = session.input.send(PtyInput::Kill);
+        }
         state.sessions.retain(|s| s.id != id);
         Ok(())
     }
@@ -556,15 +590,7 @@ mod tests {
         manager.start(&id).await.unwrap();
         assert!(!manager.list()[0].pending_restart);
 
-        manager
-            .set_network(
-                &id,
-                NetworkPolicy {
-                    allow_all: false,
-                    domains: vec![" Registry.npmjs.org ".into()],
-                },
-            )
-            .unwrap();
+        manager.add_domain(&id, " Registry.npmjs.org ").unwrap();
         let view = &manager.list()[0];
         assert!(view.pending_restart);
         assert_eq!(view.shield.network.domains, ["registry.npmjs.org"]);
@@ -572,6 +598,40 @@ mod tests {
         manager.stop(&id).await.unwrap();
         manager.start(&id).await.unwrap();
         assert!(!manager.list()[0].pending_restart);
+    }
+
+    #[tokio::test]
+    async fn mode_change_with_same_domains_sets_pending_restart() {
+        let (manager, _, id) = manager();
+        manager.set_network_mode(&id, NetworkMode::List).unwrap();
+        manager.add_domain(&id, "registry.npmjs.org").unwrap();
+        manager.start(&id).await.unwrap();
+        manager.set_network_mode(&id, NetworkMode::Deny).unwrap();
+        assert!(manager.list()[0].pending_restart);
+        manager.set_network_mode(&id, NetworkMode::List).unwrap();
+        assert!(!manager.list()[0].pending_restart);
+    }
+
+    #[test]
+    fn domain_edits_dedupe_and_validate() {
+        let (manager, _, id) = manager();
+        manager.add_domain(&id, "registry.npmjs.org").unwrap();
+        manager.add_domain(&id, "Registry.NPMjs.org").unwrap();
+        manager.add_domain(&id, "*.anthropic.com").unwrap();
+        assert!(matches!(
+            manager.add_domain(&id, "https://example.com"),
+            Err(Error::InvalidDomain(..))
+        ));
+        assert!(matches!(manager.add_domain("nope", "a.io"), Err(Error::ShieldNotFound)));
+        manager.remove_domain(&id, "registry.npmjs.org").unwrap();
+        manager.remove_domain(&id, "registry.npmjs.org").unwrap();
+        assert_eq!(manager.list()[0].shield.network.domains, ["*.anthropic.com"]);
+    }
+
+    #[test]
+    fn close_unknown_session_is_ok() {
+        let (manager, _, _) = manager();
+        manager.close_session("gone").unwrap();
     }
 
     #[tokio::test]
@@ -590,5 +650,59 @@ mod tests {
 
         reloaded.delete(&id).await.unwrap();
         assert!(Manager::new(FakeRuntime::default(), store()).unwrap().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_mount_used_by_harness_is_refused() {
+        let (manager, _, id) = manager();
+        manager.add_mount(&id, temp_dir().to_str().unwrap(), "/mnt/agent", true).unwrap();
+        manager.set_harness(&id, Some("/mnt/agent/skills")).unwrap();
+        let error = manager.remove_mount(&id, "/mnt/agent").unwrap_err();
+        assert!(error.to_string().contains("harness uses /mnt/agent/skills"), "{error}");
+        assert_eq!(manager.list()[0].shield.mounts.len(), 1);
+
+        manager.set_harness(&id, None).unwrap();
+        manager.remove_mount(&id, "/mnt/agent").unwrap();
+        assert!(manager.list()[0].shield.mounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_while_running_needs_no_restart() {
+        let (manager, _, id) = manager();
+        manager.start(&id).await.unwrap();
+        manager.rename(&id, " api ").unwrap();
+        let view = &manager.list()[0];
+        assert_eq!(view.shield.name, "api");
+        assert!(!view.pending_restart);
+        assert!(matches!(manager.rename(&id, ""), Err(Error::InvalidName(_))));
+    }
+
+    #[tokio::test]
+    async fn sessions_start_in_the_applied_harness() {
+        let (manager, runtime, id) = manager();
+        let folder = manager.list()[0].shield.folder.clone();
+        std::fs::create_dir(folder.join("agent")).unwrap();
+        manager.start(&id).await.unwrap();
+        manager.set_harness(&id, Some("/workspace/agent")).unwrap();
+        assert!(manager.list()[0].pending_restart);
+        manager.open_session(&id, SessionKind::Pi, 24, 80, |_| {}).await.unwrap();
+
+        manager.stop(&id).await.unwrap();
+        manager.start(&id).await.unwrap();
+        manager.open_session(&id, SessionKind::Pi, 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, SessionKind::Shell, 24, 80, |_| {}).await.unwrap();
+        assert_eq!(
+            *runtime.cwds.lock().unwrap(),
+            ["/workspace", "/workspace/agent", "/workspace"]
+        );
+    }
+
+    #[test]
+    fn list_folders_reads_the_shield_folder() {
+        let (manager, _, id) = manager();
+        let folder = manager.list()[0].shield.folder.clone();
+        std::fs::create_dir(folder.join("web")).unwrap();
+        assert_eq!(manager.list_folders(&id).unwrap(), ["web"]);
+        assert!(matches!(manager.list_folders("nope"), Err(Error::ShieldNotFound)));
     }
 }

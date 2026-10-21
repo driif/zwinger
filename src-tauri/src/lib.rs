@@ -69,10 +69,10 @@ pub fn run() {
         .setup(|app| {
             // VMs from an earlier run that did not exit cleanly. The manager
             // starts with no VMs, so every shield shows as stopped.
-            let reaped = tauri::async_runtime::block_on(tokio::time::timeout(
-                REAP_LIMIT,
-                Microsandbox.reap(),
-            ));
+            // The timer must be made inside the runtime, so it is in the future.
+            let reaped = tauri::async_runtime::block_on(async {
+                tokio::time::timeout(REAP_LIMIT, Microsandbox.reap()).await
+            });
             match reaped {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("reap failed: {e}"),
@@ -87,10 +87,15 @@ pub fn run() {
             commands::list_shields,
             commands::create_shield,
             commands::delete_shield,
+            commands::rename_shield,
+            commands::set_harness,
+            commands::list_folders,
             commands::add_mount,
             commands::remove_mount,
             commands::set_mount_readonly,
-            commands::set_network_policy,
+            commands::set_network_mode,
+            commands::add_domain,
+            commands::remove_domain,
             commands::start_shield,
             commands::stop_shield,
             commands::open_session,

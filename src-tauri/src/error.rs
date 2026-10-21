@@ -20,6 +20,12 @@ pub enum Error {
     MountOverlap(String, String),
     #[error("path now resolves to a different place: {0}")]
     PathChanged(String),
+    #[error("name must have 1 to 64 characters and no control characters: {0}")]
+    InvalidName(String),
+    #[error("harness uses {0}, which is not below /workspace or a mount")]
+    HarnessTarget(String),
+    #[error("harness uses {0}, which is in {1}; change the harness first")]
+    HarnessMount(String, String),
     #[error("invalid domain {0}: {1}")]
     InvalidDomain(String, String),
     #[error("shield not found")]

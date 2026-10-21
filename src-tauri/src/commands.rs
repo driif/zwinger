@@ -4,7 +4,7 @@ use tauri::ipc::Channel;
 use crate::error::Result;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::sessions::{Manager, ShieldView};
-use crate::shield::NetworkPolicy;
+use crate::shield::NetworkMode;
 
 type Shields<'a> = State<'a, Manager<Microsandbox>>;
 
@@ -21,6 +21,21 @@ pub fn create_shield(shields: Shields<'_>, folder: String) -> Result<String> {
 #[tauri::command]
 pub async fn delete_shield(shields: Shields<'_>, id: String) -> Result<()> {
     shields.delete(&id).await
+}
+
+#[tauri::command]
+pub fn rename_shield(shields: Shields<'_>, id: String, name: String) -> Result<()> {
+    shields.rename(&id, &name)
+}
+
+#[tauri::command]
+pub fn set_harness(shields: Shields<'_>, id: String, harness: Option<String>) -> Result<()> {
+    shields.set_harness(&id, harness.as_deref())
+}
+
+#[tauri::command]
+pub fn list_folders(shields: Shields<'_>, id: String) -> Result<Vec<String>> {
+    shields.list_folders(&id)
 }
 
 #[tauri::command]
@@ -50,8 +65,18 @@ pub fn set_mount_readonly(
 }
 
 #[tauri::command]
-pub fn set_network_policy(shields: Shields<'_>, id: String, policy: NetworkPolicy) -> Result<()> {
-    shields.set_network(&id, policy)
+pub fn set_network_mode(shields: Shields<'_>, id: String, mode: NetworkMode) -> Result<()> {
+    shields.set_network_mode(&id, mode)
+}
+
+#[tauri::command]
+pub fn add_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
+    shields.add_domain(&id, &domain)
+}
+
+#[tauri::command]
+pub fn remove_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
+    shields.remove_domain(&id, &domain)
 }
 
 #[tauri::command]

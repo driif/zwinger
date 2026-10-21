@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub const WORKSPACE: &str = "/workspace";
+const FOLDER_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14,6 +15,9 @@ pub struct Shield {
     pub folder: PathBuf,
     pub mounts: Vec<Mount>,
     pub network: NetworkPolicy,
+    /// The guest folder where agent sessions start: below `/workspace` or a mount.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,12 +28,63 @@ pub struct Mount {
     pub readonly: bool,
 }
 
-/// `domains` is kept when `allow_all` is on, so the allow list survives a toggle.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum NetworkMode {
+    #[default]
+    Deny,
+    List,
+    Public,
+}
+
+/// `domains` is kept in every mode, so the allow list survives a mode change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "StoredNetworkPolicy")]
 pub struct NetworkPolicy {
-    pub allow_all: bool,
+    pub mode: NetworkMode,
     pub domains: Vec<String>,
+}
+
+/// Configs saved before `mode` existed have `allowAll` instead.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredNetworkPolicy {
+    Current {
+        mode: NetworkMode,
+        domains: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Legacy {
+        allow_all: bool,
+        domains: Vec<String>,
+    },
+}
+
+impl From<StoredNetworkPolicy> for NetworkPolicy {
+    fn from(stored: StoredNetworkPolicy) -> Self {
+        match stored {
+            StoredNetworkPolicy::Current { mode, domains } => Self { mode, domains },
+            StoredNetworkPolicy::Legacy { allow_all, domains } => Self {
+                mode: if allow_all { NetworkMode::Public } else { NetworkMode::List },
+                domains,
+            },
+        }
+    }
+}
+
+impl NetworkPolicy {
+    /// Adds `input` as a normalized domain, once.
+    pub fn add_domain(&mut self, input: &str) -> Result<()> {
+        let domain = domain(input)?;
+        if !self.domains.contains(&domain) {
+            self.domains.push(domain);
+        }
+        Ok(())
+    }
+
+    pub fn remove_domain(&mut self, domain: &str) {
+        self.domains.retain(|d| d != domain);
+    }
 }
 
 impl Shield {
@@ -44,7 +99,76 @@ impl Shield {
             folder,
             mounts: Vec::new(),
             network: NetworkPolicy::default(),
+            harness: None,
         })
+    }
+
+    pub fn rename(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
+            return Err(Error::InvalidName(name.to_owned()));
+        }
+        name.clone_into(&mut self.name);
+        Ok(())
+    }
+
+    /// Accepts a sub-path of `/workspace` whose host folder exists, or a mount's
+    /// guest path or a sub-path of it. `None` clears the harness.
+    pub fn set_harness(&mut self, harness: Option<&str>) -> Result<()> {
+        let Some(input) = harness else {
+            self.harness = None;
+            return Ok(());
+        };
+        let path = normalize(input).ok_or_else(|| Error::InvalidGuestPath(input.to_owned()))?;
+        if let Ok(rel) = path.strip_prefix(WORKSPACE)
+            && !rel.as_os_str().is_empty()
+            && !self.folder.join(rel).is_dir()
+        {
+            return Err(Error::MissingPath(path.display().to_string()));
+        }
+        self.harness = Some(path.to_string_lossy().into_owned());
+        self.check()
+    }
+
+    /// The rules that every stored config must meet.
+    pub fn check(&self) -> Result<()> {
+        self.check_overlap()?;
+        match &self.harness {
+            Some(harness) if !self.harness_target_exists(Path::new(harness)) => {
+                Err(Error::HarnessTarget(harness.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn harness_target_exists(&self, harness: &Path) -> bool {
+        harness.starts_with(WORKSPACE) && harness != Path::new(WORKSPACE)
+            || self.mounts.iter().any(|m| harness.starts_with(&m.guest))
+    }
+
+    /// The guest path of the mount that holds the harness: the deepest mount
+    /// whose guest path contains it. `None` for `/workspace` or no harness.
+    fn harness_mount(&self) -> Option<&str> {
+        let harness = Path::new(self.harness.as_deref()?);
+        self.mounts
+            .iter()
+            .filter(|m| harness.starts_with(&m.guest))
+            .map(|m| m.guest.as_str())
+            .max_by_key(|g| g.len())
+    }
+
+    /// Refuses a mount change that moves the harness to a different mount, so
+    /// the harness cannot silently point to a different host folder.
+    fn keep_harness_mount(&mut self, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let before = self.harness_mount().map(str::to_owned);
+        let saved = self.mounts.clone();
+        change(self)?;
+        if self.harness_mount() != before.as_deref() {
+            self.mounts = saved;
+            let harness = self.harness.clone().unwrap_or_default();
+            return Err(Error::HarnessMount(harness, before.unwrap_or_else(|| WORKSPACE.to_owned())));
+        }
+        Ok(())
     }
 
     pub fn add_mount(&mut self, host: &str, guest: &str, readonly: bool) -> Result<()> {
@@ -53,13 +177,24 @@ impl Shield {
         if self.mounts.iter().any(|m| m.guest == guest) {
             return Err(Error::DuplicateMount(guest));
         }
-        self.mounts.push(Mount {
-            host,
-            guest,
-            readonly,
-        });
+        self.keep_harness_mount(|s| {
+            s.mounts.push(Mount {
+                host,
+                guest,
+                readonly,
+            });
+            Ok(())
+        })?;
         self.check_overlap().inspect_err(|_| {
             self.mounts.pop();
+        })
+    }
+
+    pub fn remove_mount(&mut self, guest: &str) -> Result<()> {
+        self.mount_mut(guest)?;
+        self.keep_harness_mount(|s| {
+            s.mounts.retain(|m| m.guest != guest);
+            Ok(())
         })
     }
 
@@ -167,20 +302,44 @@ pub fn domain(input: &str) -> Result<String> {
     Ok(domain)
 }
 
-pub fn guest_path(path: &str) -> Result<String> {
+/// An absolute guest path below `/`, with no `.` or `..` and no repeated or
+/// trailing slashes.
+fn normalize(path: &str) -> Option<PathBuf> {
     let p = Path::new(path);
     let normalized = p.is_absolute()
         && p.components()
             .skip(1)
             .all(|c| matches!(c, Component::Normal(_)))
         && p.components().count() > 1;
-    if !normalized {
-        return Err(Error::InvalidGuestPath(path.to_owned()));
-    }
-    if p.starts_with(WORKSPACE) || Path::new(WORKSPACE).starts_with(p) {
+    normalized.then(|| p.components().collect())
+}
+
+pub fn guest_path(path: &str) -> Result<String> {
+    let p = normalize(path).ok_or_else(|| Error::InvalidGuestPath(path.to_owned()))?;
+    if p.starts_with(WORKSPACE) || Path::new(WORKSPACE).starts_with(&p) {
         return Err(Error::WorkspaceOverlap(path.to_owned()));
     }
-    Ok(p.components().collect::<PathBuf>().to_string_lossy().into_owned())
+    Ok(p.to_string_lossy().into_owned())
+}
+
+/// The top-level folders of a shield folder, for display: real directories
+/// only (no symlinks, no hidden names), sorted, at most `FOLDER_LIMIT`.
+pub fn list_folders(folder: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Ok(name) = entry.file_name().into_string()
+            && !name.starts_with('.')
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.truncate(FOLDER_LIMIT);
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -353,6 +512,139 @@ mod tests {
         let (shield, root) = shield_with_dirs(&["project"]);
         std::fs::remove_dir(root.join("project")).unwrap();
         assert!(matches!(shield.verify_paths(), Err(Error::MissingPath(_))));
+    }
+
+    #[test]
+    fn set_harness_accepts_workspace_folders_and_mounts() {
+        let (mut shield, root) = shield_with_dirs(&["project/agent", "data"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        for (input, stored) in [
+            ("//workspace/agent/", "/workspace/agent"),
+            ("/mnt/data", "/mnt/data"),
+            ("/mnt/data/sub", "/mnt/data/sub"),
+        ] {
+            shield.set_harness(Some(input)).unwrap();
+            assert_eq!(shield.harness.as_deref(), Some(stored));
+        }
+        shield.set_harness(None).unwrap();
+        assert_eq!(shield.harness, None);
+    }
+
+    #[test]
+    fn set_harness_rejects_other_paths() {
+        let (mut shield, _) = shield_with_dirs(&["project"]);
+        for input in ["agent", "/workspace/../etc", "/"] {
+            assert!(
+                matches!(shield.set_harness(Some(input)), Err(Error::InvalidGuestPath(_))),
+                "{input}"
+            );
+        }
+        assert!(matches!(
+            shield.set_harness(Some("/workspace/missing")),
+            Err(Error::MissingPath(_))
+        ));
+        for input in ["/workspace", "/mnt/data", "/etc"] {
+            assert!(
+                matches!(shield.set_harness(Some(input)), Err(Error::HarnessTarget(_))),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_refuses_harness_without_its_mount() {
+        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        shield.set_harness(Some("/mnt/data")).unwrap();
+        shield.mounts.clear();
+        assert!(matches!(shield.check(), Err(Error::HarnessTarget(h)) if h == "/mnt/data"));
+    }
+
+    #[test]
+    fn mount_change_that_moves_the_harness_is_refused() {
+        let (mut shield, root) = shield_with_dirs(&["project", "outer", "inner"]);
+        shield.add_mount(&path(&root, "outer"), "/mnt", true).unwrap();
+        shield.add_mount(&path(&root, "inner"), "/mnt/sub", true).unwrap();
+        shield.set_harness(Some("/mnt/sub/agent")).unwrap();
+        assert!(matches!(
+            shield.remove_mount("/mnt/sub"),
+            Err(Error::HarnessMount(h, m)) if h == "/mnt/sub/agent" && m == "/mnt/sub"
+        ));
+        assert_eq!(shield.mounts.len(), 2);
+        shield.remove_mount("/mnt").unwrap();
+
+        shield.set_harness(Some("/mnt/sub/deeper")).unwrap();
+        assert!(matches!(
+            shield.add_mount(&path(&root, "outer"), "/mnt/sub/deeper", true),
+            Err(Error::HarnessMount(..))
+        ));
+        assert_eq!(shield.mounts.len(), 1);
+    }
+
+    #[test]
+    fn rename_trims_and_limits() {
+        let (mut shield, _) = shield_with_dirs(&["project"]);
+        shield.rename("  api  ").unwrap();
+        assert_eq!(shield.name, "api");
+        shield.rename(&"ü".repeat(64)).unwrap();
+        for name in ["", "   ", "a\nb", "tab\there", &"x".repeat(65)] {
+            assert!(matches!(shield.rename(name), Err(Error::InvalidName(_))), "{name:?}");
+        }
+        assert_eq!(shield.name, "ü".repeat(64));
+    }
+
+    #[test]
+    fn list_folders_returns_visible_real_directories() {
+        let (_, root) = shield_with_dirs(&["project/web", "project/api", "project/.git", "outside"]);
+        let folder = root.join("project");
+        std::fs::write(folder.join("README.md"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), folder.join("link")).unwrap();
+        assert_eq!(list_folders(&folder).unwrap(), ["api", "web"]);
+    }
+
+    #[test]
+    fn list_folders_caps_the_count() {
+        let (_, root) = shield_with_dirs(&["project"]);
+        let folder = root.join("project");
+        for i in 0..60 {
+            std::fs::create_dir(folder.join(format!("d{i:02}"))).unwrap();
+        }
+        let names = list_folders(&folder).unwrap();
+        assert_eq!(names.len(), FOLDER_LIMIT);
+        assert_eq!(names[0], "d00");
+        assert_eq!(names[49], "d49");
+    }
+
+    #[test]
+    fn legacy_network_policy_migrates() {
+        for (allow_all, mode) in [(false, NetworkMode::List), (true, NetworkMode::Public)] {
+            let json = format!(r#"{{"allowAll":{allow_all},"domains":["registry.npmjs.org"]}}"#);
+            let policy: NetworkPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                policy,
+                NetworkPolicy {
+                    mode,
+                    domains: vec!["registry.npmjs.org".into()],
+                }
+            );
+        }
+        let current: NetworkPolicy = serde_json::from_str(r#"{"mode":"deny","domains":["a.io"]}"#).unwrap();
+        assert_eq!(current.mode, NetworkMode::Deny);
+        assert_eq!(serde_json::to_string(&current).unwrap(), r#"{"mode":"deny","domains":["a.io"]}"#);
+    }
+
+    #[test]
+    fn add_domain_normalizes_and_dedupes() {
+        let mut policy = NetworkPolicy::default();
+        policy.add_domain(" Registry.npmjs.org ").unwrap();
+        policy.add_domain("registry.npmjs.org").unwrap();
+        policy.add_domain("*.anthropic.com").unwrap();
+        assert!(matches!(policy.add_domain("not a domain"), Err(Error::InvalidDomain(..))));
+        assert_eq!(policy.domains, ["registry.npmjs.org", "*.anthropic.com"]);
+
+        policy.remove_domain("registry.npmjs.org");
+        policy.remove_domain("registry.npmjs.org");
+        assert_eq!(policy.domains, ["*.anthropic.com"]);
     }
 
     #[test]

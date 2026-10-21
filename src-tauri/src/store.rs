@@ -34,7 +34,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shield::{Mount, NetworkPolicy};
+    use crate::shield::{Mount, NetworkMode, NetworkPolicy};
 
     #[test]
     fn round_trip() {
@@ -52,12 +52,27 @@ mod tests {
                 readonly: true,
             }],
             network: NetworkPolicy {
-                allow_all: true,
+                mode: NetworkMode::Public,
                 domains: vec!["registry.npmjs.org".into()],
             },
+            harness: Some("/workspace/agent".into()),
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
         assert!(!dir.join("nested").join("shields.json.tmp").exists());
+    }
+
+    #[test]
+    fn loads_config_without_harness() {
+        let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shields.json");
+        std::fs::write(
+            &path,
+            r#"[{"id":"a","name":"proj","folder":"/tmp/proj","mounts":[],
+                "network":{"allowAll":false,"domains":[]}}]"#,
+        )
+        .unwrap();
+        assert_eq!(Store::new(path).load().unwrap()[0].harness, None);
     }
 }

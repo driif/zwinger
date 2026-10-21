@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::error::{Error, Result};
-use crate::shield::{self, Shield, WORKSPACE};
+use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -51,6 +51,7 @@ pub trait SandboxRuntime: Send + Sync + 'static {
         &self,
         vm: &Self::Vm,
         kind: SessionKind,
+        cwd: &str,
         rows: u16,
         cols: u16,
     ) -> impl Future<Output = Result<Pty>> + Send;
@@ -73,15 +74,15 @@ pub fn sandbox_policy(policy: &shield::NetworkPolicy) -> Result<microsandbox::Ne
         .egress(|e| e.tcp().udp().port_range(0, 52).port_range(54, u16::MAX).deny_host())
         .egress(|e| e.icmpv4().icmpv6().deny_host())
         .egress(|e| e.deny_private().deny_loopback().deny_link_local().deny_meta());
-    let builder = if policy.allow_all {
-        builder
-            .rule(|r| r.egress().udp().tcp().port(53).allow_host())
-            .egress(|e| e.allow_public())
-    } else {
-        builder.egress(|e| {
+    let builder = match policy.mode {
+        NetworkMode::Deny => builder,
+        NetworkMode::List => builder.egress(|e| {
             e.allow_domains(domains)
                 .allow_domain_suffixes(suffixes.into_iter().map(|s| &s[2..]))
-        })
+        }),
+        NetworkMode::Public => builder
+            .rule(|r| r.egress().udp().tcp().port(53).allow_host())
+            .egress(|e| e.allow_public()),
     };
     builder
         .build()
@@ -162,7 +163,14 @@ impl SandboxRuntime for Microsandbox {
         result
     }
 
-    async fn open_pty(&self, vm: &Sandbox, kind: SessionKind, rows: u16, cols: u16) -> Result<Pty> {
+    async fn open_pty(
+        &self,
+        vm: &Sandbox,
+        kind: SessionKind,
+        cwd: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Pty> {
         let (cmd, args): (&str, &[&str]) = match kind {
             SessionKind::Shell => ("/bin/bash", &["-l"]),
             SessionKind::Pi => ("npx", &["-y", "@earendil-works/pi-coding-agent"]),
@@ -170,7 +178,7 @@ impl SandboxRuntime for Microsandbox {
         let mut handle = vm
             .exec_stream_with(cmd, |e| {
                 e.args(args.iter().copied())
-                    .cwd(WORKSPACE)
+                    .cwd(cwd)
                     .env("TERM", "xterm-256color")
                     .tty(true)
                     .stdin_pipe()
@@ -234,6 +242,7 @@ pub mod fake {
         pub log: Arc<Mutex<Vec<String>>>,
         pub fail_stop: Arc<Mutex<bool>>,
         pub pty_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
+        pub cwds: Arc<Mutex<Vec<String>>>,
     }
 
     /// Holds `open_pty` after it signals `entered`, until the test signals `release`.
@@ -270,7 +279,15 @@ pub mod fake {
             Ok(())
         }
 
-        async fn open_pty(&self, _: &FakeVm, _: SessionKind, rows: u16, cols: u16) -> Result<Pty> {
+        async fn open_pty(
+            &self,
+            _: &FakeVm,
+            _: SessionKind,
+            cwd: &str,
+            rows: u16,
+            cols: u16,
+        ) -> Result<Pty> {
+            self.cwds.lock().unwrap().push(cwd.to_owned());
             let gate = self.pty_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
@@ -309,9 +326,9 @@ mod tests {
 
     use super::*;
 
-    fn policy(allow_all: bool, domains: &[&str]) -> microsandbox::NetworkPolicy {
+    fn policy(mode: NetworkMode, domains: &[&str]) -> microsandbox::NetworkPolicy {
         sandbox_policy(&shield::NetworkPolicy {
-            allow_all,
+            mode,
             domains: domains.iter().map(|d| (*d).to_owned()).collect(),
         })
         .unwrap()
@@ -369,9 +386,10 @@ mod tests {
     #[test]
     fn every_mode_denies_by_default_and_starts_with_the_floor() {
         for policy in [
-            policy(false, &[]),
-            policy(false, &["registry.npmjs.org"]),
-            policy(true, &[]),
+            policy(NetworkMode::Deny, &["registry.npmjs.org"]),
+            policy(NetworkMode::List, &[]),
+            policy(NetworkMode::List, &["registry.npmjs.org"]),
+            policy(NetworkMode::Public, &[]),
         ] {
             assert_eq!(policy.default_egress, NetworkAction::Deny);
             assert_eq!(policy.default_ingress, NetworkAction::Deny);
@@ -381,7 +399,7 @@ mod tests {
 
     #[test]
     fn allow_list_maps_domains_and_wildcards_without_open_dns() {
-        let policy = policy(false, &["registry.npmjs.org", "*.anthropic.com"]);
+        let policy = policy(NetworkMode::List, &["registry.npmjs.org", "*.anthropic.com"]);
         let mut expected = floor();
         expected.push(allow(json!({ "domain": "registry.npmjs.org" })));
         expected.push(allow(json!({ "domain_suffix": "anthropic.com" })));
@@ -390,7 +408,7 @@ mod tests {
 
     #[test]
     fn allow_list_resolves_only_listed_names() {
-        let policy = policy(false, &["registry.npmjs.org", "*.anthropic.com"]);
+        let policy = policy(NetworkMode::List, &["registry.npmjs.org", "*.anthropic.com"]);
         assert_eq!(dns(&policy, "registry.npmjs.org"), NetworkAction::Allow);
         assert_eq!(dns(&policy, "api.anthropic.com"), NetworkAction::Allow);
         assert_eq!(dns(&policy, "anthropic.com"), NetworkAction::Allow);
@@ -401,12 +419,20 @@ mod tests {
 
     #[test]
     fn empty_allow_list_resolves_nothing() {
-        assert_eq!(dns(&policy(false, &[]), "registry.npmjs.org"), NetworkAction::Deny);
+        assert_eq!(dns(&policy(NetworkMode::List, &[]), "registry.npmjs.org"), NetworkAction::Deny);
     }
 
     #[test]
-    fn allow_all_opens_dns_and_public_only() {
-        let policy = policy(true, &["registry.npmjs.org"]);
+    fn deny_allows_no_domains() {
+        let policy = policy(NetworkMode::Deny, &["registry.npmjs.org", "*.anthropic.com"]);
+        assert_eq!(rules(&policy), Value::Array(floor()));
+        assert_eq!(dns(&policy, "registry.npmjs.org"), NetworkAction::Deny);
+        assert_eq!(dns(&policy, "api.anthropic.com"), NetworkAction::Deny);
+    }
+
+    #[test]
+    fn public_opens_dns_and_public_only() {
+        let policy = policy(NetworkMode::Public, &["registry.npmjs.org"]);
         let mut expected = floor();
         expected.push(json!({
             "direction": "egress",
@@ -427,7 +453,7 @@ mod tests {
     #[test]
     fn invalid_domain_is_rejected() {
         let result = sandbox_policy(&shield::NetworkPolicy {
-            allow_all: false,
+            mode: NetworkMode::List,
             domains: vec!["not a domain".into()],
         });
         assert!(matches!(result, Err(Error::InvalidDomain(..))));
