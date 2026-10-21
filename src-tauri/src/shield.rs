@@ -320,7 +320,8 @@ pub fn host_dir(path: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Accepts a hostname with at least two labels, or `*.` and such a hostname.
+/// Accepts a hostname with at least two labels, or `*.` and such a hostname
+/// that is not a public suffix (`*.com`, `*.co.uk`, `*.github.io`).
 /// Returns it in lowercase.
 pub fn domain(input: &str) -> Result<String> {
     let invalid = |reason: &str| Error::InvalidDomain(input.to_owned(), reason.to_owned());
@@ -342,7 +343,17 @@ pub fn domain(input: &str) -> Result<String> {
     if !labels.iter().all(valid_label) {
         return Err(invalid("use only letters, digits, hyphens and dots, with no scheme, path or port"));
     }
+    if host.len() < domain.len() && psl::suffix_str(host) == Some(host) {
+        return Err(invalid("a wildcard may not cover a public suffix"));
+    }
     Ok(domain)
+}
+
+/// The wildcard of the registrable domain of `host`, as `*.bbc.co.uk` for
+/// `news.bbc.co.uk`. `None` if `host` is the registrable domain itself.
+pub fn wildcard_for(host: &str) -> Option<String> {
+    let registrable = psl::domain_str(host)?;
+    (registrable.len() < host.len()).then(|| format!("*.{registrable}"))
 }
 
 /// An absolute guest path below `/`, with no `.` or `..` and no repeated or
@@ -720,11 +731,22 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_for_uses_the_registrable_domain() {
+        assert_eq!(wildcard_for("bbc.co.uk"), None);
+        assert_eq!(wildcard_for("news.bbc.co.uk").as_deref(), Some("*.bbc.co.uk"));
+        assert_eq!(wildcard_for("x.user.github.io").as_deref(), Some("*.user.github.io"));
+        assert_eq!(wildcard_for("google.com"), None);
+        assert_eq!(wildcard_for("a.b.example.com").as_deref(), Some("*.example.com"));
+    }
+
+    #[test]
     fn domain_rejects_other_input() {
         for input in [
             "",
             "localhost",
             "*.com",
+            "*.co.uk",
+            "*.github.io",
             "https://example.com",
             "example.com/path",
             "example.com:443",

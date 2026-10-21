@@ -5,10 +5,11 @@ use serde_json::Value;
 
 use crate::agent::{AgentCommand, Chat};
 use crate::error::Result;
+use crate::netlog::NetEvent;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::secrets::{Secret, SecretValue};
 use crate::sessions::{Manager, SecretView, ShieldView};
-use crate::shield::NetworkMode;
+use crate::shield::{self, NetworkMode};
 
 type Shields<'a> = State<'a, Manager<Microsandbox>>;
 
@@ -76,6 +77,21 @@ pub fn set_network_mode(shields: Shields<'_>, id: String, mode: NetworkMode) -> 
 #[tauri::command]
 pub fn add_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
     shields.add_domain(&id, &domain)
+}
+
+#[tauri::command]
+pub fn allow_host(shields: Shields<'_>, shield_id: String, host: String) -> Result<()> {
+    shields.allow_host(&shield_id, &host)
+}
+
+#[tauri::command]
+pub fn wildcard_for(host: String) -> Option<String> {
+    shield::wildcard_for(&host)
+}
+
+#[tauri::command]
+pub fn list_net_events(shields: Shields<'_>, shield_id: String) -> Result<Vec<NetEvent>> {
+    shields.list_net_events(&shield_id)
 }
 
 #[tauri::command]
@@ -173,5 +189,5 @@ pub async fn close_agent(shields: Shields<'_>, id: String) -> Result<()> {
 
 #[tauri::command]
 pub async fn list_chats(shields: Shields<'_>, shield_id: String) -> Result<Vec<Chat>> {
-    shields.list_chats(&shield_id)
+    shields.list_chats(&shield_id).await
 }

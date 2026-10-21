@@ -6,12 +6,14 @@ import { ShieldView } from "./api";
 interface Props {
   shields: ShieldView[];
   selectedId?: string;
+  /** Per shield, the blocked events that the Network tab has not shown yet. */
+  blocked: Record<string, number>;
   onSelect: (id: string) => void;
   onNew: () => void;
   children: ReactNode;
 }
 
-export function ShieldRail({ shields, selectedId, onSelect, onNew, children }: Props) {
+export function ShieldRail({ shields, selectedId, blocked, onSelect, onNew, children }: Props) {
   const rows = useRef<HTMLElement[]>([]);
 
   // Roving tabindex: the selected row is in the tab order, the arrow keys move between rows.
@@ -49,6 +51,11 @@ export function ShieldRail({ shields, selectedId, onSelect, onNew, children }: P
               <div className="row">
                 <span className={`dot ${shield.status.state}`} aria-label={shield.status.state} />
                 <span className="grow">{shield.name}</span>
+                {blocked[shield.id] > 0 && (
+                  <span className="rail-blocked" title="Blocked network events since you last saw the Network tab">
+                    {blocked[shield.id]}
+                  </span>
+                )}
               </div>
               <p className="rail-counts muted">
                 {shield.mounts.length + 1} folders ·{" "}

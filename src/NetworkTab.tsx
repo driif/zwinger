@@ -1,8 +1,9 @@
 import { Button, Card, CardBody, CardHeader, FilterChips, FloatingField, SegmentedControl } from "@driif/motiv";
 import { Ban, Plus, TriangleAlert, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { addDomain, NetworkMode, removeDomain, setNetworkMode, ShieldView } from "./api";
+import { addDomain, NetEvent, NetworkMode, removeDomain, setNetworkMode, ShieldView } from "./api";
 import type { Intent, Run } from "./App";
+import { NetworkActivity } from "./NetworkActivity";
 import { SecretsSection } from "./SecretsSection";
 
 const PROVIDERS = ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"];
@@ -19,7 +20,7 @@ const ALWAYS_BLOCKED = [
 
 const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
 
-/** The same rules as `shield::domain` in the backend. */
+/** Format only; the backend also rejects public suffixes. */
 function domainError(input: string) {
   const domain = input.trim().toLowerCase();
   const host = domain.startsWith("*.") ? domain.slice(2) : domain;
@@ -32,12 +33,13 @@ function domainError(input: string) {
 
 interface Props {
   shield: ShieldView;
+  events: NetEvent[];
   run: Run;
   intent?: Intent;
   onIntentDone: () => void;
 }
 
-export function NetworkTab({ shield, run, intent, onIntentDone }: Props) {
+export function NetworkTab({ shield, events, run, intent, onIntentDone }: Props) {
   const { id, network } = shield;
   const [domain, setDomain] = useState("");
   const [problem, setProblem] = useState<string>();
@@ -157,6 +159,7 @@ export function NetworkTab({ shield, run, intent, onIntentDone }: Props) {
           )}
         </CardBody>
       </Card>
+      <NetworkActivity shield={shield} events={events} run={run} />
       <SecretsSection shield={shield} run={run} />
       <Card variant="subtle" padding="md">
         <CardHeader title="Always blocked" titleAs="h2" description="Every mode blocks these groups. You cannot change this." />

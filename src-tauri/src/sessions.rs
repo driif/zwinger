@@ -1,14 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::task::AbortHandle;
 
 use crate::agent::{self, Agent, AgentCommand, Chat, Sink};
 use crate::error::{Error, Result};
+use crate::netlog::{self, Dedupe, NetEvent};
 use crate::runtime::{
     PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
 };
@@ -17,8 +19,15 @@ use crate::shield::{self, NetworkMode, NetworkPolicy, Shield, WORKSPACE};
 use crate::store::Store;
 
 const NODE_LIMIT: Duration = Duration::from_secs(15);
+/// The bytes of `node --version` output that are kept.
+const NODE_OUT: usize = 1 << 10;
 /// How long a closed agent has to exit before it is killed.
 const CLOSE_LIMIT: Duration = Duration::from_secs(5);
+/// The network events kept per shield.
+const NET_RING: usize = 500;
+
+/// Gets each new network event with its shield id.
+pub type NetSink = Box<dyn Fn(&str, &NetEvent) + Send + Sync>;
 
 /// Owns the shield configs, the running VMs, their terminal sessions and agents.
 pub struct Manager<R: SandboxRuntime> {
@@ -32,6 +41,7 @@ pub struct Manager<R: SandboxRuntime> {
     /// The state lock is not held during vault calls.
     secret_edit: Mutex<()>,
     state: Arc<Mutex<State<R::Vm>>>,
+    net_sink: Arc<OnceLock<NetSink>>,
 }
 
 struct State<V> {
@@ -43,6 +53,9 @@ struct State<V> {
     /// Per shield, counts the secret value changes. The config does not hold
     /// the values, so a running VM compares this count instead.
     secrets_rev: HashMap<String, u64>,
+    /// Per shield, the last network events. They stay after a stop, so the
+    /// user can still allow a blocked host.
+    net: HashMap<String, VecDeque<NetEvent>>,
 }
 
 enum Vm<V> {
@@ -50,10 +63,13 @@ enum Vm<V> {
     /// `applied` is the config the VM booted with; it differs from the stored
     /// config after an edit, until the next start. `applied_rev` is the
     /// `secrets_rev` that the start read before it read the values.
+    /// `net` follows the VM's network events. It is `None` if the runtime
+    /// log could not be opened.
     Running {
         vm: Arc<V>,
         applied: Shield,
         applied_rev: u64,
+        net: Option<AbortHandle>,
     },
     /// Shutdown is in progress. If it fails, the VM goes back to `Running`.
     Stopping,
@@ -157,6 +173,17 @@ impl<V> State<V> {
             .ok_or(Error::ShieldNotFound)
     }
 
+    /// Numbers the event and adds it to the shield's ring.
+    fn push_net(&mut self, id: &str, mut event: NetEvent) -> NetEvent {
+        let ring = self.net.entry(id.to_owned()).or_default();
+        event.seq = ring.back().map_or(1, |last| last.seq + 1);
+        if ring.len() == NET_RING {
+            ring.pop_front();
+        }
+        ring.push_back(event.clone());
+        event
+    }
+
     fn session(&self, id: &str) -> Result<&Session> {
         self.sessions
             .iter()
@@ -181,8 +208,21 @@ impl<R: SandboxRuntime> Manager<R> {
                 sessions: Vec::new(),
                 agents: Vec::new(),
                 secrets_rev: HashMap::new(),
+                net: HashMap::new(),
             })),
+            net_sink: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Only the first sink counts.
+    pub fn set_net_sink(&self, sink: NetSink) {
+        let _ = self.net_sink.set(sink);
+    }
+
+    pub fn list_net_events(&self, id: &str) -> Result<Vec<NetEvent>> {
+        let mut state = lock(&self.state);
+        state.shield_mut(id)?;
+        Ok(state.net.get(id).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
     }
 
     pub fn list(&self) -> Vec<ShieldView> {
@@ -305,6 +345,22 @@ impl<R: SandboxRuntime> Manager<R> {
         })
     }
 
+    /// Allows a blocked host in one edit. A shield in Deny mode changes to
+    /// List mode, else the host would stay blocked.
+    pub fn allow_host(&self, id: &str, host: &str) -> Result<()> {
+        self.edit(id, |s| {
+            if s.network.mode == NetworkMode::Deny {
+                s.network.mode = NetworkMode::List;
+            }
+            s.network.add_domain(host)?;
+            sandbox_policy(&NetworkPolicy {
+                mode: NetworkMode::List,
+                domains: s.network.domains.clone(),
+            })?;
+            Ok(())
+        })
+    }
+
     pub fn remove_domain(&self, id: &str, domain: &str) -> Result<()> {
         self.edit(id, |s| {
             s.network.remove_domain(domain);
@@ -416,6 +472,7 @@ impl<R: SandboxRuntime> Manager<R> {
             state.shields = shields;
             state.vms.remove(id);
             state.secrets_rev.remove(id);
+            state.net.remove(id);
             secrets
         };
         let mut result = Ok(());
@@ -464,6 +521,17 @@ impl<R: SandboxRuntime> Manager<R> {
             Err(e) => Err(e),
         };
 
+        let net = match &result {
+            Ok(vm) => match self.runtime.net_lines(vm).await {
+                Ok(lines) => Some(self.follow_net(id, lines)),
+                Err(e) => {
+                    eprintln!("network activity of {id} is not available: {e}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
         let mut state = lock(&self.state);
         match result {
             Ok(vm) => {
@@ -473,6 +541,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         vm: Arc::new(vm),
                         applied: shield,
                         applied_rev,
+                        net,
                     },
                 );
                 Ok(())
@@ -482,6 +551,29 @@ impl<R: SandboxRuntime> Manager<R> {
                 Err(e)
             }
         }
+    }
+
+    /// Turns the runtime log lines into the shield's events.
+    fn follow_net(&self, id: &str, mut lines: Receiver<String>) -> AbortHandle {
+        let state = self.state.clone();
+        let sink = self.net_sink.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let mut dedupe = Dedupe::default();
+            while let Some(line) = lines.recv().await {
+                let Some(event) = netlog::parse(&line) else {
+                    continue;
+                };
+                if !dedupe.keep(&event) {
+                    continue;
+                }
+                let event = lock(&state).push_net(&id, event);
+                if let Some(sink) = sink.get() {
+                    sink(&id, &event);
+                }
+            }
+        })
+        .abort_handle()
     }
 
     /// Checks the shield, marks it as starting and returns its config.
@@ -509,14 +601,17 @@ impl<R: SandboxRuntime> Manager<R> {
         let read = async {
             while let Some(event) = pipe.events.recv().await {
                 match event {
-                    PipeEvent::Stdout(bytes) => out.extend(bytes),
+                    PipeEvent::Stdout(bytes) => {
+                        let room = NODE_OUT.saturating_sub(out.len());
+                        out.extend(bytes.into_iter().take(room));
+                    }
                     PipeEvent::Stderr(_) => {}
                     PipeEvent::Exit(_) => break,
                 }
             }
         };
         if tokio::time::timeout(NODE_LIMIT, read).await.is_err() {
-            let _ = pipe.input.send(PipeInput::Kill);
+            let _ = pipe.input.try_send(PipeInput::Kill);
         }
         agent::check_node(&String::from_utf8_lossy(&out))
     }
@@ -536,20 +631,24 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The VM stays tracked until the runtime confirms shutdown, so a failed
     /// stop leaves the shield running and the user can retry.
     pub async fn stop(&self, id: &str) -> Result<()> {
-        let (vm, applied, applied_rev) = {
+        let (vm, applied, applied_rev, net) = {
             let mut state = lock(&self.state);
             state.shield_mut(id)?;
-            let (vm, applied, applied_rev) = match state.vms.get(id) {
-                Some(Vm::Running {
-                    vm,
-                    applied,
-                    applied_rev,
-                }) => (vm.clone(), applied.clone(), *applied_rev),
+            match state.vms.get(id) {
+                Some(Vm::Running { .. }) => {}
                 Some(Vm::Starting) => return Err(Error::Starting),
                 Some(Vm::Stopping) => return Err(Error::Stopping),
                 Some(Vm::Failed(_)) | None => return Err(Error::NotRunning),
+            }
+            let Some(Vm::Running {
+                vm,
+                applied,
+                applied_rev,
+                net,
+            }) = state.vms.insert(id.to_owned(), Vm::Stopping)
+            else {
+                unreachable!("checked above");
             };
-            state.vms.insert(id.to_owned(), Vm::Stopping);
             state.sessions.retain(|s| {
                 if s.shield_id == id {
                     let _ = s.input.send(PtyInput::Kill);
@@ -563,7 +662,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
                 a.shield_id != id
             });
-            (vm, applied, applied_rev)
+            (vm, applied, applied_rev, net)
         };
 
         let result = self.runtime.stop(&vm).await;
@@ -572,7 +671,11 @@ impl<R: SandboxRuntime> Manager<R> {
         match result {
             Ok(()) => {
                 state.vms.remove(id);
+                if let Some(net) = net {
+                    net.abort();
+                }
             }
+            // The follower stays with the VM that still runs.
             Err(_) => {
                 state.vms.insert(
                     id.to_owned(),
@@ -580,6 +683,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         vm,
                         applied,
                         applied_rev,
+                        net,
                     },
                 );
             }
@@ -729,14 +833,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
                 );
                 if !same_vm {
-                    let _ = pipe.input.send(PipeInput::Kill);
+                    let _ = pipe.input.try_send(PipeInput::Kill);
                     return Err(Error::NotRunning);
                 }
                 match state.agents.iter().find(|a| a.shield_id == shield_id) {
                     // A second open that ran at the same time won. If that
                     // agent is closing already, wait for it and try again.
                     Some(entry) => {
-                        let _ = pipe.input.send(PipeInput::Kill);
+                        let _ = pipe.input.try_send(PipeInput::Kill);
                         if !entry.closing {
                             entry.agent.set_sink(sink.take().expect("sink"));
                             return Ok(entry.id.clone());
@@ -784,7 +888,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 .ok_or(Error::AgentNotFound)?;
             (entry.agent.clone(), entry.shield_id.clone())
         };
-        let wire = command.wire(&self.state_dir(&shield_id))?;
+        let state = self.state_dir(&shield_id);
+        let wire = blocking(move || command.wire(&state)).await?;
         agent.call(wire).await
     }
 
@@ -808,10 +913,18 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Reads the chat files on the host, so the list also works while the
     /// shield is stopped.
-    pub fn list_chats(&self, shield_id: &str) -> Result<Vec<Chat>> {
+    pub async fn list_chats(&self, shield_id: &str) -> Result<Vec<Chat>> {
         lock(&self.state).shield_mut(shield_id)?;
-        Ok(agent::list_chats(&self.state_dir(shield_id)))
+        let state = self.state_dir(shield_id);
+        blocking(move || Ok(agent::list_chats(&state))).await
     }
+}
+
+/// Runs file reads off the async workers.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
 
 #[cfg(test)]
@@ -1012,8 +1125,8 @@ mod tests {
             sent["id"].as_str().unwrap()
         );
         let (a, b) = response.split_at(30);
-        pipe.out.send(PipeEvent::Stdout(a.into())).unwrap();
-        pipe.out.send(PipeEvent::Stdout(b.into())).unwrap();
+        pipe.out.send(PipeEvent::Stdout(a.into())).await.unwrap();
+        pipe.out.send(PipeEvent::Stdout(b.into())).await.unwrap();
         assert_eq!(call.await.unwrap().unwrap(), serde_json::json!({ "isStreaming": false }));
         assert_eq!(record(&mut first_rx).await["type"], "agent_start");
 
@@ -1021,7 +1134,7 @@ mod tests {
         let (second, mut second_rx) = sink();
         assert_eq!(manager.open_agent(&id, second).await.unwrap(), agent);
         assert!(runtime.pipes.lock().unwrap().is_empty());
-        pipe.out.send(PipeEvent::Stdout(b"{\"type\":\"turn_start\"}\n".to_vec())).unwrap();
+        pipe.out.send(PipeEvent::Stdout(b"{\"type\":\"turn_start\"}\n".to_vec())).await.unwrap();
         assert_eq!(record(&mut second_rx).await["type"], "turn_start");
 
         assert!(matches!(
@@ -1044,7 +1157,7 @@ mod tests {
             manager.agent_call(&agent, AgentCommand::GetState).await,
             Err(Error::AgentNotFound)
         ));
-        pipe.out.send(PipeEvent::Exit(137)).unwrap();
+        pipe.out.send(PipeEvent::Exit(137)).await.unwrap();
         assert!(matches!(waiting.await.unwrap(), Err(Error::AgentClosed)));
         assert_eq!(record(&mut second_rx).await["type"], "agent_exit");
         assert!(first_rx.try_recv().is_err());
@@ -1057,8 +1170,8 @@ mod tests {
         let (first, mut rx) = sink();
         let agent = manager.open_agent(&id, first).await.unwrap();
         let pipe = take_pipe(&runtime);
-        pipe.out.send(PipeEvent::Stderr(b"Error: no API key\n".to_vec())).unwrap();
-        pipe.out.send(PipeEvent::Exit(1)).unwrap();
+        pipe.out.send(PipeEvent::Stderr(b"Error: no API key\n".to_vec())).await.unwrap();
+        pipe.out.send(PipeEvent::Exit(1)).await.unwrap();
         assert_eq!(
             record(&mut rx).await,
             serde_json::json!({ "type": "agent_exit", "code": 1, "stderr": ["Error: no API key"] })
@@ -1096,7 +1209,7 @@ mod tests {
         assert!(!closing.is_finished() && !opening.is_finished());
         assert!(runtime.pipes.lock().unwrap().is_empty());
 
-        pipe.out.send(PipeEvent::Exit(0)).unwrap();
+        pipe.out.send(PipeEvent::Exit(0)).await.unwrap();
         closing.await.unwrap();
         assert_ne!(opening.await.unwrap().unwrap(), agent);
         take_pipe(&runtime);
@@ -1151,11 +1264,11 @@ mod tests {
         std::fs::create_dir(&sessions).unwrap();
         std::fs::write(sessions.join("a.jsonl"), "{\"type\":\"session\",\"timestamp\":\"t\"}\n").unwrap();
         manager.stop(&id).await.unwrap();
-        assert_eq!(manager.list_chats(&id).unwrap()[0].id, "a.jsonl");
+        assert_eq!(manager.list_chats(&id).await.unwrap()[0].id, "a.jsonl");
 
         manager.delete(&id).await.unwrap();
         assert!(!manager.state_dir(&id).exists());
-        assert!(matches!(manager.list_chats(&id), Err(Error::ShieldNotFound)));
+        assert!(matches!(manager.list_chats(&id).await, Err(Error::ShieldNotFound)));
     }
 
     #[tokio::test]
@@ -1215,6 +1328,114 @@ mod tests {
         *runtime.fail_stop.lock().unwrap() = false;
         manager.stop(&id).await.unwrap();
         assert_eq!(manager.list()[0].status, Status::Stopped);
+    }
+
+    fn dns_denied(at: &str, host: &str) -> String {
+        format!(
+            "{at} DEBUG microsandbox_network::engine::dns::forwarder: DNS query denied by network policy domain={host}"
+        )
+    }
+
+    fn net_sender(runtime: &FakeRuntime, index: usize) -> mpsc::Sender<String> {
+        runtime.net_lines.lock().unwrap()[index].clone()
+    }
+
+    async fn net_closed(runtime: &FakeRuntime, index: usize) {
+        tokio::time::timeout(Duration::from_secs(2), net_sender(runtime, index).closed())
+            .await
+            .expect("the follow task still runs");
+    }
+
+    fn hosts(events: &[NetEvent]) -> Vec<(u64, &str)> {
+        events.iter().map(|e| (e.seq, e.host.as_str())).collect()
+    }
+
+    #[tokio::test]
+    async fn network_events_reach_the_ring_and_the_sink() {
+        let (manager, runtime, id) = manager();
+        // A pair that dedupe drops, and junk.
+        *runtime.net_script.lock().unwrap() = vec![
+            dns_denied("2999-01-01T00:00:00Z", "google.com"),
+            dns_denied("2999-01-01T00:00:00.1Z", "google.com"),
+            "junk".into(),
+            dns_denied("2999-01-01T00:00:00.2Z", "example.com"),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.set_net_sink(Box::new(move |shield, event| {
+            let _ = tx.send((shield.to_owned(), event.clone()));
+        }));
+        manager.start(&id).await.unwrap();
+
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let (shield, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(shield, id);
+            sent.push(event);
+        }
+        assert_eq!(hosts(&sent), [(1, "google.com"), (2, "example.com")]);
+        assert_eq!(manager.list_net_events(&id).unwrap(), sent);
+
+        // The ring stays after a stop; a restart continues the numbers.
+        manager.stop(&id).await.unwrap();
+        net_closed(&runtime, 0).await;
+        assert_eq!(manager.list_net_events(&id).unwrap().len(), 2);
+        *runtime.net_script.lock().unwrap() = vec![dns_denied("2999-01-01T00:00:01Z", "google.com")];
+        manager.start(&id).await.unwrap();
+        let (_, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.seq, 3);
+
+        manager.delete(&id).await.unwrap();
+        net_closed(&runtime, 1).await;
+        assert!(lock(&manager.state).net.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_stop_keeps_the_follow_task() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        *runtime.fail_stop.lock().unwrap() = true;
+        assert!(manager.stop(&id).await.is_err());
+
+        net_sender(&runtime, 0)
+            .send(dns_denied("2999-01-01T00:00:00Z", "google.com"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.list_net_events(&id).unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the event did not arrive");
+
+        *runtime.fail_stop.lock().unwrap() = false;
+        manager.stop(&id).await.unwrap();
+        net_closed(&runtime, 0).await;
+    }
+
+    #[tokio::test]
+    async fn allow_host_leaves_deny_mode() {
+        let (manager, _, id) = manager();
+        assert_eq!(manager.list()[0].shield.network.mode, NetworkMode::Deny);
+        manager.allow_host(&id, "google.com").unwrap();
+        let network = &manager.list()[0].shield.network;
+        assert_eq!(network.mode, NetworkMode::List);
+        assert_eq!(network.domains, ["google.com"]);
+
+        manager.set_network_mode(&id, NetworkMode::Public).unwrap();
+        manager.allow_host(&id, "*.example.com").unwrap();
+        let network = &manager.list()[0].shield.network;
+        assert_eq!(network.mode, NetworkMode::Public);
+        assert_eq!(network.domains, ["google.com", "*.example.com"]);
+
+        assert!(matches!(manager.allow_host(&id, "not a host"), Err(Error::InvalidDomain(..))));
+        assert!(matches!(manager.allow_host("missing", "google.com"), Err(Error::ShieldNotFound)));
     }
 
     #[tokio::test]

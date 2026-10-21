@@ -1,7 +1,7 @@
 import { Button, ElasticTabs } from "@driif/motiv";
 import { Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
-import { listFolders, SessionKind, ShieldView } from "./api";
+import { listFolders, NetEvent, SessionKind, ShieldView } from "./api";
 import { AgentsTab } from "./AgentsTab";
 import type { Intent, Pane, Run, Tab } from "./App";
 import { NetworkTab } from "./NetworkTab";
@@ -19,6 +19,8 @@ const TABS = [
 
 interface Props {
   shield: ShieldView;
+  /** The shield's network events, oldest first. */
+  events: NetEvent[];
   tab: Tab;
   onTab: (tab: Tab) => void;
   intent?: Intent;
@@ -38,6 +40,7 @@ interface Props {
 // Not keyed by shield: the terminal tab keeps the panes of every shield mounted.
 export function ShieldPage({
   shield,
+  events,
   tab,
   onTab,
   intent,
@@ -111,7 +114,7 @@ export function ShieldPage({
         panels={{
           overview: (
             <div className="overview">
-              <ShieldMap shield={shield} folders={folders} onJump={onTab} />
+              <ShieldMap shield={shield} folders={folders} events={events} onJump={onTab} />
               <dl className="facts">
                 <div>
                   <dt>Agent starts in</dt>
@@ -148,6 +151,7 @@ export function ShieldPage({
             <NetworkTab
               key={shield.id}
               shield={shield}
+              events={events}
               run={edit}
               intent={tab === "network" ? intent : undefined}
               onIntentDone={onIntentDone}

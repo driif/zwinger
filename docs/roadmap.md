@@ -10,6 +10,7 @@ Flow: install the app → create a shield on a folder → mount more folders →
 - **Mount**: an extra host folder, ro or rw, at an explicit guest path.
 - **Harness**: a folder for the agents (skills, plugins, instructions, task notes), separate from the code. Agents start in the harness and know where the code is. Like umputun's ralphex / revmux run outside the repo.
 - **Network policy**: allow-listed hosts. The app sees the shield's requests and can inject credentials (bearer tokens) per host. The agent only sees placeholders, never host tokens.
+- **App**: a saved long-running command in a shield (for example a dev server), started and stopped from the shield tree.
 - **Agent**: pi (main), claude, codex. Run as chat, not only as terminal. Several agents can work on one task together (like the `duo` skill).
 
 ## Milestones
@@ -21,5 +22,6 @@ Flow: install the app → create a shield on a folder → mount more folders →
 | M2 | secrets + credential injection | Secrets in the macOS Keychain. Per-host injection with microsandbox secret placeholders (TLS proxy). UI in the Network tab and on the map. |
 | M3 | agent chat (pi) | pi in RPC mode inside the shield. Chat UI: streaming, tool calls, abort, model choice, sessions. pi available in the VM without per-start npx. |
 | M4 | network activity | Live request log per shield (allowed / denied / injected). One-click allow of a denied host. |
+| M4b | canvas + shield tree | Shield map on a draggable canvas (React Flow) with saved layout; drop folders from Finder to mount. Left rail as a tree: shield → Agents / Terminals / Apps, reorder by drag (dnd-kit). **Apps**: saved long-running commands in a shield. |
 | M5 | multi-agent | claude and codex adapters. Task runs where agents plan, implement and review together. Agent-to-agent messages (A2A). |
 | M6 | production | Onboarding, settings, error and empty states, app icon, release build, signing and notarization, auto-update, CI. |

@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod error;
+mod netlog;
 mod runtime;
 mod secrets;
 mod sessions;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Manager as _, RunEvent, Wry};
+use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 
 use crate::runtime::{Microsandbox, SandboxRuntime as _};
 
@@ -89,6 +90,12 @@ pub fn run() {
             }
             let store = store::Store::new(data.join("shields.json"));
             let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data)?;
+            // One app-wide event, so the rail and the map update while the
+            // Network tab is closed.
+            let handle = app.handle().clone();
+            manager.set_net_sink(Box::new(move |shield_id, event| {
+                let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
+            }));
             app.manage(manager);
             Ok(())
         })
@@ -105,6 +112,9 @@ pub fn run() {
             commands::set_network_mode,
             commands::add_domain,
             commands::remove_domain,
+            commands::allow_host,
+            commands::wildcard_for,
+            commands::list_net_events,
             commands::put_secret,
             commands::remove_secret,
             commands::list_secrets,

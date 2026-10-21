@@ -2,12 +2,27 @@ import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button, Card } from "@driif/motiv";
 import { Plus, RotateCw, Shield } from "lucide-react";
-import { closeSession, createShield, listShields, SessionKind, ShieldView, startShield, stopShield } from "./api";
+import {
+  closeSession,
+  createShield,
+  isBlocked,
+  listNetEvents,
+  listShields,
+  NetEvent,
+  onNetEvent,
+  SessionKind,
+  ShieldView,
+  startShield,
+  stopShield,
+} from "./api";
 import { CommandBar } from "./CommandBar";
 import { ShieldPage } from "./ShieldPage";
 import { ShieldRail } from "./ShieldRail";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
+
+/** The same size as the ring in the backend. */
+const NET_RING = 500;
 
 export type Tab = "overview" | "agents" | "terminal" | "network" | "settings";
 
@@ -36,6 +51,11 @@ export default function App() {
   const [intent, setIntent] = useState<Intent>();
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
+  const [net, setNet] = useState<Record<string, NetEvent[]>>({});
+  /** Per shield, the last `seq` that the Network tab showed. */
+  const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
+  const [listening, setListening] = useState(false);
+  const backfilled = useRef(new Set<string>());
 
   // Replies can arrive out of order. Only the reply to the latest request is used.
   const refresh = () => {
@@ -60,6 +80,32 @@ export default function App() {
     refresh();
   }, []);
 
+  // Merged by seq: the live events and the backfill can overlap.
+  const addNet = (shieldId: string, events: NetEvent[]) =>
+    setNet((current) => {
+      const bySeq = new Map((current[shieldId] ?? []).map((e) => [e.seq, e]));
+      for (const event of events) bySeq.set(event.seq, event);
+      return { ...current, [shieldId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
+    });
+
+  useEffect(() => {
+    const stop = onNetEvent((shieldId, event) => addNet(shieldId, [event]));
+    stop.then(() => setListening(true));
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // The backfill starts after the listener, so no event falls between the two.
+  useEffect(() => {
+    if (!listening) return;
+    for (const { id } of shields) {
+      if (backfilled.current.has(id)) continue;
+      backfilled.current.add(id);
+      listNetEvents(id).then((events) => addNet(id, events), () => {});
+    }
+  }, [shields, listening]);
+
   useEffect(() => {
     setPanes((current) => current.filter((p) => shields.some((s) => s.id === p.shieldId)));
   }, [shields]);
@@ -67,6 +113,17 @@ export default function App() {
   const shield = shields.find((s) => s.id === selectedId) ?? shields[0];
   const shieldPanes = panes.filter((p) => p.shieldId === shield?.id);
   const activePane = shield && activePanes[shield.id];
+  const events = (shield && net[shield.id]) ?? [];
+  const latestSeq = events[events.length - 1]?.seq ?? 0;
+
+  useEffect(() => {
+    if (tab !== "network" || !shield) return;
+    setLastSeen((current) => ({ ...current, [shield.id]: latestSeq }));
+  }, [tab, shield?.id, latestSeq]);
+
+  const blocked = Object.fromEntries(
+    shields.map(({ id }) => [id, (net[id] ?? []).filter((e) => isBlocked(e) && e.seq > (lastSeen[id] ?? 0)).length]),
+  );
 
   function showPane(key: string | undefined) {
     if (!shield) return;
@@ -141,6 +198,7 @@ export default function App() {
       <ShieldRail
         shields={shields}
         selectedId={shield?.id}
+        blocked={blocked}
         onSelect={setSelectedId}
         onNew={actions.newShield}
       >
@@ -173,6 +231,7 @@ export default function App() {
             )}
             <ShieldPage
               shield={shield}
+              events={events}
               tab={tab}
               onTab={setTab}
               intent={intent}

@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SecretBuilder};
-use microsandbox::{ExecEvent, Sandbox};
+use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 
 use crate::agent::{self, AGENT_DIR, PI_DIR, STATE_DIR};
 use crate::error::{Error, Result};
+use crate::netlog;
 use crate::secrets::{Secret, SecretValue};
 use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
@@ -19,6 +20,8 @@ const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// (`microsandbox_protocol::GUEST_TLS_CA_PATH`, not re-exported).
 const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 const IMAGE: &str = "node:22-slim";
+/// The queue size of each direction of a pipe. A full queue holds the sender.
+pub const PIPE_QUEUE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,10 +65,11 @@ pub enum PipeEvent {
     Exit(i32),
 }
 
-/// A running process with no terminal. `Exit` is the last event.
+/// A running process with no terminal. `Exit` is the last event. Both queues
+/// hold `PIPE_QUEUE` messages, so a slow reader slows the process down.
 pub struct Pipe {
-    pub input: UnboundedSender<PipeInput>,
-    pub events: UnboundedReceiver<PipeEvent>,
+    pub input: Sender<PipeInput>,
+    pub events: Receiver<PipeEvent>,
 }
 
 /// The seam between the shield manager and the VM backend, so tests do not boot VMs.
@@ -93,6 +97,9 @@ pub trait SandboxRuntime: Send + Sync + 'static {
     fn open_pipe(&self, vm: &Self::Vm, argv: &[String], cwd: &str) -> impl Future<Output = Result<Pipe>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
     fn reap(&self) -> impl Future<Output = Result<()>> + Send;
+    /// Follows the raw runtime log lines of the VM that are written from now
+    /// on. The lines stop when the receiver is dropped.
+    fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
 }
 
 /// Builds the tenant policy. The MultiTenant profile adds a host-owned public-only
@@ -173,6 +180,8 @@ impl SandboxRuntime for Microsandbox {
             .deployment_profile(DeploymentProfile::MultiTenant)
             .ephemeral(true)
             .replace()
+            // The network events are debug lines of the runtime log.
+            .log_level(LogLevel::Debug)
             .workdir(WORKSPACE)
             .volume(WORKSPACE, |m| m.bind(&shield.folder));
         for mount in &shield.mounts {
@@ -242,6 +251,13 @@ impl SandboxRuntime for Microsandbox {
             }
         }
         result
+    }
+
+    /// Tails `runtime.log` itself: `follow_logs` returns a `futures` Stream,
+    /// and this crate has no `futures` dependency to read it.
+    async fn net_lines(&self, vm: &Sandbox) -> Result<Receiver<String>> {
+        let path = microsandbox::logs::log_dir_for(vm.name()).join("runtime.log");
+        Ok(netlog::tail(path).await?)
     }
 
     async fn open_pty(
@@ -315,8 +331,8 @@ impl SandboxRuntime for Microsandbox {
         let sink = handle.take_stdin().ok_or(Error::AgentClosed)?;
         let control = handle.control();
 
-        let (input, mut input_rx) = mpsc::unbounded_channel();
-        let (events_tx, events) = mpsc::unbounded_channel();
+        let (input, mut input_rx) = mpsc::channel(PIPE_QUEUE);
+        let (events_tx, events) = mpsc::channel(PIPE_QUEUE);
 
         tokio::spawn(async move {
             while let Some(msg) = input_rx.recv().await {
@@ -331,13 +347,14 @@ impl SandboxRuntime for Microsandbox {
         });
         tokio::spawn(async move {
             let mut code = -1;
+            // Input runs in its own task, so a full event queue does not hold a kill.
             while let Some(event) = handle.recv().await {
                 match event {
                     ExecEvent::Stdout(bytes) => {
-                        let _ = events_tx.send(PipeEvent::Stdout(bytes.to_vec()));
+                        let _ = events_tx.send(PipeEvent::Stdout(bytes.to_vec())).await;
                     }
                     ExecEvent::Stderr(bytes) => {
-                        let _ = events_tx.send(PipeEvent::Stderr(bytes.to_vec()));
+                        let _ = events_tx.send(PipeEvent::Stderr(bytes.to_vec())).await;
                     }
                     ExecEvent::Exited { code: c } => {
                         code = c;
@@ -345,13 +362,13 @@ impl SandboxRuntime for Microsandbox {
                     }
                     ExecEvent::Failed(failed) => {
                         let message = format!("{}\n", failed.message);
-                        let _ = events_tx.send(PipeEvent::Stderr(message.into_bytes()));
+                        let _ = events_tx.send(PipeEvent::Stderr(message.into_bytes())).await;
                         break;
                     }
                     ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
                 }
             }
-            let _ = events_tx.send(PipeEvent::Exit(code));
+            let _ = events_tx.send(PipeEvent::Exit(code)).await;
         });
 
         Ok(Pipe { input, events })
@@ -387,13 +404,18 @@ pub mod fake {
         /// check. The test plays the process: it reads stdin, and sends output
         /// in chunks of its choice and the exit when it wants.
         pub pipes: Arc<Mutex<Vec<FakePipe>>>,
+        /// The lines that each `net_lines` sends first.
+        pub net_script: Arc<Mutex<Vec<String>>>,
+        /// The senders of the `net_lines` calls. The test sends more lines
+        /// and sees when the receiver is gone.
+        pub net_lines: Arc<Mutex<Vec<Sender<String>>>>,
     }
 
     pub struct FakePipe {
         pub argv: Vec<String>,
         pub cwd: String,
-        pub stdin: UnboundedReceiver<PipeInput>,
-        pub out: UnboundedSender<PipeEvent>,
+        pub stdin: Receiver<PipeInput>,
+        pub out: Sender<PipeEvent>,
     }
 
     /// Holds `open_pty`, `open_pipe` or `start` after it signals `entered`, until the test
@@ -442,6 +464,16 @@ pub mod fake {
             Ok(())
         }
 
+        async fn net_lines(&self, _: &FakeVm) -> Result<Receiver<String>> {
+            let script = self.net_script.lock().unwrap().clone();
+            let (tx, rx) = mpsc::channel(script.len() + netlog::TAIL_QUEUE);
+            for line in script {
+                let _ = tx.try_send(line);
+            }
+            self.net_lines.lock().unwrap().push(tx);
+            Ok(rx)
+        }
+
         async fn open_pty(
             &self,
             _: &FakeVm,
@@ -481,13 +513,13 @@ pub mod fake {
         }
 
         async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str) -> Result<Pipe> {
-            let (input, stdin) = mpsc::unbounded_channel();
-            let (out, events) = mpsc::unbounded_channel();
+            let (input, stdin) = mpsc::channel(PIPE_QUEUE);
+            let (out, events) = mpsc::channel(PIPE_QUEUE);
             if argv == ["node", "--version"] {
                 let version = self.node_version.lock().unwrap().clone();
                 let version = version.unwrap_or_else(|| "v22.19.0\n".into());
-                let _ = out.send(PipeEvent::Stdout(version.into_bytes()));
-                let _ = out.send(PipeEvent::Exit(0));
+                let _ = out.try_send(PipeEvent::Stdout(version.into_bytes()));
+                let _ = out.try_send(PipeEvent::Exit(0));
                 return Ok(Pipe { input, events });
             }
             let gate = self.pty_gate.lock().unwrap().clone();

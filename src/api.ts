@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type SessionKind = "shell" | "pi";
 
@@ -91,6 +92,32 @@ export const setNetworkMode = (id: string, mode: NetworkMode) => invoke<void>("s
 export const addDomain = (id: string, domain: string) => invoke<void>("add_domain", { id, domain });
 
 export const removeDomain = (id: string, domain: string) => invoke<void>("remove_domain", { id, domain });
+
+/** Allows the host in one edit. A shield in Deny mode changes to List mode. */
+export const allowHost = (shieldId: string, host: string) => invoke<void>("allow_host", { shieldId, host });
+
+/** The wildcard of the host's registrable domain, as `*.bbc.co.uk` for `news.bbc.co.uk`. `null` if there is none. */
+export const wildcardFor = (host: string) => invoke<string | null>("wildcard_for", { host });
+
+export type NetKind = "dns_allowed" | "dns_denied" | "tls" | "tls_denied";
+
+/** A network event from the runtime log. `seq` counts per shield; `at` is in ms since the epoch. */
+export interface NetEvent {
+  seq: number;
+  at: number;
+  kind: NetKind;
+  host: string;
+  dst: string | null;
+}
+
+export const isBlocked = (event: NetEvent) => event.kind === "dns_denied" || event.kind === "tls_denied";
+
+/** The events that the backend keeps for the shield, oldest first. */
+export const listNetEvents = (shieldId: string) => invoke<NetEvent[]>("list_net_events", { shieldId });
+
+/** Resolves to the function that stops the listener. */
+export const onNetEvent = (handler: (shieldId: string, event: NetEvent) => void) =>
+  listen<{ shieldId: string; event: NetEvent }>("net-event", ({ payload }) => handler(payload.shieldId, payload.event));
 
 export const listSecrets = (id: string) => invoke<SecretView[]>("list_secrets", { id });
 

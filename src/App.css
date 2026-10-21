@@ -61,6 +61,15 @@ p {
   font-size: 0.75rem;
 }
 
+.rail-blocked {
+  padding: 0 calc(var(--motiv-space) * 1.5);
+  border-radius: var(--motiv-radius-full);
+  background: var(--motiv-color-danger);
+  color: var(--motiv-color-surface);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
 .dot {
   flex-shrink: 0;
   width: 0.5rem;
@@ -311,6 +320,19 @@ p {
 .map-node.blocked > text {
   text-decoration: line-through;
   fill: var(--motiv-color-text-muted);
+}
+
+.map-node.denied > rect {
+  stroke: var(--motiv-color-danger);
+  stroke-dasharray: 4 3;
+}
+
+.map-node.denied > svg {
+  color: var(--motiv-color-danger);
+}
+
+.map-activity {
+  fill: var(--motiv-color-success);
 }
 
 .map-badge > rect {

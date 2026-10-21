@@ -1,6 +1,6 @@
 import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Network, Package, Shield } from "lucide-react";
-import { KeyboardEvent, ReactNode } from "react";
-import { ShieldView } from "./api";
+import { KeyboardEvent, ReactNode, useEffect, useState } from "react";
+import { isBlocked, NetEvent, ShieldView } from "./api";
 import type { Tab } from "./App";
 import { coveredBy, reachable } from "./SecretsSection";
 
@@ -21,6 +21,9 @@ const GAP = 12;
 const H = 28;
 const CAP = 6;
 const CHAR = 7.2;
+const ACTIVE_MS = 10_000;
+const BLOCKED_MS = 60_000;
+const BLOCKED_CAP = 5;
 
 /** Keeps the end of a path, which is the part that tells folders apart. */
 function fit(text: string, width: number) {
@@ -37,12 +40,14 @@ interface NodeProps {
   icon: LucideIcon;
   label: string;
   title?: string;
-  tone?: "warn" | "blocked" | "harness" | "muted";
+  tone?: "warn" | "blocked" | "denied" | "harness" | "muted";
   badges?: string[];
+  /** Shows a dot for recent traffic. */
+  active?: boolean;
   onJump?: () => void;
 }
 
-function Node({ x, y, width, icon: Icon, label, title, tone, badges = [], onJump }: NodeProps) {
+function Node({ x, y, width, icon: Icon, label, title, tone, badges = [], active, onJump }: NodeProps) {
   const textWidth = width - 36 - badges.length * 56;
   const button = onJump && {
     role: "button",
@@ -74,6 +79,7 @@ function Node({ x, y, width, icon: Icon, label, title, tone, badges = [], onJump
           </g>
         );
       })}
+      {active && <circle className="map-activity" cx={x + width - 8} cy={y + 8} r={3} />}
     </g>
   );
 }
@@ -91,12 +97,40 @@ function Line({ from, to, blocked }: { from: [number, number]; to: [number, numb
 interface Props {
   shield: ShieldView;
   folders: string[];
+  /** The shield's network events, oldest first. */
+  events: NetEvent[];
   onJump: (tab: Tab) => void;
 }
 
 /** Host paths on the left, the microVM in the middle, egress on the right. */
-export function ShieldMap({ shield, folders, onJump }: Props) {
+export function ShieldMap({ shield, folders, events, onJump }: Props) {
   const { harness, network, status } = shield;
+  const [now, setNow] = useState(Date.now);
+  const latest = events[events.length - 1]?.at ?? 0;
+
+  // Ticks while an event is recent, so the activity dots and blocked hosts expire.
+  useEffect(() => {
+    const tick = () => {
+      const time = Date.now();
+      setNow(time);
+      if (time > latest + BLOCKED_MS) clearInterval(timer);
+    };
+    const timer = setInterval(tick, 1000);
+    tick();
+    return () => clearInterval(timer);
+  }, [latest]);
+
+  const recent = (event: NetEvent, ms: number) => now - event.at < ms;
+  const active = (domain: string) =>
+    events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS) && coveredBy(domain, [e.host]));
+  const blockedHosts = [
+    ...new Set(
+      events
+        .filter((e) => isBlocked(e) && recent(e, BLOCKED_MS))
+        .reverse()
+        .map((e) => e.host),
+    ),
+  ].slice(0, BLOCKED_CAP);
   const toSettings = () => onJump("settings");
   const toNetwork = () => onJump("network");
   const center = (y: number) => y + H / 2;
@@ -235,7 +269,17 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
   let ny = TOP;
   if (network.mode === "public") {
     net.push(
-      <Node key="internet" x={NET_X} y={ny} width={NET_W} icon={Globe} label="Public internet" tone="warn" onJump={toNetwork} />,
+      <Node
+        key="internet"
+        x={NET_X}
+        y={ny}
+        width={NET_W}
+        icon={Globe}
+        label="Public internet"
+        tone="warn"
+        active={events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS))}
+        onJump={toNetwork}
+      />,
     );
     lines.push(<Line key="internet" from={gateway} to={[NET_X, center(ny)]} />);
     ny += ROW;
@@ -264,6 +308,7 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
           icon={Globe}
           label={domain}
           badges={keyBadge(domain)}
+          active={active(domain)}
           onJump={toNetwork}
         />,
       );
@@ -312,6 +357,23 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
     />,
   );
   lines.push(<Line key="blocked" from={gateway} to={[NET_X, center(ny)]} blocked />);
+  for (const host of blockedHosts) {
+    ny += ROW;
+    net.push(
+      <Node
+        key={`denied ${host}`}
+        x={NET_X}
+        y={ny}
+        width={NET_W}
+        icon={Ban}
+        label={host}
+        title={`${host} was blocked in the last minute`}
+        tone="denied"
+        onJump={toNetwork}
+      />,
+    );
+    lines.push(<Line key={`denied ${host}`} from={gateway} to={[NET_X, center(ny)]} blocked />);
+  }
   const legendY = Math.max(boxBottom, ny + H) + 24;
   const height = legendY + (secretHosts.length > 0 ? 48 : 0);
 
