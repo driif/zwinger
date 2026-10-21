@@ -28,6 +28,7 @@ thiserror = "2.0.21"
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
 dirs = "7.0.0"
 tauri-plugin-dialog = "2"
+keyring = { version = "3.6.3", features = ["apple-native"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -8836,6 +8836,7 @@ name = "zwinger"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "keyring",
  "microsandbox",
  "serde",
  "serde_json",
