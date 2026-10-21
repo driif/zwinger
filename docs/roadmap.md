@@ -25,4 +25,5 @@ Flow: install the app → create a shield on a folder → mount more folders →
 | M4b | canvas + shield tree | Shield map on a draggable canvas (React Flow) with saved layout; drop folders from Finder to mount. Left rail as a tree: shield → Agents / Terminals / Apps, reorder by drag (dnd-kit). **Apps**: saved long-running commands in a shield. |
 | M5a | more agents | Claude Code and Codex next to pi (download on demand, mounted read-only). |
 | M5b | task runs + run room | Agents plan, implement and review together (duo pattern) inside a shield. **Run room**: live timeline of agent messages, stage bar, each agent's position, disagreements and concessions, verdicts; the user steps in. Also watches external duo round folders. A2A later. |
+| M5c | host agents | Use the agents installed on the Mac (Claude Code, Codex, pi, Gemini): JS agents mounted from the host install, native ones as one cached Linux build of the same version; the user's agent profile mounted read-only; subscription login reuse (model to decide). ADR 0001. |
 | M6 | production | Onboarding, settings, error and empty states, app icon, release build, signing and notarization, auto-update, CI. |
