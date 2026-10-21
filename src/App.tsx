@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Button, Card } from "@driif/motiv";
@@ -6,13 +6,14 @@ import { Plus, RotateCw, Shield } from "lucide-react";
 import {
   AGENT_NAMES,
   AgentKind,
-  closeSession,
+  closeTerminal,
   createShield,
   Detection,
   detectHostAgents,
   hostAgents,
   InstallProgress,
   installRuntime,
+  INVALID_ORDER,
   isBlocked,
   isLive,
   isRoundFolder,
@@ -23,6 +24,9 @@ import {
   NetEvent,
   onNetEvent,
   onRenewDue,
+  openSession,
+  reopenTerminal,
+  reorderTerminals,
   resolveFolder,
   RuntimeName,
   RuntimeView,
@@ -36,9 +40,11 @@ import { CommandBar } from "./CommandBar";
 import { HostAgentsSettings } from "./HostAgentsSettings";
 import { ShieldPage } from "./ShieldPage";
 import { agentsOf, ShieldRail } from "./ShieldRail";
-import { TaskRoom } from "./TaskRoom";
+import { fittedSize } from "./TerminalPane";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
+
+const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
 /** The same size as the ring in the backend. */
 const NET_RING = 500;
@@ -56,6 +62,7 @@ export type View =
   /** No `taskId` adds a task. */
   | { kind: "taskEdit"; taskId?: string };
 
+/** A terminal of a shield. `key` is the terminal id. No `sessionId`: the terminal is dormant. */
 export interface Pane {
   key: string;
   shieldId: string;
@@ -96,7 +103,6 @@ export default function App() {
   const [shields, setShields] = useState<ShieldView[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [view, setView] = useState<View>({ kind: "overview" });
-  const [panes, setPanes] = useState<Pane[]>([]);
   const [activePanes, setActivePanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [intent, setIntent] = useState<Intent>();
@@ -120,12 +126,17 @@ export default function App() {
   /** Per shield, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
 
-  // Replies can arrive out of order. Only the reply to the latest request is used.
+  // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the list it read.
   const refresh = () => {
     const request = ++refreshes.current;
     return listShields().then(
-      (next) => request === refreshes.current && setShields(next),
-      (e) => request === refreshes.current && setError(String(e)),
+      (next) => {
+        if (request === refreshes.current) setShields(next);
+        return next;
+      },
+      (e) => {
+        if (request === refreshes.current) setError(String(e));
+      },
     );
   };
 
@@ -209,10 +220,6 @@ export default function App() {
     }
   }, [shields, listening]);
 
-  useEffect(() => {
-    setPanes((current) => current.filter((p) => shields.some((s) => s.id === p.shieldId)));
-  }, [shields]);
-
   const reloadRuns = (id: string) =>
     listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
 
@@ -237,6 +244,14 @@ export default function App() {
     return () => clearInterval(timer);
   }, [appsRunning]);
 
+  const panes: Pane[] = shields.flatMap((s) =>
+    s.terminals.map((t) => ({
+      key: t.id,
+      shieldId: s.id,
+      kind: t.kind,
+      sessionId: s.sessions.find((session) => session.terminalId === t.id)?.id,
+    })),
+  );
   const shield = shields.find((s) => s.id === selectedId) ?? shields[0];
   const shieldPanes = panes.filter((p) => p.shieldId === shield?.id);
   const activePane = shield && activePanes[shield.id];
@@ -301,10 +316,20 @@ export default function App() {
     const session: SessionKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
     if (session.type === "agent" && !mounted.includes(session.agent))
       throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this shield.`);
-    const key = crypto.randomUUID();
-    setPanes((current) => [...current, { key, shieldId: target.id, kind: session }]);
+    const { rows, cols } = fittedSize();
+    const sessionId = await openSession(target.id, session, rows, cols);
+    const terminalId = (await refresh())?.flatMap((s) => s.sessions).find((s) => s.id === sessionId)?.terminalId;
     setSelectedId(target.id);
-    showPane(key, target.id);
+    if (terminalId) showPane(terminalId, target.id);
+  }
+
+  /** Starts a new process for a dormant or exited terminal, in its place. */
+  async function reopen(pane: Pane) {
+    if (shields.find((s) => s.id === pane.shieldId)?.status.state !== "running") await startShield(pane.shieldId);
+    const { rows, cols } = fittedSize();
+    await reopenTerminal(pane.shieldId, pane.key, rows, cols);
+    await refresh();
+    showPane(pane.key, pane.shieldId);
   }
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
@@ -344,20 +369,18 @@ export default function App() {
   function closePane(key: string) {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
-    const { sessionId } = pane;
-    if (sessionId) run(() => closeSession(sessionId));
-    setPanes((current) => current.filter((p) => p !== pane));
+    run(() => closeTerminal(pane.shieldId, key));
     const rest = shieldPanes.filter((p) => p !== pane);
     if (key === activePane && view.kind === "terminal") showPane(rest[rest.length - 1]?.key);
     else if (key === activePane) setActivePanes((current) => ({ ...current, [pane.shieldId]: "" }));
   }
 
-  /** Puts the panes of the shield in the order of `keys`, for this app session. */
-  const movePanes = (shieldId: string, keys: string[]) =>
-    setPanes((current) => [
-      ...current.filter((p) => p.shieldId !== shieldId),
-      ...keys.map((k) => current.find((p) => p.key === k)!),
-    ]);
+  /** Saves the order of the shield's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
+  const moveTerminals = (shieldId: string, ids: string[]) =>
+    reorderTerminals(shieldId, ids).then(refresh, (e) => {
+      if (String(e) !== INVALID_ORDER) setError(String(e));
+      return refresh();
+    });
 
   const toggle = (shield: ShieldView) =>
     run(() => (shield.status.state === "running" ? stopShield(shield.id) : startShield(shield.id)));
@@ -410,7 +433,8 @@ export default function App() {
         onToggle={toggle}
         onNewSession={(id, kind) => run(() => newSession(kind, shields.find((s) => s.id === id)))}
         onClosePane={closePane}
-        onMovePanes={movePanes}
+        onReopen={(pane) => run(() => reopen(pane))}
+        onMoveTerminals={moveTerminals}
         onNew={actions.newShield}
         onHostAgents={() => setShowHostAgents(true)}
         dropFolder={dropFolder}
@@ -456,7 +480,9 @@ export default function App() {
         ) : roundFolder ? (
           <section className="page">
             <div className="view task-view">
-              <TaskRoom key={roundFolder} kind="folder" path={roundFolder} />
+              <Suspense>
+                <TaskRoom key={roundFolder} kind="folder" path={roundFolder} />
+              </Suspense>
             </div>
           </section>
         ) : shield ? (
@@ -492,15 +518,9 @@ export default function App() {
               run={run}
               onToggle={() => toggle(shield)}
               onNewSession={(kind) => run(() => newSession(kind))}
-              onPaneOpen={(key, sessionId) => {
-                setPanes((current) => current.map((p) => (p.key === key ? { ...p, sessionId } : p)));
-                refresh();
-              }}
+              onReopen={(pane) => run(() => reopen(pane))}
               onPaneExit={refresh}
-              onPaneError={(key, e) => {
-                setError(String(e));
-                setPanes((current) => current.filter((p) => p.key !== key));
-              }}
+              onPaneError={(e) => setError(String(e))}
             />
           </>
         ) : (

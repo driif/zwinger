@@ -55,7 +55,7 @@ export function AppView({ shield, app, run, onExit, onError }: Props) {
         </Button>
       </header>
       {appRun ? (
-        <TerminalPane key={appRun.sessionId} session={{ attach: appRun.sessionId }} active onExit={onExit} onError={onError} />
+        <TerminalPane key={appRun.sessionId} sessionId={appRun.sessionId} active onExit={onExit} onError={onError} />
       ) : (
         <div className="empty">
           <p className="muted">

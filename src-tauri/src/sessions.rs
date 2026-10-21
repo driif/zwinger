@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde::Serialize;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, UnboundedSender};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 
 use crate::agent::{AgentKind, gemini, launch, pi};
 use crate::error::{Error, Result};
@@ -31,8 +33,21 @@ const NODE_OUT: usize = 1 << 10;
 const CLOSE_LIMIT: Duration = Duration::from_secs(5);
 /// The network events kept per shield.
 const NET_RING: usize = 500;
-/// The output bytes kept per app run, for a view that attaches later.
-const APP_RING: usize = 256 << 10;
+/// The output bytes kept per session, for a view that attaches later.
+const RING: usize = 1 << 20;
+/// A frame takes the queued output up to this many bytes, or for at most
+/// [`FRAME_WAIT`].
+const FRAME: usize = 64 << 10;
+const FRAME_WAIT: Duration = Duration::from_millis(8);
+/// A first chunk up to this size with nothing queued after it is sent at
+/// once, so the echo of a key has no delay.
+const ECHO: usize = 1 << 10;
+/// The frames that a view may have not acknowledged. Then the session stops
+/// reading its process until the view acknowledges one.
+const WINDOW: usize = 8;
+/// A view that acknowledges no frame for this long is gone, such as after a
+/// reload, and is detached.
+const ACK_LIMIT: Duration = Duration::from_secs(5);
 /// The terminal size of an app until a view attaches and resizes it.
 const APP_SIZE: (u16, u16) = (24, 80);
 /// How long a shield stop waits for its task runs to write their manifests.
@@ -142,47 +157,204 @@ impl HostRun {
     }
 }
 
+/// The backend owns each session, not a view: a view attaches to it and
+/// detaches.
 struct Session {
     id: String,
     shield_id: String,
     kind: SessionKind,
     input: UnboundedSender<PtyInput>,
     exit_code: Option<i32>,
-    /// Set for an app run. The backend owns it, not a view.
+    output: Arc<Mutex<Output>>,
+    /// Set for a shell or agent terminal.
+    terminal_id: Option<String>,
+    /// Set for an app run.
     app: Option<AppRun>,
 }
 
 struct AppRun {
     app_id: String,
-    output: Arc<Mutex<AppOutput>>,
     /// Becomes `true` when the process has exited.
     exited: watch::Receiver<bool>,
 }
 
-/// The kept output of an app run and the view that gets new output.
+/// The kept output of a session and the view that gets new output.
 #[derive(Default)]
-struct AppOutput {
+struct Output {
     ring: VecDeque<u8>,
     exit: Option<i32>,
-    /// The view that gets new output, with the token of its attach.
-    sink: Option<(u64, PtySink)>,
+    sink: Option<Sink>,
     attaches: u64,
+    /// Wakes the pump when a view acknowledges a frame or goes.
+    room: Arc<Notify>,
+}
+
+/// The view that gets new output.
+struct Sink {
+    /// The token of its attach.
+    token: u64,
+    send: PtySink,
+    /// The output frames that the view has not acknowledged.
+    in_flight: usize,
 }
 
 type PtySink = Box<dyn Fn(PtyEvent) + Send>;
 
-impl AppOutput {
+impl Output {
     fn push(&mut self, event: PtyEvent) {
         match &event {
             PtyEvent::Output(bytes) => {
                 self.ring.extend(bytes);
-                let excess = self.ring.len().saturating_sub(APP_RING);
+                let excess = self.ring.len().saturating_sub(RING);
                 self.ring.drain(..excess);
             }
             PtyEvent::Exit(code) => self.exit = Some(*code),
         }
-        if let Some((_, sink)) = &self.sink {
-            sink(event);
+        if let Some(sink) = &mut self.sink {
+            if matches!(event, PtyEvent::Output(_)) {
+                sink.in_flight += 1;
+            }
+            (sink.send)(event);
+        }
+    }
+
+    /// The view has [`WINDOW`] frames that it has not acknowledged.
+    fn full(&self) -> bool {
+        self.sink.as_ref().is_some_and(|s| s.in_flight >= WINDOW)
+    }
+
+    /// Sends the kept output to `send`, and the exit if there is one; then
+    /// new output. Takes over from the earlier view. Returns the token.
+    fn attach(&mut self, send: PtySink) -> u64 {
+        self.attaches += 1;
+        let token = self.attaches;
+        let mut sink = Sink {
+            token,
+            send,
+            in_flight: 0,
+        };
+        // One frame, so the replay takes one slot of the ack window. The ring
+        // is bounded, so the frame is too.
+        let kept: Vec<u8> = self.ring.iter().copied().collect();
+        if !kept.is_empty() {
+            sink.in_flight += 1;
+            (sink.send)(PtyEvent::Output(kept));
+        }
+        if let Some(code) = self.exit {
+            (sink.send)(PtyEvent::Exit(code));
+        }
+        self.sink = Some(sink);
+        self.room.notify_one();
+        token
+    }
+
+    /// A stale token changes nothing.
+    fn detach(&mut self, token: u64) {
+        if self.sink.as_ref().is_some_and(|s| s.token == token) {
+            self.sink = None;
+            self.room.notify_one();
+        }
+    }
+
+    /// A stale token changes nothing.
+    fn ack(&mut self, token: u64) {
+        if let Some(sink) = self.sink.as_mut().filter(|s| s.token == token) {
+            sink.in_flight = sink.in_flight.saturating_sub(1);
+            self.room.notify_one();
+        }
+    }
+}
+
+/// The PTY events of a session, read frame by frame.
+struct Frames {
+    events: Receiver<PtyEvent>,
+    /// The output after the end of the last frame.
+    carry: Vec<u8>,
+}
+
+impl Frames {
+    fn new(events: Receiver<PtyEvent>) -> Self {
+        Self { events, carry: Vec::new() }
+    }
+
+    /// Reads the next frame of at most [`FRAME`] bytes: the carried output
+    /// or the output of one event, and the output queued after it up to
+    /// [`FRAME_WAIT`]. A small first chunk with nothing queued after it is the
+    /// frame alone. The output after [`FRAME`] bytes goes to the next frame.
+    /// The exit ends a frame. `None`: the events have ended.
+    async fn next(&mut self) -> Option<(Vec<u8>, Option<i32>)> {
+        let mut bytes = if self.carry.is_empty() {
+            match self.events.recv().await? {
+                PtyEvent::Output(bytes) => bytes,
+                PtyEvent::Exit(code) => return Some((Vec::new(), Some(code))),
+            }
+        } else {
+            std::mem::take(&mut self.carry)
+        };
+        let deadline = Instant::now() + FRAME_WAIT;
+        let mut alone = true;
+        let mut exit = None;
+        while bytes.len() < FRAME {
+            let event = match self.events.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) if alone && bytes.len() <= ECHO => break,
+                Err(TryRecvError::Empty) => match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) | Err(_) => break,
+                },
+            };
+            alone = false;
+            match event {
+                PtyEvent::Output(more) => bytes.extend(more),
+                PtyEvent::Exit(code) => {
+                    exit = Some(code);
+                    break;
+                }
+            }
+        }
+        if bytes.len() > FRAME {
+            self.carry = bytes.split_off(FRAME);
+        }
+        Some((bytes, exit))
+    }
+}
+
+/// Moves the PTY output into the session's output frame by frame, until the
+/// process exits. While the view is full, it does not read, so the process
+/// blocks on its writes. The exit code is recorded before the `Exit` event
+/// is delivered, so a listing done in reaction to it shows the exit.
+async fn pump<V>(state: Arc<Mutex<State<V>>>, session_id: String, output: Arc<Mutex<Output>>, events: Receiver<PtyEvent>) {
+    let mut frames = Frames::new(events);
+    let room = lock(&output).room.clone();
+    loop {
+        loop {
+            let notified = room.notified();
+            if !lock(&output).full() {
+                break;
+            }
+            if tokio::time::timeout(ACK_LIMIT, notified).await.is_err() {
+                let mut output = lock(&output);
+                if output.full() {
+                    output.sink = None;
+                }
+            }
+        }
+        let Some((bytes, exit)) = frames.next().await else {
+            return;
+        };
+        if let Some(code) = exit
+            && let Some(s) = lock(&state).sessions.iter_mut().find(|s| s.id == session_id)
+        {
+            s.exit_code = Some(code);
+        }
+        let mut output = lock(&output);
+        if !bytes.is_empty() {
+            output.push(PtyEvent::Output(bytes));
+        }
+        if let Some(code) = exit {
+            output.push(PtyEvent::Exit(code));
+            return;
         }
     }
 }
@@ -237,6 +409,7 @@ pub struct SessionView {
     pub id: String,
     pub kind: SessionKind,
     pub exit_code: Option<i32>,
+    pub terminal_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +484,13 @@ impl<V> State<V> {
         event
     }
 
+    /// The terminal has a session whose process runs.
+    fn has_live_terminal(&self, terminal_id: &str) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.terminal_id.as_deref() == Some(terminal_id) && s.exit_code.is_none())
+    }
+
     fn session(&self, id: &str) -> Result<&Session> {
         self.sessions
             .iter()
@@ -371,8 +551,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 let (status, pending_restart) = match state.vms.get(&shield.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting) => (Status::Starting, false),
-                    // A new name, layout or app list is used at once, so it
-                    // needs no restart.
+                    // A new name, layout, app list or terminal list is used
+                    // at once, so it needs no restart.
                     Some(Vm::Running {
                         applied, applied_rev, ..
                     }) => (
@@ -382,6 +562,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             layout: shield.layout.clone(),
                             apps: shield.apps.clone(),
                             tasks: shield.tasks.clone(),
+                            terminals: shield.terminals.clone(),
                             auto_renew: shield.auto_renew,
                             agents_unprompted: shield.agents_unprompted,
                             ..(**applied).clone()
@@ -409,6 +590,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             id: s.id.clone(),
                             kind: s.kind,
                             exit_code: s.exit_code,
+                            terminal_id: s.terminal_id.clone(),
                         })
                         .collect(),
                     app_runs: sessions
@@ -487,6 +669,10 @@ impl<R: SandboxRuntime> Manager<R> {
 
     pub fn reorder_apps(&self, id: &str, app_ids: &[String]) -> Result<()> {
         self.edit(id, |s| s.reorder_apps(app_ids))
+    }
+
+    pub fn reorder_terminals(&self, id: &str, terminal_ids: &[String]) -> Result<()> {
+        self.edit(id, |s| s.reorder_terminals(terminal_ids))
     }
 
     /// Applies `edit` to the stored config and persists it. The change is kept
@@ -1242,16 +1428,34 @@ impl<R: SandboxRuntime> Manager<R> {
         .await;
     }
 
-    /// Streams the session's output and its exit to `on_event`. The exit code is
-    /// recorded before the `Exit` event is delivered, so a listing done in reaction
-    /// to it already shows the session as exited.
-    pub async fn open_session(
+    /// Adds a terminal of `kind` to the end of the shield's list and opens
+    /// it. Returns the session id. A failed open adds no terminal.
+    pub async fn open_session(&self, shield_id: &str, kind: SessionKind, rows: u16, cols: u16) -> Result<String> {
+        self.open_terminal(shield_id, None, kind, rows, cols).await
+    }
+
+    /// Opens a dormant terminal again: a new process under the same terminal
+    /// id, in the same place. Returns the session id.
+    pub async fn reopen_terminal(&self, shield_id: &str, terminal_id: &str, rows: u16, cols: u16) -> Result<String> {
+        let kind = {
+            let mut state = lock(&self.state);
+            let kind = state.shield_mut(shield_id)?.terminal(terminal_id)?.kind;
+            if state.has_live_terminal(terminal_id) {
+                return Err(Error::TerminalOpen);
+            }
+            kind
+        };
+        self.open_terminal(shield_id, Some(terminal_id), kind, rows, cols).await
+    }
+
+    /// `terminal_id` `None` adds a new terminal.
+    async fn open_terminal(
         &self,
         shield_id: &str,
+        terminal_id: Option<&str>,
         kind: SessionKind,
         rows: u16,
         cols: u16,
-        on_event: impl Fn(PtyEvent) + Send + 'static,
     ) -> Result<String> {
         let (vm, cwd) = match lock(&self.state).vms.get(shield_id) {
             Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
@@ -1266,43 +1470,58 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             _ => return Err(Error::NotRunning),
         };
-        let mut pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
+        let pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
         let id = uuid::Uuid::new_v4().to_string();
+        let output = Arc::new(Mutex::new(Output::default()));
         {
-            // The shield may have stopped, or stopped and started again, while
-            // the process opened. Its stop did not see this session, so kill it.
             let mut state = lock(&self.state);
+            // The shield may have stopped, or stopped and started again, while
+            // the process opened. Its stop did not see this session, so kill
+            // it. A close or a second open of the terminal may also have run.
             let same_vm = matches!(
                 state.vms.get(shield_id),
                 Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
             );
-            if !same_vm {
-                let _ = pty.input.send(PtyInput::Kill);
-                return Err(Error::NotRunning);
-            }
+            let terminal = match terminal_id {
+                _ if !same_vm => Err(Error::NotRunning),
+                None => self.add_terminal(&mut state, shield_id, kind),
+                Some(tid) => match state.shield_mut(shield_id).and_then(|s| s.terminal(tid).map(|_| ())) {
+                    Err(e) => Err(e),
+                    Ok(()) if state.has_live_terminal(tid) => Err(Error::TerminalOpen),
+                    Ok(()) => Ok(tid.to_owned()),
+                },
+            };
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(e) => {
+                    let _ = pty.input.send(PtyInput::Kill);
+                    return Err(e);
+                }
+            };
+            state.sessions.retain(|s| s.terminal_id.as_ref() != Some(&terminal));
             state.sessions.push(Session {
                 id: id.clone(),
                 shield_id: shield_id.to_owned(),
                 kind,
                 input: pty.input,
                 exit_code: None,
+                output: output.clone(),
+                terminal_id: Some(terminal),
                 app: None,
             });
         }
-
-        let state = self.state.clone();
-        let session_id = id.clone();
-        tokio::spawn(async move {
-            while let Some(event) = pty.events.recv().await {
-                if let PtyEvent::Exit(code) = event
-                    && let Some(s) = lock(&state).sessions.iter_mut().find(|s| s.id == session_id)
-                {
-                    s.exit_code = Some(code);
-                }
-                on_event(event);
-            }
-        });
+        tokio::spawn(pump(self.state.clone(), id.clone(), output, pty.events));
         Ok(id)
+    }
+
+    /// Adds a terminal record and saves it. Returns its id.
+    fn add_terminal(&self, state: &mut State<R::Vm>, shield_id: &str, kind: SessionKind) -> Result<String> {
+        let mut shields = state.shields.clone();
+        let shield = shields.iter_mut().find(|s| s.id == shield_id).ok_or(Error::ShieldNotFound)?;
+        let terminal_id = shield.add_terminal(kind);
+        self.store.save(&shields)?;
+        state.shields = shields;
+        Ok(terminal_id)
     }
 
     /// Runs the app's saved command as `/bin/sh -lc` in a PTY that the
@@ -1329,9 +1548,9 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let argv = ["/bin/sh".to_owned(), "-lc".to_owned(), app.command];
         let (rows, cols) = APP_SIZE;
-        let mut pty = self.runtime.open_pty(&vm, &argv, &app.cwd, rows, cols).await?;
+        let pty = self.runtime.open_pty(&vm, &argv, &app.cwd, rows, cols).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        let output = Arc::new(Mutex::new(AppOutput::default()));
+        let output = Arc::new(Mutex::new(Output::default()));
         let (exited_tx, exited) = watch::channel(false);
         {
             let mut state = lock(&self.state);
@@ -1367,9 +1586,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 kind: SessionKind::Shell,
                 input: pty.input,
                 exit_code: None,
+                output: output.clone(),
+                terminal_id: None,
                 app: Some(AppRun {
                     app_id: app_id.to_owned(),
-                    output: output.clone(),
                     exited,
                 }),
             });
@@ -1378,18 +1598,8 @@ impl<R: SandboxRuntime> Manager<R> {
         let state = self.state.clone();
         let session_id = id.clone();
         tokio::spawn(async move {
-            while let Some(event) = pty.events.recv().await {
-                if let PtyEvent::Exit(code) = event
-                    && let Some(s) = lock(&state).sessions.iter_mut().find(|s| s.id == session_id)
-                {
-                    s.exit_code = Some(code);
-                }
-                let exit = matches!(event, PtyEvent::Exit(_));
-                lock(&output).push(event);
-                if exit {
-                    let _ = exited_tx.send(true);
-                }
-            }
+            pump(state, session_id, output, pty.events).await;
+            let _ = exited_tx.send(true);
         });
         Ok(id)
     }
@@ -1433,38 +1643,31 @@ impl<R: SandboxRuntime> Manager<R> {
         self.start_app(shield_id, app_id).await
     }
 
-    /// Sends the kept output of the app run to `on_event`, and its exit if it
-    /// has exited; then new output. A later attach takes over. Returns the
-    /// token for [`Manager::detach_app`].
-    pub fn attach_app(&self, session_id: &str, on_event: impl Fn(PtyEvent) + Send + 'static) -> Result<u64> {
-        let output = self.app_output(session_id)?;
-        let mut output = lock(&output);
-        on_event(PtyEvent::Output(output.ring.iter().copied().collect()));
-        if let Some(code) = output.exit {
-            on_event(PtyEvent::Exit(code));
-        }
-        output.attaches += 1;
-        let token = output.attaches;
-        output.sink = Some((token, Box::new(on_event)));
-        Ok(token)
+    /// Sends the kept output of the session to `on_event`, and its exit if
+    /// it has exited; then new output. A later attach takes over. Returns the
+    /// token for [`Manager::detach_session`] and [`Manager::ack_session`].
+    pub fn attach_session(&self, session_id: &str, on_event: impl Fn(PtyEvent) + Send + 'static) -> Result<u64> {
+        let output = self.output(session_id)?;
+        Ok(lock(&output).attach(Box::new(on_event)))
     }
 
     /// Stops the output to the view of `token`. A later attach keeps its sink,
-    /// and an ended run is not an error.
-    pub fn detach_app(&self, session_id: &str, token: u64) {
-        let Ok(output) = self.app_output(session_id) else {
-            return;
-        };
-        let mut output = lock(&output);
-        if output.sink.as_ref().is_some_and(|(t, _)| *t == token) {
-            output.sink = None;
+    /// and an ended session is not an error.
+    pub fn detach_session(&self, session_id: &str, token: u64) {
+        if let Ok(output) = self.output(session_id) {
+            lock(&output).detach(token);
         }
     }
 
-    fn app_output(&self, session_id: &str) -> Result<Arc<Mutex<AppOutput>>> {
-        let state = lock(&self.state);
-        let run = state.session(session_id)?.app.as_ref().ok_or(Error::SessionNotFound)?;
-        Ok(run.output.clone())
+    /// The view of `token` has written one more output frame.
+    pub fn ack_session(&self, session_id: &str, token: u64) {
+        if let Ok(output) = self.output(session_id) {
+            lock(&output).ack(token);
+        }
+    }
+
+    fn output(&self, session_id: &str) -> Result<Arc<Mutex<Output>>> {
+        Ok(lock(&self.state).session(session_id)?.output.clone())
     }
 
     pub fn write(&self, id: &str, data: Vec<u8>) -> Result<()> {
@@ -1483,13 +1686,20 @@ impl<R: SandboxRuntime> Manager<R> {
             .map_err(|_| Error::SessionClosed)
     }
 
-    /// An unknown id is not an error: a stop already removed the session.
-    pub fn close_session(&self, id: &str) -> Result<()> {
-        let mut state = lock(&self.state);
-        if let Ok(session) = state.session(id) {
-            let _ = session.input.send(PtyInput::Kill);
-        }
-        state.sessions.retain(|s| s.id != id);
+    /// Removes the terminal and kills its process. An unknown terminal is
+    /// not an error: it is already gone.
+    pub fn close_terminal(&self, shield_id: &str, terminal_id: &str) -> Result<()> {
+        self.edit(shield_id, |s| {
+            s.remove_terminal(terminal_id);
+            Ok(())
+        })?;
+        lock(&self.state).sessions.retain(|s| {
+            let closed = s.terminal_id.as_deref() == Some(terminal_id);
+            if closed {
+                let _ = s.input.send(PtyInput::Kill);
+            }
+            !closed
+        });
         Ok(())
     }
 
@@ -1898,6 +2108,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::runtime::PTY_QUEUE;
     use crate::runtime::fake::{FakeRuntime, PtyGate};
     use crate::host_agents::fake::{FakeClock, FakeFs};
     use crate::host_agents::login::fake::{FakeLogins, claude_doc};
@@ -1948,6 +2159,16 @@ mod tests {
         PtyEvent::Output(text.as_bytes().to_vec())
     }
 
+    fn attach(manager: &Manager<FakeRuntime>, session: &str) -> (u64, mpsc::UnboundedReceiver<PtyEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let token = manager
+            .attach_session(session, move |e| {
+                let _ = tx.send(e);
+            })
+            .unwrap();
+        (token, rx)
+    }
+
     #[tokio::test]
     async fn delete_refuses_a_shield_that_is_starting() {
         let (manager, _runtime, id, vault) = manager_with_vault();
@@ -1962,20 +2183,15 @@ mod tests {
     async fn session_lifecycle() {
         let (manager, runtime, id) = manager();
         assert!(matches!(
-            manager.open_session(&id, SessionKind::Shell, 24, 80, |_| {}).await,
+            manager.open_session(&id, SessionKind::Shell, 24, 80).await,
             Err(Error::NotRunning)
         ));
 
         manager.start(&id).await.unwrap();
         assert_eq!(manager.list()[0].status, Status::Running);
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = manager
-            .open_session(&id, SessionKind::Shell, 24, 80, move |e| {
-                let _ = tx.send(e);
-            })
-            .await
-            .unwrap();
+        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let (_, mut rx) = attach(&manager, &session);
         assert_eq!(next(&mut rx).await, output("24x80"));
 
         manager.write(&session, b"ls\r".to_vec()).unwrap();
@@ -1988,8 +2204,10 @@ mod tests {
         assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
         assert_eq!(manager.list()[0].sessions[0].exit_code, Some(137));
 
-        manager.close_session(&session).unwrap();
+        let terminal = manager.list()[0].shield.terminals[0].id.clone();
+        manager.close_terminal(&id, &terminal).unwrap();
         assert!(manager.list()[0].sessions.is_empty());
+        assert!(manager.list()[0].shield.terminals.is_empty());
         assert!(matches!(
             manager.write(&session, b"x".to_vec()),
             Err(Error::SessionNotFound)
@@ -2014,7 +2232,7 @@ mod tests {
         let manager = Arc::new(manager);
         let opening = tokio::spawn({
             let (manager, id) = (manager.clone(), id.clone());
-            async move { manager.open_session(&id, SessionKind::Shell, 24, 80, |_| {}).await }
+            async move { manager.open_session(&id, SessionKind::Shell, 24, 80).await }
         });
         gate.entered.notified().await;
         manager.stop(&id).await.unwrap();
@@ -2073,28 +2291,28 @@ mod tests {
         let pi = std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap();
         assert_eq!(Some(pi), launch::wrapper(AgentKind::Pi, launch::Found::default(), true));
 
-        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/pi"]);
         assert!(matches!(
-            manager.open_session(&id, agent(AgentKind::Claude, false), 24, 80, |_| {}).await,
+            manager.open_session(&id, agent(AgentKind::Claude, false), 24, 80).await,
             Err(Error::RuntimeMissing(name)) if name == "claude"
         ));
         runtimes::fake_install(&manager.data, "claude");
         runtimes::fake_install(&manager.data, "codex");
         // Installed after the start: the VM has not mounted it.
         assert!(matches!(
-            manager.open_session(&id, agent(AgentKind::Codex, false), 24, 80, |_| {}).await,
+            manager.open_session(&id, agent(AgentKind::Codex, false), 24, 80).await,
             Err(Error::RuntimeNotMounted(_))
         ));
         assert!(matches!(
-            manager.open_session(&id, agent(AgentKind::Gemini, false), 24, 80, |_| {}).await,
+            manager.open_session(&id, agent(AgentKind::Gemini, false), 24, 80).await,
             Err(Error::NotHostAgent(_))
         ));
 
         manager.stop(&id).await.unwrap();
         manager.start(&id).await.unwrap();
         assert_eq!(wrappers(&manager, &id), ["claude", "codex", "pi"]);
-        manager.open_session(&id, agent(AgentKind::Codex, true), 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, agent(AgentKind::Codex, true), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/codex", "resume", "--last"]);
         assert_eq!(manager.list()[0].sessions[0].kind, agent(AgentKind::Codex, true));
     }
@@ -2126,16 +2344,11 @@ mod tests {
     async fn a_live_agent_session_keeps_the_shield_busy() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        manager.open_session(&id, SessionKind::Shell, 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
         assert!(!lock(&manager.state).is_busy(&id));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = manager
-            .open_session(&id, agent(AgentKind::Pi, false), 24, 80, move |e| {
-                let _ = tx.send(e);
-            })
-            .await
-            .unwrap();
+        let session = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        let (_, mut rx) = attach(&manager, &session);
         assert!(lock(&manager.state).is_busy(&id));
         manager.send(&session, PtyInput::Kill).unwrap();
         while next(&mut rx).await != PtyEvent::Exit(137) {}
@@ -2207,18 +2420,15 @@ mod tests {
     async fn stop_kills_sessions() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        manager
-            .open_session(&id, agent(AgentKind::Pi, false), 24, 80, move |e| {
-                let _ = tx.send(e);
-            })
-            .await
-            .unwrap();
+        let session = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        let (_, mut rx) = attach(&manager, &session);
         next(&mut rx).await;
 
         manager.stop(&id).await.unwrap();
         assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
         assert!(manager.list()[0].sessions.is_empty());
+        // The terminal stays as a dormant row.
+        assert_eq!(manager.list()[0].shield.terminals.len(), 1);
     }
 
     #[tokio::test]
@@ -2388,9 +2598,9 @@ mod tests {
     }
 
     #[test]
-    fn close_unknown_session_is_ok() {
-        let (manager, _, _) = manager();
-        manager.close_session("gone").unwrap();
+    fn close_unknown_terminal_is_ok() {
+        let (manager, _, id) = manager();
+        manager.close_terminal(&id, "gone").unwrap();
     }
 
     #[tokio::test]
@@ -2444,12 +2654,12 @@ mod tests {
         manager.start(&id).await.unwrap();
         manager.set_harness(&id, Some("/workspace/agent")).unwrap();
         assert!(manager.list()[0].pending_restart);
-        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
 
         manager.stop(&id).await.unwrap();
         manager.start(&id).await.unwrap();
-        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80, |_| {}).await.unwrap();
-        manager.open_session(&id, SessionKind::Shell, 24, 80, |_| {}).await.unwrap();
+        manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
         assert_eq!(
             *runtime.cwds.lock().unwrap(),
             ["/workspace", "/workspace/agent", "/workspace"]
@@ -2605,15 +2815,7 @@ mod tests {
         let session = manager.start_app(&id, &web).await.unwrap();
         manager.write(&session, b"ready".to_vec()).unwrap();
 
-        let attach = || {
-            let (tx, rx) = mpsc::unbounded_channel();
-            manager
-                .attach_app(&session, move |e| {
-                    let _ = tx.send(e);
-                })
-                .unwrap();
-            rx
-        };
+        let attach = || attach(&manager, &session).1;
         let mut rx = attach();
         // The echo of the write reaches the ring in a task.
         while rx.try_recv() != Ok(output("24x80ready")) {
@@ -2648,29 +2850,225 @@ mod tests {
         let web = app(&manager, &id, "pnpm dev", false);
         manager.start(&id).await.unwrap();
         let session = manager.start_app(&id, &web).await.unwrap();
-        let attach = || {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let token = manager
-                .attach_app(&session, move |e| {
-                    let _ = tx.send(e);
-                })
-                .unwrap();
-            (token, rx)
-        };
-        let (old, _old_rx) = attach();
-        let (new, mut rx) = attach();
+        let (old, _old_rx) = attach(&manager, &session);
+        let (new, mut rx) = attach(&manager, &session);
         assert_ne!(old, new);
-        manager.detach_app(&session, old);
+        manager.detach_session(&session, old);
         let _ = next(&mut rx).await;
         manager.write(&session, b"x".to_vec()).unwrap();
         while next(&mut rx).await != output("x") {}
 
-        manager.detach_app(&session, new);
+        manager.detach_session(&session, new);
         manager.write(&session, b"y".to_vec()).unwrap();
         manager.send(&session, PtyInput::Kill).unwrap();
         until(|| runs(&manager) == [(web.clone(), Some(137))]).await;
         assert!(rx.try_recv().is_err());
-        manager.detach_app("gone", new);
+        manager.detach_session("gone", new);
+    }
+
+    #[test]
+    fn the_ring_keeps_the_last_bytes_only() {
+        let mut output = Output::default();
+        output.push(PtyEvent::Output(vec![b'a'; RING - 1]));
+        output.push(PtyEvent::Output(b"bcd".to_vec()));
+        assert_eq!(output.ring.len(), RING);
+        assert!(output.ring.iter().rev().take(3).eq(b"dcb"));
+        assert_eq!(output.ring[0], b'a');
+        output.push(PtyEvent::Output(vec![b'z'; 2 * RING]));
+        assert_eq!(output.ring.len(), RING);
+        assert!(output.ring.iter().all(|b| *b == b'z'));
+    }
+
+    #[tokio::test]
+    async fn a_reattach_replays_the_output_in_order_and_a_stale_token_gets_nothing() {
+        let (manager, _, id) = manager();
+        manager.start(&id).await.unwrap();
+        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        for text in ["one ", "two ", "three"] {
+            manager.write(&session, text.as_bytes().to_vec()).unwrap();
+        }
+        until(|| lock(&manager.output(&session).unwrap()).ring.len() == "24x80one two three".len()).await;
+
+        let (old, mut old_rx) = attach(&manager, &session);
+        assert_eq!(next(&mut old_rx).await, output("24x80one two three"));
+        let (new, mut rx) = attach(&manager, &session);
+        assert_eq!(next(&mut rx).await, output("24x80one two three"));
+        manager.write(&session, b"four".to_vec()).unwrap();
+        assert_eq!(next(&mut rx).await, output("four"));
+        // The stale view gets no new output, and its detach and ack change nothing.
+        manager.detach_session(&session, old);
+        manager.ack_session(&session, old);
+        assert_eq!(lock(&manager.output(&session).unwrap()).sink.as_ref().map(|s| (s.token, s.in_flight)), Some((new, 2)));
+        manager.send(&session, PtyInput::Kill).unwrap();
+        assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
+        assert!(old_rx.try_recv().is_err());
+
+        // After the exit, an attach gets the output and then the exit.
+        let (_, mut rx) = attach(&manager, &session);
+        assert_eq!(next(&mut rx).await, output("24x80one two threefour"));
+        assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_coalesces_up_to_its_size_and_its_wait() {
+        let (tx, events) = mpsc::channel(PTY_QUEUE);
+        let mut frames = Frames::new(events);
+        let start = Instant::now();
+
+        // A small chunk with nothing queued goes at once.
+        tx.send(output("k")).await.unwrap();
+        assert_eq!(frames.next().await, Some((b"k".to_vec(), None)));
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        // Queued chunks merge up to the frame size.
+        for _ in 0..6 {
+            tx.send(PtyEvent::Output(vec![b'x'; 16 << 10])).await.unwrap();
+        }
+        assert_eq!(frames.next().await.unwrap().0.len(), FRAME);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        // The rest waits for more until the frame wait ends.
+        assert_eq!(frames.next().await.unwrap().0.len(), 32 << 10);
+        assert_eq!(start.elapsed(), FRAME_WAIT);
+
+        // Output that comes during the wait joins the frame; the exit ends it.
+        let sender = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            sender.send(output("b")).await.unwrap();
+            sender.send(PtyEvent::Exit(0)).await.unwrap();
+        });
+        tx.send(PtyEvent::Output(vec![b'a'; ECHO + 1])).await.unwrap();
+        let (bytes, exit) = frames.next().await.unwrap();
+        assert_eq!((bytes.len(), bytes.last(), exit), (ECHO + 2, Some(&b'b'), Some(0)));
+        drop(tx);
+        assert_eq!(frames.next().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_past_the_frame_size_goes_to_the_next_frame() {
+        let (tx, events) = mpsc::channel(PTY_QUEUE);
+        let mut frames = Frames::new(events);
+        tx.send(PtyEvent::Output(vec![b'a'; 48 << 10])).await.unwrap();
+        tx.send(PtyEvent::Output(vec![b'b'; 48 << 10])).await.unwrap();
+        tx.send(PtyEvent::Output(vec![b'c'; 3 * FRAME])).await.unwrap();
+        tx.send(PtyEvent::Exit(0)).await.unwrap();
+        drop(tx);
+        let mut all = Vec::new();
+        let exit = loop {
+            let (bytes, exit) = frames.next().await.unwrap();
+            assert!(bytes.len() <= FRAME);
+            all.extend(bytes);
+            if exit.is_some() {
+                break exit;
+            }
+        };
+        assert_eq!(exit, Some(0));
+        assert_eq!(all.len(), (96 << 10) + 3 * FRAME);
+        assert!(all[..48 << 10].iter().all(|b| *b == b'a'));
+        assert!(all[48 << 10..96 << 10].iter().all(|b| *b == b'b'));
+        assert!(all[96 << 10..].iter().all(|b| *b == b'c'));
+        assert_eq!(frames.next().await, None);
+    }
+
+    #[test]
+    fn an_attach_replays_the_ring_in_one_frame() {
+        let mut output = Output::default();
+        output.push(PtyEvent::Output((0..RING).map(|i| i as u8).collect()));
+        let sent = Arc::new(Mutex::new(Vec::<PtyEvent>::new()));
+        let into = sent.clone();
+        output.attach(Box::new(move |event| lock(&into).push(event)));
+        let sent = lock(&sent);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(output.sink.as_ref().unwrap().in_flight, 1);
+        let PtyEvent::Output(bytes) = &sent[0] else { panic!("{:?}", sent[0]) };
+        assert!(bytes.iter().eq(output.ring.iter()));
+    }
+
+    #[tokio::test]
+    async fn a_burst_stays_bounded_and_a_full_view_holds_the_process() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        let burst = 50 << 20;
+        *runtime.burst.lock().unwrap() = burst;
+        let sent = runtime.burst_sent.clone();
+        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let (token, mut rx) = attach(&manager, &session);
+
+        // A view that acknowledges nothing holds the process after its window.
+        let mut frames = 0;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            frames += 1;
+        }
+        assert!(frames <= WINDOW + 1, "{frames} frames");
+        // The fake prints chunks of one frame each: the window, the queue and the frame that waits.
+        let held = sent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(held <= (WINDOW + PTY_QUEUE + 2) * FRAME, "{held} bytes read");
+
+        // Each acknowledged frame lets one more frame through.
+        manager.ack_session(&session, token);
+        assert!(next(&mut rx).await != PtyEvent::Exit(0));
+
+        // A detached session drains into the ring.
+        manager.detach_session(&session, token);
+        let output = manager.output(&session).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while sent.load(std::sync::atomic::Ordering::SeqCst) < burst || lock(&output).ring.back() != Some(&b'x') {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the burst did not drain");
+        assert_eq!(lock(&output).ring.len(), RING);
+    }
+
+    fn terminal_ids(manager: &Manager<FakeRuntime>) -> Vec<String> {
+        manager.list()[0].shield.terminals.iter().map(|t| t.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn terminals_keep_their_order_and_close_drops_them() {
+        let dir = temp_dir();
+        let store = || Store::new(dir.join("shields.json"));
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        manager.start(&id).await.unwrap();
+        for kind in [SessionKind::Shell, agent(AgentKind::Pi, false), SessionKind::Shell] {
+            manager.open_session(&id, kind, 24, 80).await.unwrap();
+        }
+        let mut ids = terminal_ids(&manager);
+        ids.reverse();
+        manager.reorder_terminals(&id, &ids).unwrap();
+        assert!(!manager.list()[0].pending_restart);
+        assert!(matches!(manager.reorder_terminals(&id, &ids[1..]), Err(Error::InvalidOrder)));
+        manager.close_terminal(&id, &ids[1]).unwrap();
+        assert_eq!(terminal_ids(&manager), [ids[0].clone(), ids[2].clone()]);
+        assert_eq!(manager.list()[0].sessions.len(), 2);
+
+        // A stop keeps the records as dormant rows.
+        manager.stop(&id).await.unwrap();
+        assert_eq!(terminal_ids(&manager), [ids[0].clone(), ids[2].clone()]);
+
+        // After a process restart, the saved records come back with no session.
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        assert_eq!(terminal_ids(&reloaded), [ids[0].clone(), ids[2].clone()]);
+        assert!(reloaded.list()[0].sessions.is_empty());
+
+        // A dormant row opens again under its id and in its place.
+        reloaded.start(&id).await.unwrap();
+        let session = reloaded.reopen_terminal(&id, &ids[2], 24, 80).await.unwrap();
+        assert_eq!(terminal_ids(&reloaded), [ids[0].clone(), ids[2].clone()]);
+        let view = &reloaded.list()[0].sessions[0];
+        assert_eq!((view.id.as_str(), view.terminal_id.as_deref()), (session.as_str(), Some(ids[2].as_str())));
+        assert!(matches!(reloaded.reopen_terminal(&id, &ids[2], 24, 80).await, Err(Error::TerminalOpen)));
+        assert!(matches!(reloaded.reopen_terminal(&id, &ids[1], 24, 80).await, Err(Error::TerminalNotFound)));
+
+        // An exited terminal opens again in place of its old session.
+        reloaded.send(&session, PtyInput::Kill).unwrap();
+        until(|| reloaded.list()[0].sessions[0].exit_code.is_some()).await;
+        let again = reloaded.reopen_terminal(&id, &ids[2], 24, 80).await.unwrap();
+        let sessions = &reloaded.list()[0].sessions;
+        assert_eq!((sessions.len(), sessions[0].id.as_str()), (1, again.as_str()));
     }
 
     #[tokio::test]
@@ -3439,14 +3837,14 @@ mod tests {
         assert!(view.host_notices.iter().any(|n| n.contains("bundled pi")), "{:?}", view.host_notices);
         assert!(view.host_notices.iter().any(|n| n.contains("darwin-arm64.node")), "{:?}", view.host_notices);
         let gemini = agent(AgentKind::Gemini, false);
-        assert!(matches!(manager.open_session(&id, gemini, 24, 80, |_| {}).await, Err(Error::HostAgentFailed(..))));
+        assert!(matches!(manager.open_session(&id, gemini, 24, 80).await, Err(Error::HostAgentFailed(..))));
         assert_eq!(wrappers(&manager, &id), ["pi"]);
         assert!(wrapper("pi").contains("exec node /opt/zwinger/pi/cli.js "));
 
         // Gemini CLI that is no host agent of the shield.
         let (plain, _, plain_id) = manager_with_host();
         plain.start(&plain_id).await.unwrap();
-        assert!(matches!(plain.open_session(&plain_id, gemini, 24, 80, |_| {}).await, Err(Error::NotHostAgent(_))));
+        assert!(matches!(plain.open_session(&plain_id, gemini, 24, 80).await, Err(Error::NotHostAgent(_))));
     }
 
     fn manager_with_host() -> (Manager<FakeRuntime>, FakeRuntime, String) {

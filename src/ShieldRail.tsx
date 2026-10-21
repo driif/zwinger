@@ -289,7 +289,10 @@ interface Props {
   onToggle: (shield: ShieldView) => void;
   onNewSession: (shieldId: string, kind: SessionKind) => void;
   onClosePane: (key: string) => void;
-  onMovePanes: (shieldId: string, keys: string[]) => void;
+  /** Opens a dormant or exited terminal again. */
+  onReopen: (pane: Pane) => void;
+  /** Saves the order of all terminals of the shield. */
+  onMoveTerminals: (shieldId: string, ids: string[]) => void;
   onNew: () => void;
   /** Opens the agents on this Mac. */
   onHostAgents: () => void;
@@ -315,7 +318,8 @@ export function ShieldRail({
   onToggle,
   onNewSession,
   onClosePane,
-  onMovePanes,
+  onReopen,
+  onMoveTerminals,
   onNew,
   onHostAgents,
   dropFolder,
@@ -361,17 +365,11 @@ export function ShieldRail({
         .map((pane) => {
           const { kind } = pane;
           const session = shield.sessions.find((s) => s.id === pane.sessionId);
-          const state =
-            pane.sessionId === undefined
-              ? "opening"
-              : session === undefined
-                ? "ended"
-                : session.exitCode !== null
-                  ? `exited ${session.exitCode}`
-                  : undefined;
+          const state = !session ? "dormant" : session.exitCode !== null ? `exited ${session.exitCode}` : undefined;
           const name = paneName(pane, panes);
           const Icon = kind.type === "agent" ? AGENT_ICONS[kind.agent] : SquareTerminal;
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
+          const open: MenuAction[] = state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : [];
           return {
             entity: pane.key,
             label: (
@@ -386,6 +384,7 @@ export function ShieldRail({
             menu:
               kind.type === "agent"
                 ? [
+                    ...open,
                     {
                       label: "Continue last session",
                       icon: <History size={14} />,
@@ -393,7 +392,7 @@ export function ShieldRail({
                     },
                     close,
                   ]
-                : [close],
+                : [...open, close],
           };
         });
     const shieldRunning = shield.status.state === "running";
@@ -612,9 +611,9 @@ export function ShieldRail({
     if (container === "shields") run(() => reorderShields(next));
     else if (container.endsWith("|apps")) run(() => reorderApps(shieldId, next));
     else {
-      // Agents and terminals are both panes: the other group keeps its order.
+      // Agents and terminals are one saved list: the other group keeps its order.
       const others = panes.filter((p) => p.shieldId === shieldId && !next.includes(p.key)).map((p) => p.key);
-      onMovePanes(shieldId, [...next, ...others]);
+      onMoveTerminals(shieldId, [...next, ...others]);
     }
   }
 

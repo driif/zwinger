@@ -54,6 +54,14 @@ export interface SessionView {
   id: string;
   kind: SessionKind;
   exitCode: number | null;
+  /** Set for a shell or agent terminal. An app run has none. */
+  terminalId: string | null;
+}
+
+/** A shell or agent terminal of a shield. With no session it is dormant, and it can open again. */
+export interface Terminal {
+  id: string;
+  kind: SessionKind;
 }
 
 export interface Pos {
@@ -116,6 +124,8 @@ export interface ShieldView {
   layout: Record<string, Pos>;
   apps: App[];
   tasks: Task[];
+  /** In tree order. */
+  terminals: Terminal[];
   status: ShieldStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
@@ -135,7 +145,11 @@ export interface ShieldView {
   hostNotices: string[];
 }
 
-export type PtyEvent = { event: "output"; data: number[] } | { event: "exit"; data: number };
+/** Output bytes, or the exit. Tauri can send small raw bodies as a number array. */
+export type SessionFrame = ArrayBuffer | number[] | { exit: number };
+
+/** The message of the backend's `InvalidOrder` error. */
+export const INVALID_ORDER = "the order must name each item once";
 
 export const listShields = () => invoke<ShieldView[]>("list_shields");
 
@@ -164,13 +178,22 @@ export const stopApp = (id: string, appId: string) => invoke<void>("stop_app", {
 
 export const restartApp = (id: string, appId: string) => invoke<string>("restart_app", { id, appId });
 
-/** Sends the kept output of the run, then new output. A later attach takes over. Resolves to the token for `detachApp`. */
-export function attachApp(sessionId: string, onEvent: (event: PtyEvent) => void) {
-  return invoke<number>("attach_app", { sessionId, onEvent: new Channel<PtyEvent>(onEvent) });
+export const reorderTerminals = (id: string, terminalIds: string[]) =>
+  invoke<void>("reorder_terminals", { id, terminalIds });
+
+/**
+ * Sends the kept output of the session, and its exit if it has exited, then new output. A later attach takes over.
+ * Resolves to the token for `detachSession` and `ackSession`.
+ */
+export function attachSession(sessionId: string, onFrame: (frame: SessionFrame) => void) {
+  return invoke<number>("attach_session", { sessionId, onEvent: new Channel<SessionFrame>(onFrame) });
 }
 
 /** Stops the output to the attach of `token`. A later attach keeps its output. */
-export const detachApp = (sessionId: string, token: number) => invoke<void>("detach_app", { sessionId, token });
+export const detachSession = (sessionId: string, token: number) => invoke<void>("detach_session", { sessionId, token });
+
+/** The attach of `token` has written one more output frame. The session holds its process while frames wait. */
+export const ackSession = (sessionId: string, token: number) => invoke<void>("ack_session", { sessionId, token });
 
 /** The canonical folder of a host path: a link resolves to its target. */
 export const resolveFolder = (path: string) => invoke<string>("resolve_folder", { path });
@@ -234,16 +257,13 @@ export const startShield = (id: string) => invoke<void>("start_shield", { id });
 
 export const stopShield = (id: string) => invoke<void>("stop_shield", { id });
 
-export function openSession(
-  shieldId: string,
-  kind: SessionKind,
-  rows: number,
-  cols: number,
-  onEvent: (event: PtyEvent) => void,
-) {
-  const channel = new Channel<PtyEvent>(onEvent);
-  return invoke<string>("open_session", { shieldId, kind, rows, cols, onEvent: channel });
-}
+/** Adds a terminal to the end of the shield's list and opens it. Resolves to the session id. */
+export const openSession = (shieldId: string, kind: SessionKind, rows: number, cols: number) =>
+  invoke<string>("open_session", { shieldId, kind, rows, cols });
+
+/** Opens a dormant or exited terminal again, under the same id. Resolves to the session id. */
+export const reopenTerminal = (shieldId: string, terminalId: string, rows: number, cols: number) =>
+  invoke<string>("reopen_terminal", { shieldId, terminalId, rows, cols });
 
 export const writeSession = (id: string, data: string) =>
   invoke<void>("write_session", { id, data });
@@ -251,7 +271,9 @@ export const writeSession = (id: string, data: string) =>
 export const resizeSession = (id: string, rows: number, cols: number) =>
   invoke<void>("resize_session", { id, rows, cols });
 
-export const closeSession = (id: string) => invoke<void>("close_session", { id });
+/** Removes the terminal and ends its process. */
+export const closeTerminal = (shieldId: string, terminalId: string) =>
+  invoke<void>("close_terminal", { shieldId, terminalId });
 
 export type AgentKind = "pi" | "claude" | "codex" | "gemini";
 

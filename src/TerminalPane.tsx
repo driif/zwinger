@@ -1,8 +1,22 @@
 import { useEffect, useRef } from "react";
-import { FitAddon, init, Terminal } from "ghostty-web";
-import { attachApp, closeSession, detachApp, openSession, PtyEvent, resizeSession, SessionKind, writeSession } from "./api";
+import type { FitAddon, Terminal } from "ghostty-web";
+import { ackSession, attachSession, detachSession, resizeSession, SessionFrame, writeSession } from "./api";
 
-const ready = init();
+let ghostty: Promise<typeof import("ghostty-web")> | undefined;
+
+/** Loads ghostty-web and its WASM once, on the first terminal. */
+function loadGhostty() {
+  ghostty ??= import("ghostty-web").then(async (module) => {
+    await module.init();
+    return module;
+  });
+  return ghostty;
+}
+
+let fitted = { rows: 24, cols: 80 };
+
+/** The size of the last terminal that fitted itself. A new session opens at this size. */
+export const fittedSize = () => fitted;
 
 /** The keys that Option sends with ESC first, besides letters and digits. */
 const META_KEYS: Record<string, string> = {
@@ -108,28 +122,33 @@ function agentKey(event: KeyboardEvent): string | undefined {
 }
 
 interface Props {
-  /** A new session that the pane owns, or the run of an app, which the backend owns. */
-  session: { shieldId: string; kind: SessionKind } | { attach: string };
+  sessionId: string;
   active: boolean;
-  onOpen?: (sessionId: string) => void;
   onExit: () => void;
   onError: (error: unknown) => void;
 }
 
-export function TerminalPane({ session, active, onOpen, onExit, onError }: Props) {
+/** Attaches to the session while it is mounted. An unmount detaches; the session keeps running. */
+export function TerminalPane({ sessionId, active, onExit, onError }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal>(null);
   const fitter = useRef<FitAddon>(null);
 
-  // Runs once per pane: the pane owns its terminal, and its session unless it attaches, for its whole life.
   useEffect(() => {
     let disposed = false;
     let term: Terminal | undefined;
-    let detach: (() => void) | undefined;
     let stopInput: (() => void) | undefined;
-    let id: string | undefined;
-    ready
-      .then(async () => {
+    let token: number | undefined;
+    /** The frames written before the attach resolved to its token. */
+    let unacked = 0;
+    const send = (data: string) => writeSession(sessionId, data).catch(() => {});
+    const ack = () => {
+      if (disposed) return;
+      if (token === undefined) unacked++;
+      else ackSession(sessionId, token).catch(() => {});
+    };
+    loadGhostty()
+      .then(async ({ FitAddon, Terminal }) => {
         if (disposed) return;
         term = new Terminal({
           fontSize: 13,
@@ -148,52 +167,48 @@ export function TerminalPane({ session, active, onOpen, onExit, onError }: Props
         t.attachCustomKeyEventHandler((event) => {
           const text = agentKey(event);
           if (text === undefined) return false;
-          if (id) writeSession(id, text).catch(() => {});
+          send(text);
           return true;
         });
-        const onEvent = (event: PtyEvent) => {
+        t.onData(send);
+        stopInput = tuiInput(t, container.current!, send);
+        t.onResize(({ rows, cols }) => {
+          if (!container.current?.hidden) fitted = { rows, cols };
+          resizeSession(sessionId, rows, cols).catch(() => {});
+        });
+        const onFrame = (frame: SessionFrame) => {
           if (disposed) return;
-          if (event.event === "output") t.write(new Uint8Array(event.data));
-          else onExit();
+          if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) return onExit();
+          // The parse is synchronous. The write callback waits for an animation frame, which a hidden window does not get.
+          t.write(frame instanceof ArrayBuffer ? new Uint8Array(frame) : Uint8Array.from(frame));
+          ack();
         };
-        if ("attach" in session) {
-          const attach = session.attach;
-          const token = await attachApp(attach, onEvent);
-          detach = () => detachApp(attach, token).catch(() => {});
-          if (disposed) return detach();
-          // An exited run takes no input.
-          await resizeSession(attach, t.rows, t.cols).catch(() => {});
-          if (disposed) return;
-          id = attach;
-        } else {
-          const opened = await openSession(session.shieldId, session.kind, t.rows, t.cols, onEvent);
-          if (disposed) return closeSession(opened);
-          // Again at once: the PTY can open at 24x80 before the size arrives, and an agent TUI draws its first frame then.
-          fit.fit();
-          await resizeSession(opened, t.rows, t.cols).catch(() => {});
-          id = opened;
+        token = await attachSession(sessionId, onFrame);
+        if (disposed) return detachSession(sessionId, token).catch(() => {});
+        for (; unacked > 0; unacked--) ackSession(sessionId, token).catch(() => {});
+        // After the replay, so the TUI draws itself again at this size. An exited session takes no input.
+        fit.fit();
+        await resizeSession(sessionId, t.rows, t.cols).catch(() => {});
+        if (!disposed && active) {
+          fitted = { rows: t.rows, cols: t.cols };
+          t.focus();
         }
-        const live = id;
-        t.onData((data) => writeSession(live, data).catch(() => {}));
-        stopInput = tuiInput(t, container.current!, (data) => writeSession(live, data).catch(() => {}));
-        t.onResize(({ rows, cols }) => resizeSession(live, rows, cols).catch(() => {}));
-        t.focus();
-        onOpen?.(live);
       })
       .catch(onError);
     return () => {
       disposed = true;
       stopInput?.();
-      detach?.();
+      if (token !== undefined) detachSession(sessionId, token).catch(() => {});
       term?.dispose();
     };
   }, []);
 
   // A hidden pane cannot measure itself, so it fits when it shows.
   useEffect(() => {
-    if (!active) return;
+    if (!active || !terminal.current) return;
     fitter.current?.fit();
-    terminal.current?.focus();
+    fitted = { rows: terminal.current.rows, cols: terminal.current.cols };
+    terminal.current.focus();
   }, [active]);
 
   return <div ref={container} className="terminal" hidden={!active} />;

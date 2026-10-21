@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, AgentKind};
 use crate::error::{Error, Result};
 use crate::host_agents::login;
+use crate::runtime::SessionKind;
 use crate::secrets::{self, Origin, Secret};
 
 pub const WORKSPACE: &str = "/workspace";
@@ -38,6 +39,10 @@ pub struct Shield {
     pub apps: Vec<App>,
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// The terminals of the shield, in tree order. A terminal with no live
+    /// session is dormant: it opens again under the same id.
+    #[serde(default)]
+    pub terminals: Vec<Terminal>,
     /// The agents that the shield takes from the host. At most one per kind.
     #[serde(default)]
     pub host_agents: Vec<HostAgentUse>,
@@ -79,6 +84,14 @@ pub struct App {
     pub command: String,
     pub cwd: String,
     pub autostart: bool,
+}
+
+/// A shell or agent terminal of a shield. It stays when its process ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Terminal {
+    pub id: String,
+    pub kind: SessionKind,
 }
 
 /// An app as the UI sends it. No `id` adds a new app.
@@ -213,6 +226,7 @@ impl Shield {
             layout: BTreeMap::new(),
             apps: Vec::new(),
             tasks: Vec::new(),
+            terminals: Vec::new(),
             host_agents: Vec::new(),
             auto_renew: false,
             agents_unprompted: true,
@@ -272,6 +286,27 @@ impl Shield {
     /// `ids` must name each app once.
     pub fn reorder_apps(&mut self, ids: &[String]) -> Result<()> {
         reorder(&mut self.apps, ids, |a| &a.id)
+    }
+
+    /// Adds a terminal at the end and returns its id.
+    pub fn add_terminal(&mut self, kind: SessionKind) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.terminals.push(Terminal { id: id.clone(), kind });
+        id
+    }
+
+    /// An unknown id is not an error: the terminal is already gone.
+    pub fn remove_terminal(&mut self, id: &str) {
+        self.terminals.retain(|t| t.id != id);
+    }
+
+    /// `ids` must name each terminal once.
+    pub fn reorder_terminals(&mut self, ids: &[String]) -> Result<()> {
+        reorder(&mut self.terminals, ids, |t| &t.id)
+    }
+
+    pub fn terminal(&self, id: &str) -> Result<&Terminal> {
+        self.terminals.iter().find(|t| t.id == id).ok_or(Error::TerminalNotFound)
     }
 
     pub fn app(&self, id: &str) -> Result<&App> {

@@ -1,6 +1,6 @@
 import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, LiquidSwitch, SpringCheckbox } from "@driif/motiv";
 import { Play, RotateCw, Square, TriangleAlert } from "lucide-react";
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
   AGENT_NAMES,
   AgentKind,
@@ -21,10 +21,12 @@ import type { Intent, Pane, Run, Runtimes, TabView, View } from "./App";
 import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
-import { ShieldMap } from "./ShieldMap";
 import { TaskDialog } from "./TaskDialog";
-import { TaskRoom } from "./TaskRoom";
 import { TerminalTab } from "./TerminalTab";
+
+// React Flow and the run room are large and not on the first screen of every shield.
+const ShieldMap = lazy(() => import("./ShieldMap").then((m) => ({ default: m.ShieldMap })));
+const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
 /** The provider host of each host login. pi's depends on its login. Gemini CLI has none. */
 const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
@@ -141,12 +143,13 @@ interface Props {
   onToggle: () => void;
   /** `agent` opens the shield's first agent. */
   onNewSession: (kind: SessionKind | "agent") => void;
-  onPaneOpen: (key: string, sessionId: string) => void;
+  /** Opens a dormant or exited terminal again. */
+  onReopen: (pane: Pane) => void;
   onPaneExit: () => void;
-  onPaneError: (key: string, error: unknown) => void;
+  onPaneError: (error: unknown) => void;
 }
 
-// Not keyed by shield: the terminal view keeps the panes of every shield mounted.
+// Not keyed by shield: the terminal view keeps the panes of every shield attached.
 export function ShieldPage({
   shield,
   events,
@@ -274,16 +277,18 @@ export function ShieldPage({
           panels={{
             overview: (
               <div className="overview">
-                <ShieldMap
-                  key={shield.id}
-                  shield={shield}
-                  folders={folders}
-                  events={events}
-                  visible={isTab && tab === "overview"}
-                  run={run}
-                  onJump={jump}
-                  onDropFolder={onDropFolder}
-                />
+                <Suspense>
+                  <ShieldMap
+                    key={shield.id}
+                    shield={shield}
+                    folders={folders}
+                    events={events}
+                    visible={isTab && tab === "overview"}
+                    run={run}
+                    onJump={jump}
+                    onDropFolder={onDropFolder}
+                  />
+                </Suspense>
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
@@ -371,17 +376,19 @@ export function ShieldPage({
       )}
       {task && view.kind === "task" && (
         <div className="view task-view">
-          <TaskRoom
-            key={task.id}
-            kind="task"
-            shield={shield}
-            task={task}
-            runs={runs.filter((r) => r.taskId === task.id)}
-            run={view.run}
-            onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
-            onRunsChange={onRunsChange}
-            onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
-          />
+          <Suspense>
+            <TaskRoom
+              key={task.id}
+              kind="task"
+              shield={shield}
+              task={task}
+              runs={runs.filter((r) => r.taskId === task.id)}
+              run={view.run}
+              onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
+              onRunsChange={onRunsChange}
+              onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
+            />
+          </Suspense>
         </div>
       )}
       {view.kind === "taskEdit" && (

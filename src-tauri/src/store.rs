@@ -41,7 +41,8 @@ mod tests {
     use super::*;
     use crate::agent::AgentKind;
     use crate::secrets::{Origin, Places, Secret};
-    use crate::shield::{App, HostAgentUse, Mount, NetworkMode, NetworkPolicy, Pos, Task, TaskAgent};
+    use crate::runtime::SessionKind;
+    use crate::shield::{App, HostAgentUse, Mount, NetworkMode, NetworkPolicy, Pos, Task, TaskAgent, Terminal};
 
     #[test]
     fn round_trip() {
@@ -102,6 +103,10 @@ mod tests {
                 gates: vec!["pnpm build".into()],
                 workdir: "/workspace".into(),
             }],
+            terminals: vec![
+                Terminal { id: "term-1".into(), kind: SessionKind::Agent { agent: AgentKind::Codex, resume: false } },
+                Terminal { id: "term-2".into(), kind: SessionKind::Shell },
+            ],
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             auto_renew: true,
             agents_unprompted: false,
@@ -128,6 +133,7 @@ mod tests {
         assert!(shield.layout.is_empty());
         assert!(shield.apps.is_empty());
         assert!(shield.tasks.is_empty());
+        assert!(shield.terminals.is_empty());
         assert!(shield.host_agents.is_empty() && !shield.auto_renew);
         assert!(shield.agents_unprompted);
     }

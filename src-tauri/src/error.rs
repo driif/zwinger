@@ -82,6 +82,10 @@ pub enum Error {
     MountNotFound,
     #[error("session not found")]
     SessionNotFound,
+    #[error("terminal not found")]
+    TerminalNotFound,
+    #[error("the terminal is already open")]
+    TerminalOpen,
     #[error("shield is not running")]
     NotRunning,
     #[error("shield is already started")]

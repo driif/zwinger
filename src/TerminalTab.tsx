@@ -1,7 +1,8 @@
 import { Button } from "@driif/motiv";
-import { Bot, SquareTerminal } from "lucide-react";
+import { Bot, Play, SquareTerminal } from "lucide-react";
 import { SessionKind, ShieldView } from "./api";
 import type { Pane } from "./App";
+import { paneName } from "./ShieldRail";
 import { TerminalPane } from "./TerminalPane";
 
 interface Props {
@@ -11,14 +12,15 @@ interface Props {
   visible: boolean;
   /** `agent` opens the shield's first agent. */
   onNewSession: (kind: SessionKind | "agent") => void;
-  onPaneOpen: (key: string, sessionId: string) => void;
+  /** Opens a dormant or exited terminal again. */
+  onReopen: (pane: Pane) => void;
   onPaneExit: () => void;
-  onPaneError: (key: string, error: unknown) => void;
+  onPaneError: (error: unknown) => void;
 }
 
-/** Keeps the panes of every shield mounted; the tree picks the pane that shows. */
-export function TerminalTab({ shield, panes, activePane, visible, onNewSession, onPaneOpen, onPaneExit, onPaneError }: Props) {
-  const shown = panes.some((p) => p.shieldId === shield.id && p.key === activePane);
+/** Keeps the panes of every shield attached; the tree picks the pane that shows. */
+export function TerminalTab({ shield, panes, activePane, visible, onNewSession, onReopen, onPaneExit, onPaneError }: Props) {
+  const shown = panes.find((p) => p.shieldId === shield.id && p.key === activePane);
   return (
     <div className="terminal-tab">
       {!shown && (
@@ -36,16 +38,26 @@ export function TerminalTab({ shield, panes, activePane, visible, onNewSession, 
           </div>
         </div>
       )}
-      {panes.map((pane) => (
-        <TerminalPane
-          key={pane.key}
-          session={{ shieldId: pane.shieldId, kind: pane.kind }}
-          active={visible && pane.shieldId === shield.id && pane.key === activePane}
-          onOpen={(sessionId) => onPaneOpen(pane.key, sessionId)}
-          onExit={onPaneExit}
-          onError={(e) => onPaneError(pane.key, e)}
-        />
-      ))}
+      {shown && !shown.sessionId && (
+        <div className="empty">
+          <p className="muted">{paneName(shown, panes)} is not running. Open it to start a new process in its place.</p>
+          <Button variant="outline" iconLeft={<Play size={14} />} onClick={() => onReopen(shown)}>
+            Open
+          </Button>
+        </div>
+      )}
+      {panes.map(
+        (pane) =>
+          pane.sessionId && (
+            <TerminalPane
+              key={pane.sessionId}
+              sessionId={pane.sessionId}
+              active={visible && pane.key === shown?.key}
+              onExit={onPaneExit}
+              onError={onPaneError}
+            />
+          ),
+      )}
     </div>
   );
 }

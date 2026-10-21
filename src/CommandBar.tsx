@@ -80,7 +80,7 @@ export function CommandBar({
         onSelect: () => onShowPane(pane.key),
       }),
     );
-    if (activePane) commands.push(action("close", "Close session"));
+    if (activePane) commands.push(action("close", "Close terminal"));
     if (panes.length > 1) commands.push(action("next", "Next session"), action("previous", "Previous session"));
     commands.push(
       action("overview", "Overview"),

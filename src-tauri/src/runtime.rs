@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SecretBuilder};
 use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
@@ -25,6 +25,9 @@ const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
+/// The queue size of the output of a PTY. A full queue holds the reader, so
+/// the process blocks on its writes.
+pub const PTY_QUEUE: usize = 64;
 /// Runs `process.argv[1..]` in its own process group, with the same stdio.
 /// On SIGTERM it kills the whole group, so the tool processes of an agent
 /// die with it. It exits with the code of the process, or 128 + its signal.
@@ -93,7 +96,7 @@ pub enum PtyEvent {
 /// A running terminal process. `Exit` is the last event; the stream ends after it.
 pub struct Pty {
     pub input: UnboundedSender<PtyInput>,
-    pub events: UnboundedReceiver<PtyEvent>,
+    pub events: Receiver<PtyEvent>,
 }
 
 #[derive(Debug)]
@@ -345,7 +348,7 @@ impl SandboxRuntime for Microsandbox {
         control.resize(rows, cols).await?;
 
         let (input, mut input_rx) = mpsc::unbounded_channel();
-        let (events_tx, events) = mpsc::unbounded_channel();
+        let (events_tx, events) = mpsc::channel(PTY_QUEUE);
 
         tokio::spawn(async move {
             while let Some(msg) = input_rx.recv().await {
@@ -363,7 +366,7 @@ impl SandboxRuntime for Microsandbox {
             while let Some(event) = handle.recv().await {
                 match event {
                     ExecEvent::Stdout(bytes) | ExecEvent::Stderr(bytes) => {
-                        let _ = events_tx.send(PtyEvent::Output(bytes.to_vec()));
+                        let _ = events_tx.send(PtyEvent::Output(bytes.to_vec())).await;
                     }
                     ExecEvent::Exited { code: c } => {
                         code = c;
@@ -371,13 +374,13 @@ impl SandboxRuntime for Microsandbox {
                     }
                     ExecEvent::Failed(failed) => {
                         let message = format!("{}\r\n", failed.message);
-                        let _ = events_tx.send(PtyEvent::Output(message.into_bytes()));
+                        let _ = events_tx.send(PtyEvent::Output(message.into_bytes())).await;
                         break;
                     }
                     ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
                 }
             }
-            let _ = events_tx.send(PtyEvent::Exit(code));
+            let _ = events_tx.send(PtyEvent::Exit(code)).await;
         });
 
         Ok(Pty { input, events })
@@ -503,6 +506,10 @@ pub mod fake {
         /// The senders of the `net_lines` calls. The test sends more lines
         /// and sees when the receiver is gone.
         pub net_lines: Arc<Mutex<Vec<Sender<String>>>>,
+        /// The bytes that the next PTY prints after its size, in 64 KiB chunks.
+        pub burst: Arc<Mutex<usize>>,
+        /// The burst bytes that the PTY reader has taken so far.
+        pub burst_sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     pub struct FakePipe {
@@ -582,12 +589,12 @@ pub mod fake {
             // The TUI probe of the host pi ends at once: with an error, or as if pi had started.
             if argv.last().is_some_and(|a| a == "--no-session") {
                 let (input, _) = mpsc::unbounded_channel();
-                let (tx, events) = mpsc::unbounded_channel();
+                let (tx, events) = mpsc::channel(PTY_QUEUE);
                 if argv.iter().any(|a| self.probe_fail.lock().unwrap().contains(a)) {
-                    let _ = tx.send(PtyEvent::Output(b"Error: Cannot find module './darwin-arm64.node'\r\n".to_vec()));
-                    let _ = tx.send(PtyEvent::Exit(1));
+                    let _ = tx.try_send(PtyEvent::Output(b"Error: Cannot find module './darwin-arm64.node'\r\n".to_vec()));
+                    let _ = tx.try_send(PtyEvent::Exit(1));
                 } else {
-                    let _ = tx.send(PtyEvent::Exit(0));
+                    let _ = tx.try_send(PtyEvent::Exit(0));
                 }
                 return Ok(Pty { input, events });
             }
@@ -599,16 +606,30 @@ pub mod fake {
             let log = self.log.clone();
             let kill_gate = self.kill_gate.clone();
             let (input, mut input_rx) = mpsc::unbounded_channel();
-            let (tx, events) = mpsc::unbounded_channel();
-            let _ = tx.send(PtyEvent::Output(format!("{rows}x{cols}").into_bytes()));
+            let (tx, events) = mpsc::channel(PTY_QUEUE);
+            let _ = tx.try_send(PtyEvent::Output(format!("{rows}x{cols}").into_bytes()));
+            let burst = std::mem::take(&mut *self.burst.lock().unwrap());
+            if burst > 0 {
+                let (tx, sent) = (tx.clone(), self.burst_sent.clone());
+                tokio::spawn(async move {
+                    let chunk = 64 << 10;
+                    for start in (0..burst).step_by(chunk) {
+                        let len = chunk.min(burst - start);
+                        if tx.send(PtyEvent::Output(vec![b'x'; len])).await.is_err() {
+                            return;
+                        }
+                        sent.fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
             tokio::spawn(async move {
                 while let Some(msg) = input_rx.recv().await {
                     match msg {
                         PtyInput::Data(data) => {
-                            let _ = tx.send(PtyEvent::Output(data));
+                            let _ = tx.send(PtyEvent::Output(data)).await;
                         }
                         PtyInput::Resize { rows, cols } => {
-                            let _ = tx.send(PtyEvent::Output(format!("{rows}x{cols}").into_bytes()));
+                            let _ = tx.send(PtyEvent::Output(format!("{rows}x{cols}").into_bytes())).await;
                         }
                         PtyInput::Kill => {
                             log.lock().unwrap().push("kill".into());
@@ -617,7 +638,7 @@ pub mod fake {
                                 gate.entered.notify_one();
                                 gate.release.notified().await;
                             }
-                            let _ = tx.send(PtyEvent::Exit(137));
+                            let _ = tx.send(PtyEvent::Exit(137)).await;
                             return;
                         }
                     }
