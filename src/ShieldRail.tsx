@@ -271,6 +271,8 @@ interface Props {
   onClosePane: (key: string) => void;
   onMovePanes: (shieldId: string, keys: string[]) => void;
   onNew: () => void;
+  /** Opens the agents on this Mac. */
+  onHostAgents: () => void;
   /** A folder dropped from Finder on empty rail space. */
   dropFolder?: DroppedFolder;
   onDropDone: (create: boolean) => void;
@@ -297,6 +299,7 @@ export function ShieldRail({
   onClosePane,
   onMovePanes,
   onNew,
+  onHostAgents,
   dropFolder,
   onDropDone,
   children,
@@ -737,6 +740,9 @@ export function ShieldRail({
                         >
                           {shield.name}
                         </span>
+                        {shield.renewDue && (
+                          <RotateCw size={12} className="warn" aria-label="The host login is due: restart to renew" />
+                        )}
                         {blocked[shield.id] > 0 && (
                           <span className="rail-blocked" title="Blocked network events since you last saw them">
                             {blocked[shield.id]}
@@ -841,9 +847,14 @@ export function ShieldRail({
           {announcement}
         </div>
       </div>
-      <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
-        New shield
-      </Button>
+      <div className="row">
+        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
+          New shield
+        </Button>
+        <Button variant="ghost" size="sm" iconLeft={<Bot size={14} />} onClick={onHostAgents}>
+          Agents on this Mac
+        </Button>
+      </div>
     </aside>
   );
 }

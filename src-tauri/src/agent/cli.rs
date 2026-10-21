@@ -1,6 +1,6 @@
-//! Claude Code and Codex. They have no RPC like pi, so this module does the
+//! Claude Code, Codex and Gemini CLI. They have no RPC like pi, so this module does the
 //! chat commands itself: it starts a process per chat (Claude Code) or per
-//! turn (Codex), answers `get_state` and `get_messages`, and keeps each chat
+//! turn (Codex, Gemini CLI), answers `get_state` and `get_messages`, and keeps each chat
 //! as a transcript in a host-only file (`<app_data>/chats/<shield>/<agent>`).
 //! The guest cannot write that dir, so the files are trusted.
 
@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 
-use super::{AgentCommand, AgentKind, Chat, Framer, Line, Sink, TITLE_CHARS, claude, codex, cut, keep, lock, send_now};
+use super::{AgentCommand, AgentKind, Chat, Framer, Line, Sink, TITLE_CHARS, claude, codex, cut, gemini, keep, lock, send_now};
 use crate::error::{Error, Result};
 use crate::runtime::{Pipe, PipeEvent, PipeInput};
 
@@ -279,11 +279,14 @@ impl Inner {
 enum Mapper {
     Claude(claude::Mapper),
     Codex(codex::Mapper),
+    Gemini(gemini::Mapper),
 }
 
-/// The Claude Code or Codex agent of a shield.
+/// The Claude Code, Codex or Gemini CLI agent of a shield.
 pub struct CliAgent {
     kind: AgentKind,
+    /// The guest path of Gemini CLI's entry point. `None` for the other kinds.
+    entry: Option<String>,
     /// The host dir of the agent's transcripts.
     dir: PathBuf,
     spawn: Spawn,
@@ -299,9 +302,17 @@ pub struct CliAgent {
 }
 
 impl CliAgent {
-    pub fn new(kind: AgentKind, dir: PathBuf, spawn: Spawn, sink: Sink, on_finish: Box<dyn FnOnce() + Send>) -> Self {
+    pub fn new(
+        kind: AgentKind,
+        entry: Option<String>,
+        dir: PathBuf,
+        spawn: Spawn,
+        sink: Sink,
+        on_finish: Box<dyn FnOnce() + Send>,
+    ) -> Self {
         Self {
             kind,
+            entry,
             dir,
             spawn,
             sink: Mutex::new(sink),
@@ -314,6 +325,11 @@ impl CliAgent {
 
     pub fn set_sink(&self, sink: Sink) {
         *lock(&self.sink) = sink;
+    }
+
+    /// A turn runs.
+    pub fn is_busy(&self) -> bool {
+        lock(&self.inner).running
     }
 
     fn emit(&self, record: Value) {
@@ -520,13 +536,18 @@ impl CliAgent {
         };
         let argv = {
             let model = lock(&self.inner).model.clone();
-            match self.kind {
-                AgentKind::Claude => claude::argv(session.as_deref(), model.as_deref()),
-                _ => codex::argv(session.as_deref(), model.as_deref()),
+            match (self.kind, &self.entry) {
+                (AgentKind::Claude, _) => Ok(claude::argv(session.as_deref(), model.as_deref())),
+                (AgentKind::Gemini, Some(entry)) => Ok(gemini::argv(entry, session.as_deref(), model.as_deref(), true)),
+                (AgentKind::Gemini, None) => Err(Error::NotHostAgent(self.kind.label().to_owned())),
+                _ => Ok(codex::argv(session.as_deref(), model.as_deref())),
             }
         };
 
-        let pipe = (self.spawn)(argv, cwd).await;
+        let pipe = match argv {
+            Ok(argv) => (self.spawn)(argv, cwd).await,
+            Err(e) => Err(e),
+        };
         let finish = {
             let mut inner = lock(&self.inner);
             inner.starting = false;
@@ -544,7 +565,7 @@ impl CliAgent {
                                 });
                             }
                         }
-                        // Codex reads the prompt from stdin until it closes.
+                        // Codex and Gemini CLI read the prompt from stdin until it closes.
                         _ => {
                             send_now(&pipe.input, PipeInput::Data(message.clone().into_bytes()));
                             send_now(&pipe.input, PipeInput::Close);
@@ -639,7 +660,7 @@ impl CliAgent {
         let Some((number, input)) = inner.process.clone() else {
             return;
         };
-        if self.kind == AgentKind::Codex {
+        if self.kind != AgentKind::Claude {
             return send_now(&input, PipeInput::Kill);
         }
         send_now(&input, PipeInput::Data(claude::interrupt_line(number)));
@@ -659,6 +680,7 @@ impl CliAgent {
         let mut stderr = VecDeque::new();
         let mut mapper = match self.kind {
             AgentKind::Claude => Mapper::Claude(claude::Mapper::default()),
+            AgentKind::Gemini => Mapper::Gemini(gemini::Mapper::default()),
             _ => Mapper::Codex(codex::Mapper::default()),
         };
         let mut code = -1;
@@ -718,6 +740,7 @@ impl CliAgent {
         let (records, session) = match mapper {
             Mapper::Claude(mapper) => (mapper.map(event), claude::session_id(event)),
             Mapper::Codex(mapper) => (mapper.map(event), codex::session_id(event)),
+            Mapper::Gemini(mapper) => (mapper.map(event), gemini::session_id(event)),
         };
         let mut inner = lock(&self.inner);
         // An ended process, such as the one of the chat before.
@@ -739,7 +762,7 @@ impl CliAgent {
     }
 
     /// Asks the agent to exit: Claude Code ends when its stdin closes; a
-    /// Codex turn is killed.
+    /// Codex or Gemini CLI turn is killed.
     pub fn close(self: &Arc<Self>) {
         let input = match self.kind {
             AgentKind::Claude => PipeInput::Close,
@@ -849,8 +872,10 @@ mod tests {
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = finished.clone();
         let dir = temp_dir().join(kind.name());
+        let entry = (kind == AgentKind::Gemini).then(|| "/opt/zwinger/host/gemini/bundle/gemini.js".to_owned());
         let agent = CliAgent::new(
             kind,
+            entry,
             dir.clone(),
             spawn,
             Box::new(move |r| {

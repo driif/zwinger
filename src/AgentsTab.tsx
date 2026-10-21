@@ -14,6 +14,7 @@ import {
   Bot,
   Braces,
   Download,
+  Gem,
   KeyRound,
   LucideIcon,
   RotateCw,
@@ -32,7 +33,6 @@ import {
   closeAgent,
   deleteChat,
   openAgent,
-  RuntimeName,
   RuntimeView,
   ShieldView,
   ThinkingLevel,
@@ -43,14 +43,16 @@ import { Markdown } from "./Markdown";
 import { reachable } from "./SecretsSection";
 import { AGENT_KEYS, PROVIDER_KEYS } from "./providers";
 
-export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces };
+export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces, gemini: Gem };
 
+/** Gemini CLI runs only from this Mac, so it is listed only as a host agent. */
 const KINDS: AgentKind[] = ["pi", "claude", "codex"];
 
 /** Suggestions only: the model field takes any name that the CLI knows. */
-const MODEL_PRESETS: Record<RuntimeName, string[]> = {
+const MODEL_PRESETS: Record<Exclude<AgentKind, "pi">, string[]> = {
   claude: ["sonnet", "opus", "haiku"],
   codex: ["gpt-5-codex", "gpt-5"],
+  gemini: ["gemini-2.5-pro", "gemini-2.5-flash"],
 };
 
 /** Install, or the progress of the install that runs. Only the download can be cancelled. */
@@ -204,8 +206,9 @@ export function AgentsTab({
   const isPi = agent === "pi";
   const name = AGENT_NAMES[agent];
   const Icon = AGENT_ICONS[agent];
-  const runtime = isPi ? undefined : runtimes.list.find((r) => r.name === agent);
-  const installed = isPi || runtime?.installed === true;
+  const runtime = runtimes.list.find((r) => r.name === agent);
+  // Gemini CLI has no runtime to install: it comes from this Mac.
+  const installed = isPi || agent === "gemini" || runtime?.installed === true;
   const mounted = isPi || shield.runtimes.includes(agent);
   const [opened, setOpened] = useState<{ kind: AgentKind; id: string }>();
   // The tab stays mounted across agents: the ID of another agent is no ID.
@@ -426,11 +429,18 @@ export function AgentsTab({
             className="model-picker"
             menuLabel="New chat"
             placeholder="New chat"
-            commands={KINDS.map((kind) => ({
-              id: kind,
-              label: `New ${AGENT_NAMES[kind]} chat`,
-              onSelect: () => newChat(kind),
-            }))}
+            commands={[
+              ...shield.hostAgents.map(({ kind }) => ({
+                id: kind,
+                label: `New ${AGENT_NAMES[kind]} chat · from this Mac`,
+                onSelect: () => newChat(kind),
+              })),
+              ...KINDS.filter((kind) => !shield.hostAgents.some((a) => a.kind === kind)).map((kind) => ({
+                id: kind,
+                label: `New ${AGENT_NAMES[kind]} chat`,
+                onSelect: () => newChat(kind),
+              })),
+            ]}
           />
           <span className="row" title={name}>
             <Icon size={16} aria-hidden />
@@ -505,7 +515,16 @@ export function AgentsTab({
             <InstallControl runtime={runtime} runtimes={runtimes} />
           </Card>
         )}
-        {installed && running && !mounted && (
+        {agent === "gemini" && running && !mounted && (
+          <Card variant="outlined" padding="sm" className="row">
+            <TriangleAlert size={16} className="warn" />
+            <span className="grow">
+              {shield.hostNotices.find((n) => n.startsWith("Gemini CLI")) ??
+                "Gemini CLI runs only from this Mac. Add it with Add agent, then restart the shield."}
+            </span>
+          </Card>
+        )}
+        {installed && running && !mounted && agent !== "gemini" && (
           <Card variant="outlined" padding="sm" className="row">
             <RotateCw size={16} className="warn" />
             <span className="grow">{name} was installed after the shield started. Restart the shield to use it.</span>

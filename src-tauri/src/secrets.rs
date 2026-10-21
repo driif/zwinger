@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentKind;
 use crate::error::{Error, Result};
+use crate::host_agents::login;
 use crate::shield;
 
 const SERVICE: &str = "zwinger";
@@ -32,6 +34,26 @@ pub struct Secret {
     pub name: String,
     pub hosts: Vec<String>,
     pub places: Places,
+    #[serde(default, skip_serializing_if = "Origin::is_user")]
+    pub origin: Origin,
+}
+
+/// Where the value of a secret comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Origin {
+    /// The vault: the user sets the value.
+    #[default]
+    User,
+    /// The agent's login on the Mac, read at each shield start. The vault
+    /// never has its value, and the user cannot edit it.
+    HostLogin { agent: AgentKind },
+}
+
+impl Origin {
+    pub fn is_user(&self) -> bool {
+        *self == Self::User
+    }
 }
 
 /// The request locations where the proxy replaces the placeholder with the
@@ -107,6 +129,16 @@ impl Secret {
         }
         if hosts.is_empty() {
             return Err(invalid(name, "add at least one host"));
+        }
+        // The refresh hosts never get a host token, so the agent cannot renew
+        // the login or swap it for a new one.
+        if let Origin::HostLogin { .. } = self.origin {
+            if let Some(host) = hosts.iter().find(|h| login::is_refresh_host(h)) {
+                return Err(invalid(name, &format!("a host login may not reach the refresh host {host}")));
+            }
+            if self.places.query || self.places.body {
+                return Err(invalid(name, "a host login goes into header fields only"));
+            }
         }
         self.hosts = hosts;
         let mut fields: Vec<String> = Vec::new();
@@ -306,6 +338,7 @@ pub mod tests {
                 query: false,
                 body: false,
             },
+            origin: Origin::User,
         }
     }
 
@@ -374,6 +407,26 @@ pub mod tests {
             places(r#"{"headerFields":["x-goog-api-key"],"query":false,"body":false}"#),
             ["x-goog-api-key"]
         );
+    }
+
+    #[test]
+    fn host_logins_reach_no_refresh_host_and_use_headers_only() {
+        let mut login = secret("CLAUDE_CODE_OAUTH_TOKEN", &["api.anthropic.com"]);
+        login.origin = Origin::HostLogin { agent: AgentKind::Claude };
+        assert!(login.clone().normalize().is_ok());
+        for host in ["console.anthropic.com", "platform.claude.com", "auth.openai.com", "api.github.com", "oauth2.googleapis.com"] {
+            let mut bad = login.clone();
+            bad.hosts.push(host.into());
+            assert!(matches!(bad.normalize(), Err(Error::InvalidSecret(..))), "{host}");
+            // A user secret may name them.
+            assert!(secret("GITHUB_TOKEN", &[host]).normalize().is_ok());
+        }
+        let mut body = login.clone();
+        body.places.body = true;
+        assert!(matches!(body.normalize(), Err(Error::InvalidSecret(..))));
+        let json = serde_json::to_value(&login).unwrap();
+        assert_eq!(json["origin"], serde_json::json!({ "kind": "hostLogin", "agent": "claude" }));
+        assert_eq!(serde_json::from_value::<Secret>(json).unwrap(), login);
     }
 
     #[test]

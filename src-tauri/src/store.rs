@@ -39,9 +39,9 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::{Places, Secret};
     use crate::agent::AgentKind;
-    use crate::shield::{App, Mount, NetworkMode, NetworkPolicy, Pos, Task, TaskAgent};
+    use crate::secrets::{Origin, Places, Secret};
+    use crate::shield::{App, HostAgentUse, Mount, NetworkMode, NetworkPolicy, Pos, Task, TaskAgent};
 
     #[test]
     fn round_trip() {
@@ -71,6 +71,16 @@ mod tests {
                     query: false,
                     body: false,
                 },
+                origin: Origin::User,
+            }, Secret {
+                name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                hosts: vec!["api.anthropic.com".into()],
+                places: Places {
+                    header_fields: vec!["authorization".into()],
+                    query: false,
+                    body: false,
+                },
+                origin: Origin::HostLogin { agent: AgentKind::Claude },
             }],
             layout: [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into(),
             apps: vec![App {
@@ -92,6 +102,8 @@ mod tests {
                 gates: vec!["pnpm build".into()],
                 workdir: "/workspace".into(),
             }],
+            host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
+            auto_renew: true,
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
@@ -115,5 +127,6 @@ mod tests {
         assert!(shield.layout.is_empty());
         assert!(shield.apps.is_empty());
         assert!(shield.tasks.is_empty());
+        assert!(shield.host_agents.is_empty() && !shield.auto_renew);
     }
 }

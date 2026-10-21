@@ -11,7 +11,7 @@ Flow: install the app → create a shield on a folder → mount more folders →
 - **Harness**: a folder for the agents (skills, plugins, instructions, task notes), separate from the code. Agents start in the harness and know where the code is. Like umputun's ralphex / revmux run outside the repo.
 - **Network policy**: allow-listed hosts. The app sees the shield's requests and can inject credentials (bearer tokens) per host. The agent only sees placeholders, never host tokens.
 - **App**: a saved long-running command in a shield (for example a dev server), started and stopped from the shield tree.
-- **Agent**: pi (main), claude, codex. Run as chat, not only as terminal. Several agents can work on one task together (like the `duo` skill).
+- **Agent**: pi, Claude Code, Codex, Gemini. Each runs as its own TUI in a shield terminal (`claude`, `codex`, `pi`, `gemini` are on PATH in the VM); zwinger does not reimplement agent UIs. Several agents can work on one task together (like the `duo` skill) — headless, shown in the run room.
 
 ## Milestones
 
@@ -26,4 +26,5 @@ Flow: install the app → create a shield on a folder → mount more folders →
 | M5a | more agents | Claude Code and Codex next to pi (download on demand, mounted read-only). |
 | M5b | task runs + run room | Agents plan, implement and review together (duo pattern) inside a shield. **Run room**: live timeline of agent messages, stage bar, each agent's position, disagreements and concessions, verdicts; the user steps in. Also watches external duo round folders. A2A later. |
 | M5c | host agents | Use the agents installed on the Mac (Claude Code, Codex, pi, Gemini): JS agents mounted from the host install, native ones as one cached Linux build of the same version; the user's agent profile mounted read-only; subscription login reuse, proxy-injected (ADR 0002). ADR 0001. |
+| M5d | native agent terminals | Agent commands on PATH in the VM (wrappers with the shield's state and host login); the Agents group opens the agent's own TUI in a terminal; the custom chat UI is removed. Then a backlog cleanup. |
 | M6 | production | Onboarding, settings, error and empty states, app icon, release build, signing and notarization, auto-update, CI. |

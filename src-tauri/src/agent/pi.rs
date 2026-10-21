@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use serde_json::{Value, json};
@@ -17,6 +17,10 @@ use crate::runtime::{PipeEvent, PipeInput};
 
 /// The pi bundle, mounted read-only.
 pub const PI_DIR: &str = "/opt/zwinger/pi";
+/// The host install of pi, mounted read-only when the shield uses it.
+pub const HOST_DIR: &str = "/opt/zwinger/host/pi";
+/// The entry point in the host package. Detection accepts only this layout.
+pub const HOST_ENTRY: &str = "dist/cli.js";
 pub const AGENT_DIR: &str = "/opt/zwinger/state/agent";
 const SESSIONS: &str = "sessions";
 /// pi 1.3 needs at least this Node version.
@@ -30,13 +34,19 @@ const CHAT_TAIL: u64 = 1 << 20;
 /// A longer line of a chat file is skipped.
 const CHAT_LINE: usize = 64 << 10;
 
+/// The script of the host pi (`host` true) or of the bundled pi.
+pub fn cli(host: bool) -> String {
+    if host { format!("{HOST_DIR}/{HOST_ENTRY}") } else { format!("{PI_DIR}/cli.js") }
+}
+
 /// The argv of the terminal pi (`rpc` false) or the agent pi (`rpc` true).
-pub fn pi_argv(rpc: bool) -> Vec<String> {
-    let mut argv = vec!["node", "/opt/zwinger/pi/cli.js", "--session-dir", "/opt/zwinger/state/sessions"];
+pub fn pi_argv(rpc: bool, host: bool) -> Vec<String> {
+    let mut argv = vec!["node".to_owned(), cli(host)];
+    argv.extend(["--session-dir", "/opt/zwinger/state/sessions"].map(str::to_owned));
     if rpc {
-        argv.extend(["--mode", "rpc"]);
+        argv.extend(["--mode", "rpc"].map(str::to_owned));
     }
-    argv.into_iter().map(str::to_owned).collect()
+    argv
 }
 
 impl AgentCommand {
@@ -70,6 +80,8 @@ pub struct Agent {
     next: AtomicU64,
     /// Set by [`Agent::finish`].
     done: watch::Sender<bool>,
+    /// Between pi's `agent_start` and `agent_settled`.
+    busy: AtomicBool,
 }
 
 /// What [`Agent::run`] saw when pi ended.
@@ -89,7 +101,13 @@ impl Agent {
             sink: Mutex::new(sink),
             next: AtomicU64::new(1),
             done: watch::Sender::new(false),
+            busy: AtomicBool::new(false),
         }
+    }
+
+    /// A turn runs.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
     }
 
     /// A reopened Agents tab gets the records from now on.
@@ -220,7 +238,14 @@ impl Agent {
                     self.send_now(line);
                 }
             }
-            _ => self.emit(record),
+            _ => {
+                match record["type"].as_str() {
+                    Some("agent_start") => self.busy.store(true, Ordering::Relaxed),
+                    Some("agent_settled") => self.busy.store(false, Ordering::Relaxed),
+                    _ => {}
+                }
+                self.emit(record)
+            }
         }
     }
 

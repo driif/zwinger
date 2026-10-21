@@ -1,7 +1,18 @@
 import { Button, Card, CardBody, CardHeader, FloatingField, SpringCheckbox } from "@driif/motiv";
 import { KeyRound, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
-import { addDomain, listSecrets, setNetworkMode, NetworkPolicy, Places, putSecret, removeSecret, SecretView, ShieldView } from "./api";
+import {
+  addDomain,
+  AGENT_NAMES,
+  listSecrets,
+  setNetworkMode,
+  NetworkPolicy,
+  Places,
+  putSecret,
+  removeSecret,
+  SecretView,
+  ShieldView,
+} from "./api";
 import type { Run } from "./App";
 
 const PRESETS = [
@@ -108,7 +119,10 @@ export function SecretsSection({ shield, run }: Props) {
                   {secret.name}
                 </span>
                 {!secret.set && <span className="danger">No value</span>}
-                {removing === secret.name ? (
+                {secret.origin.kind === "hostLogin" ? (
+                  // Read-only: the value comes from the Mac at each start. The Add agent step changes it.
+                  <span className="muted">{AGENT_NAMES[secret.origin.agent]} login from this Mac</span>
+                ) : removing === secret.name ? (
                   <>
                     <span className="danger">Remove?</span>
                     <Button size="sm" variant="ghost" onClick={() => setRemoving(undefined)}>

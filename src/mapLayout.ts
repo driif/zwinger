@@ -1,6 +1,6 @@
 import type { Edge, Node } from "@xyflow/react";
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package } from "lucide-react";
-import { AGENT_NAMES, isBlocked, NetEvent, ShieldView } from "./api";
+import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package, UserCog } from "lucide-react";
+import { AGENT_NAMES, AgentKind, isBlocked, NetEvent, ShieldView } from "./api";
 import { coveredBy, reachable } from "./SecretsSection";
 
 const HOST_X = 16;
@@ -164,9 +164,10 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
   }
   // Not user mounts: zwinger binds its own copy of each agent runtime, and the agent cannot change it.
   y += GAP;
+  const fromMac = (kind: AgentKind) => shield.hostAgents.some((a) => a.kind === kind);
   for (const [name, origin] of [
-    ["pi", "bundled with zwinger"],
-    ...shield.runtimes.map((r) => [r, "downloaded by zwinger"] as const),
+    ["pi", fromMac("pi") ? "from this Mac, or bundled with zwinger if it does not load" : "bundled with zwinger"],
+    ...shield.runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
   ] as const) {
     y += ROW;
     inner(`agent:${name}`, NODE_X, y, NODE_W, {
@@ -176,6 +177,38 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
       tone: "muted",
       badges: ["ro"],
     });
+  }
+  // A host agent's profile is a read-only copy of its config dir on this Mac; its login stays on the Mac.
+  for (const used of shield.hostAgents) {
+    const name = AGENT_NAMES[used.kind];
+    if (used.profile) {
+      y += ROW;
+      inner(`profile:${used.kind}`, NODE_X, y, NODE_W, {
+        icon: UserCog,
+        label: `profile (ro) · ${name}`,
+        title: `/opt/zwinger/profile/${used.kind}, a read-only copy of the ${name} profile on this Mac, without logins, history or sessions`,
+        tone: "muted",
+        badges: ["ro"],
+      });
+      outer(`source:profile:${used.kind}`, HOST_X, y, HOST_W, {
+        icon: UserCog,
+        label: `${name} profile`,
+        title: `The ${name} profile on this Mac, copied at each start`,
+        badges: [],
+      });
+      edge(`source:profile:${used.kind}`, `profile:${used.kind}`);
+    }
+    if (used.login) {
+      y += ROW;
+      inner(`login:${used.kind}`, NODE_X, y, NODE_W, {
+        icon: KeyRound,
+        label: `login · ${name}`,
+        title: `The ${name} login of this Mac. The agent sees a placeholder; the proxy adds the token to requests to the provider.`,
+        tone: "muted",
+        badges: ["key"],
+        jump: "network",
+      });
+    }
   }
   // The boundary is first, so React Flow knows the parent before its children.
   nodes.unshift({

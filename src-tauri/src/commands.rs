@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -11,12 +11,14 @@ use serde_json::Value;
 
 use crate::agent::{AgentCommand, AgentKind, Chat};
 use crate::error::Result;
+use crate::host_agents::HostAgents;
+use crate::host_agents::detect::Detection;
 use crate::netlog::NetEvent;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::runtimes::{Progress, RuntimeView, Runtimes};
 use crate::secrets::{Secret, SecretValue};
 use crate::sessions::{Manager, RunSummary, SecretView, ShieldView};
-use crate::shield::{self, AppDraft, NetworkMode, Pos, TaskDraft};
+use crate::shield::{self, AppDraft, HostAgentUse, NetworkMode, Pos, TaskDraft};
 use crate::task_artifacts::{self, Room};
 use crate::task_runs::{Control, LiveRecord, Status};
 
@@ -286,10 +288,18 @@ pub fn list_runtimes(runtimes: State<'_, Runtimes>) -> Result<Vec<RuntimeView>> 
     runtimes.list()
 }
 
+/// `version` `None` installs the pinned version. An unpinned version needs
+/// `confirm` once.
 #[tauri::command]
-pub async fn install_runtime(runtimes: State<'_, Runtimes>, name: String, on_progress: Channel<Progress>) -> Result<()> {
+pub async fn install_runtime(
+    runtimes: State<'_, Runtimes>,
+    name: String,
+    version: Option<String>,
+    confirm: bool,
+    on_progress: Channel<Progress>,
+) -> Result<()> {
     runtimes
-        .install(&name, move |progress| {
+        .install(&name, version.as_deref(), confirm, move |progress| {
             // The webview may have closed the channel; the install goes on.
             let _ = on_progress.send(progress);
         })
@@ -299,6 +309,41 @@ pub async fn install_runtime(runtimes: State<'_, Runtimes>, name: String, on_pro
 #[tauri::command]
 pub fn cancel_runtime_install(runtimes: State<'_, Runtimes>, name: String) {
     runtimes.cancel(&name);
+}
+
+type Host<'a> = State<'a, Arc<HostAgents>>;
+
+/// The last detection of the host agents, else a new one.
+#[tauri::command]
+pub async fn host_agents(host: Host<'_>) -> Result<Detection> {
+    let host = host.inner().clone();
+    tokio::task::spawn_blocking(move || host.last())
+        .await
+        .map_err(|e| std::io::Error::other(e).into())
+}
+
+/// Looks for the host agents again.
+#[tauri::command]
+pub async fn detect_host_agents(host: Host<'_>) -> Result<Detection> {
+    let host = host.inner().clone();
+    tokio::task::spawn_blocking(move || host.detect())
+        .await
+        .map_err(|e| std::io::Error::other(e).into())
+}
+
+#[tauri::command]
+pub async fn put_host_agent(shields: Shields<'_>, id: String, agent: HostAgentUse, allow_hosts: bool) -> Result<()> {
+    shields.put_host_agent(&id, agent, allow_hosts).await
+}
+
+#[tauri::command]
+pub fn remove_host_agent(shields: Shields<'_>, id: String, agent: AgentKind) -> Result<()> {
+    shields.remove_host_agent(&id, agent)
+}
+
+#[tauri::command]
+pub fn set_auto_renew(shields: Shields<'_>, id: String, on: bool) -> Result<()> {
+    shields.set_auto_renew(&id, on)
 }
 
 #[tauri::command]

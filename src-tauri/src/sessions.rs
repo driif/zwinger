@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -11,15 +11,17 @@ use tokio::task::AbortHandle;
 
 use crate::agent::cli::{self, CliAgent, Spawn};
 use crate::agent::pi::{self, Agent};
-use crate::agent::{AgentCommand, AgentKind, Chat, Handle, Sink};
+use crate::agent::{AgentCommand, AgentKind, Chat, Handle, Sink, gemini};
 use crate::error::{Error, Result};
+use crate::host_agents::login::{self, Step};
+use crate::host_agents::{self, HostAgents, profile};
 use crate::netlog::{self, Dedupe, NetEvent};
 use crate::runtime::{
-    PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
+    Bind, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
 };
 use crate::runtimes;
-use crate::secrets::{self, Places, Secret, SecretValue, Vault};
-use crate::shield::{self, AppDraft, NetworkMode, NetworkPolicy, Pos, Shield, TaskDraft, WORKSPACE};
+use crate::secrets::{self, Origin, Places, Secret, SecretValue, Vault};
+use crate::shield::{self, AppDraft, HostAgentUse, NetworkMode, NetworkPolicy, Pos, Shield, TaskDraft, WORKSPACE};
 use crate::store::Store;
 use crate::task_agents::Exec;
 use crate::task_artifacts::{self, Mirror, RoundWriter};
@@ -38,9 +40,18 @@ const APP_RING: usize = 256 << 10;
 const APP_SIZE: (u16, u16) = (24, 80);
 /// How long a shield stop waits for its task runs to write their manifests.
 const RUN_STOP_LIMIT: Duration = Duration::from_secs(15);
+/// How long the check that a host package loads in the VM may run.
+const PROBE_LIMIT: Duration = Duration::from_secs(15);
+/// The bytes of a probe's stderr that a notice shows.
+const PROBE_ERR: usize = 512;
+/// The first and the longest wait before a due host login is checked again.
+const RENEW_RETRY: Duration = Duration::from_secs(60);
+const RENEW_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 
 /// Gets each new network event with its shield id.
 pub type NetSink = Box<dyn Fn(&str, &NetEvent) + Send + Sync>;
+/// Gets the id of a shield whose host login is due for renewal.
+pub type RenewSink = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Owns the shield configs, the running VMs, their terminal sessions and agents.
 pub struct Manager<R: SandboxRuntime> {
@@ -56,11 +67,13 @@ pub struct Manager<R: SandboxRuntime> {
     secret_edit: Mutex<()>,
     state: Arc<Mutex<State<R::Vm>>>,
     net_sink: Arc<OnceLock<NetSink>>,
-    runs: task_runs::Registry,
+    runs: Arc<task_runs::Registry>,
     /// Serializes run starts, so two starts cannot take the same run name.
     run_start: Mutex<()>,
     /// The stage limits of new task runs.
     run_config: task_runs::Config,
+    host: Arc<HostAgents>,
+    renew_sink: Arc<OnceLock<RenewSink>>,
 }
 
 struct State<V> {
@@ -94,10 +107,33 @@ enum Vm<V> {
         applied_rev: u64,
         net: Option<AbortHandle>,
         runtimes: Vec<&'static str>,
+        host: HostRun,
     },
     /// Shutdown is in progress. If it fails, the VM goes back to `Running`.
     Stopping,
     Failed(String),
+}
+
+/// What a start did for the shield's host agents.
+#[derive(Default)]
+struct HostRun {
+    /// pi runs from the host install; else the bundled pi runs.
+    pi_host: bool,
+    /// The guest path of Gemini CLI's entry point, if it runs in the VM.
+    gemini: Option<String>,
+    /// The expiry of each host login at the start, in ms since the epoch.
+    /// A login with no expiry is not here: it is not renewed.
+    logins: Vec<(AgentKind, i64)>,
+    /// The earliest expiry of the host logins, in ms since the epoch.
+    login_expires: Option<i64>,
+    /// The renewal of each login in `logins`. A stop aborts them.
+    renew: Vec<AbortHandle>,
+    /// The Mac has a newer host login: a restart uses it.
+    renew_due: bool,
+    /// What the user should know, such as a fallback.
+    notices: Vec<String>,
+    /// The host agents that do not run in the VM, with the reason.
+    failed: Vec<(AgentKind, String)>,
 }
 
 struct Session {
@@ -165,8 +201,16 @@ pub struct ShieldView {
     pub sessions: Vec<SessionView>,
     /// The apps that run or have exited. An app with no entry is stopped.
     pub app_runs: Vec<AppRunView>,
-    /// The agent runtimes that the running VM has mounted.
+    /// The agent runtimes that the running VM has mounted. A host Gemini CLI
+    /// that loads counts as one.
     pub runtimes: Vec<&'static str>,
+    /// The earliest expiry of the host logins of the running VM, in ms.
+    pub login_expires_at: Option<i64>,
+    /// A host login is due for renewal: a restart reads the new token.
+    pub renew_due: bool,
+    /// What the start of the running VM did differently for the host
+    /// agents, such as a fallback.
+    pub host_notices: Vec<String>,
 }
 
 /// A secret as the UI sees it. It has no value, only if the vault has one.
@@ -178,6 +222,7 @@ pub struct SecretView {
     pub places: Places,
     pub placeholder: String,
     pub set: bool,
+    pub origin: Origin,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -213,9 +258,13 @@ fn prune_vault(vault: &dyn Vault, shields: &[Shield]) {
         Ok(accounts) => accounts,
         Err(e) => return eprintln!("secret prune: cannot list the vault: {e}"),
     };
+    // A host login has no value in the vault, so its account is not kept.
     let configured: HashSet<String> = shields
         .iter()
-        .flat_map(|shield| shield.secrets.iter().map(|s| secrets::account(&shield.id, &s.name)))
+        .flat_map(|shield| {
+            let user = shield.secrets.iter().filter(|s| s.origin.is_user());
+            user.map(|s| secrets::account(&shield.id, &s.name))
+        })
         .collect();
     for account in accounts.iter().filter(|a| !configured.contains(*a)) {
         let Some((shield_id, name)) = account.split_once('/') else {
@@ -232,6 +281,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<V> State<V> {
+    /// An agent turn or an app works in the shield. The task runs are in
+    /// the run registry.
+    fn is_busy(&self, id: &str) -> bool {
+        self.agents.iter().any(|a| a.shield_id == id && a.agent.is_busy())
+            || self.sessions.iter().any(|s| s.shield_id == id && s.app.is_some() && s.exit_code.is_none())
+    }
+
     fn secrets_rev(&self, id: &str) -> u64 {
         self.secrets_rev.get(id).copied().unwrap_or(0)
     }
@@ -267,7 +323,7 @@ impl<V> State<V> {
 }
 
 impl<R: SandboxRuntime> Manager<R> {
-    pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf) -> Result<Self> {
+    pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf, host: Arc<HostAgents>) -> Result<Self> {
         let shields = store.load()?;
         prune_vault(vault.as_ref(), &shields);
         Ok(Self {
@@ -286,15 +342,22 @@ impl<R: SandboxRuntime> Manager<R> {
                 app_stops: HashMap::new(),
             })),
             net_sink: Arc::new(OnceLock::new()),
-            runs: task_runs::Registry::default(),
+            runs: Arc::default(),
             run_start: Mutex::new(()),
             run_config: task_runs::Config::default(),
+            host,
+            renew_sink: Arc::new(OnceLock::new()),
         })
     }
 
     /// Only the first sink counts.
     pub fn set_net_sink(&self, sink: NetSink) {
         let _ = self.net_sink.set(sink);
+    }
+
+    /// Only the first sink counts.
+    pub fn set_renew_sink(&self, sink: RenewSink) {
+        let _ = self.renew_sink.set(sink);
     }
 
     pub fn list_net_events(&self, id: &str) -> Result<Vec<NetEvent>> {
@@ -323,6 +386,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             layout: shield.layout.clone(),
                             apps: shield.apps.clone(),
                             tasks: shield.tasks.clone(),
+                            auto_renew: shield.auto_renew,
                             ..(**applied).clone()
                         } != *shield
                             || *applied_rev != state.secrets_rev(&shield.id),
@@ -331,9 +395,11 @@ impl<R: SandboxRuntime> Manager<R> {
                     Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
                 };
                 let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
-                let runtimes = match state.vms.get(&shield.id) {
-                    Some(Vm::Running { runtimes, .. }) => runtimes.clone(),
-                    _ => Vec::new(),
+                let (runtimes, login_expires_at, renew_due, host_notices) = match state.vms.get(&shield.id) {
+                    Some(Vm::Running { runtimes, host, .. }) => {
+                        (runtimes.clone(), host.login_expires, host.renew_due, host.notices.clone())
+                    }
+                    _ => (Vec::new(), None, false, Vec::new()),
                 };
                 ShieldView {
                     shield: shield.clone(),
@@ -358,6 +424,9 @@ impl<R: SandboxRuntime> Manager<R> {
                         })
                         .collect(),
                     runtimes,
+                    login_expires_at,
+                    renew_due,
+                    host_notices,
                 }
             })
             .collect()
@@ -369,6 +438,11 @@ impl<R: SandboxRuntime> Manager<R> {
 
     fn state_dir(&self, id: &str) -> PathBuf {
         self.data.join("shields").join(id)
+    }
+
+    /// The host-owned profile snapshots of the shield's host agents.
+    fn profile_dir(&self, id: &str) -> PathBuf {
+        self.data.join("profiles").join(id)
     }
 
     pub fn create(&self, folder: &str) -> Result<String> {
@@ -473,10 +547,13 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn add_domain(&self, id: &str, domain: &str) -> Result<()> {
         self.edit(id, |s| {
             s.network.add_domain(domain)?;
-            sandbox_policy(&NetworkPolicy {
-                mode: NetworkMode::List,
-                domains: s.network.domains.clone(),
-            })?;
+            sandbox_policy(
+                &NetworkPolicy {
+                    mode: NetworkMode::List,
+                    domains: s.network.domains.clone(),
+                },
+                &[],
+            )?;
             Ok(())
         })
     }
@@ -489,10 +566,13 @@ impl<R: SandboxRuntime> Manager<R> {
                 s.network.mode = NetworkMode::List;
             }
             s.network.add_domain(host)?;
-            sandbox_policy(&NetworkPolicy {
-                mode: NetworkMode::List,
-                domains: s.network.domains.clone(),
-            })?;
+            sandbox_policy(
+                &NetworkPolicy {
+                    mode: NetworkMode::List,
+                    domains: s.network.domains.clone(),
+                },
+                &[],
+            )?;
             Ok(())
         })
     }
@@ -508,6 +588,9 @@ impl<R: SandboxRuntime> Manager<R> {
     /// the current value. The vault is written before the config, and a failed
     /// config save restores the vault.
     pub fn put_secret(&self, id: &str, secret: Secret, value: Option<SecretValue>) -> Result<()> {
+        if !secret.origin.is_user() {
+            return Err(Error::HostLoginSecret(secret.name));
+        }
         let secret = secret.normalize()?;
         if value.as_ref().is_some_and(|v| v.expose().is_empty()) {
             return Err(Error::SecretValueRequired(secret.name));
@@ -521,6 +604,9 @@ impl<R: SandboxRuntime> Manager<R> {
                 .find(|s| s.id == id)
                 .ok_or(Error::ShieldNotFound)?
                 .clone();
+            if shield.secrets.iter().any(|s| s.name == secret.name && !s.origin.is_user()) {
+                return Err(Error::HostLoginSecret(secret.name));
+            }
             let is_new = shield.put_secret(secret.clone());
             shield.check()?;
             is_new
@@ -561,11 +647,74 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
+    /// Adds the host agent to the shield, or changes it: its runtime, and
+    /// its profile and host login if `used` asks for them. A login adds the
+    /// agent's host-login secret; `allow_hosts` also adds its provider host to
+    /// the allow list, which the user confirmed. Applies on the next start.
+    pub async fn put_host_agent(&self, id: &str, used: HostAgentUse, allow_hosts: bool) -> Result<()> {
+        let kind = used.kind;
+        let host = self.host.clone();
+        if blocking(move || Ok(host.last().agent(kind).is_none())).await? {
+            return Err(Error::HostAgentMissing(kind.label().to_owned()));
+        }
+        let login = match (used.login, login::api_host(kind)) {
+            (false, _) => None,
+            (true, Some(api)) => Some(login::secret(kind, api)),
+            // pi's host depends on the provider of its login.
+            (true, None) => {
+                let host = self.host.clone();
+                let token = blocking(move || host.token(kind)).await?;
+                Some(login::secret(kind, &token.host))
+            }
+        };
+        let login = login.map(Secret::normalize).transpose()?;
+        let _edit = lock(&self.secret_edit);
+        self.edit(id, |s| {
+            if let Some(secret) = &login {
+                if s.secrets.iter().any(|x| x.name == secret.name && x.origin.is_user()) {
+                    return Err(Error::DuplicateSecret(secret.name.clone()));
+                }
+                if allow_hosts {
+                    if s.network.mode == NetworkMode::Deny {
+                        s.network.mode = NetworkMode::List;
+                    }
+                    for host in &secret.hosts {
+                        s.network.add_domain(host)?;
+                    }
+                }
+            }
+            s.put_host_agent(used, login);
+            Ok(())
+        })
+    }
+
+    /// Also removes its host-login secret. Applies on the next start.
+    pub fn remove_host_agent(&self, id: &str, kind: AgentKind) -> Result<()> {
+        let _edit = lock(&self.secret_edit);
+        self.edit(id, |s| {
+            s.remove_host_agent(kind);
+            Ok(())
+        })
+    }
+
+    /// Needs no restart.
+    pub fn set_auto_renew(&self, id: &str, on: bool) -> Result<()> {
+        self.edit(id, |s| {
+            s.auto_renew = on;
+            Ok(())
+        })
+    }
+
     /// Saves the config first, so that a failure leaves a value with no
     /// secret, not a secret with no value.
     pub fn remove_secret(&self, id: &str, name: &str) -> Result<()> {
         let _edit = lock(&self.secret_edit);
-        self.edit(id, |s| s.remove_secret(name))?;
+        self.edit(id, |s| {
+            if s.secrets.iter().any(|x| x.name == name && !x.origin.is_user()) {
+                return Err(Error::HostLoginSecret(name.to_owned()));
+            }
+            s.remove_secret(name)
+        })?;
         lock(&self.state).bump_secrets_rev(id);
         self.vault.delete(id, name)
     }
@@ -576,11 +725,12 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(secrets
             .into_iter()
             .map(|secret| SecretView {
-                set: accounts.contains(&secrets::account(id, &secret.name)),
+                set: !secret.origin.is_user() || accounts.contains(&secrets::account(id, &secret.name)),
                 placeholder: secret.placeholder(),
                 name: secret.name,
                 hosts: secret.hosts,
                 places: secret.places,
+                origin: secret.origin,
             })
             .collect())
     }
@@ -620,7 +770,8 @@ impl<R: SandboxRuntime> Manager<R> {
             }
         }
         self.runs.forget(id, None);
-        for dir in [self.state_dir(id), self.data.join("chats").join(id), self.data.join("tasks").join(id)] {
+        let dirs = [self.state_dir(id), self.data.join("chats").join(id), self.data.join("tasks").join(id), self.profile_dir(id)];
+        for dir in dirs {
             if let Err(e) = std::fs::remove_dir_all(dir)
                 && e.kind() != std::io::ErrorKind::NotFound
                 && result.is_ok()
@@ -633,30 +784,51 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The config snapshot and the vault reads hold `secret_edit`, so a start
     /// never pairs a new value with old hosts. The lock is released before the
-    /// runtime start.
+    /// host logins are read (the Keychain can wait for the macOS prompt) and
+    /// before the runtime start.
     pub async fn start(&self, id: &str) -> Result<()> {
-        let (shield, applied_rev, entries) = {
+        let (shield, applied_rev, values) = {
             let _edit = lock(&self.secret_edit);
             let (shield, applied_rev) = self.claim_start(id)?;
-            match self
-                .secret_values(&shield)
-                .and_then(|values| secret_entries(&shield.secrets, values))
-                .and_then(|entries| {
-                    // Claude Code's HOME and CODEX_HOME. Codex needs its dir to exist.
-                    for kind in [AgentKind::Claude, AgentKind::Codex] {
-                        std::fs::create_dir_all(self.state_dir(id).join(kind.name()))?;
-                    }
-                    Ok(entries)
-                }) {
-                Ok(entries) => (shield, applied_rev, entries),
+            match self.vault_values(&shield) {
+                Ok(values) => (shield, applied_rev, values),
                 Err(e) => {
                     lock(&self.state).vms.remove(id);
                     return Err(e);
                 }
             }
         };
-        let installed = runtimes::installed(&self.data);
-        let result = match self.runtime.start(&shield, entries, &self.state_dir(id), &installed).await {
+        let prepared = {
+            let (host, data, shield) = (self.host.clone(), self.data.clone(), shield.clone());
+            blocking(move || prepare(&host, &data, &shield, values)).await
+        };
+        let (entries, prepared) = match prepared
+            .and_then(|mut p| Ok((secret_entries(&shield.secrets, std::mem::take(&mut p.values))?, p)))
+        {
+            Ok(ready) => ready,
+            Err(e) => {
+                lock(&self.state).vms.remove(id);
+                return Err(e);
+            }
+        };
+        let Prepared { binds, wanted, mut run, .. } = prepared;
+        let installed = runtimes::installed(&self.data, &wanted);
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let Some(version) = wanted.get(kind.name()) else {
+                continue;
+            };
+            let label = kind.label();
+            let used = match installed.iter().find(|r| r.name == kind.name()) {
+                Some(r) if r.version == *version => continue,
+                Some(r) => format!(", so the shield uses {label} {}", r.version),
+                None => String::new(),
+            };
+            run.notices.push(format!(
+                "The Linux build of {label} {version} is not downloaded yet{used}. \
+                 Download it in the Agents settings, then restart the shield."
+            ));
+        }
+        let result = match self.runtime.start(&shield, entries, &self.state_dir(id), &installed, &binds).await {
             Ok(vm) => match self.check_node(&vm).await {
                 Ok(()) => Ok(vm),
                 Err(e) => {
@@ -666,6 +838,28 @@ impl<R: SandboxRuntime> Manager<R> {
             },
             Err(e) => Err(e),
         };
+
+        let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
+        if let Ok(vm) = &result {
+            if run.pi_host && let Err(e) = self.probe(vm, &pi::cli(true)).await {
+                run.pi_host = false;
+                run.notices.push(format!(
+                    "The pi of this Mac does not load in the shield ({e}), so the bundled pi runs. It can be a different version."
+                ));
+            }
+            if let Some(entry) = run.gemini.clone() {
+                match self.probe(vm, &entry).await {
+                    Ok(()) => names.push(AgentKind::Gemini.name()),
+                    Err(e) => {
+                        run.gemini = None;
+                        run.failed.push((AgentKind::Gemini, e));
+                    }
+                }
+            }
+            for (kind, why) in &run.failed {
+                run.notices.push(format!("{} from this Mac does not run in the shield: {why}", kind.label()));
+            }
+        }
 
         let net = match &result {
             Ok(vm) => match self.runtime.net_lines(vm).await {
@@ -682,14 +876,17 @@ impl<R: SandboxRuntime> Manager<R> {
             let mut state = lock(&self.state);
             match result {
                 Ok(vm) => {
+                    let vm = Arc::new(vm);
+                    run.renew = run.logins.iter().map(|&(kind, started)| self.watch_renewal(id, &vm, kind, started)).collect();
                     state.vms.insert(
                         id.to_owned(),
                         Vm::Running {
-                            vm: Arc::new(vm),
+                            vm,
                             applied: Box::new(shield),
                             applied_rev,
                             net,
-                            runtimes: installed.iter().map(|r| r.name).collect(),
+                            runtimes: names,
+                            host: run,
                         },
                     );
                     let apps = state.shield_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
@@ -709,6 +906,96 @@ impl<R: SandboxRuntime> Manager<R> {
             }
         }
         Ok(())
+    }
+
+    /// Renews one host login while the VM runs. When the login is due, it
+    /// reads the login on the Mac again and follows [`login::renew_step`]:
+    /// a newer login marks the VM and calls the renew sink, which restarts
+    /// the shield if that may happen; no newer login shows the notice to
+    /// open the agent on the Mac. It checks again on a backoff. It ends
+    /// with the VM: a stop aborts it, and a new VM ends it.
+    fn watch_renewal(&self, id: &str, vm: &Arc<R::Vm>, kind: AgentKind, started: i64) -> AbortHandle {
+        let (state, runs, host, sink) = (self.state.clone(), self.runs.clone(), self.host.clone(), self.renew_sink.clone());
+        let (id, vm) = (id.to_owned(), vm.clone());
+        tokio::spawn(async move {
+            let mut retry = RENEW_RETRY;
+            loop {
+                let now = host.now_ms();
+                // The Keychain read can wait for the macOS prompt.
+                let current = if now < started - login::RENEW_BEFORE_MS {
+                    None
+                } else {
+                    let host = host.clone();
+                    tokio::task::spawn_blocking(move || host.token(kind)).await.ok().and_then(|t| t.ok()?.expires)
+                };
+                let (step, changed) = {
+                    let mut state = lock(&state);
+                    let auto = state.shields.iter().any(|s| s.id == id && s.auto_renew);
+                    let busy = state.is_busy(&id) || runs.has_live(&id);
+                    let Some(Vm::Running { vm: running, host: run, .. }) = state.vms.get_mut(&id) else {
+                        return;
+                    };
+                    if !Arc::ptr_eq(running, &vm) {
+                        return;
+                    }
+                    let step = login::renew_step(started, current, now, busy, auto);
+                    let label = kind.label();
+                    let notice = format!(
+                        "The {label} login expires soon and this Mac has no newer one. Open {label} on this Mac once to refresh it."
+                    );
+                    let changed = match step {
+                        Step::Wait(_) => false,
+                        Step::ExpiresSoon => {
+                            let new = !run.notices.contains(&notice);
+                            if new {
+                                run.notices.push(notice);
+                            }
+                            new
+                        }
+                        // The Mac has a newer login now: the notice is stale.
+                        Step::Restart | Step::Notify | Step::Retry => {
+                            let count = run.notices.len();
+                            run.notices.retain(|n| *n != notice);
+                            let removed = run.notices.len() != count;
+                            let due = std::mem::replace(&mut run.renew_due, true);
+                            step == Step::Restart || removed || !due
+                        }
+                    };
+                    (step, changed)
+                };
+                if changed && let Some(sink) = sink.get() {
+                    sink(&id);
+                }
+                let wait = match step {
+                    Step::Wait(wait) => wait,
+                    _ => {
+                        let wait = retry;
+                        retry = (retry * 2).min(RENEW_RETRY_MAX);
+                        wait
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        })
+        .abort_handle()
+    }
+
+    /// The Mac has a newer host login for the shield: restarts the shield if
+    /// the user turned that on and no agent turn, app or task run works in
+    /// it. A new host token applies only to a new VM.
+    pub async fn renew(&self, id: &str) -> Result<()> {
+        {
+            let state = lock(&self.state);
+            let shield = state.shields.iter().find(|s| s.id == id).ok_or(Error::ShieldNotFound)?;
+            if !matches!(state.vms.get(id), Some(Vm::Running { host, .. }) if host.renew_due) {
+                return Ok(());
+            }
+            if !shield.auto_renew || state.is_busy(id) || self.runs.has_live(id) {
+                return Ok(());
+            }
+        }
+        self.stop(id).await?;
+        self.start(id).await
     }
 
     /// Turns the runtime log lines into the shield's events.
@@ -774,16 +1061,50 @@ impl<R: SandboxRuntime> Manager<R> {
         pi::check_node(&String::from_utf8_lossy(&out))
     }
 
-    fn secret_values(&self, shield: &Shield) -> Result<Vec<SecretValue>> {
+    /// The vault value of each user secret. A host login has `None`: its
+    /// value comes from the Mac.
+    fn vault_values(&self, shield: &Shield) -> Result<Vec<Option<SecretValue>>> {
         shield
             .secrets
             .iter()
-            .map(|secret| {
-                self.vault
-                    .get(&shield.id, &secret.name)?
-                    .ok_or_else(|| Error::SecretMissing(secret.name.clone()))
+            .map(|secret| match secret.origin {
+                Origin::HostLogin { .. } => Ok(None),
+                Origin::User => match self.vault.get(&shield.id, &secret.name)? {
+                    Some(value) => Ok(Some(value)),
+                    None => Err(Error::SecretMissing(secret.name.clone())),
+                },
             })
             .collect()
+    }
+
+    /// Checks that `node <script> --version` runs in the VM. The error is
+    /// the end of its stderr.
+    async fn probe(&self, vm: &R::Vm, script: &str) -> std::result::Result<(), String> {
+        let argv = ["node".to_owned(), script.to_owned(), "--version".to_owned()];
+        let mut pipe = self.runtime.open_pipe(vm, &argv, WORKSPACE).await.map_err(|e| e.to_string())?;
+        let mut err = Vec::new();
+        let read = async {
+            while let Some(event) = pipe.events.recv().await {
+                match event {
+                    PipeEvent::Stderr(bytes) => err.extend(bytes),
+                    PipeEvent::Stdout(_) => {}
+                    PipeEvent::Exit(code) => return code,
+                }
+            }
+            -1
+        };
+        match tokio::time::timeout(PROBE_LIMIT, read).await {
+            Ok(0) => Ok(()),
+            Ok(code) => {
+                let text = String::from_utf8_lossy(&err);
+                let tail: String = text.trim().chars().rev().take(PROBE_ERR).collect::<Vec<_>>().into_iter().rev().collect();
+                Err(if tail.is_empty() { format!("it ended with code {code}") } else { tail })
+            }
+            Err(_) => {
+                let _ = pipe.input.try_send(PipeInput::Kill);
+                Err("it did not answer in time".to_owned())
+            }
+        }
     }
 
     /// The VM stays tracked until the runtime confirms shutdown, so a failed
@@ -791,7 +1112,7 @@ impl<R: SandboxRuntime> Manager<R> {
     pub async fn stop(&self, id: &str) -> Result<()> {
         // First, so each run settles its manifest before its processes die with the VM.
         self.runs.cancel_shield(id, "the shield stopped", RUN_STOP_LIMIT).await;
-        let (vm, applied, applied_rev, net, runtimes) = {
+        let (vm, applied, applied_rev, net, runtimes, host) = {
             let mut state = lock(&self.state);
             state.shield_mut(id)?;
             match state.vms.get(id) {
@@ -806,6 +1127,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 applied_rev,
                 net,
                 runtimes,
+                host,
             }) = state.vms.insert(id.to_owned(), Vm::Stopping)
             else {
                 unreachable!("checked above");
@@ -823,7 +1145,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
                 a.shield_id != id
             });
-            (vm, applied, applied_rev, net, runtimes)
+            (vm, applied, applied_rev, net, runtimes, host)
         };
 
         let result = self.runtime.stop(&vm).await;
@@ -832,8 +1154,8 @@ impl<R: SandboxRuntime> Manager<R> {
         match result {
             Ok(()) => {
                 state.vms.remove(id);
-                if let Some(net) = net {
-                    net.abort();
+                for task in net.iter().chain(&host.renew) {
+                    task.abort();
                 }
             }
             // The follower stays with the VM that still runs.
@@ -846,6 +1168,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         applied_rev,
                         net,
                         runtimes,
+                        host,
                     },
                 );
             }
@@ -881,17 +1204,17 @@ impl<R: SandboxRuntime> Manager<R> {
         cols: u16,
         on_event: impl Fn(PtyEvent) + Send + 'static,
     ) -> Result<String> {
-        let (vm, cwd) = match lock(&self.state).vms.get(shield_id) {
-            Some(Vm::Running { vm, applied, .. }) => {
+        let (vm, cwd, pi_host) = match lock(&self.state).vms.get(shield_id) {
+            Some(Vm::Running { vm, applied, host, .. }) => {
                 let cwd = match kind {
                     SessionKind::Pi => applied.harness.as_deref(),
                     SessionKind::Shell => None,
                 };
-                (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
+                (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned(), host.pi_host)
             }
             _ => return Err(Error::NotRunning),
         };
-        let mut pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
+        let mut pty = self.runtime.open_pty(&vm, &kind.argv(pi_host), &cwd, rows, cols).await?;
         let id = uuid::Uuid::new_v4().to_string();
         {
             // The shield may have stopped, or stopped and started again, while
@@ -1143,21 +1466,21 @@ impl<R: SandboxRuntime> Manager<R> {
                         return Ok(entry.id.clone());
                     }
                     None => match state.vms.get(shield_id) {
-                        Some(Vm::Running { vm, applied, .. }) => {
-                            Ok((vm.clone(), applied.harness.as_deref().unwrap_or(WORKSPACE).to_owned()))
+                        Some(Vm::Running { vm, applied, host, .. }) => {
+                            Ok((vm.clone(), applied.harness.as_deref().unwrap_or(WORKSPACE).to_owned(), host.pi_host))
                         }
                         _ => return Err(Error::NotRunning),
                     },
                 }
             };
-            let (vm, cwd) = match found {
+            let (vm, cwd, pi_host) = match found {
                 Ok(found) => found,
                 Err(closing) => {
                     closing.exited().await;
                     continue;
                 }
             };
-            let pipe = self.runtime.open_pipe(&vm, &pi::pi_argv(true), &cwd).await?;
+            let pipe = self.runtime.open_pipe(&vm, &pi::pi_argv(true, pi_host), &cwd).await?;
             let id = uuid::Uuid::new_v4().to_string();
             let added = {
                 let mut state = lock(&self.state);
@@ -1228,19 +1551,15 @@ impl<R: SandboxRuntime> Manager<R> {
                         return Ok(entry.id.clone());
                     }
                     None => {
-                        let (vm, cwd) = match state.vms.get(shield_id) {
-                            Some(Vm::Running { runtimes, .. }) if !runtimes.contains(&kind.name()) => {
-                                let installed = runtimes::installed(&self.data).iter().any(|r| r.name == kind.name());
-                                let name = kind.name().to_owned();
-                                return Err(if installed {
-                                    Error::RuntimeNotMounted(name)
-                                } else {
-                                    Error::RuntimeMissing(name)
-                                });
+                        let (vm, cwd, entry) = match state.vms.get(shield_id) {
+                            Some(Vm::Running { runtimes, host, .. }) if !runtimes.contains(&kind.name()) => {
+                                return Err(self.unmounted(kind, host));
                             }
-                            Some(Vm::Running { vm, applied, .. }) => {
-                                (vm.clone(), applied.harness.as_deref().unwrap_or(WORKSPACE).to_owned())
-                            }
+                            Some(Vm::Running { vm, applied, host, .. }) => (
+                                vm.clone(),
+                                applied.harness.as_deref().unwrap_or(WORKSPACE).to_owned(),
+                                host.gemini.clone().filter(|_| kind == AgentKind::Gemini),
+                            ),
                             _ => return Err(Error::NotRunning),
                         };
                         let id = uuid::Uuid::new_v4().to_string();
@@ -1258,7 +1577,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             let (state, id) = (self.state.clone(), id.clone());
                             Box::new(move || lock(&state).agents.retain(|a| a.id != id))
                         };
-                        let agent = CliAgent::new(kind, self.chat_dir(shield_id, kind), spawn, sink, on_finish);
+                        let agent = CliAgent::new(kind, entry, self.chat_dir(shield_id, kind), spawn, sink, on_finish);
                         state.agents.push(AgentEntry {
                             id: id.clone(),
                             shield_id: shield_id.to_owned(),
@@ -1271,6 +1590,22 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             };
             closing.exited().await;
+        }
+    }
+
+    /// Why the running VM has no runtime of the agent.
+    fn unmounted(&self, kind: AgentKind, host: &HostRun) -> Error {
+        let name = kind.name().to_owned();
+        if kind == AgentKind::Gemini {
+            return match host.failed.iter().find(|(k, _)| *k == kind) {
+                Some((_, why)) => Error::HostAgentFailed(kind.label().to_owned(), why.clone()),
+                None => Error::NotHostAgent(kind.label().to_owned()),
+            };
+        }
+        if runtimes::installed(&self.data, &HashMap::new()).iter().any(|r| r.name == name) {
+            Error::RuntimeNotMounted(name)
+        } else {
+            Error::RuntimeMissing(name)
         }
     }
 
@@ -1317,7 +1652,7 @@ impl<R: SandboxRuntime> Manager<R> {
     pub async fn list_chats(&self, shield_id: &str) -> Result<Vec<Chat>> {
         lock(&self.state).shield_mut(shield_id)?;
         let state = self.state_dir(shield_id);
-        let dirs = [AgentKind::Claude, AgentKind::Codex].map(|kind| (kind, self.chat_dir(shield_id, kind)));
+        let dirs = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini].map(|kind| (kind, self.chat_dir(shield_id, kind)));
         blocking(move || {
             let mut chats = pi::list_chats(&state);
             for (kind, dir) in &dirs {
@@ -1407,11 +1742,18 @@ impl<R: SandboxRuntime> Manager<R> {
     /// must be writable before the run starts.
     pub fn start_task_run(&self, id: &str, task_id: &str) -> Result<String> {
         let _start = lock(&self.run_start);
-        let (task, vm, applied, runtimes) = {
+        let (task, vm, applied, pi_host, gemini, unmounted) = {
             let mut state = lock(&self.state);
             let task = state.shield_mut(id)?.task(task_id)?.clone();
             match state.vms.get(id) {
-                Some(Vm::Running { vm, applied, runtimes, .. }) => (task, vm.clone(), applied.clone(), runtimes.clone()),
+                Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
+                    let unmounted = task
+                        .agents
+                        .iter()
+                        .find(|a| a.kind != AgentKind::Pi && !runtimes.contains(&a.kind.name()))
+                        .map(|a| self.unmounted(a.kind, host));
+                    (task, vm.clone(), applied.clone(), host.pi_host, host.gemini.clone(), unmounted)
+                }
                 _ => return Err(Error::NotRunning),
             }
         };
@@ -1433,16 +1775,8 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             _ => return Err(Error::MirrorUnwritable(harness.to_owned(), "the folder is read-only".to_owned())),
         };
-        for agent in &task.agents {
-            let name = agent.kind.name();
-            if agent.kind != AgentKind::Pi && !runtimes.contains(&name) {
-                let installed = runtimes::installed(&self.data).iter().any(|r| r.name == name);
-                return Err(if installed {
-                    Error::RuntimeNotMounted(name.to_owned())
-                } else {
-                    Error::RuntimeMissing(name.to_owned())
-                });
-            }
+        if let Some(e) = unmounted {
+            return Err(e);
         }
         mirror.check()?;
         let writer = RoundWriter::create(dir.join(&run), Some(mirror))?;
@@ -1451,6 +1785,8 @@ impl<R: SandboxRuntime> Manager<R> {
             vm,
             cwd: task.workdir.clone(),
             artifacts: Some(guest_artifacts(harness, &task.slug, &run)),
+            pi_host,
+            gemini,
         };
         self.runs.start(task_runs::Spec {
             shield_id: id.to_owned(),
@@ -1535,6 +1871,9 @@ impl<R: SandboxRuntime> Manager<R> {
             vm,
             cwd: task.workdir,
             artifacts: Some(guest_artifacts(harness.as_deref().unwrap_or(WORKSPACE), &task.slug, run)),
+            // The diff runs git only.
+            pi_host: false,
+            gemini: None,
         };
         let (_, mut cancel) = tokio::sync::watch::channel(false);
         Ok(exec
@@ -1577,6 +1916,137 @@ fn run_names(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// What a start needs for the shield's host agents.
+struct Prepared {
+    /// The value of each secret, in the order of the config.
+    values: Vec<SecretValue>,
+    binds: Vec<Bind>,
+    /// The host version of each native runtime that a host agent uses.
+    wanted: HashMap<&'static str, String>,
+    run: HostRun,
+}
+
+/// Copies the profiles and links them into the agents' state, reads the
+/// host logins and writes the guest logins, and picks the host packages and
+/// runtime versions. `vault` has the value of each user secret. It reads the
+/// Keychain and copies files, so it runs on a blocking thread. The state dir
+/// is guest-writable: each write there follows no link.
+fn prepare(host: &HostAgents, data: &Path, shield: &Shield, vault: Vec<Option<SecretValue>>) -> Result<Prepared> {
+    let state = data.join("shields").join(&shield.id);
+    std::fs::create_dir_all(&state)?;
+    // Claude Code's HOME, CODEX_HOME and Gemini CLI's HOME. Codex needs its dir to exist.
+    for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini] {
+        host_agents::open_parts(&state, &[kind.name()])?;
+    }
+    let mut run = HostRun::default();
+
+    let detection = host.last();
+    let home = host.home();
+    let mut binds = Vec::new();
+    let mut wanted = HashMap::new();
+    for kind in host_agents::KINDS {
+        let used = shield.host_agent(kind);
+        let snapshot_dir = data.join("profiles").join(&shield.id).join(kind.name());
+        let mut entries = Vec::new();
+        if used.is_some_and(|u| u.profile) {
+            let snapshot = profile::snapshot(kind, &home, &snapshot_dir)?;
+            if !snapshot.skipped.is_empty() {
+                run.notices.push(format!(
+                    "The {} profile skipped {} entries: links out of their folder, denied names, or files over the size limit.",
+                    kind.label(),
+                    snapshot.skipped.len()
+                ));
+            }
+            binds.push(Bind {
+                guest: profile::guest_dir(kind),
+                host: snapshot_dir,
+            });
+            entries = snapshot.entries;
+        } else if let Err(e) = std::fs::remove_dir_all(&snapshot_dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
+        profile::link(kind, &state, &entries)?;
+        if used.is_none() {
+            continue;
+        }
+        let Some(found) = detection.agent(kind) else {
+            match kind {
+                AgentKind::Gemini => run.failed.push((kind, "it is not installed on this Mac".to_owned())),
+                _ => run.notices.push(format!("{} is not installed on this Mac, so the shield uses its own copy.", kind.label())),
+            }
+            continue;
+        };
+        match (kind, found.package.clone(), found.entry.as_deref()) {
+            (AgentKind::Claude | AgentKind::Codex, ..) => {
+                wanted.insert(kind.name(), found.version.clone());
+            }
+            (AgentKind::Pi, Some(package), _) => {
+                binds.push(Bind {
+                    guest: pi::HOST_DIR.to_owned(),
+                    host: package,
+                });
+                run.pi_host = true;
+            }
+            (AgentKind::Gemini, Some(package), Some(entry)) => {
+                binds.push(Bind {
+                    guest: gemini::DIR.to_owned(),
+                    host: package,
+                });
+                run.gemini = Some(format!("{}/{entry}", gemini::DIR));
+            }
+            // Detection gives each JS agent its package, and Gemini CLI its entry point.
+            (AgentKind::Pi | AgentKind::Gemini, ..) => {
+                run.failed.push((kind, "detection found no package or entry point; refresh the detection".to_owned()));
+            }
+        }
+    }
+
+    // After the links, so no link of the profile replaces a login file.
+    let now = host.now_ms();
+    let mut values = Vec::new();
+    for (secret, value) in shield.secrets.iter().zip(vault) {
+        let Origin::HostLogin { agent } = secret.origin else {
+            values.extend(value);
+            continue;
+        };
+        let token = host.token(agent)?;
+        if !secret.hosts.contains(&token.host) {
+            return Err(Error::HostLogin(
+                agent.name().to_owned(),
+                format!("it now uses {}; add the agent to the shield again", token.host),
+            ));
+        }
+        for file in login::guest_files(&token, &secret.placeholder(), now) {
+            let dir = host_agents::open_parts(&state, file.dir)?;
+            host_agents::write_at(&dir, file.name, &file.body)?;
+        }
+        match token.expires {
+            Some(expires) => run.logins.push((agent, expires)),
+            None => run.notices.push(format!(
+                "The {} login of this Mac has no expiry that zwinger can read, so the shield does not renew it. \
+                 Restart the shield when the agent reports a login error.",
+                agent.label()
+            )),
+        }
+        values.push(token.access);
+    }
+    run.login_expires = run.logins.iter().map(|&(_, expires)| expires).min();
+    if login::denied_hosts(&shield.secrets).contains(&login::GITHUB_API) {
+        run.notices.push(format!(
+            "The GitHub API ({}) is blocked in this shield: pi's Copilot login is refreshed there.",
+            login::GITHUB_API
+        ));
+    }
+    Ok(Prepared {
+        values,
+        binds,
+        wanted,
+        run,
+    })
+}
+
 /// Runs file reads off the async workers.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(work)
@@ -1592,6 +2062,8 @@ mod tests {
 
     use super::*;
     use crate::runtime::fake::{FakePipe, FakeRuntime, PtyGate};
+    use crate::host_agents::fake::{FakeClock, FakeFs};
+    use crate::host_agents::login::fake::{FakeLogins, claude_doc};
     use crate::secrets::fake::MemoryVault;
     use crate::secrets::tests::secret;
 
@@ -1605,6 +2077,15 @@ mod tests {
         Arc::new(MemoryVault::default())
     }
 
+    /// No host agents.
+    fn host() -> Arc<HostAgents> {
+        host_with(FakeFs::default(), FakeLogins::default(), 0)
+    }
+
+    fn host_with(fs: FakeFs, logins: FakeLogins, now: i64) -> Arc<HostAgents> {
+        Arc::new(HostAgents::new(Arc::new(fs), Arc::new(logins), Arc::new(FakeClock(now.into())), temp_dir()))
+    }
+
     fn manager() -> (Manager<FakeRuntime>, FakeRuntime, String) {
         let (manager, runtime, id, _) = manager_with_vault();
         (manager, runtime, id)
@@ -1614,7 +2095,7 @@ mod tests {
         let dir = temp_dir();
         let runtime = FakeRuntime::default();
         let vault = vault();
-        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir()).unwrap();
+        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         (manager, runtime, id, vault)
     }
@@ -1767,7 +2248,7 @@ mod tests {
         let (first, mut first_rx) = sink();
         let agent = manager.open_agent(&id, AgentKind::Pi, first).await.unwrap();
         let mut pipe = take_pipe(&runtime);
-        assert_eq!(pipe.argv, pi::pi_argv(true));
+        assert_eq!(pipe.argv, pi::pi_argv(true, false));
         assert_eq!(pipe.cwd, "/workspace");
 
         let call = tokio::spawn({
@@ -2051,7 +2532,7 @@ mod tests {
     async fn stop_all_stops_running_shields() {
         let dir = temp_dir();
         let runtime = FakeRuntime::default();
-        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir()).unwrap();
+        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host()).unwrap();
         let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
         let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
         manager.create(temp_dir().to_str().unwrap()).unwrap();
@@ -2258,18 +2739,18 @@ mod tests {
     async fn config_persists_across_managers() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("shields.json"));
-        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.add_mount(&id, temp_dir().to_str().unwrap(), "/mnt/data", true).unwrap();
         manager.set_mount_readonly(&id, "/mnt/data", false).unwrap();
 
-        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let mounts = &reloaded.list()[0].shield.mounts;
         assert_eq!(mounts.len(), 1);
         assert!(!mounts[0].readonly);
 
         reloaded.delete(&id).await.unwrap();
-        assert!(Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap().list().is_empty());
+        assert!(Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap().list().is_empty());
     }
 
     #[tokio::test]
@@ -2419,13 +2900,13 @@ mod tests {
     async fn reorder_shields_persists() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("shields.json"));
-        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
         let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
         assert!(matches!(manager.reorder_shields(std::slice::from_ref(&b)), Err(Error::InvalidOrder)));
         manager.reorder_shields(&[b.clone(), a.clone()]).unwrap();
 
-        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let order: Vec<String> = reloaded.list().into_iter().map(|v| v.shield.id).collect();
         assert_eq!(order, [b, a]);
     }
@@ -2843,13 +3324,13 @@ mod tests {
         let dir = temp_dir();
         let store = || Store::new(dir.join("shields.json"));
         let vault = vault();
-        let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir()).unwrap();
+        let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.put_secret(&id, secret("KEY", &["a.io"]), value("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.set("deleted-shield", "KEY", &SecretValue::new("y")).unwrap();
 
-        Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir()).unwrap();
+        Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let mut accounts = vault.accounts().unwrap();
         accounts.sort();
         assert_eq!(accounts, [secrets::account(&id, "KEY")]);
@@ -2861,14 +3342,14 @@ mod tests {
         let dir = temp_dir();
         let store = || Store::new(dir.join("shields.json"));
         let vault = vault();
-        let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir()).unwrap();
+        let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
 
         assert!(matches!(manager.remove_secret(&id, "KEY"), Err(Error::Keychain(_))));
-        let reloaded = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir()).unwrap();
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(stored(&vault, &id, "GONE").as_deref(), Some("x"));
     }
@@ -2910,7 +3391,7 @@ mod tests {
         let vault = Arc::new(GatedVault::default());
         let runtime = FakeRuntime::default();
         let manager = Arc::new(
-            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir()).unwrap(),
+            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host()).unwrap(),
         );
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.put_secret(&id, secret("KEY", &["a.io"]), value("v1")).unwrap();
@@ -2941,5 +3422,370 @@ mod tests {
         let view = &manager.list()[0];
         assert_eq!(view.status, Status::Running);
         assert!(!view.pending_restart);
+    }
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    /// A Mac with Claude Code 2.1.310, a `~/.claude` with a skill, Codex,
+    /// pi and Gemini CLI. `home` is a real folder, as the profile copies it.
+    fn mac(home: &Path) -> FakeFs {
+        let mut fs = FakeFs {
+            home: home.to_owned(),
+            ..FakeFs::default()
+        };
+        let bin = home.join(".local/share/claude/versions/2.1.310");
+        fs.links.insert(home.join(".local/bin/claude"), bin.clone());
+        fs.versions.insert(bin, "2.1.310 (Claude Code)".into());
+        fs.dirs.insert(home.join(".claude"));
+        std::fs::create_dir_all(home.join(".claude/skills/review")).unwrap();
+        std::fs::write(home.join(".claude/skills/review/SKILL.md"), "review").unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "secret").unwrap();
+        fs.file("/usr/local/lib/node_modules/@openai/codex/package.json", r#"{"version":"0.163.0"}"#);
+        fs.versions.insert("/usr/local/bin/codex".into(), "codex-cli 0.163.0".into());
+        for (name, entry) in [("@earendil-works/pi-coding-agent", "dist/cli.js"), ("@google/gemini-cli", "bundle/gemini.js")] {
+            let manifest = format!(r#"{{"version":"1.0.0","bin":{{"gemini":"{entry}"}}}}"#);
+            fs.file(&format!("/usr/local/lib/node_modules/{name}/package.json"), &manifest);
+            fs.file(&format!("/usr/local/lib/node_modules/{name}/{entry}"), "");
+        }
+        fs
+    }
+
+    fn host_manager(logins: FakeLogins, now: i64) -> (Manager<FakeRuntime>, FakeRuntime, String, Arc<MemoryVault>) {
+        let (dir, home) = (temp_dir(), temp_dir());
+        let runtime = FakeRuntime::default();
+        let vault = vault();
+        let host = host_with(mac(&home), logins, now);
+        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host).unwrap();
+        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        (manager, runtime, id, vault)
+    }
+
+    fn uses(kind: AgentKind, profile: bool, login: bool) -> HostAgentUse {
+        HostAgentUse { kind, profile, login }
+    }
+
+    #[tokio::test]
+    async fn a_host_agent_gets_its_login_and_profile_at_start() {
+        let logins = FakeLogins::default();
+        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("sk-ant-oat-real", NOW + 3_600_000));
+        let (manager, runtime, id, vault) = host_manager(logins, NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), true).await.unwrap();
+
+        let shield = manager.list().remove(0).shield;
+        assert_eq!(shield.network.mode, NetworkMode::List);
+        assert_eq!(shield.network.domains, ["api.anthropic.com"]);
+        let listed = manager.list_secrets(&id).unwrap();
+        assert_eq!((listed[0].name.as_str(), listed[0].set), ("CLAUDE_CODE_OAUTH_TOKEN", true));
+        assert_eq!(listed[0].origin, Origin::HostLogin { agent: AgentKind::Claude });
+        // The user cannot edit or remove it, and the vault never holds it.
+        let mut edit = secret("CLAUDE_CODE_OAUTH_TOKEN", &["api.anthropic.com"]);
+        assert!(matches!(manager.put_secret(&id, edit.clone(), Some(SecretValue::new("x"))), Err(Error::HostLoginSecret(_))));
+        edit.origin = Origin::HostLogin { agent: AgentKind::Claude };
+        assert!(matches!(manager.put_secret(&id, edit, None), Err(Error::HostLoginSecret(_))));
+        assert!(matches!(manager.remove_secret(&id, "CLAUDE_CODE_OAUTH_TOKEN"), Err(Error::HostLoginSecret(_))));
+
+        manager.start(&id).await.unwrap();
+        assert!(vault.values.lock().unwrap().is_empty());
+        assert_eq!(
+            *runtime.secrets.lock().unwrap(),
+            [("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), vec![microsandbox::HostPattern::Exact("api.anthropic.com".into())])]
+        );
+        let snapshot = manager.profile_dir(&id).join("claude");
+        assert_eq!(
+            *runtime.binds.lock().unwrap(),
+            [Bind { guest: "/opt/zwinger/profile/claude".into(), host: snapshot.clone() }]
+        );
+        assert!(snapshot.join("skills/review/SKILL.md").is_file());
+        assert!(!snapshot.join(".credentials.json").exists());
+        let skills = manager.state_dir(&id).join("claude/.claude/skills");
+        assert_eq!(std::fs::read_link(skills).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
+
+        let view = manager.list().remove(0);
+        assert_eq!((view.login_expires_at, view.renew_due), (Some(NOW + 3_600_000), false));
+        // Neither the host version nor the pinned Claude Code is downloaded.
+        assert!(view.host_notices.iter().any(|n| n.contains("Claude Code 2.1.310 is not downloaded")), "{:?}", view.host_notices);
+        assert!(!view.pending_restart);
+
+        // The profile off: its links and its snapshot go at the next start.
+        manager.stop(&id).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        manager.start(&id).await.unwrap();
+        assert!(runtime.binds.lock().unwrap().is_empty());
+        assert!(!manager.state_dir(&id).join("claude/.claude/skills").exists());
+        assert!(!snapshot.exists());
+        manager.stop(&id).await.unwrap();
+        manager.delete(&id).await.unwrap();
+        assert!(!manager.profile_dir(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn the_guest_login_has_placeholders_only() {
+        let logins = FakeLogins::default();
+        let doc = serde_json::json!({
+            "tokens": { "id_token": "id.real", "access_token": "at-real", "refresh_token": "rt-real", "account_id": "acc" },
+        });
+        logins.docs.lock().unwrap().insert(AgentKind::Codex, doc.to_string());
+        let (manager, runtime, id, _) = host_manager(logins, NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Codex, false, true), false).await.unwrap();
+        // A link that the guest planted at the login file is replaced, not written through.
+        let outside = temp_dir().join("precious");
+        std::fs::write(&outside, "host").unwrap();
+        std::fs::create_dir_all(manager.state_dir(&id).join("codex")).unwrap();
+        std::os::unix::fs::symlink(&outside, manager.state_dir(&id).join("codex/auth.json")).unwrap();
+
+        manager.start(&id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "host");
+        let auth = std::fs::read_to_string(manager.state_dir(&id).join("codex/auth.json")).unwrap();
+        assert!(auth.contains("$MSB_CODEX_HOST_LOGIN$") && auth.contains(login::INERT_REFRESH) && auth.contains("id.real"));
+        assert!(!auth.contains("at-real") && !auth.contains("rt-real"));
+        assert_eq!(runtime.secrets.lock().unwrap()[0].1, [microsandbox::HostPattern::Exact("chatgpt.com".into())]);
+        // The access token here is no JWT, so its expiry is unknown.
+        let notices = manager.list().remove(0).host_notices;
+        assert_eq!(
+            notices,
+            [
+                "The Codex login of this Mac has no expiry that zwinger can read, so the shield does not renew it. Restart the shield when the agent reports a login error.",
+                "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings, then restart the shield.",
+            ]
+        );
+        // Installed: no download notice.
+        manager.stop(&id).await.unwrap();
+        runtimes::fake_install(&manager.data, "codex");
+        manager.start(&id).await.unwrap();
+        assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("not downloaded")));
+        assert_eq!(*runtime.runtimes.lock().unwrap(), ["codex"]);
+    }
+
+    #[tokio::test]
+    async fn an_expired_or_missing_host_login_fails_the_start() {
+        let logins = FakeLogins::default();
+        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t", NOW - 1));
+        let (manager, runtime, id, _) = host_manager(logins, NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
+        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert!(runtime.log.lock().unwrap().is_empty());
+        // pi's login names its provider, so pi needs one to be added with a login.
+        assert!(matches!(
+            manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), false).await,
+            Err(Error::HostLoginMissing(_))
+        ));
+        // An agent that this Mac does not have.
+        let (empty, _, empty_id) = self::manager();
+        assert!(matches!(
+            empty.put_host_agent(&empty_id, uses(AgentKind::Codex, false, false), false).await,
+            Err(Error::HostAgentMissing(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pi_copilot_login_blocks_the_github_api_and_gemini_has_no_host_login() {
+        let logins = FakeLogins::default();
+        let pi = serde_json::json!({ "github-copilot": {
+            "type": "oauth", "access": "tid=1;proxy-ep=proxy.business.githubcopilot.com;", "refresh": "r", "expires": NOW + 3_600_000,
+        } });
+        logins.docs.lock().unwrap().insert(AgentKind::Pi, pi.to_string());
+        let gemini = serde_json::json!({ "access_token": "ya29", "expiry_date": NOW + 3_600_000 });
+        logins.docs.lock().unwrap().insert(AgentKind::Gemini, gemini.to_string());
+        let (manager, runtime, id, _) = host_manager(logins, NOW);
+
+        let err = manager.put_host_agent(&id, uses(AgentKind::Gemini, false, true), true).await.unwrap_err();
+        assert!(err.to_string().contains("not supported yet"), "{err}");
+        manager.add_domain(&id, "api.github.com").unwrap();
+        assert!(matches!(
+            manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await,
+            Err(Error::RefreshHostConflict(..))
+        ));
+        manager.remove_domain(&id, "api.github.com").unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await.unwrap();
+        assert_eq!(manager.list()[0].shield.network.domains, ["api.business.githubcopilot.com"]);
+
+        manager.start(&id).await.unwrap();
+        assert_eq!(runtime.secrets.lock().unwrap()[0].1, [microsandbox::HostPattern::Exact("api.business.githubcopilot.com".into())]);
+        let notices = manager.list().remove(0).host_notices;
+        assert!(notices.iter().any(|n| n.contains("GitHub API (api.github.com) is blocked")), "{notices:?}");
+    }
+
+    /// A shield with Claude Code's host login, its fake login source and
+    /// clock, and the ids that the renew sink got.
+    struct Renewal {
+        manager: Manager<FakeRuntime>,
+        runtime: FakeRuntime,
+        id: String,
+        logins: Arc<FakeLogins>,
+        clock: Arc<FakeClock>,
+        due: mpsc::UnboundedReceiver<String>,
+    }
+
+    async fn renewal(doc: String) -> Renewal {
+        let (dir, home) = (temp_dir(), temp_dir());
+        let runtime = FakeRuntime::default();
+        let logins = Arc::new(FakeLogins::default());
+        logins.docs.lock().unwrap().insert(AgentKind::Claude, doc);
+        let clock = Arc::new(FakeClock(NOW.into()));
+        let host = Arc::new(HostAgents::new(Arc::new(mac(&home)), logins.clone(), clock.clone(), temp_dir()));
+        let manager = Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host).unwrap();
+        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let (tx, due) = mpsc::unbounded_channel();
+        manager.set_renew_sink(Box::new(move |id| {
+            let _ = tx.send(id.to_owned());
+        }));
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        Renewal {
+            manager,
+            runtime,
+            id,
+            logins,
+            clock,
+            due,
+        }
+    }
+
+    impl Renewal {
+        /// Moves the fake clock and the paused timers forward.
+        async fn pass(&self, minutes: i64) {
+            self.clock.0.fetch_add(minutes * 60_000, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(minutes as u64 * 60)).await;
+        }
+
+        /// The next id from the renew sink. The renewal reads the login on a
+        /// blocking thread, so this waits in real time. A short sleep, not a
+        /// yield: the paused timers fire only when the runtime parks.
+        async fn next_due(&mut self) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(id) = self.due.try_recv() {
+                    return id;
+                }
+                assert!(std::time::Instant::now() < deadline, "no renewal");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        fn starts(&self) -> usize {
+            self.runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_renewal_waits_for_a_newer_login_on_the_mac() {
+        let mut r = renewal(claude_doc("t", NOW + 20 * 60_000)).await;
+        r.manager.set_auto_renew(&r.id, true).unwrap();
+        r.manager.start(&r.id).await.unwrap();
+        tokio::time::pause();
+
+        // Not due yet.
+        r.pass(9).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(r.due.try_recv().is_err());
+        // Due, but the Mac has the same login: a restart would not renew it.
+        r.pass(2).await;
+        assert_eq!(r.next_due().await, r.id);
+        let view = r.manager.list().remove(0);
+        assert!(!view.renew_due);
+        assert!(view.host_notices.iter().any(|n| n.contains("Open Claude Code on this Mac once")), "{:?}", view.host_notices);
+        r.manager.renew(&r.id).await.unwrap();
+        assert_eq!(r.starts(), 1);
+
+        // The user opened Claude Code on the Mac: a newer login. An app works,
+        // so the restart waits.
+        r.logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t2", NOW + 3 * 3_600_000));
+        let app = app(&r.manager, &r.id, "pnpm dev", false);
+        r.manager.start_app(&r.id, &app).await.unwrap();
+        r.pass(1).await;
+        assert_eq!(r.next_due().await, r.id);
+        assert!(r.manager.list()[0].renew_due);
+        r.manager.renew(&r.id).await.unwrap();
+        assert_eq!(r.starts(), 1);
+
+        // Idle: the next check restarts with the new login.
+        r.manager.stop_app(&r.id, &app).unwrap();
+        until(|| r.manager.list()[0].app_runs.iter().all(|a| a.exit_code.is_some())).await;
+        r.pass(2).await;
+        assert_eq!(r.next_due().await, r.id);
+        r.manager.renew(&r.id).await.unwrap();
+        assert_eq!(r.starts(), 2);
+        let view = r.manager.list().remove(0);
+        assert_eq!((view.login_expires_at, view.renew_due), (Some(NOW + 3 * 3_600_000), false));
+        assert!(view.host_notices.iter().all(|n| !n.contains("expires soon")), "{:?}", view.host_notices);
+    }
+
+    #[tokio::test]
+    async fn without_auto_restart_a_newer_login_shows_restart_to_renew() {
+        let mut r = renewal(claude_doc("t", NOW + 5 * 60_000)).await;
+        r.manager.start(&r.id).await.unwrap();
+        tokio::time::pause();
+        // Due at the start, with the same login: the notice, no restart.
+        assert_eq!(r.next_due().await, r.id);
+        assert!(!r.manager.list()[0].renew_due);
+        assert!(r.manager.list()[0].host_notices.iter().any(|n| n.contains("expires soon")));
+        r.logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t2", NOW + 3_600_000));
+        r.pass(1).await;
+        assert_eq!(r.next_due().await, r.id);
+        let view = r.manager.list().remove(0);
+        assert!(view.renew_due);
+        assert!(view.host_notices.iter().all(|n| !n.contains("expires soon")), "{:?}", view.host_notices);
+        r.manager.renew(&r.id).await.unwrap();
+        assert_eq!(r.starts(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_login_with_no_expiry_is_not_renewed() {
+        let doc = serde_json::json!({ "claudeAiOauth": { "accessToken": "t" } }).to_string();
+        let r = renewal(doc).await;
+        r.manager.start(&r.id).await.unwrap();
+        let view = r.manager.list().remove(0);
+        assert_eq!(view.login_expires_at, None);
+        assert!(view.host_notices.iter().any(|n| n.contains("does not renew it")), "{:?}", view.host_notices);
+        assert!(matches!(lock(&r.manager.state).vms.get(&r.id), Some(Vm::Running { host, .. }) if host.renew.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn a_renewal_ends_with_the_vm() {
+        let r = renewal(claude_doc("t", NOW + 3_600_000)).await;
+        r.manager.start(&r.id).await.unwrap();
+        let renewal = match lock(&r.manager.state).vms.get(&r.id) {
+            Some(Vm::Running { host, .. }) => host.renew[0].clone(),
+            _ => unreachable!(),
+        };
+        r.manager.stop(&r.id).await.unwrap();
+        until(|| renewal.is_finished()).await;
+        assert!(!r.manager.list()[0].renew_due);
+    }
+
+    #[tokio::test]
+    async fn host_js_agents_run_from_the_mac_with_their_fallbacks() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
+        manager.start(&id).await.unwrap();
+        let binds: Vec<String> = runtime.binds.lock().unwrap().iter().map(|b| b.guest.clone()).collect();
+        assert_eq!(binds, ["/opt/zwinger/host/pi", "/opt/zwinger/host/gemini"]);
+        assert!(manager.list()[0].runtimes.contains(&"gemini"));
+        manager.open_agent(&id, AgentKind::Pi, sink().0).await.unwrap();
+        assert_eq!(take_pipe(&runtime).argv[..2], ["node", "/opt/zwinger/host/pi/dist/cli.js"]);
+        manager.stop(&id).await.unwrap();
+
+        // A darwin-only native module: pi falls back to the bundle, Gemini CLI has none.
+        *runtime.probe_fail.lock().unwrap() =
+            vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
+        manager.start(&id).await.unwrap();
+        let view = manager.list().remove(0);
+        assert!(!view.runtimes.contains(&"gemini"));
+        assert!(view.host_notices.iter().any(|n| n.contains("bundled pi")), "{:?}", view.host_notices);
+        assert!(view.host_notices.iter().any(|n| n.contains("darwin-arm64.node")), "{:?}", view.host_notices);
+        assert!(matches!(manager.open_agent(&id, AgentKind::Gemini, sink().0).await, Err(Error::HostAgentFailed(..))));
+        manager.open_agent(&id, AgentKind::Pi, sink().0).await.unwrap();
+        assert_eq!(take_pipe(&runtime).argv[..2], ["node", "/opt/zwinger/pi/cli.js"]);
+
+        // Gemini CLI that is no host agent of the shield.
+        let (plain, _, plain_id) = manager_with_host();
+        plain.start(&plain_id).await.unwrap();
+        assert!(matches!(plain.open_agent(&plain_id, AgentKind::Gemini, sink().0).await, Err(Error::NotHostAgent(_))));
+    }
+
+    fn manager_with_host() -> (Manager<FakeRuntime>, FakeRuntime, String) {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        (manager, runtime, id)
     }
 }

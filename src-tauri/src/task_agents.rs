@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::agent::{AgentKind, Framer, Line, claude, codex, pi};
+use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, pi};
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::shield::TaskAgent;
 
@@ -107,11 +107,14 @@ impl std::fmt::Display for Failure {
 
 /// The argv of a one-shot call. Read-only stages pass the read-only flags
 /// that the CLI has: Claude Code loses its edit tools and pi gets read tools
-/// only. Codex's own sandbox does not work in the VM, so for Codex read-only
-/// is the instruction in the prompt and the check after the stage.
-pub fn argv(agent: &TaskAgent, access: Access) -> Vec<String> {
+/// only. Gemini CLI without `--yolo` refuses the tools that need an approval.
+/// Codex's own sandbox does not work in the VM, so for Codex read-only
+/// is the instruction in the prompt and the check after the stage. `pi_host`
+/// runs the host pi that the shield mounts. `gemini` is the guest path of
+/// Gemini CLI's entry point, if the shield mounts it.
+pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&str>) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
-    match agent.kind {
+    Ok(match agent.kind {
         AgentKind::Claude => {
             // `--dangerously-skip-permissions` as in the Agents tab: the shield is the sandbox.
             let mut argv: Vec<String> = [
@@ -152,10 +155,14 @@ pub fn argv(agent: &TaskAgent, access: Access) -> Vec<String> {
             argv.push("-".to_owned());
             argv
         }
+        AgentKind::Gemini => {
+            let entry = gemini.ok_or_else(|| Failure::Start("Gemini CLI is not mounted in the shield".to_owned()))?;
+            gemini::argv(entry, None, model, access == Access::Write)
+        }
         AgentKind::Pi => {
             let mut argv = vec![
                 "node".to_owned(),
-                format!("{}/cli.js", pi::PI_DIR),
+                pi::cli(pi_host),
                 "--no-session".to_owned(),
                 "--mode".to_owned(),
                 "json".to_owned(),
@@ -170,7 +177,7 @@ pub fn argv(agent: &TaskAgent, access: Access) -> Vec<String> {
             argv.push("-p".to_owned());
             argv
         }
-    }
+    })
 }
 
 /// The end of `text`: at most `limit` bytes, cut at a char boundary.
@@ -302,6 +309,10 @@ pub struct Exec<R: SandboxRuntime> {
     pub cwd: String,
     /// The guest path of the run's artifact folder, which git checks skip.
     pub artifacts: Option<String>,
+    /// pi runs from the host install that the shield mounts.
+    pub pi_host: bool,
+    /// The guest path of Gemini CLI's entry point, if the shield mounts it.
+    pub gemini: Option<String>,
 }
 
 /// The final text of a call and the error that the CLI reported.
@@ -314,6 +325,7 @@ struct Result_ {
 enum Mapper {
     Claude(claude::Mapper),
     Codex(codex::Mapper),
+    Gemini(gemini::Mapper),
     Pi,
 }
 
@@ -394,6 +406,7 @@ impl<R: SandboxRuntime> Exec<R> {
         let mut mapper = match agent.kind {
             AgentKind::Claude => Mapper::Claude(claude::Mapper::default()),
             AgentKind::Codex => Mapper::Codex(codex::Mapper::default()),
+            AgentKind::Gemini => Mapper::Gemini(gemini::Mapper::default()),
             AgentKind::Pi => Mapper::Pi,
         };
         let mut framer = Framer::default();
@@ -415,6 +428,10 @@ impl<R: SandboxRuntime> Exec<R> {
                         codex_result(&event, &mut result);
                         m.map(&event)
                     }
+                    Mapper::Gemini(m) => {
+                        gemini_result(&event, &mut result);
+                        m.map(&event)
+                    }
                     Mapper::Pi => {
                         pi_result(&event, &mut result);
                         vec![event]
@@ -425,7 +442,7 @@ impl<R: SandboxRuntime> Exec<R> {
                 }
             }
         };
-        let (code, stderr) = self.drive(&argv(agent, access), prompt.as_bytes(), limits, cancel, on_stdout).await?;
+        let (code, stderr) = self.drive(&argv(agent, access, self.pi_host, self.gemini.as_deref())?, prompt.as_bytes(), limits, cancel, on_stdout).await?;
         if let Some(error) = result.error {
             return Err(Failure::Agent(error));
         }
@@ -640,6 +657,24 @@ fn codex_result(event: &Value, result: &mut Result_) {
     }
 }
 
+/// The assistant text after the last tool result of a Gemini CLI run is its
+/// reply: Gemini CLI streams it in deltas.
+fn gemini_result(event: &Value, result: &mut Result_) {
+    match event["type"].as_str() {
+        Some("tool_result") => result.text.clear(),
+        Some("message") if event["role"] == "assistant" => {
+            if event["delta"] != true {
+                result.text.clear();
+            }
+            result.text.push_str(event["content"].as_str().unwrap_or_default());
+        }
+        Some("result") if event["status"] != "success" => {
+            result.error = Some(text_or(&event["error"]["message"], "Gemini CLI failed"));
+        }
+        _ => {}
+    }
+}
+
 /// The last assistant message of a pi run is its reply.
 fn pi_result(event: &Value, result: &mut Result_) {
     let message = &event["message"];
@@ -689,22 +724,51 @@ mod tests {
         }
     }
 
+    const GEMINI: Option<&str> = Some("/opt/zwinger/host/gemini/bundle/gemini.js");
+
     #[test]
     fn read_only_stages_pass_the_read_only_flags() {
-        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read);
+        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, false, GEMINI).unwrap();
         assert!(claude.windows(2).any(|w| w == ["--disallowedTools", "Edit,Write,NotebookEdit"]));
         assert!(claude.windows(2).any(|w| w == ["--model", "opus"]));
-        assert!(!argv(&agent(AgentKind::Claude, None), Access::Write).contains(&"--disallowedTools".to_owned()));
+        assert!(!argv(&agent(AgentKind::Claude, None), Access::Write, false, GEMINI).unwrap().contains(&"--disallowedTools".to_owned()));
 
-        let pi = argv(&agent(AgentKind::Pi, None), Access::Read);
+        let pi = argv(&agent(AgentKind::Pi, None), Access::Read, false, GEMINI).unwrap();
         assert!(pi.windows(2).any(|w| w == ["--tools", PI_READ_TOOLS]));
         assert_eq!(pi.last().map(String::as_str), Some("-p"));
-        assert!(!argv(&agent(AgentKind::Pi, None), Access::Write).contains(&"--tools".to_owned()));
+        assert!(!argv(&agent(AgentKind::Pi, None), Access::Write, false, GEMINI).unwrap().contains(&"--tools".to_owned()));
 
-        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read);
-        assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write));
+        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, false, GEMINI).unwrap();
+        assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, false, GEMINI).unwrap());
         assert!(codex.windows(2).any(|w| w == ["-m", "gpt-5"]));
         assert_eq!(codex.last().map(String::as_str), Some("-"));
+
+        let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, false, GEMINI).unwrap();
+        assert!(!gemini.contains(&"--yolo".to_owned()));
+        assert!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, GEMINI).unwrap().contains(&"--yolo".to_owned()));
+        assert_eq!(gemini[3], "/opt/zwinger/host/gemini/bundle/gemini.js");
+        assert!(matches!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, None), Err(Failure::Start(_))));
+
+        let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, true, GEMINI).unwrap();
+        assert_eq!(host_pi[1], "/opt/zwinger/host/pi/dist/cli.js");
+        assert_eq!(pi[1], "/opt/zwinger/pi/cli.js");
+    }
+
+    #[test]
+    fn the_gemini_reply_is_the_text_after_the_last_tool_result() {
+        let mut result = Result_::default();
+        for line in [
+            r#"{"type":"message","role":"assistant","content":"I will look.","delta":true}"#,
+            r#"{"type":"tool_result","tool_id":"t","status":"success","output":"a"}"#,
+            r#"{"type":"message","role":"assistant","content":"```json\n{\"a\":","delta":true}"#,
+            r#"{"type":"message","role":"assistant","content":"1}\n```","delta":true}"#,
+            r#"{"type":"result","status":"success"}"#,
+        ] {
+            gemini_result(&serde_json::from_str(line).unwrap(), &mut result);
+        }
+        assert_eq!((result.text.as_str(), result.error.as_deref()), ("```json\n{\"a\":1}\n```", None));
+        gemini_result(&json!({ "type": "result", "status": "error", "error": { "message": "429" } }), &mut result);
+        assert_eq!(result.error.as_deref(), Some("429"));
     }
 
     #[test]

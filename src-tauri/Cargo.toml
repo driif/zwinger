@@ -36,6 +36,10 @@ flate2 = "1.1.10"
 tar = "0.4.46"
 sha2 = "0.10.9"
 base64 = "0.22.1"
+toml = "1.1.8"
+
+[dev-dependencies]
+tokio = { version = "1.54.0", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"

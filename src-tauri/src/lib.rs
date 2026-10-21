@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 mod error;
+mod host_agents;
 mod netlog;
 mod runtime;
 mod runtimes;
@@ -94,14 +95,44 @@ pub fn run() {
             }
             let store = store::Store::new(data.join("shields.json"));
             let data_dir = data.clone();
-            let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data)?;
+            let host = Arc::new(host_agents::HostAgents::new(
+                Arc::new(host_agents::RealFs),
+                Arc::new(host_agents::login::HostLogins {
+                    home: dirs::home_dir().unwrap_or_default(),
+                }),
+                Arc::new(host_agents::SystemClock),
+                data.clone(),
+            ));
+            // At app start, off the main thread: detection runs `--version`.
+            std::thread::spawn({
+                let host = host.clone();
+                move || host.detect()
+            });
+            let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data, host.clone())?;
             // One app-wide event, so the rail and the map update while the
             // Network tab is closed.
             let handle = app.handle().clone();
             manager.set_net_sink(Box::new(move |shield_id, event| {
                 let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
             }));
+            // A host login is due: the UI shows the notice or 'Restart to
+            // renew', and the manager restarts the shield if the Mac has a
+            // newer login and the user turned that on. The renewal ends with
+            // the VM.
+            let handle = app.handle().clone();
+            manager.set_renew_sink(Box::new(move |shield_id| {
+                let _ = handle.emit("renew-due", shield_id);
+                let (handle, shield_id) = (handle.clone(), shield_id.to_owned());
+                tauri::async_runtime::spawn(async move {
+                    let manager = handle.state::<sessions::Manager<Microsandbox>>();
+                    if let Err(e) = manager.renew(&shield_id).await {
+                        eprintln!("renewal of {shield_id} failed: {e}");
+                    }
+                    let _ = handle.emit("renew-due", shield_id);
+                });
+            }));
             app.manage(manager);
+            app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
             app.manage(commands::Watches::default());
             Ok(())
@@ -151,6 +182,11 @@ pub fn run() {
             commands::list_runtimes,
             commands::install_runtime,
             commands::cancel_runtime_install,
+            commands::host_agents,
+            commands::detect_host_agents,
+            commands::put_host_agent,
+            commands::remove_host_agent,
+            commands::set_auto_renew,
             commands::put_task,
             commands::remove_task,
             commands::start_task_run,

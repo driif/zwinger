@@ -9,6 +9,9 @@ import {
   closeSession,
   createShield,
   deleteChat,
+  Detection,
+  detectHostAgents,
+  hostAgents,
   InstallProgress,
   installRuntime,
   isBlocked,
@@ -21,6 +24,7 @@ import {
   listTaskRuns,
   NetEvent,
   onNetEvent,
+  onRenewDue,
   renameChat,
   resolveFolder,
   RuntimeName,
@@ -32,6 +36,7 @@ import {
   stopShield,
 } from "./api";
 import { CommandBar } from "./CommandBar";
+import { HostAgentsSettings } from "./HostAgentsSettings";
 import { ShieldPage } from "./ShieldPage";
 import { ShieldRail } from "./ShieldRail";
 import { TaskRoom } from "./TaskRoom";
@@ -94,7 +99,8 @@ export interface Runtimes {
   list: RuntimeView[];
   /** The installs that run now. */
   installs: Partial<Record<RuntimeName, InstallProgress>>;
-  onInstall: (name: RuntimeName) => void;
+  /** No `version` installs the pinned version. `confirm` accepts a version with no pinned hash. */
+  onInstall: (name: RuntimeName, version?: string, confirm?: boolean) => void;
 }
 
 export default function App() {
@@ -120,6 +126,12 @@ export default function App() {
   const [chatAction, setChatAction] = useState<{ shieldId: string; action: ChatAction }>();
   const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
+  /** The agents on this Mac. `undefined` while a detection runs. */
+  const [detection, setDetection] = useState<Detection>();
+  /** The main area shows the agents on this Mac instead of a shield. */
+  const [showHostAgents, setShowHostAgents] = useState(false);
+  /** Per shield, the host agent that its Add agent step shows. */
+  const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
 
   // Replies can arrive out of order. Only the reply to the latest request is used.
   const refresh = () => {
@@ -142,22 +154,44 @@ export default function App() {
 
   const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => setError(String(e)));
 
+  // Detection runs at app start and on request, never in a loop.
+  const detect = (fresh: boolean) => {
+    setDetection(undefined);
+    (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => setError(String(e)));
+  };
+
   useEffect(() => {
     refresh();
     reloadRuntimes();
+    detect(false);
+  }, []);
+
+  // A host login is due, or the shield restarted to renew it.
+  useEffect(() => {
+    const stop = onRenewDue(() => refresh());
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
   }, []);
 
   const runtimes: Runtimes = {
     list: runtimeList,
     installs,
-    onInstall: (name) =>
+    onInstall: (name, version, confirm) =>
       run(async () => {
         setInstalls((current) => ({ ...current, [name]: { stage: "download", received: 0, total: null } }));
         try {
-          await installRuntime(name, (progress) => setInstalls((current) => ({ ...current, [name]: progress })));
+          await installRuntime(
+            name,
+            (progress) => setInstalls((current) => ({ ...current, [name]: progress })),
+            version ?? null,
+            confirm ?? false,
+          );
         } finally {
           setInstalls((current) => ({ ...current, [name]: undefined }));
           await reloadRuntimes();
+          // The runtime source of a host agent changes.
+          if (version) detect(true);
         }
       }),
   };
@@ -244,12 +278,14 @@ export default function App() {
   /** Items belong to one shield, so another shield shows its Overview instead. */
   function select(id: string) {
     setRoundFolder(undefined);
+    setShowHostAgents(false);
     setSelectedId(id);
     if (id === shield?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
   function openView(shieldId: string, next: View) {
     setRoundFolder(undefined);
+    setShowHostAgents(false);
     setSelectedId(shieldId);
     if (next.kind === "terminal") showPane(next.key, shieldId);
     else setView(next);
@@ -414,6 +450,7 @@ export default function App() {
         onClosePane={closePane}
         onMovePanes={movePanes}
         onNew={actions.newShield}
+        onHostAgents={() => setShowHostAgents(true)}
         dropFolder={dropFolder}
         onDropDone={(create) => {
           setDropFolder(undefined);
@@ -437,11 +474,24 @@ export default function App() {
           onRestart={restart}
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
+          onHostAgents={() => setShowHostAgents(true)}
           run={run}
         />
       </ShieldRail>
       <main className="main">
-        {roundFolder ? (
+        {showHostAgents ? (
+          <HostAgentsSettings
+            detection={detection}
+            shields={shields}
+            runtimes={runtimes}
+            run={run}
+            onRefresh={() => detect(true)}
+            onUse={(shieldId, agent) => {
+              select(shieldId);
+              setAdding((current) => ({ ...current, [shieldId]: agent.kind }));
+            }}
+          />
+        ) : roundFolder ? (
           <section className="page">
             <div className="view task-view">
               <TaskRoom key={roundFolder} kind="folder" path={roundFolder} />
@@ -476,6 +526,9 @@ export default function App() {
               }}
               onDropFolder={dropMount}
               runtimes={runtimes}
+              detection={detection}
+              adding={adding[shield.id]}
+              onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
               onRestart={() => restart(shield.id)}
               runs={runs[shield.id] ?? []}
               onRunsChange={() => reloadRuns(shield.id)}

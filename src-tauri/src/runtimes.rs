@@ -1,11 +1,15 @@
 //! The agent runtimes that zwinger downloads on first use: Claude Code and
-//! Codex. They are pinned npm packages, fetched on the host from the
-//! registry, checked against a pinned SHA-512 (and the registry's
-//! `dist.integrity`, which must name the same hash) and unpacked into
-//! `<app_data>/runtimes/<name>/<version>/`. A shield start mounts each
-//! installed runtime read-only at `/opt/zwinger/<name>`.
+//! Codex. They are npm packages, fetched on the host from the registry,
+//! checked against a pinned SHA-512 (and the registry's `dist.integrity`,
+//! which must name the same hash) and unpacked into
+//! `<app_data>/runtimes/<name>/<version>/`. A shield start mounts one
+//! installed version of each runtime read-only at `/opt/zwinger/<name>`.
+//!
+//! A host agent asks for the Linux build of the host's version. A version
+//! with no pinned hash can be installed only after the user confirms it
+//! once; then the registry's `dist.integrity` is the only check.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -26,6 +30,15 @@ const REGISTRY: &str = "https://registry.npmjs.org";
 const CLAUDE_VERSION: &str = "2.1.306";
 const CODEX_VERSION: &str = "0.163.0";
 pub const NAMES: [&str; 2] = ["claude", "codex"];
+/// The SRI hash of each pinned version per npm arch.
+const PINS: [(&str, &str, &str, &str); 4] = [
+    ("claude", CLAUDE_VERSION, "arm64", "sha512-AePKWuymgDSCh7nScJ4dx/pF1Kppzk4IwQuh6JCROiqQdBVGaaHw6jVf/fY5PhbSjy9EQML6yOiUfc50aFpnTA=="),
+    ("claude", CLAUDE_VERSION, "x64", "sha512-4gsb0IQhxzi1NhoUETXkNZb1t6wJ9tnfAYBKmb0+NmsAwOG37Dacq7bLqsooEkusaT0PyQRFUMt0SgWxx9LEEA=="),
+    ("codex", CODEX_VERSION, "arm64", "sha512-IH2/R+4OarjGvsAf1ll3fdyLwrPgYLl3uzp6u9CyD9sj2Lw+ViDSe3QBZVHdcHJs0eIiZFg6Wprcuy4CRZaUGw=="),
+    ("codex", CODEX_VERSION, "x64", "sha512-uwRaOsrYogLQhcxAM/GoeWrw0QIWEMRo7c9gM8sKAviVkZQHlu9kRLJ5PkufbV+ABGjyZgIwiFdJ0LCJ0N6e8w=="),
+];
+/// The unpinned versions that the user confirmed, as `<name>@<version>`.
+const CONFIRMED: &str = "confirmed.json";
 /// Progress is reported after each this many bytes.
 const REPORT: u64 = 1 << 20;
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
@@ -46,11 +59,12 @@ struct Wanted {
 struct Package {
     name: &'static str,
     /// The version that the UI shows.
-    version: &'static str,
+    version: String,
     npm: String,
     npm_version: String,
-    /// The SRI hash of the tarball of this version and arch.
-    sha512: &'static str,
+    /// The pinned SRI hash of the tarball of this version and arch. `None`
+    /// for a version that zwinger does not pin.
+    sha512: Option<&'static str>,
     files: Vec<Wanted>,
 }
 
@@ -63,33 +77,53 @@ fn arch() -> Result<(&'static str, &'static str)> {
     }
 }
 
-fn package(name: &str) -> Result<Package> {
+fn pinned_version(name: &str) -> Result<&'static str> {
+    match name {
+        "claude" => Ok(CLAUDE_VERSION),
+        "codex" => Ok(CODEX_VERSION),
+        _ => Err(Error::UnknownRuntime(name.to_owned())),
+    }
+}
+
+/// zwinger pins a hash for this version of the runtime.
+pub fn is_pinned(name: &str, version: &str) -> bool {
+    PINS.iter().any(|(n, v, ..)| *n == name && *v == version)
+}
+
+/// A version is a plain `x.y.z` (maybe with a pre-release), so it is safe
+/// in a registry URL and a folder name.
+fn check_version(name: &str, version: &str) -> Result<()> {
+    let valid = !version.is_empty()
+        && version.len() <= 64
+        && version.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && version.starts_with(|c: char| c.is_ascii_digit());
+    if valid { Ok(()) } else { Err(Error::BadPackage(name.to_owned(), format!("invalid version {version:?}"))) }
+}
+
+fn package(name: &str, version: &str) -> Result<Package> {
     let (arch, target) = arch()?;
+    pinned_version(name)?;
+    check_version(name, version)?;
+    let sha512 = PINS.iter().find(|(n, v, a, _)| *n == name && *v == version && *a == arch).map(|p| p.3);
     match name {
         "claude" => Ok(Package {
             name: "claude",
-            version: CLAUDE_VERSION,
+            version: version.to_owned(),
             npm: format!("@anthropic-ai/claude-code-linux-{arch}"),
-            npm_version: CLAUDE_VERSION.to_owned(),
-            sha512: match arch {
-                "arm64" => "sha512-AePKWuymgDSCh7nScJ4dx/pF1Kppzk4IwQuh6JCROiqQdBVGaaHw6jVf/fY5PhbSjy9EQML6yOiUfc50aFpnTA==",
-                _ => "sha512-4gsb0IQhxzi1NhoUETXkNZb1t6wJ9tnfAYBKmb0+NmsAwOG37Dacq7bLqsooEkusaT0PyQRFUMt0SgWxx9LEEA==",
-            },
+            npm_version: version.to_owned(),
+            sha512,
             files: vec![Wanted {
                 from: "package/claude".to_owned(),
                 to: "claude",
                 required: true,
             }],
         }),
-        "codex" => Ok(Package {
+        _ => Ok(Package {
             name: "codex",
-            version: CODEX_VERSION,
+            version: version.to_owned(),
             npm: "@openai/codex".to_owned(),
-            npm_version: format!("{CODEX_VERSION}-linux-{arch}"),
-            sha512: match arch {
-                "arm64" => "sha512-IH2/R+4OarjGvsAf1ll3fdyLwrPgYLl3uzp6u9CyD9sj2Lw+ViDSe3QBZVHdcHJs0eIiZFg6Wprcuy4CRZaUGw==",
-                _ => "sha512-uwRaOsrYogLQhcxAM/GoeWrw0QIWEMRo7c9gM8sKAviVkZQHlu9kRLJ5PkufbV+ABGjyZgIwiFdJ0LCJ0N6e8w==",
-            },
+            npm_version: format!("{version}-linux-{arch}"),
+            sha512,
             files: vec![
                 Wanted {
                     from: format!("package/vendor/{target}/bin/codex"),
@@ -104,7 +138,6 @@ fn package(name: &str) -> Result<Package> {
                 },
             ],
         }),
-        _ => Err(Error::UnknownRuntime(name.to_owned())),
     }
 }
 
@@ -120,7 +153,8 @@ fn is_installed(dir: &Path, package: &Package) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeView {
     pub name: &'static str,
-    pub version: &'static str,
+    /// The pinned version.
+    pub version: String,
     pub installed: bool,
 }
 
@@ -135,17 +169,31 @@ pub enum Progress {
 #[derive(Debug, Clone)]
 pub struct Installed {
     pub name: &'static str,
+    pub version: String,
     pub dir: PathBuf,
 }
 
-/// The installed runtimes of the pinned versions.
-pub fn installed(data: &Path) -> Vec<Installed> {
+/// The Linux build of this version is installed.
+pub fn is_cached(data: &Path, name: &str, version: &str) -> bool {
+    package(name, version).is_ok_and(|package| is_installed(&runtime_dir(data, &package), &package))
+}
+
+/// The installed runtime of each name: the version in `wanted` (the host
+/// version of a host agent) if it is installed, else the pinned version.
+pub fn installed(data: &Path, wanted: &HashMap<&str, String>) -> Vec<Installed> {
     NAMES
         .iter()
-        .filter_map(|name| package(name).ok())
-        .filter_map(|package| {
-            let dir = runtime_dir(data, &package);
-            is_installed(&dir, &package).then_some(Installed { name: package.name, dir })
+        .filter_map(|name| {
+            let pinned = pinned_version(name).ok()?.to_owned();
+            let versions = wanted.get(name).into_iter().cloned().chain([pinned]);
+            versions.filter_map(|v| package(name, &v).ok()).find_map(|package| {
+                let dir = runtime_dir(data, &package);
+                is_installed(&dir, &package).then_some(Installed {
+                    name: package.name,
+                    version: package.version,
+                    dir,
+                })
+            })
         })
         .collect()
 }
@@ -191,24 +239,58 @@ impl Runtimes {
         NAMES
             .iter()
             .map(|name| {
-                let package = package(name)?;
+                let package = package(name, pinned_version(name)?)?;
+                let installed = is_installed(&runtime_dir(&self.data, &package), &package);
                 Ok(RuntimeView {
                     name: package.name,
                     version: package.version,
-                    installed: is_installed(&runtime_dir(&self.data, &package), &package),
+                    installed,
                 })
             })
             .collect()
     }
 
-    /// Downloads, checks and unpacks the runtime. An installed runtime is
-    /// not an error. The work is in a temp dir that is renamed into place,
-    /// so a failed install leaves nothing that a start would mount.
-    pub async fn install(&self, name: &str, progress: impl Fn(Progress) + Send + Sync) -> Result<()> {
-        let package = package(name)?;
+    fn confirmed(&self) -> BTreeSet<String> {
+        std::fs::read(self.data.join("runtimes").join(CONFIRMED))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Keeps the user's confirm of an unpinned version, so it is asked once.
+    fn confirm(&self, package: &Package) -> Result<()> {
+        let mut confirmed = self.confirmed();
+        if confirmed.insert(format!("{}@{}", package.name, package.version)) {
+            let dir = self.data.join("runtimes");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(CONFIRMED), serde_json::to_vec_pretty(&confirmed)?)?;
+        }
+        Ok(())
+    }
+
+    /// Downloads, checks and unpacks the runtime: `version`, else the pinned
+    /// version. A version with no pin needs `confirm` once, which is kept.
+    /// An installed runtime is not an error. The work is in a temp dir that
+    /// is renamed into place, so a failed install leaves nothing that a start
+    /// would mount.
+    pub async fn install(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        confirm: bool,
+        progress: impl Fn(Progress) + Send + Sync,
+    ) -> Result<()> {
+        let package = package(name, version.unwrap_or(pinned_version(name)?))?;
         let dest = runtime_dir(&self.data, &package);
         if is_installed(&dest, &package) {
             return Ok(());
+        }
+        if package.sha512.is_none() {
+            if confirm {
+                self.confirm(&package)?;
+            } else if !self.confirmed().contains(&format!("{}@{}", package.name, package.version)) {
+                return Err(Error::UnpinnedVersion(package.name.to_owned(), package.version));
+            }
         }
         let cancel = Arc::new(Notify::new());
         {
@@ -251,7 +333,7 @@ async fn fetch(
     cancel: &Notify,
 ) -> Result<()> {
     let tgz = tmp.join("package.tgz");
-    let digest = tokio::select! {
+    let (digest, sha512) = tokio::select! {
         // A cancel wins over a download that ends at the same time.
         biased;
         () = cancel.notified() => return Err(Error::InstallCancelled(package.name.to_owned())),
@@ -270,9 +352,9 @@ async fn fetch(
             required: f.required,
         })
         .collect();
-    let (unpacked, sha512) = (root.clone(), package.sha512);
+    let unpacked = root.clone();
     tokio::task::spawn_blocking(move || {
-        check_integrity(name, sha512, &digest)?;
+        check_integrity(name, &sha512, &digest)?;
         extract(name, &tgz, &files, &unpacked)
     })
     .await
@@ -286,9 +368,15 @@ async fn fetch(
     Ok(())
 }
 
-/// Downloads the tarball to `tgz` and returns its SHA-512 digest. The
-/// registry must name the pinned hash before the download starts.
-async fn download(package: &Package, tgz: &Path, progress: &(impl Fn(Progress) + Send + Sync)) -> Result<Vec<u8>> {
+/// Downloads the tarball to `tgz` and returns its SHA-512 digest and the
+/// integrity that the download must match. The registry must name the
+/// pinned hash before the download starts. An unpinned version must match
+/// the registry's integrity.
+async fn download(
+    package: &Package,
+    tgz: &Path,
+    progress: &(impl Fn(Progress) + Send + Sync),
+) -> Result<(Vec<u8>, String)> {
     let bad = |why: &str| Error::BadPackage(package.name.to_owned(), why.to_owned());
     let client = reqwest::Client::builder()
         .https_only(true)
@@ -302,7 +390,13 @@ async fn download(package: &Package, tgz: &Path, progress: &(impl Fn(Progress) +
         return Err(bad("the tarball is not on the registry"));
     }
     let integrity = meta["dist"]["integrity"].as_str().ok_or_else(|| bad("no dist.integrity"))?;
-    check_pinned(package, integrity)?;
+    let expected = match package.sha512 {
+        Some(pinned) => {
+            check_pinned(pinned, package.name, integrity)?;
+            pinned.to_owned()
+        }
+        None => integrity.to_owned(),
+    };
 
     // About 290 MB: it streams to disk and is hashed on the way.
     let mut response = client.get(tarball).send().await?.error_for_status()?;
@@ -323,16 +417,16 @@ async fn download(package: &Package, tgz: &Path, progress: &(impl Fn(Progress) +
     file.flush().await?;
     drop(file);
     progress(Progress::Download { received, total });
-    Ok(hasher.finalize().to_vec())
+    Ok((hasher.finalize().to_vec(), expected))
 }
 
 /// The registry's `dist.integrity` must name the pinned hash, so a changed
 /// package fails before its download.
-fn check_pinned(package: &Package, integrity: &str) -> Result<()> {
-    if integrity.split_whitespace().any(|h| h == package.sha512) {
+fn check_pinned(pinned: &str, name: &str, integrity: &str) -> Result<()> {
+    if integrity.split_whitespace().any(|h| h == pinned) {
         Ok(())
     } else {
-        Err(Error::IntegrityMismatch(package.name.to_owned()))
+        Err(Error::IntegrityMismatch(name.to_owned()))
     }
 }
 
@@ -391,7 +485,12 @@ fn extract(name: &str, tgz: &Path, files: &[Wanted], root: &Path) -> Result<()> 
 /// Puts the required files of the pinned version in place, as an install does.
 #[cfg(test)]
 pub fn fake_install(data: &Path, name: &str) {
-    let package = package(name).unwrap();
+    fake_install_version(data, name, pinned_version(name).unwrap());
+}
+
+#[cfg(test)]
+pub fn fake_install_version(data: &Path, name: &str, version: &str) {
+    let package = package(name, version).unwrap();
     let dir = runtime_dir(data, &package);
     for file in package.files.iter().filter(|f| f.required) {
         let to = dir.join(file.to);
@@ -496,18 +595,18 @@ mod tests {
 
     #[test]
     fn the_pinned_hash_must_match_the_registry_and_the_download() {
-        let claude = package("claude").unwrap();
+        let pinned = package("claude", CLAUDE_VERSION).unwrap().sha512.unwrap();
         let hash = base64::engine::general_purpose::STANDARD
-            .decode(claude.sha512.strip_prefix("sha512-").unwrap())
+            .decode(pinned.strip_prefix("sha512-").unwrap())
             .unwrap();
         assert_eq!(hash.len(), 64);
-        check_pinned(&claude, &format!("sha1-abc {}", claude.sha512)).unwrap();
+        check_pinned(pinned, "claude", &format!("sha1-abc {pinned}")).unwrap();
         let other = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b"x")));
-        assert!(matches!(check_pinned(&claude, &other), Err(Error::IntegrityMismatch(_))));
-        check_integrity("claude", claude.sha512, &hash).unwrap();
+        assert!(matches!(check_pinned(pinned, "claude", &other), Err(Error::IntegrityMismatch(_))));
+        check_integrity("claude", pinned, &hash).unwrap();
         let download = Sha512::digest(b"changed tarball").to_vec();
-        assert!(matches!(check_integrity("claude", claude.sha512, &download), Err(Error::IntegrityMismatch(_))));
-        assert_ne!(package("codex").unwrap().sha512, claude.sha512);
+        assert!(matches!(check_integrity("claude", pinned, &download), Err(Error::IntegrityMismatch(_))));
+        assert_ne!(package("codex", CODEX_VERSION).unwrap().sha512, Some(pinned));
     }
 
     #[tokio::test]
@@ -516,12 +615,12 @@ mod tests {
         let runtimes = Arc::new(Runtimes::new(data.clone()));
         let install = tokio::spawn({
             let runtimes = runtimes.clone();
-            async move { runtimes.install("codex", |_| {}).await }
+            async move { runtimes.install("codex", None, false, |_| {}).await }
         });
         while !runtimes.installing.lock().unwrap().contains_key("codex") {
             tokio::task::yield_now().await;
         }
-        assert!(matches!(runtimes.install("codex", |_| {}).await, Err(Error::RuntimeInstalling(_))));
+        assert!(matches!(runtimes.install("codex", None, false, |_| {}).await, Err(Error::RuntimeInstalling(_))));
         runtimes.cancel("codex");
         assert!(matches!(install.await.unwrap(), Err(Error::InstallCancelled(_))));
         assert!(runtimes.installing.lock().unwrap().is_empty());
@@ -546,29 +645,60 @@ mod tests {
     #[test]
     fn packages_are_pinned_per_arch() {
         let (arch, target) = arch().unwrap();
-        let claude = package("claude").unwrap();
+        let claude = package("claude", "2.1.306").unwrap();
         assert_eq!(claude.npm, format!("@anthropic-ai/claude-code-linux-{arch}"));
         assert_eq!(claude.npm_version, "2.1.306");
-        let codex = package("codex").unwrap();
+        let codex = package("codex", "0.163.0").unwrap();
         assert_eq!((codex.npm.as_str(), codex.npm_version.clone()), ("@openai/codex", format!("0.163.0-linux-{arch}")));
         assert_eq!(codex.files[0].from, format!("package/vendor/{target}/bin/codex"));
-        assert!(matches!(package("pi"), Err(Error::UnknownRuntime(_))));
+        assert!(matches!(package("pi", "1.0.0"), Err(Error::UnknownRuntime(_))));
+        // Another version has no pin, and a version must be safe in a URL and a folder name.
+        let newer = package("codex", "0.170.1").unwrap();
+        assert_eq!((newer.sha512, newer.npm_version), (None, format!("0.170.1-linux-{arch}")));
+        assert!(is_pinned("claude", "2.1.306") && !is_pinned("claude", "2.1.310"));
+        for bad in ["", "../1", "1.0/x", "latest", "1.0 0"] {
+            assert!(matches!(package("claude", bad), Err(Error::BadPackage(..))), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_version_needs_one_confirm() {
+        let data = temp_dir();
+        let runtimes = Runtimes::new(data.clone());
+        let result = runtimes.install("claude", Some("2.1.310"), false, |_| {}).await;
+        assert!(matches!(result, Err(Error::UnpinnedVersion(n, v)) if n == "claude" && v == "2.1.310"));
+        let package = package("claude", "2.1.310").unwrap();
+        runtimes.confirm(&package).unwrap();
+        assert!(Runtimes::new(data).confirmed().contains("claude@2.1.310"));
+        // An installed version needs no confirm.
+        let other = temp_dir();
+        fake_install_version(&other, "claude", "2.1.311");
+        Runtimes::new(other).install("claude", Some("2.1.311"), false, |_| {}).await.unwrap();
     }
 
     #[test]
     fn installed_lists_complete_runtimes_only() {
         let data = temp_dir();
-        assert!(installed(&data).is_empty());
-        let codex = package("codex").unwrap();
+        let pinned = HashMap::new();
+        assert!(installed(&data, &pinned).is_empty());
+        let codex = package("codex", CODEX_VERSION).unwrap();
         let dir = runtime_dir(&data, &codex);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        assert!(installed(&data).is_empty());
+        assert!(installed(&data, &pinned).is_empty());
         std::fs::write(dir.join("bin/codex"), "x").unwrap();
-        let found = installed(&data);
+        let found = installed(&data, &pinned);
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].name, &found[0].dir), ("codex", &dir));
-        let list = Runtimes::new(data).list().unwrap();
+        let list = Runtimes::new(data.clone()).list().unwrap();
         assert_eq!(list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(), [("claude", false), ("codex", true)]);
+
+        // The host version wins when it is cached; else the pinned version is the fallback.
+        let host = HashMap::from([("codex", "0.170.1".to_owned())]);
+        assert_eq!(installed(&data, &host)[0].version, CODEX_VERSION);
+        fake_install_version(&data, "codex", "0.170.1");
+        assert!(is_cached(&data, "codex", "0.170.1"));
+        let found = installed(&data, &host);
+        assert_eq!((found[0].version.as_str(), found[0].dir.clone()), ("0.170.1", runtime_dir(&data, &package("codex", "0.170.1").unwrap())));
     }
 
     /// Downloads the real pinned Codex from the npm registry. Needs network:
@@ -578,7 +708,7 @@ mod tests {
     async fn live_install_codex() {
         let data = std::env::temp_dir().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
         let runtimes = Runtimes::new(data.clone());
-        runtimes.install("codex", |_| {}).await.unwrap();
+        runtimes.install("codex", None, false, |_| {}).await.unwrap();
         let list = runtimes.list().unwrap();
         assert!(list.iter().any(|r| r.name == "codex" && r.installed));
         let _ = std::fs::remove_dir_all(data);

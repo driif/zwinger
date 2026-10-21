@@ -118,6 +118,26 @@ pub enum Error {
     InstallCancelled(String),
     #[error("no agent runtime for this computer ({0})")]
     UnsupportedArch(String),
+    #[error("{0} {1} has no hash that zwinger pins; confirm the download of this version first")]
+    UnpinnedVersion(String, String),
+    #[error("{0} is already a host agent of this shield")]
+    DuplicateHostAgent(String),
+    #[error("{0} is not installed on this Mac")]
+    HostAgentMissing(String),
+    #[error("{0} runs only from this Mac; add it to the shield with Add agent, then restart the shield")]
+    NotHostAgent(String),
+    #[error("{0} from this Mac does not run in the shield: {1}")]
+    HostAgentFailed(String, String),
+    #[error("the {0} login on this Mac: {1}")]
+    HostLogin(String, String),
+    #[error("{0} has no login on this Mac; log in with {0} on the Mac first")]
+    HostLoginMissing(String),
+    #[error("the {0} login on this Mac has expired; open {0} on the Mac once to renew it, then start the shield again")]
+    HostLoginExpired(String),
+    #[error("secret {0} is the host login of an agent; change it in the agent's settings")]
+    HostLoginSecret(String),
+    #[error("{0} is blocked in this shield: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off")]
+    RefreshHostConflict(String, String),
     #[error("the download of {0} does not match its integrity hash")]
     IntegrityMismatch(String),
     #[error("invalid package of {0}: {1}")]

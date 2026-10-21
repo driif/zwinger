@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentKind};
 use crate::error::{Error, Result};
-use crate::secrets::{self, Secret};
+use crate::host_agents::login;
+use crate::secrets::{self, Origin, Secret};
 
 pub const WORKSPACE: &str = "/workspace";
 const FOLDER_LIMIT: usize = 50;
@@ -37,6 +38,23 @@ pub struct Shield {
     pub apps: Vec<App>,
     #[serde(default)]
     pub tasks: Vec<Task>,
+    /// The agents that the shield takes from the host. At most one per kind.
+    #[serde(default)]
+    pub host_agents: Vec<HostAgentUse>,
+    /// Restart the shield when a host login is due for renewal, if nothing
+    /// works in it then.
+    #[serde(default)]
+    pub auto_renew: bool,
+}
+
+/// A host agent of a shield: its runtime, and if the shield also gets the
+/// agent's profile (read-only) and its host login.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostAgentUse {
+    pub kind: AgentKind,
+    pub profile: bool,
+    pub login: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -188,6 +206,8 @@ impl Shield {
             layout: BTreeMap::new(),
             apps: Vec::new(),
             tasks: Vec::new(),
+            host_agents: Vec::new(),
+            auto_renew: false,
         })
     }
 
@@ -401,6 +421,28 @@ impl Shield {
         }
     }
 
+    /// Adds or replaces the host agent of its kind. `login` is the agent's
+    /// host-login secret if the use has a login; it replaces the old one.
+    pub fn put_host_agent(&mut self, used: HostAgentUse, login: Option<Secret>) {
+        let kind = used.kind;
+        self.secrets.retain(|s| s.origin != Origin::HostLogin { agent: kind });
+        self.secrets.extend(login);
+        match self.host_agents.iter_mut().find(|a| a.kind == kind) {
+            Some(current) => *current = used,
+            None => self.host_agents.push(used),
+        }
+    }
+
+    /// Also removes its host-login secret.
+    pub fn remove_host_agent(&mut self, kind: AgentKind) {
+        self.host_agents.retain(|a| a.kind != kind);
+        self.secrets.retain(|s| s.origin != Origin::HostLogin { agent: kind });
+    }
+
+    pub fn host_agent(&self, kind: AgentKind) -> Option<&HostAgentUse> {
+        self.host_agents.iter().find(|a| a.kind == kind)
+    }
+
     pub fn remove_secret(&mut self, name: &str) -> Result<()> {
         let before = self.secrets.len();
         self.secrets.retain(|s| s.name != name);
@@ -414,6 +456,29 @@ impl Shield {
     pub fn check(&self) -> Result<()> {
         self.check_overlap()?;
         secrets::check_unique(&self.secrets)?;
+        for (i, used) in self.host_agents.iter().enumerate() {
+            if self.host_agents[..i].iter().any(|a| a.kind == used.kind) {
+                return Err(Error::DuplicateHostAgent(used.kind.name().to_owned()));
+            }
+        }
+        // A host-login secret belongs to a host agent with a login.
+        for secret in &self.secrets {
+            if let Origin::HostLogin { agent } = secret.origin
+                && !self.host_agent(agent).is_some_and(|a| a.login)
+            {
+                return Err(Error::InvalidSecret(secret.name.clone(), format!("{} has no host login", agent.name())));
+            }
+        }
+        // The policy denies the refresh hosts of the host logins, also over
+        // the allow list, such as pi's Copilot login and `api.github.com`.
+        for host in login::denied_hosts(&self.secrets) {
+            if self.network.domains.iter().any(|d| d == host) {
+                return Err(Error::RefreshHostConflict(host.to_owned(), "the allow-list entry".to_owned()));
+            }
+            if let Some(secret) = self.secrets.iter().find(|s| s.origin.is_user() && s.hosts.iter().any(|h| h == host)) {
+                return Err(Error::RefreshHostConflict(host.to_owned(), format!("the secret {}", secret.name)));
+            }
+        }
         if let Some(app) = self.apps.iter().find(|a| !self.guest_target_exists(Path::new(&a.cwd))) {
             return Err(Error::AppCwd(app.name.clone(), app.cwd.clone()));
         }
@@ -1166,5 +1231,59 @@ mod tests {
         ] {
             assert!(matches!(domain(input), Err(Error::InvalidDomain(..))), "{input:?}");
         }
+    }
+
+    #[test]
+    fn host_agents_keep_one_entry_and_one_login_per_kind() {
+        let mut shield = Shield::new(temp_dir("host").to_str().unwrap()).unwrap();
+        let login = |agent| Secret {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            hosts: vec!["api.anthropic.com".into()],
+            places: secrets::Places { header_fields: vec!["authorization".into()], query: false, body: false },
+            origin: Origin::HostLogin { agent },
+        };
+        let claude = |profile, login| HostAgentUse { kind: AgentKind::Claude, profile, login };
+        shield.put_host_agent(claude(true, true), Some(login(AgentKind::Claude)));
+        shield.put_host_agent(claude(false, true), Some(login(AgentKind::Claude)));
+        shield.check().unwrap();
+        assert_eq!((shield.host_agents.len(), shield.secrets.len()), (1, 1));
+        assert!(!shield.host_agents[0].profile);
+
+        // The login off removes its secret.
+        shield.put_host_agent(claude(false, false), None);
+        assert!(shield.secrets.is_empty());
+        shield.check().unwrap();
+
+        // A host-login secret with no host login, and two entries of a kind, are refused.
+        shield.secrets.push(login(AgentKind::Claude));
+        assert!(matches!(shield.check(), Err(Error::InvalidSecret(..))));
+        shield.remove_host_agent(AgentKind::Claude);
+        assert!(shield.secrets.is_empty() && shield.host_agents.is_empty());
+        shield.host_agents = vec![claude(false, false), claude(true, false)];
+        assert!(matches!(shield.check(), Err(Error::DuplicateHostAgent(_))));
+    }
+
+    #[test]
+    fn pi_copilot_login_conflicts_with_the_github_api() {
+        let mut shield = Shield::new(temp_dir("copilot").to_str().unwrap()).unwrap();
+        let pi = HostAgentUse { kind: AgentKind::Pi, profile: false, login: true };
+        shield.put_host_agent(pi, Some(login::secret(AgentKind::Pi, "api.business.githubcopilot.com")));
+        shield.network.add_domain("github.com").unwrap();
+        shield.check().unwrap();
+
+        shield.network.add_domain("api.github.com").unwrap();
+        assert!(matches!(shield.check(), Err(Error::RefreshHostConflict(h, _)) if h == "api.github.com"));
+        shield.network.domains.retain(|d| d != "api.github.com");
+        shield.secrets.push(Secret {
+            name: "GITHUB_TOKEN".into(),
+            hosts: vec!["api.github.com".into(), "github.com".into()],
+            places: secrets::Places { header_fields: vec!["authorization".into()], query: false, body: false },
+            origin: Origin::User,
+        });
+        let err = shield.check().unwrap_err();
+        assert!(err.to_string().contains("the secret GITHUB_TOKEN"), "{err}");
+        // Without the login, the GitHub API is open again.
+        shield.remove_host_agent(AgentKind::Pi);
+        shield.check().unwrap();
     }
 }

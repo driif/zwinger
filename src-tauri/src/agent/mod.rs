@@ -1,9 +1,10 @@
-//! The agents of a shield: pi, Claude Code and Codex. Each one runs in the VM
+//! The agents of a shield: pi, Claude Code, Codex and Gemini CLI. Each one runs in the VM
 //! and talks JSONL over pipes. The Agents tab gets pi-shaped records from each.
 
 pub mod claude;
 pub mod cli;
 pub mod codex;
+pub mod gemini;
 pub mod pi;
 
 use std::collections::VecDeque;
@@ -33,6 +34,7 @@ pub enum AgentKind {
     Pi,
     Claude,
     Codex,
+    Gemini,
 }
 
 impl AgentKind {
@@ -42,6 +44,17 @@ impl AgentKind {
             Self::Pi => "pi",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// The name that the user sees.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Gemini => "Gemini CLI",
         }
     }
 }
@@ -115,8 +128,8 @@ pub enum ThinkingLevel {
 }
 
 /// The commands that the UI may send. Rust builds the JSON that pi gets,
-/// so fields that are not listed here never reach pi. Claude Code and Codex
-/// get no JSON: [`cli::CliAgent`] does the command.
+/// so fields that are not listed here never reach pi. Claude Code, Codex
+/// and Gemini CLI get no JSON: [`cli::CliAgent`] does the command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AgentCommand {
@@ -167,6 +180,14 @@ impl Handle {
         match self {
             Self::Pi(agent) => agent.set_sink(sink),
             Self::Cli(agent) => agent.set_sink(sink),
+        }
+    }
+
+    /// A turn runs.
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::Pi(agent) => agent.is_busy(),
+            Self::Cli(agent) => agent.is_busy(),
         }
     }
 

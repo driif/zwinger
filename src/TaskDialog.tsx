@@ -3,6 +3,9 @@ import { FormEvent, useState } from "react";
 import { AGENT_NAMES, AgentKind, putTask, ShieldView, TaskAgent } from "./api";
 
 const KINDS: AgentKind[] = ["claude", "codex", "pi"];
+/** Gemini CLI runs only from this Mac. */
+const kinds = (shield: ShieldView): AgentKind[] =>
+  shield.hostAgents.some((a) => a.kind === "gemini") ? [...KINDS, "gemini"] : KINDS;
 
 interface Props {
   shield: ShieldView;
@@ -70,7 +73,7 @@ export function TaskDialog({ shield, taskId, onDone }: Props) {
             <div key={index} className="row">
               <SegmentedControl
                 label={index === 0 ? "First agent (decides a tiebreak)" : "Second agent"}
-                options={KINDS.map((kind) => ({ value: kind, label: AGENT_NAMES[kind] }))}
+                options={kinds(shield).map((kind) => ({ value: kind, label: AGENT_NAMES[kind] }))}
                 value={agents[index].kind}
                 onChange={(kind) => setAgent(index, { kind: kind as AgentKind })}
               />

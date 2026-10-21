@@ -32,10 +32,14 @@ export interface Secret {
   places: Places;
 }
 
+/** `hostLogin`: the agent's login on this Mac, read at each start. The user cannot edit it. */
+export type SecretOrigin = { kind: "user" } | { kind: "hostLogin"; agent: AgentKind };
+
 export interface SecretView extends Secret {
   placeholder: string;
-  /** The Keychain has a value. */
+  /** The Keychain has a value, or the value comes from the Mac. */
   set: boolean;
+  origin: SecretOrigin;
 }
 
 export type ShieldStatus =
@@ -92,6 +96,13 @@ export interface Task {
   workdir: string;
 }
 
+/** A host agent of a shield: its runtime, and its read-only profile and host login if set. */
+export interface HostAgentUse {
+  kind: AgentKind;
+  profile: boolean;
+  login: boolean;
+}
+
 export interface ShieldView {
   id: string;
   name: string;
@@ -99,7 +110,7 @@ export interface ShieldView {
   mounts: Mount[];
   network: NetworkPolicy;
   harness: string | null;
-  secrets: Secret[];
+  secrets: (Secret & { origin?: SecretOrigin })[];
   /** The map positions that the user dragged, by node id. */
   layout: Record<string, Pos>;
   apps: App[];
@@ -108,8 +119,17 @@ export interface ShieldView {
   pendingRestart: boolean;
   sessions: SessionView[];
   appRuns: AppRun[];
-  /** The agent runtimes that the running VM has mounted. */
-  runtimes: RuntimeName[];
+  /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
+  runtimes: ("claude" | "codex" | "gemini")[];
+  hostAgents: HostAgentUse[];
+  /** Restart when this Mac has a newer host login than the VM, if nothing works in the shield. */
+  autoRenew: boolean;
+  /** The earliest expiry of the running VM's host logins, in ms since the epoch. */
+  loginExpiresAt: number | null;
+  /** A host login is due and this Mac has a newer one: a restart reads it. */
+  renewDue: boolean;
+  /** What the start did differently for the host agents, such as a fallback. */
+  hostNotices: string[];
 }
 
 export type PtyEvent = { event: "output"; data: number[] } | { event: "exit"; data: number };
@@ -241,9 +261,9 @@ export type AgentCommand =
   | { type: "switch_session"; chat: string }
   | { type: "set_session_name"; name: string };
 
-export type AgentKind = "pi" | "claude" | "codex";
+export type AgentKind = "pi" | "claude" | "codex" | "gemini";
 
-export const AGENT_NAMES: Record<AgentKind, string> = { pi: "pi", claude: "Claude Code", codex: "Codex" };
+export const AGENT_NAMES: Record<AgentKind, string> = { pi: "pi", claude: "Claude Code", codex: "Codex", gemini: "Gemini CLI" };
 
 /** A chat of a shield. `id` is a file name, unique per agent. */
 export interface Chat {
@@ -290,10 +310,65 @@ export type InstallProgress = { stage: "download"; received: number; total: numb
 
 export const listRuntimes = () => invoke<RuntimeView[]>("list_runtimes");
 
-/** Downloads the pinned version and checks its integrity. Resolves when it is installed. */
-export function installRuntime(name: RuntimeName, onProgress: (progress: InstallProgress) => void) {
-  return invoke<void>("install_runtime", { name, onProgress: new Channel<InstallProgress>(onProgress) });
+/**
+ * Downloads `version`, else the pinned version, and checks its integrity. Resolves when it is installed.
+ * A version with no pinned hash fails until the user confirms it once with `confirm`.
+ */
+export function installRuntime(
+  name: RuntimeName,
+  onProgress: (progress: InstallProgress) => void,
+  version: string | null = null,
+  confirm = false,
+) {
+  return invoke<void>("install_runtime", { name, version, confirm, onProgress: new Channel<InstallProgress>(onProgress) });
 }
+
+/** Where a shield's copy of a host agent comes from. */
+export type RuntimeSource = "host" | "cached" | "pinned";
+
+/** Gemini CLI authenticates with a `GEMINI_API_KEY` secret only. */
+export const GEMINI_NO_LOGIN =
+  "Subscription login is not supported yet (needs the app proxy, #16). Add a GEMINI_API_KEY secret to the shield instead.";
+
+export type LoginState = { state: "found"; expires: number | null } | { state: "expired" } | { state: "none" };
+
+/** An agent that is installed on this Mac. */
+export interface HostAgent {
+  kind: AgentKind;
+  version: string;
+  /** The host path of the install. */
+  path: string;
+  source: RuntimeSource;
+  /** zwinger pins a hash for the Linux build of this version. Without a pin, the download needs one confirm. */
+  pinned: boolean;
+  /** The Mac has a config dir that the profile can copy. */
+  profile: boolean;
+  login: LoginState;
+}
+
+export interface Detection {
+  agents: HostAgent[];
+  /** Antigravity is installed. It is not supported yet. */
+  antigravity: boolean;
+}
+
+/** The last detection, else a new one. */
+export const hostAgents = () => invoke<Detection>("host_agents");
+
+export const detectHostAgents = () => invoke<Detection>("detect_host_agents");
+
+/** `allowHosts` also adds the login's provider host to the allow list. Applies on the next start. */
+export const putHostAgent = (id: string, agent: HostAgentUse, allowHosts: boolean) =>
+  invoke<void>("put_host_agent", { id, agent, allowHosts });
+
+/** Also removes its host login. */
+export const removeHostAgent = (id: string, agent: AgentKind) => invoke<void>("remove_host_agent", { id, agent });
+
+export const setAutoRenew = (id: string, on: boolean) => invoke<void>("set_auto_renew", { id, on });
+
+/** Resolves to the function that stops the listener. */
+export const onRenewDue = (handler: (shieldId: string) => void) =>
+  listen<string>("renew-due", ({ payload }) => handler(payload));
 
 /** Stops the download. The install then fails with a cancel error. */
 export const cancelRuntimeInstall = (name: RuntimeName) => invoke<void>("cancel_runtime_install", { name });
