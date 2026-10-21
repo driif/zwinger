@@ -23,5 +23,6 @@ Flow: install the app → create a shield on a folder → mount more folders →
 | M3 | agent chat (pi) | pi in RPC mode inside the shield. Chat UI: streaming, tool calls, abort, model choice, sessions. pi available in the VM without per-start npx. |
 | M4 | network activity | Live request log per shield (allowed / denied / injected). One-click allow of a denied host. |
 | M4b | canvas + shield tree | Shield map on a draggable canvas (React Flow) with saved layout; drop folders from Finder to mount. Left rail as a tree: shield → Agents / Terminals / Apps, reorder by drag (dnd-kit). **Apps**: saved long-running commands in a shield. |
-| M5 | multi-agent | claude and codex adapters. Task runs where agents plan, implement and review together. Agent-to-agent messages (A2A). |
+| M5a | more agents | Claude Code and Codex next to pi (download on demand, mounted read-only). |
+| M5b | task runs + run room | Agents plan, implement and review together (duo pattern) inside a shield. **Run room**: live timeline of agent messages, stage bar, each agent's position, disagreements and concessions, verdicts; the user steps in. Also watches external duo round folders. A2A later. |
 | M6 | production | Onboarding, settings, error and empty states, app icon, release build, signing and notarization, auto-update, CI. |

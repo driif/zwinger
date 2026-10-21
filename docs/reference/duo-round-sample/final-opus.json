@@ -1,0 +1,11 @@
+{
+  "ship": true,
+  "blocking": [],
+  "residual": [
+    "The 'is a link to <target>' note in `src/ShieldRail.tsx:581` and `src/SettingsTab.tsx:75` shows whenever the dropped string is not the same as the canonical path. A trailing slash or a `..` segment also makes the note show, even when the path is not a link. The path that gets mounted is still the canonical one, so this is only a wording issue.",
+    "Only folders dropped from Finder go through `resolve_folder`. A folder picked in the file dialog (`SettingsTab.pickMount`) or from New shield is used without it. This matches the scope of finding 4, but the confirm step does not show the canonical path for those two ways in.",
+    "Chat rename and chat delete run through the hidden AgentsTab of the target shield. A rename on a shield that is not running starts the VM first, as the plan says. If pi does not become ready, the action waits until it does and gives no error.",
+    "All three gates pass: `pnpm build`, `cargo clippy -D warnings` and `cargo test` (128 passed). The only output is Vite's warning about the chunk size."
+  ],
+  "task_met": "Yes. The change fixes all nine review findings in round 02-fix: rail row actions and context menu, activity dots on blocked hosts, motiv map controls, canonical-path confirms for drops, hit-testing the boundary by position, no pruning while folders load, merging nodes by id, attach/detach tokens, and drafts kept across tree navigation. It also keeps the M3/M4 items from task.md: the canvas map, the rail tree with drag and drop, Apps, and the two M4 carry-overs. I found no part of the task that is missing, no mixed approach and nothing outside the scope."
+}

@@ -1,0 +1,42 @@
+{
+  "summary": "I fixed all nine review findings, and all three gates pass. Rust has four new parts: attach tokens with `detach_app` (a detach with an old token keeps the new sink), `resolve_folder` (it wraps `shield::host_dir`), `delete_chat` (it opens the dir with NOFOLLOW|DIRECTORY, checks the file with `statat` without following links, then calls `unlinkat`; it accepts only listed ids), and the `set_session_name` command. `read_chat` now also reads the last 1 MiB of a chat file to find a late `session_info`. Each part has a test. On the map: blocked host nodes show activity dots, and motiv `IconButtonGroup` controls in a `Panel` replace React Flow's `<Controls>`. Nodes are merged by id, a drag does not prune the layout, and folder ids are not pruned while `folders` is undefined. The map has its own Finder drop listener, which tests the drop point against the boundary rect. Both drop paths resolve the folder in Rust before the confirm step, show the canonical path, and say '<dropped> is a link to <target>' when the paths differ. ShieldPage keeps the tabs mounted (hidden) during chat, terminal and app views, so a mount draft is kept, and the map calls fitView again when it shows. Each rail item has one Ellipsis button. It, a right-click, Shift+F10 or the ContextMenu key opens a menu made of a motiv Card and ghost Buttons, which closes on Escape or an outside click. Chat rename and delete run in AgentsTab through `get_state`, `switch_session` / `new_session` and `set_session_name`; App keeps each shield's current chat.",
+  "files": [
+    "src-tauri/src/agent.rs",
+    "src-tauri/src/commands.rs",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/sessions.rs",
+    "src-tauri/src/shield.rs",
+    "src/api.ts",
+    "src/App.tsx",
+    "src/App.css",
+    "src/AgentsTab.tsx",
+    "src/AppsSection.tsx",
+    "src/mapLayout.ts",
+    "src/SettingsTab.tsx",
+    "src/ShieldMap.tsx",
+    "src/ShieldPage.tsx",
+    "src/ShieldRail.tsx",
+    "src/TerminalPane.tsx"
+  ],
+  "gates": {
+    "pnpm build": "- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.\n\u2713 built in 180ms",
+    "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.91s",
+    "cargo test --manifest-path src-tauri/Cargo.toml": "test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s"
+  },
+  "deviations": [
+    "The rail cannot call pi itself: `open_agent` would take the event sink from the open AgentsTab. So App selects the shield, starts it if it is stopped, and gives the chat action to that shield's AgentsTab. AgentsTab reads `get_state` again at the time of the action. If pi is streaming, the action fails with 'pi is busy'. Then it does switch_session or new_session, set_session_name or delete_chat, and loads the chat. Errors go to the App status line through `run`. A delete of a chat that pi does not hold (the shield is stopped, or the chat is not current) calls `deleteChat` directly and does not start the VM.",
+    "A rename of a chat that is not current makes it pi's current chat, as the plan's order says (switch, then rename). The open chat view then follows it through `onChat`.",
+    "The rail's inline app Start/Stop button and terminal X button are gone: the plan asks for one Ellipsis IconButton per item. The app menu therefore starts with Start or Stop, before Edit, Restart and Delete, so the rail can still start and stop apps.",
+    "`resolve_folder` lives in `shield.rs` and the command calls it, so the Rust test can call it. A path that is not UTF-8 gives `MissingPath`. It is not converted lossily.",
+    "ShieldMap wraps itself in `ReactFlowProvider`, so the drop listener can use `screenToFlowPosition` and `getNode`. The fitView call when the map shows is wrapped in `requestAnimationFrame`, so it runs after the hidden container has its size again. I did not check this in the running app."
+  ],
+  "left_undone": [],
+  "missing_dependencies": [],
+  "backlog": [
+    "Rename a chat without changing pi's current chat: append the `session_info` line from Rust, or switch back after the rename.",
+    "Rail menu: a click on the Ellipsis of an open menu closes it and opens it again, because the outside click comes first. Make it toggle.",
+    "Rail menu: place it above the row when it would go past the bottom of the rail.",
+    "Show the canonical path and 'link to' also for folders picked in the dialog (Add mount, New shield), not only for dropped folders.",
+    "Write the late chat title through a session-name cache, so a long chat is not read twice for each list."
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "fixed": [
+    {
+      "finding": "src/App.tsx:240 \u2014 a delete on a running shield can skip the current-chat check because it trusts the cached currentChats.",
+      "what_changed": "startChatAction now deletes directly only when the shield is not running. Every delete on a running shield goes to AgentsTab.doChatAction. That function reads pi's get_state at action time, sends new_session if pi holds the chat, and then deletes the chat. I removed the currentChats cache from App.tsx because nothing else used it. onChat now only updates the chat view."
+    }
+  ],
+  "rebuttals": [],
+  "files": [
+    "src/App.tsx"
+  ],
+  "gates": {
+    "pnpm build": "(!) Some chunks are larger than 500 kB after minification. ... \u2713 built in 417ms"
+  },
+  "missing_dependencies": [],
+  "message": "I accept the finding. Every chat delete on a running shield now goes through AgentsTab, which reads pi's state when the action runs. A shield that is not running deletes directly, because no pi holds a chat. I removed the currentChats cache, so there is no stale path left. I changed only src/App.tsx, so I ran only pnpm build, and it passes."
+}

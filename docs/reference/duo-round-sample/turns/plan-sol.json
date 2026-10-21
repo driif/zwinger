@@ -1,0 +1,18 @@
+{
+  "plan": "Fix the nine review findings in the current M4b implementation. In `src/ShieldRail.tsx`, `src/AppsSection.tsx`, `src/AgentsTab.tsx`, `src/App.tsx`, and `src/api.ts`, add motiv row actions for app edit, delete, and restart; chat rename and delete; and terminal close. In `src-tauri/src/agent.rs`, `src-tauri/src/sessions.rs`, `src-tauri/src/commands.rs`, and `src-tauri/src/lib.rs`, use pi\u2019s `set_session_name` for renaming and delete chat files through a no-follow directory after leaving the active chat. In `src/mapLayout.ts` and `src/ShieldMap.tsx`, show activity on blocked hosts, replace React Flow controls with motiv controls, preserve unchanged node objects during refreshes, and prune saved positions only after folders load. In `src/App.tsx`, `src/SettingsTab.tsx`, `src/ShieldRail.tsx`, and `src/ShieldMap.tsx`, resolve Finder paths through a Rust command before confirmation and hit-test drops against the boundary node in flow coordinates. Keep the settings panel mounted during tree navigation in `src/ShieldPage.tsx` and `src/App.css` so mount drafts survive; add attach tokens and detach handling in `src/TerminalPane.tsx` and `src-tauri/src/sessions.rs`. Add focused Rust tests for chat deletion, path resolution, and attachment ownership, then run the three gates in `task.md`.",
+  "touches": [
+    "ui",
+    "state",
+    "tauri-command",
+    "rust"
+  ],
+  "risks": [
+    "Renaming or deleting the active chat must wait until pi is idle and must update the selected chat.",
+    "A late app-output event must not reach a disposed terminal or detach a newer viewer.",
+    "Boundary hit-testing must use the same coordinate scale as Tauri\u2019s drop position."
+  ],
+  "claim": "sol",
+  "claim_reason": "The fixes share state across `App.tsx`, `ShieldPage.tsx`, and `sessions.rs`. One implementer can coordinate the view lifetime and backend session changes in a single pass.",
+  "unknowns": [],
+  "backlog": []
+}

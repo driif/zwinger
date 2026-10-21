@@ -1,0 +1,41 @@
+{
+  "task": "m4b-canvas-tree",
+  "round": "02-fix",
+  "implementer": "opus",
+  "reviewer": "sol",
+  "planned": [
+    "opus",
+    "sol"
+  ],
+  "degraded": [],
+  "crossreview_verdict": "revise",
+  "final_reviewers": [
+    "opus",
+    "sol"
+  ],
+  "ship": false,
+  "ship_basis": "both reviewers",
+  "blocking": [
+    {
+      "what": "The blocked-request count can clear while Activity is not visible.",
+      "why": "ShieldPage keeps the Network panel mounted. IntersectionObserver tests its position, so the hidden panel can remain intersecting. NetworkTab then marks each new event as seen while another tab is open.",
+      "where": "src/NetworkTab.tsx:64-72; src/ShieldPage.tsx:172-180"
+    }
+  ],
+  "task_met": {
+    "opus": "Yes. The change fixes all nine review findings in round 02-fix: rail row actions and context menu, activity dots on blocked hosts, motiv map controls, canonical-path confirms for drops, hit-testing the boundary by position, no pruning while folders load, merging nodes by id, attach/detach tokens, and drafts kept across tree navigation. It also keeps the M3/M4 items from task.md: the canvas map, the rail tree with drag and drop, Apps, and the two M4 carry-overs. I found no part of the task that is missing, no mixed approach and nothing outside the scope.",
+    "sol": "The canvas, shield tree, and Apps features are implemented. The carried-over requirement to clear the blocked count only when Activity is visible is not met."
+  },
+  "backlog": [
+    "Show a zwinger chat title in pi too: sync it with set_session_name the next time that chat is current",
+    "Lift all per-shield drafts (mount, app, secret) into one App-level draft store, so that they also survive a shield switch",
+    "Undo for chat and app delete (soft delete with a short undo toast)",
+    "Proper accessible context-menu component in @driif/motiv (Menu/Popover), to replace the local Card-based menu",
+    "Rename a chat that is not current without switching pi's open session (needs pi support for naming any session)",
+    "Rename a chat without changing pi's current chat: append the `session_info` line from Rust, or switch back after the rename.",
+    "Rail menu: a click on the Ellipsis of an open menu closes it and opens it again, because the outside click comes first. Make it toggle.",
+    "Rail menu: place it above the row when it would go past the bottom of the rail.",
+    "Show the canonical path and 'link to' also for folders picked in the dialog (Add mount, New shield), not only for dropped folders.",
+    "Write the late chat title through a session-name cache, so a long chat is not read twice for each list."
+  ]
+}

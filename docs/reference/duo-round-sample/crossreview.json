@@ -1,0 +1,15 @@
+{
+  "verdict": "revise",
+  "findings": [
+    {
+      "severity": "blocking",
+      "file": "src/App.tsx",
+      "line": 240,
+      "what": "A delete on a running shield can skip the current-chat check.",
+      "why": "currentChats is filled asynchronously. If it is unset or stale, this branch can delete the chat that pi is using without first sending new_session. That can lose the active chat file.",
+      "fix": "Route every delete on a running shield through AgentsTab. Read pi's current state at action time, send new_session if it holds the chat, then delete."
+    }
+  ],
+  "plan_gaps": [],
+  "message": "The map fixes, canonical drop confirms, attach tokens, persistent tabs, and rail menus follow the plan. One chat-delete path still risks data loss because it trusts a cached current chat. Use the fresh pi state check for every delete while the shield runs. I attempted all three gates, but this read-only workspace denied writes to Vite and Cargo cache files; the implementation report records them as passing."
+}

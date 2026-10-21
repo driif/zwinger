@@ -1,0 +1,14 @@
+{
+  "ship": false,
+  "blocking": [
+    {
+      "what": "The blocked-request count can clear while Activity is not visible.",
+      "why": "ShieldPage keeps the Network panel mounted. IntersectionObserver tests its position, so the hidden panel can remain intersecting. NetworkTab then marks each new event as seen while another tab is open.",
+      "where": "src/NetworkTab.tsx:64-72; src/ShieldPage.tsx:172-180"
+    }
+  ],
+  "residual": [
+    "The read-only workspace prevented gate verification: Vite could not write its temporary config file, and both Cargo gates could not open the build lock. TypeScript completed before Vite failed."
+  ],
+  "task_met": "The canvas, shield tree, and Apps features are implemented. The carried-over requirement to clear the blocked count only when Activity is visible is not met."
+}
