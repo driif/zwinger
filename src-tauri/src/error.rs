@@ -24,6 +24,8 @@ pub enum Error {
     AppDataOverlap(String, String),
     #[error("path now resolves to a different place: {0}")]
     PathChanged(String),
+    #[error("folder is not verified since the update: {0}; confirm that it is the folder that you added")]
+    PathUnverified(String),
     #[error("name must have 1 to 64 characters and no control characters: {0}")]
     InvalidName(String),
     #[error("harness uses {0}, which is not below /workspace or a mount")]
@@ -76,6 +78,10 @@ pub enum Error {
     SecretMissing(String),
     #[error("Keychain: {0}")]
     Keychain(String),
+    #[error("the Keychain did not answer in time; allow access in the macOS prompt, then try again")]
+    KeychainTimeout,
+    #[error("a Keychain change of secret {0} has not finished; answer the macOS prompt, then try again")]
+    SecretPending(String),
     #[error("shield not found")]
     ShieldNotFound,
     #[error("mount not found")]
@@ -130,7 +136,9 @@ pub enum Error {
     HostLoginExpired(String),
     #[error("secret {0} is the host login of an agent; change it in the agent's settings")]
     HostLoginSecret(String),
-    #[error("{0} is blocked in this shield: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off")]
+    #[error(
+        "{0} is blocked in this shield: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off"
+    )]
     RefreshHostConflict(String, String),
     #[error("the download of {0} does not match its integrity hash")]
     IntegrityMismatch(String),

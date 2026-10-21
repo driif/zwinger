@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Button, Card } from "@driif/motiv";
-import { Plus, RotateCw, Shield } from "lucide-react";
+import { Plus, RotateCw, Shield, TriangleAlert } from "lucide-react";
 import {
   AGENT_NAMES,
   AgentKind,
@@ -22,6 +22,7 @@ import {
   listShields,
   listTaskRuns,
   NetEvent,
+  onGuestLogin,
   onNetEvent,
   onRenewDue,
   openSession,
@@ -35,6 +36,7 @@ import {
   ShieldView,
   startShield,
   stopShield,
+  takeAppNotices,
 } from "./api";
 import { CommandBar } from "./CommandBar";
 import { HostAgentsSettings } from "./HostAgentsSettings";
@@ -105,6 +107,7 @@ export default function App() {
   const [view, setView] = useState<View>({ kind: "overview" });
   const [activePanes, setActivePanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
+  const [appNotices, setAppNotices] = useState<string[]>([]);
   const [intent, setIntent] = useState<Intent>();
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
@@ -170,6 +173,18 @@ export default function App() {
     return () => {
       stop.then((unlisten) => unlisten());
     };
+  }, []);
+
+  // An agent login was made in a shield, or it is gone.
+  useEffect(() => {
+    const stop = onGuestLogin(() => refresh());
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    takeAppNotices().then(setAppNotices, (e) => setError(String(e)));
   }, []);
 
   const runtimes: Runtimes = {
@@ -465,6 +480,15 @@ export default function App() {
         />
       </ShieldRail>
       <main className="main">
+        {appNotices.map((notice) => (
+          <Card key={notice} variant="outlined" padding="sm" className="banner row">
+            <TriangleAlert size={16} className="warn" />
+            <span className="grow">{notice}</span>
+            <Button size="sm" variant="outline" onClick={() => setAppNotices((all) => all.filter((n) => n !== notice))}>
+              Dismiss
+            </Button>
+          </Card>
+        ))}
         {showHostAgents ? (
           <HostAgentsSettings
             detection={detection}
@@ -510,6 +534,7 @@ export default function App() {
               adding={adding[shield.id]}
               onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
               onRestart={() => restart(shield.id)}
+              onHostAgents={() => setShowHostAgents(true)}
               runs={runs[shield.id] ?? []}
               onRunsChange={() => reloadRuns(shield.id)}
               onRefresh={refresh}

@@ -53,13 +53,7 @@ pub fn parse(line: &str) -> Option<NetEvent> {
     let at = epoch_ms(stamp)?;
     let event = |kind, host: &str, dst: Option<&str>| {
         let host = host.trim_end_matches('.');
-        (!host.is_empty()).then(|| NetEvent {
-            seq: 0,
-            at,
-            kind,
-            host: host.to_owned(),
-            dst: dst.map(str::to_owned),
-        })
+        (!host.is_empty()).then(|| NetEvent { seq: 0, at, kind, host: host.to_owned(), dst: dst.map(str::to_owned) })
     };
     if rest.contains("DNS query denied by network policy") {
         return event(NetKind::DnsDenied, field(rest, "domain")?, None);
@@ -84,9 +78,7 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// Reads a UTC RFC 3339 time, as `2026-10-21T11:25:40.591549Z` or with `+00:00`.
 fn epoch_ms(stamp: &str) -> Option<u64> {
-    let stamp = stamp
-        .strip_suffix('Z')
-        .or_else(|| stamp.strip_suffix("+00:00"))?;
+    let stamp = stamp.strip_suffix('Z').or_else(|| stamp.strip_suffix("+00:00"))?;
     let (date, time) = stamp.split_once('T')?;
     let mut date = date.splitn(3, '-').map(str::parse::<u64>);
     let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
@@ -234,23 +226,14 @@ mod tests {
     const TLS_DENIED: &str = "2026-10-21T10:48:33.000000Z DEBUG microsandbox_network::engine::tcp::deny: TLS egress denied by default policy sni=evil.example dst=93.184.216.34:443";
 
     fn event(kind: NetKind, host: &str, dst: Option<&str>, at: u64) -> NetEvent {
-        NetEvent {
-            seq: 0,
-            at,
-            kind,
-            host: host.into(),
-            dst: dst.map(Into::into),
-        }
+        NetEvent { seq: 0, at, kind, host: host.into(), dst: dst.map(Into::into) }
     }
 
     #[test]
     fn parses_each_line_kind() {
         assert_eq!(parse(DNS_DENIED), Some(event(NetKind::DnsDenied, "google.com", None, 1_792_579_711_771)));
         assert_eq!(parse(DNS_ALLOWED), Some(event(NetKind::DnsAllowed, "example.com", None, 1_792_579_711_859)));
-        assert_eq!(
-            parse(TLS),
-            Some(event(NetKind::Tls, "example.com", Some("104.20.23.154:443"), 1_792_579_711_934))
-        );
+        assert_eq!(parse(TLS), Some(event(NetKind::Tls, "example.com", Some("104.20.23.154:443"), 1_792_579_711_934)));
         assert_eq!(
             parse(TLS_DENIED),
             Some(event(NetKind::TlsDenied, "evil.example", Some("93.184.216.34:443"), 1_792_579_713_000))
@@ -288,12 +271,8 @@ mod tests {
     fn dedupe_drops_the_reference_pairs() {
         let log = include_str!("../../docs/reference/microsandbox-runtime-network-log.txt");
         let mut dedupe = Dedupe::default();
-        let kept: Vec<(NetKind, String)> = log
-            .lines()
-            .filter_map(parse)
-            .filter(|e| dedupe.keep(e))
-            .map(|e| (e.kind, e.host))
-            .collect();
+        let kept: Vec<(NetKind, String)> =
+            log.lines().filter_map(parse).filter(|e| dedupe.keep(e)).map(|e| (e.kind, e.host)).collect();
         // The second google.com denial and the second example.com lookup
         // come less than 1 s after the first ones.
         assert_eq!(

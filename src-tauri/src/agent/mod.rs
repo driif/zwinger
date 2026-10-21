@@ -6,6 +6,7 @@ pub mod claude;
 pub mod cli;
 pub mod codex;
 pub mod gemini;
+pub mod guest_login;
 pub mod launch;
 pub mod pi;
 

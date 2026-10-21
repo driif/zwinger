@@ -301,10 +301,7 @@ pub struct RoundReader {
 
 impl RoundReader {
     pub fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            files: BTreeMap::new(),
-        }
+        Self { dir, files: BTreeMap::new() }
     }
 
     /// Reads the known files that are new or changed, up to `READ_FILES`
@@ -363,11 +360,8 @@ impl RoundReader {
     }
 
     pub fn room(&self) -> Room {
-        let files = self
-            .files
-            .iter()
-            .map(|(name, (stamp, bytes))| (name.as_str(), (stamp.0, bytes.as_deref())))
-            .collect();
+        let files =
+            self.files.iter().map(|(name, (stamp, bytes))| (name.as_str(), (stamp.0, bytes.as_deref()))).collect();
         project(&files)
     }
 }
@@ -454,10 +448,7 @@ fn text(value: &Value) -> String {
 }
 
 fn strings(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|items| items.iter().map(text).filter(|s| !s.trim().is_empty()).collect())
-        .unwrap_or_default()
+    value.as_array().map(|items| items.iter().map(text).filter(|s| !s.trim().is_empty()).collect()).unwrap_or_default()
 }
 
 /// The first sentence of `text`, cut to `SUMMARY_CHARS`.
@@ -563,11 +554,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
     let events: Vec<Event> = lines("events.jsonl")
         .iter()
-        .map(|e| Event {
-            at: text(&e["at"]),
-            kind: text(&e["kind"]),
-            detail: text(&e["detail"]),
-        })
+        .map(|e| Event { at: text(&e["at"]), kind: text(&e["kind"]), detail: text(&e["detail"]) })
         .collect();
 
     // Stages, from the `stage` events.
@@ -602,7 +589,13 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     let mut turns_seen: BTreeSet<u32> = started.iter().map(|(s, _)| turn_of(s)).filter(|n| *n > 0).collect();
     turns_seen.extend(file_turns(files));
     let mut ids = vec!["plan".to_owned()];
-    ids.extend((1..=TURNS).chain(turns_seen.iter().copied()).collect::<BTreeSet<_>>().into_iter().map(|n| format!("exchange-{n}")));
+    ids.extend(
+        (1..=TURNS)
+            .chain(turns_seen.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|n| format!("exchange-{n}")),
+    );
     ids.extend(STAGES[2..].iter().map(|s| (*s).to_owned()));
     let last = started.iter().map(|(s, _)| s).max_by_key(|s| stage_key(s)).cloned();
     let stages = ids
@@ -620,28 +613,24 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 (None, _) if ended.is_some() => "skipped",
                 (None, _) => "pending",
             };
-            Stage {
-                id: id.clone(),
-                label: stage_label(id),
-                state,
-                started: at,
-            }
+            Stage { id: id.clone(), label: stage_label(id), state, started: at }
         })
         .collect();
 
     // Agents' turns and positions.
     let mut messages = Vec::new();
-    let mut message = |from: &str, to: String, kind: &str, stage: &str, at: Option<String>, summary_of: &str, body: String| {
-        messages.push(Message {
-            from: from.to_owned(),
-            to,
-            kind: kind.to_owned(),
-            stage: stage.to_owned(),
-            at,
-            summary: summary(summary_of),
-            body,
-        });
-    };
+    let mut message =
+        |from: &str, to: String, kind: &str, stage: &str, at: Option<String>, summary_of: &str, body: String| {
+            messages.push(Message {
+                from: from.to_owned(),
+                to,
+                kind: kind.to_owned(),
+                stage: stage.to_owned(),
+                at,
+                summary: summary(summary_of),
+                body,
+            });
+        };
     let mut positions = Vec::new();
     for agent in &agents {
         let name = format!("turns/plan-{agent}.json");
@@ -697,28 +686,17 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 agent: agent.clone(),
                 point: point.clone(),
             }));
-            replies.push(Reply {
-                agent: agent.clone(),
-                agreed,
-                implementer,
-                conceded,
-            });
+            replies.push(Reply { agent: agent.clone(), agreed, implementer, conceded });
         }
         let converged = (replies.len() == agents.len() && agents.len() == 2 && replies.iter().all(|r| r.agreed))
             .then(|| replies[0].implementer.clone())
             .flatten()
             .filter(|pick| replies.iter().all(|r| r.implementer.as_ref() == Some(pick)));
-        turns.push(Turn {
-            turn: n,
-            replies,
-            converged,
-        });
+        turns.push(Turn { turn: n, replies, converged });
     }
 
-    let tiebreak = json("tiebreak.json").map(|t| Tiebreak {
-        implementer: known(&text(&t["implementer"])),
-        why: text(&t["why"]),
-    });
+    let tiebreak =
+        json("tiebreak.json").map(|t| Tiebreak { implementer: known(&text(&t["implementer"])), why: text(&t["why"]) });
     if let Some(t) = &tiebreak {
         // duo's tiebreak is by its first agent; an in-app run names it.
         let by = events.iter().find_map(|e| e.detail.strip_prefix("tiebreak by ")).and_then(known);
@@ -736,9 +714,14 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         };
         known(name).map(|n| (n, e.detail.contains("user")))
     });
-    let walkover = events.iter().find(|e| e.kind == "walkover").and_then(|e| known(e.detail.split_whitespace().next()?));
+    let walkover =
+        events.iter().find(|e| e.kind == "walkover").and_then(|e| known(e.detail.split_whitespace().next()?));
     let converged_turn = turns.iter().find(|t| t.converged.is_some());
-    let user_pick = events.iter().rev().find(|e| e.kind == "decision" && e.detail.starts_with("user chose ")).and_then(|e| known(e.detail.strip_prefix("user chose ")?));
+    let user_pick = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "decision" && e.detail.starts_with("user chose "))
+        .and_then(|e| known(e.detail.strip_prefix("user chose ")?));
     let implementer = manifest
         .as_ref()
         .and_then(|m| known(&text(&m["implementer"])))
@@ -804,13 +787,25 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     if let Some(i) = json("implementation.json") {
         let from = implementer.clone().unwrap_or_else(|| "implementer".to_owned());
         let mut body = text(&i["summary"]);
-        for (title, key) in [("Deviations", "deviations"), ("Left undone", "left_undone"), ("Missing dependencies", "missing_dependencies")] {
+        for (title, key) in [
+            ("Deviations", "deviations"),
+            ("Left undone", "left_undone"),
+            ("Missing dependencies", "missing_dependencies"),
+        ] {
             let items = strings(&i[key]);
             if !items.is_empty() {
                 body.push_str(&format!("\n\n**{title}:**\n{}", bullets(&items)));
             }
         }
-        message(&from, peer(&from), "implementation", "implement", mtime("implementation.json"), &text(&i["summary"]), body);
+        message(
+            &from,
+            peer(&from),
+            "implementation",
+            "implement",
+            mtime("implementation.json"),
+            &text(&i["summary"]),
+            body,
+        );
     }
 
     let gates: Vec<Gate> = files
@@ -819,11 +814,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default()
         .iter()
-        .map(|g| Gate {
-            command: text(&g["command"]),
-            code: g["code"].as_i64(),
-            output: text(&g["output"]),
-        })
+        .map(|g| Gate { command: text(&g["command"]), code: g["code"].as_i64(), output: text(&g["output"]) })
         .collect();
     if !gates.is_empty() {
         let passed = gates.iter().filter(|g| g.code == Some(0)).count();
@@ -888,11 +879,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .map(|b| Blocking {
-                what: text(&b["what"]),
-                why: text(&b["why"]),
-                at: text(&b["where"]),
-            })
+            .map(|b| Blocking { what: text(&b["what"]), why: text(&b["why"]), at: text(&b["where"]) })
             .collect()
     };
     let mut finals = Vec::new();
@@ -951,11 +938,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             }
             continue;
         }
-        let notice = || Notice {
-            agent: name_in(&event.detail),
-            stage: current.clone(),
-            detail: event.detail.clone(),
-        };
+        let notice = || Notice { agent: name_in(&event.detail), stage: current.clone(), detail: event.detail.clone() };
         match event.kind.as_str() {
             "agent_degraded" | "agent_stalled" | "agent_timeout" => {
                 let notice = notice();
@@ -992,12 +975,9 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     }
 
     let questions = match files.get("open-questions.txt") {
-        Some((_, Some(bytes))) if questions_open || ended == Some("stopped") => String::from_utf8_lossy(bytes)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect(),
+        Some((_, Some(bytes))) if questions_open || ended == Some("stopped") => {
+            String::from_utf8_lossy(bytes).lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+        }
         _ => Vec::new(),
     };
 
@@ -1027,10 +1007,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
 /// The highest `t<n>` of the turn files.
 fn file_turns<'a>(files: &'a BTreeMap<&str, (i64, Option<&[u8]>)>) -> impl Iterator<Item = u32> + 'a {
-    files
-        .keys()
-        .filter_map(|k| k.strip_prefix("turns/t")?.split('-').next()?.parse::<u32>().ok())
-        .filter(|n| *n > 0)
+    files.keys().filter_map(|k| k.strip_prefix("turns/t")?.split('-').next()?.parse::<u32>().ok()).filter(|n| *n > 0)
 }
 
 fn bullets(items: &[String]) -> String {
@@ -1068,7 +1045,9 @@ fn within_limit(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     }
     let keep = FILE_LIMIT as usize - 128;
     let mut out = bytes[..keep].to_vec();
-    out.extend_from_slice(format!("\n\n[The next {} bytes are omitted: the file is over the limit.]\n", bytes.len() - keep).as_bytes());
+    out.extend_from_slice(
+        format!("\n\n[The next {} bytes are omitted: the file is over the limit.]\n", bytes.len() - keep).as_bytes(),
+    );
     out.into()
 }
 
@@ -1312,7 +1291,8 @@ mod tests {
         assert_eq!(room.decided_by.as_deref(), Some("agreement"));
 
         // Both opening plans, then the replies, in stage order.
-        let kinds: Vec<(&str, &str)> = room.messages.iter().filter(|m| m.kind != "event").map(|m| (m.from.as_str(), m.kind.as_str())).collect();
+        let kinds: Vec<(&str, &str)> =
+            room.messages.iter().filter(|m| m.kind != "event").map(|m| (m.from.as_str(), m.kind.as_str())).collect();
         assert_eq!(
             kinds,
             [
@@ -1393,10 +1373,8 @@ mod tests {
     fn the_mirror_gets_the_files_and_never_a_link() {
         let host = temp_dir().join("round");
         let root = temp_dir();
-        let mirror = Mirror {
-            root: root.clone(),
-            parts: [".zwinger", "tasks", "fix", "01"].map(str::to_owned).to_vec(),
-        };
+        let mirror =
+            Mirror { root: root.clone(), parts: [".zwinger", "tasks", "fix", "01"].map(str::to_owned).to_vec() };
         mirror.check().unwrap();
         let mut writer = RoundWriter::create(host.clone(), Some(mirror)).unwrap();
         writer.write_json("turns/plan-a.json", &json!({ "plan": "p" }));
@@ -1434,7 +1412,8 @@ mod tests {
         let dir = temp_dir();
         let writer = RoundWriter::create(dir.clone(), None).unwrap();
         writer.event("stage", &"é".repeat(DETAIL_LIMIT));
-        let first: Value = serde_json::from_str(std::fs::read_to_string(dir.join("events.jsonl")).unwrap().trim()).unwrap();
+        let first: Value =
+            serde_json::from_str(std::fs::read_to_string(dir.join("events.jsonl")).unwrap().trim()).unwrap();
         assert!(text(&first["detail"]).len() <= DETAIL_LIMIT);
 
         std::fs::write(dir.join("events.jsonl"), vec![b'\n'; (FILE_LIMIT - EVENTS_RESERVE) as usize]).unwrap();
@@ -1513,7 +1492,8 @@ mod tests {
 
     #[test]
     fn known_names() {
-        for name in ["events.jsonl", "messages.jsonl", "final-opus.json", "turns/plan-sol.json", "turns/t12-opus.json"] {
+        for name in ["events.jsonl", "messages.jsonl", "final-opus.json", "turns/plan-sol.json", "turns/t12-opus.json"]
+        {
             assert_eq!(known(name), Some(true), "{name}");
         }
         assert_eq!(known("turns/plan-sol.prompt.md"), Some(false));

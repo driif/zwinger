@@ -22,10 +22,7 @@ const STDERR_LINES: usize = 20;
 const OUTPUT_TAIL: usize = 32 << 10;
 const DIFF_LIMIT: usize = 2 << 20;
 const STATUS_LIMIT: usize = 64 << 10;
-const GIT_LIMIT: Limits = Limits {
-    idle: Duration::from_secs(120),
-    hard: Duration::from_secs(300),
-};
+const GIT_LIMIT: Limits = Limits { idle: Duration::from_secs(120), hard: Duration::from_secs(300) };
 /// A longer reply degrades the agent.
 pub const REPLY_LIMIT: usize = 4 << 20;
 /// The end of a reply that the JSON search reads.
@@ -64,7 +61,10 @@ pub struct Limits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     Start(String),
-    Exit { code: i32, stderr: Vec<String> },
+    Exit {
+        code: i32,
+        stderr: Vec<String>,
+    },
     Idle(Duration),
     Hard(Duration),
     Cancelled,
@@ -121,8 +121,15 @@ pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&st
         AgentKind::Claude => {
             // `--dangerously-skip-permissions` as in the agent sessions: the shield is the sandbox.
             argv.extend(
-                ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--dangerously-skip-permissions"]
-                    .map(str::to_owned),
+                [
+                    "-p",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--include-partial-messages",
+                    "--dangerously-skip-permissions",
+                ]
+                .map(str::to_owned),
             );
             if access == Access::Read {
                 argv.extend(["--disallowedTools".to_owned(), "Edit,Write,NotebookEdit".to_owned()]);
@@ -132,7 +139,10 @@ pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&st
             }
         }
         AgentKind::Codex => {
-            argv.extend(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"].map(str::to_owned));
+            argv.extend(
+                ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check"]
+                    .map(str::to_owned),
+            );
             if let Some(model) = model {
                 argv.extend(["-m".to_owned(), model.to_owned()]);
             }
@@ -326,11 +336,8 @@ impl<R: SandboxRuntime> Exec<R> {
         if *cancel.borrow() {
             return Err(Failure::Cancelled);
         }
-        let mut pipe = self
-            .runtime
-            .open_pipe(&self.vm, argv, &self.cwd)
-            .await
-            .map_err(|e| Failure::Start(e.to_string()))?;
+        let mut pipe =
+            self.runtime.open_pipe(&self.vm, argv, &self.cwd).await.map_err(|e| Failure::Start(e.to_string()))?;
         let _ = pipe.input.send(PipeInput::Data(input.to_vec())).await;
         let _ = pipe.input.send(PipeInput::Close).await;
         let hard = Instant::now() + limits.hard;
@@ -425,7 +432,15 @@ impl<R: SandboxRuntime> Exec<R> {
                 }
             }
         };
-        let (code, stderr) = self.drive(&argv(agent, access, self.pi_host, self.gemini.as_deref())?, prompt.as_bytes(), limits, cancel, on_stdout).await?;
+        let (code, stderr) = self
+            .drive(
+                &argv(agent, access, self.pi_host, self.gemini.as_deref())?,
+                prompt.as_bytes(),
+                limits,
+                cancel,
+                on_stdout,
+            )
+            .await?;
         if let Some(error) = result.error {
             return Err(Failure::Agent(error));
         }
@@ -451,21 +466,11 @@ impl<R: SandboxRuntime> Exec<R> {
         loop {
             match self.agent(agent, access, &prompt, limits, cancel, live).await {
                 Ok(raw) if raw.len() > REPLY_LIMIT => {
-                    return Reply {
-                        json: None,
-                        failure: Some(Failure::TooLarge(raw.len())),
-                        raw,
-                        retried,
-                    };
+                    return Reply { json: None, failure: Some(Failure::TooLarge(raw.len())), raw, retried };
                 }
                 Ok(raw) => match parse(&raw).await {
                     Some(json) => {
-                        return Reply {
-                            json: Some(json),
-                            raw,
-                            retried,
-                            failure: None,
-                        };
+                        return Reply { json: Some(json), raw, retried, failure: None };
                     }
                     None if !retried => {
                         retried = true;
@@ -481,12 +486,7 @@ impl<R: SandboxRuntime> Exec<R> {
                     }
                 },
                 Err(failure) => {
-                    return Reply {
-                        json: None,
-                        raw: String::new(),
-                        retried,
-                        failure: Some(failure),
-                    };
+                    return Reply { json: None, raw: String::new(), retried, failure: Some(failure) };
                 }
             }
         }
@@ -563,11 +563,7 @@ impl<R: SandboxRuntime> Exec<R> {
                 let Some(head) = head.map(str::to_owned) else {
                     return Err(SnapshotError::Failed("git printed no HEAD".to_owned()));
                 };
-                Ok(Snapshot {
-                    head,
-                    status,
-                    hash: hash.finalize().into(),
-                })
+                Ok(Snapshot { head, status, hash: hash.finalize().into() })
             }
             Ok((code, _)) => Err(SnapshotError::Failed(format!("git ended with code {code}"))),
             Err(failure) => Err(SnapshotError::Failed(format!("git {failure}"))),
@@ -682,7 +678,9 @@ fn text_or(value: &Value, default: &str) -> String {
 /// The stdout line of a Claude Code `result` event, for fakes.
 #[cfg(test)]
 pub fn claude_result_line(text: &str) -> Vec<u8> {
-    let mut line = serde_json::json!({ "type": "result", "subtype": "success", "is_error": false, "result": text }).to_string().into_bytes();
+    let mut line = serde_json::json!({ "type": "result", "subtype": "success", "is_error": false, "result": text })
+        .to_string()
+        .into_bytes();
     line.push(b'\n');
     line
 }
@@ -701,10 +699,7 @@ mod tests {
     use super::*;
 
     fn agent(kind: AgentKind, model: Option<&str>) -> TaskAgent {
-        TaskAgent {
-            kind,
-            model: model.map(str::to_owned),
-        }
+        TaskAgent { kind, model: model.map(str::to_owned) }
     }
 
     const GEMINI: Option<&str> = Some("/opt/zwinger/host/gemini/bundle/gemini.js");
@@ -714,12 +709,18 @@ mod tests {
         let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, false, GEMINI).unwrap();
         assert!(claude.windows(2).any(|w| w == ["--disallowedTools", "Edit,Write,NotebookEdit"]));
         assert!(claude.windows(2).any(|w| w == ["--model", "opus"]));
-        assert!(!argv(&agent(AgentKind::Claude, None), Access::Write, false, GEMINI).unwrap().contains(&"--disallowedTools".to_owned()));
+        assert!(
+            !argv(&agent(AgentKind::Claude, None), Access::Write, false, GEMINI)
+                .unwrap()
+                .contains(&"--disallowedTools".to_owned())
+        );
 
         let pi = argv(&agent(AgentKind::Pi, None), Access::Read, false, GEMINI).unwrap();
         assert!(pi.windows(2).any(|w| w == ["--tools", PI_READ_TOOLS]));
         assert_eq!(pi.last().map(String::as_str), Some("-p"));
-        assert!(!argv(&agent(AgentKind::Pi, None), Access::Write, false, GEMINI).unwrap().contains(&"--tools".to_owned()));
+        assert!(
+            !argv(&agent(AgentKind::Pi, None), Access::Write, false, GEMINI).unwrap().contains(&"--tools".to_owned())
+        );
 
         let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, false, GEMINI).unwrap();
         assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, false, GEMINI).unwrap());
@@ -728,7 +729,9 @@ mod tests {
 
         let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, false, GEMINI).unwrap();
         assert!(!gemini.contains(&"--yolo".to_owned()));
-        assert!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, GEMINI).unwrap().contains(&"--yolo".to_owned()));
+        assert!(
+            argv(&agent(AgentKind::Gemini, None), Access::Write, false, GEMINI).unwrap().contains(&"--yolo".to_owned())
+        );
         assert_eq!(gemini[3], "/opt/zwinger/host/gemini/bundle/gemini.js");
         assert!(matches!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, None), Err(Failure::Start(_))));
 
@@ -759,7 +762,10 @@ mod tests {
         assert_eq!(json_block("x\n```json\n{\"a\":1}\n```\ny\n```json\n{\"a\":2}\n```"), Some(json!({ "a": 2 })));
         // A broken last block falls back to the one before.
         assert_eq!(json_block("```json\n{\"a\":1}\n```\n```json\n{\"a\":\n```"), Some(json!({ "a": 1 })));
-        assert_eq!(json_block("Done. {\"ship\": true, \"x\": {\"y\": 1}} bye"), Some(json!({ "ship": true, "x": { "y": 1 } })));
+        assert_eq!(
+            json_block("Done. {\"ship\": true, \"x\": {\"y\": 1}} bye"),
+            Some(json!({ "ship": true, "x": { "y": 1 } }))
+        );
         assert_eq!(json_block("```json\n[1, 2]\n```"), None);
         assert_eq!(json_block("no json here"), None);
         // Braces in strings, and an unclosed brace before the object.
@@ -784,7 +790,10 @@ mod tests {
         let mut r = Result_::default();
         claude_result(&serde_json::from_slice(&claude_result_line("hi")).unwrap(), &mut r);
         assert_eq!((r.text.as_str(), r.error.as_deref()), ("hi", None));
-        claude_result(&json!({ "type": "result", "is_error": true, "result": "", "subtype": "error_max_turns" }), &mut r);
+        claude_result(
+            &json!({ "type": "result", "is_error": true, "result": "", "subtype": "error_max_turns" }),
+            &mut r,
+        );
         assert_eq!(r.error.as_deref(), Some("error_max_turns"));
 
         let mut r = Result_::default();
@@ -794,9 +803,15 @@ mod tests {
         assert_eq!(r.text, "done");
 
         let mut r = Result_::default();
-        pi_result(&json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "text", "text": "ok" }] } }), &mut r);
+        pi_result(
+            &json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "text", "text": "ok" }] } }),
+            &mut r,
+        );
         assert_eq!(r.text, "ok");
-        pi_result(&json!({ "type": "message_end", "message": { "role": "assistant", "content": [], "stopReason": "error", "errorMessage": "401" } }), &mut r);
+        pi_result(
+            &json!({ "type": "message_end", "message": { "role": "assistant", "content": [], "stopReason": "error", "errorMessage": "401" } }),
+            &mut r,
+        );
         assert_eq!(r.error.as_deref(), Some("401"));
     }
 }

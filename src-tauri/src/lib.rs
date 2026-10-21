@@ -13,6 +13,7 @@ mod task_agents;
 mod task_artifacts;
 mod task_runs;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -20,7 +21,10 @@ use std::time::Duration;
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 
-use crate::runtime::{Microsandbox, SandboxRuntime as _};
+use crate::host_agents::HostAgents;
+use crate::runtime::{Microsandbox, SandboxRuntime};
+use crate::secrets::Vault;
+use crate::sessions::Manager;
 
 const REAP_LIMIT: Duration = Duration::from_secs(10);
 const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
@@ -60,13 +64,49 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
                 app,
                 "Window",
                 true,
-                &[
-                    &PredefinedMenuItem::minimize(app, None)?,
-                    &PredefinedMenuItem::fullscreen(app, None)?,
-                ],
+                &[&PredefinedMenuItem::minimize(app, None)?, &PredefinedMenuItem::fullscreen(app, None)?],
             )?,
         ],
     )
+}
+
+/// Removes the VMs of an earlier run, loads the shields and makes the
+/// manager. The manager starts with no VMs, so every shield shows as
+/// stopped; a notice names the removed VMs.
+fn boot<R: SandboxRuntime>(
+    runtime: R,
+    vault: Arc<dyn Vault>,
+    data: &Path,
+    host: Arc<HostAgents>,
+) -> error::Result<Manager<R>> {
+    // The timer must be made inside the runtime, so it is in the future.
+    let reaped = tauri::async_runtime::block_on(async { tokio::time::timeout(REAP_LIMIT, runtime.reap()).await });
+    let reaped = match reaped {
+        Ok(Ok(reaped)) => reaped,
+        Ok(Err(e)) => {
+            eprintln!("reap failed: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            eprintln!("reap timed out");
+            Vec::new()
+        }
+    };
+    let store = store::Store::new(data.join("shields.json"));
+    let manager = Manager::new(runtime, store, vault, data.to_owned(), host)?;
+    if !reaped.is_empty() {
+        let shields = manager.list();
+        let names: Vec<String> = reaped
+            .iter()
+            .map(|vm| {
+                let shield = runtime::shield_id(vm).and_then(|id| shields.iter().find(|v| v.shield.id == id));
+                shield.map_or_else(|| vm.clone(), |v| v.shield.name.clone())
+            })
+            .collect();
+        manager
+            .add_app_notice(format!("zwinger stopped the VMs that the last run left running: {}.", names.join(", ")));
+    }
+    Ok(manager)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -82,24 +122,10 @@ pub fn run() {
             let data = data.canonicalize()?;
             let pi = agent::pi::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
             let runtime = Microsandbox { pi };
-            // VMs from an earlier run that did not exit cleanly. The manager
-            // starts with no VMs, so every shield shows as stopped.
-            // The timer must be made inside the runtime, so it is in the future.
-            let reaped = tauri::async_runtime::block_on(async {
-                tokio::time::timeout(REAP_LIMIT, runtime.reap()).await
-            });
-            match reaped {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("reap failed: {e}"),
-                Err(_) => eprintln!("reap timed out"),
-            }
-            let store = store::Store::new(data.join("shields.json"));
             let data_dir = data.clone();
-            let host = Arc::new(host_agents::HostAgents::new(
+            let host = Arc::new(HostAgents::new(
                 Arc::new(host_agents::RealFs),
-                Arc::new(host_agents::login::HostLogins {
-                    home: dirs::home_dir().unwrap_or_default(),
-                }),
+                Arc::new(host_agents::login::HostLogins { home: dirs::home_dir().unwrap_or_default() }),
                 Arc::new(host_agents::SystemClock),
                 data.clone(),
             ));
@@ -108,7 +134,8 @@ pub fn run() {
                 let host = host.clone();
                 move || host.detect()
             });
-            let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data, host.clone())?;
+            let vault = Arc::new(secrets::Ordered::new(Arc::new(secrets::Keychain)));
+            let manager = boot(runtime, vault, &data, host.clone())?;
             // One app-wide event, so the rail and the map update while the
             // Network tab is closed.
             let handle = app.handle().clone();
@@ -124,12 +151,16 @@ pub fn run() {
                 let _ = handle.emit("renew-due", shield_id);
                 let (handle, shield_id) = (handle.clone(), shield_id.to_owned());
                 tauri::async_runtime::spawn(async move {
-                    let manager = handle.state::<sessions::Manager<Microsandbox>>();
+                    let manager = handle.state::<Manager<Microsandbox>>();
                     if let Err(e) = manager.renew(&shield_id).await {
                         eprintln!("renewal of {shield_id} failed: {e}");
                     }
                     let _ = handle.emit("renew-due", shield_id);
                 });
+            }));
+            let handle = app.handle().clone();
+            manager.set_guest_sink(Box::new(move |shield_id| {
+                let _ = handle.emit("guest-login", shield_id);
             }));
             app.manage(manager);
             app.manage(host);
@@ -194,6 +225,9 @@ pub fn run() {
             commands::is_round_folder,
             commands::watch_room,
             commands::unwatch_room,
+            commands::take_app_notices,
+            commands::remove_guest_login,
+            commands::confirm_paths,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -206,19 +240,14 @@ pub fn run() {
             api.prevent_exit();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                app.state::<sessions::Manager<Microsandbox>>()
-                    .stop_all(STOP_ALL_LIMIT)
-                    .await;
+                app.state::<Manager<Microsandbox>>().stop_all(STOP_ALL_LIMIT).await;
                 app.exit(0);
             });
         }
         // ⌘Q on macOS ends the loop without ExitRequested. Stop the VMs here,
         // before the process exits.
         RunEvent::Exit => {
-            tauri::async_runtime::block_on(
-                app.state::<sessions::Manager<Microsandbox>>()
-                    .stop_all(STOP_ALL_LIMIT),
-            );
+            tauri::async_runtime::block_on(app.state::<Manager<Microsandbox>>().stop_all(STOP_ALL_LIMIT));
         }
         _ => {}
     });
@@ -226,6 +255,39 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::host_agents::fake::{FakeClock, FakeFs};
+    use crate::host_agents::login::fake::FakeLogins;
+    use crate::runtime::fake::FakeRuntime;
+    use crate::secrets::fake::MemoryVault;
+
+    /// A plain test: `boot` makes its own runtime context, as in the app's setup.
+    #[test]
+    fn boot_reaps_loads_and_names_the_removed_vms() {
+        let data = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data.join("proj")).unwrap();
+        let data = data.canonicalize().unwrap();
+        let shield = shield::Shield::new(data.join("proj").to_str().unwrap()).unwrap();
+        store::Store::new(data.join("shields.json")).save(std::slice::from_ref(&shield)).unwrap();
+        let runtime = FakeRuntime::default();
+        *runtime.reaped.lock().unwrap() = vec![format!("zwinger-{}", shield.id), "zwinger-gone".into()];
+        let host = Arc::new(HostAgents::new(
+            Arc::new(FakeFs::default()),
+            Arc::new(FakeLogins::default()),
+            Arc::new(FakeClock(0.into())),
+            data.clone(),
+        ));
+
+        let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host).unwrap();
+        assert_eq!(*runtime.log.lock().unwrap(), ["reap"]);
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(
+            manager.take_app_notices(),
+            ["zwinger stopped the VMs that the last run left running: proj, zwinger-gone."]
+        );
+        assert!(manager.take_app_notices().is_empty());
+    }
+
     #[test]
     fn the_chat_commands_are_gone() {
         let source = include_str!("lib.rs");

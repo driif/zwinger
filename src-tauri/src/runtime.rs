@@ -19,9 +19,6 @@ use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Where microsandbox puts its TLS interception CA in the guest
-/// (`microsandbox_protocol::GUEST_TLS_CA_PATH`, not re-exported).
-const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
@@ -49,7 +46,10 @@ pub enum SessionKind {
     Shell,
     /// The agent's own TUI, through its wrapper. `resume` continues the
     /// agent's last session.
-    Agent { agent: AgentKind, resume: bool },
+    Agent {
+        agent: AgentKind,
+        resume: bool,
+    },
 }
 
 impl SessionKind {
@@ -70,6 +70,11 @@ impl SessionKind {
 /// The env of each PTY exec. A login shell resets `PATH`; the profile file
 /// of [`launch::PROFILE`] puts the wrappers back.
 pub const PTY_ENV: [(&str, &str); 3] = [("PATH", launch::PATH), ("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
+
+/// The CA bundle vars of OpenSSL, Python requests, curl and git. They point
+/// at the system bundle, which [`launch::trust_argv`] extends with the
+/// interception CA.
+const CA_ENV: [&str; 4] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"];
 
 /// A host folder that a start mounts read-only, such as a host agent's
 /// package or profile snapshot.
@@ -148,7 +153,8 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     /// Runs `argv` with stdin, stdout and stderr as pipes.
     fn open_pipe(&self, vm: &Self::Vm, argv: &[String], cwd: &str) -> impl Future<Output = Result<Pipe>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
-    fn reap(&self) -> impl Future<Output = Result<()>> + Send;
+    /// Returns the names of the VMs that it removed.
+    fn reap(&self) -> impl Future<Output = Result<Vec<String>>> + Send;
     /// Follows the raw runtime log lines of the VM that are written from now
     /// on. The lines stop when the receiver is dropped.
     fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
@@ -161,34 +167,24 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
 /// `denied` are the refresh hosts of the shield's host logins: they are denied
 /// next, before any allow, so also Public mode and the allow list cannot reach them.
 pub fn sandbox_policy(policy: &shield::NetworkPolicy, denied: &[&str]) -> Result<microsandbox::NetworkPolicy> {
-    let (suffixes, domains): (Vec<&str>, Vec<&str>) = policy
-        .domains
-        .iter()
-        .map(String::as_str)
-        .partition(|d| d.starts_with("*."));
+    let (suffixes, domains): (Vec<&str>, Vec<&str>) =
+        policy.domains.iter().map(String::as_str).partition(|d| d.starts_with("*."));
     let builder = microsandbox::NetworkPolicy::builder()
         .default_deny()
         .egress(|e| e.tcp().udp().port_range(0, 52).port_range(54, u16::MAX).deny_host())
         .egress(|e| e.icmpv4().icmpv6().deny_host())
         .egress(|e| e.deny_private().deny_loopback().deny_link_local().deny_meta());
-    let builder = if denied.is_empty() {
-        builder
-    } else {
-        builder.egress(|e| e.deny_domains(denied.iter().copied()))
-    };
+    let builder = if denied.is_empty() { builder } else { builder.egress(|e| e.deny_domains(denied.iter().copied())) };
     let builder = match policy.mode {
         NetworkMode::Deny => builder,
-        NetworkMode::List => builder.egress(|e| {
-            e.allow_domains(domains)
-                .allow_domain_suffixes(suffixes.into_iter().map(|s| &s[2..]))
-        }),
-        NetworkMode::Public => builder
-            .rule(|r| r.egress().udp().tcp().port(53).allow_host())
-            .egress(|e| e.allow_public()),
+        NetworkMode::List => {
+            builder.egress(|e| e.allow_domains(domains).allow_domain_suffixes(suffixes.into_iter().map(|s| &s[2..])))
+        }
+        NetworkMode::Public => {
+            builder.rule(|r| r.egress().udp().tcp().port(53).allow_host()).egress(|e| e.allow_public())
+        }
     };
-    builder
-        .build()
-        .map_err(|e| Error::InvalidDomain(policy.domains.join(", "), e.to_string()))
+    builder.build().map_err(|e| Error::InvalidDomain(policy.domains.join(", "), e.to_string()))
 }
 
 /// Pairs each secret with its value. The guest gets the placeholder in the
@@ -202,19 +198,15 @@ pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Ve
         .zip(values)
         .map(|(secret, value)| {
             let secret = secret.clone().normalize()?;
-            let builder = SecretBuilder::new()
-                .env(&secret.name)
-                .placeholder(secret.placeholder())
-                .value(value.expose());
+            let builder =
+                SecretBuilder::new().env(&secret.name).placeholder(secret.placeholder()).value(value.expose());
             // An empty field list means all header fields to microsandbox.
             let builder = if secret.places.header_fields.is_empty() {
                 builder.substitute_in_headers(false)
             } else {
                 builder.substitute_in_header_fields(&secret.places.header_fields)
             };
-            let builder = builder
-                .substitute_in_query(secret.places.query)
-                .substitute_in_body(secret.places.body);
+            let builder = builder.substitute_in_query(secret.places.query).substitute_in_body(secret.places.body);
             Ok(secret.hosts.iter().fold(builder, |b, host| b.allow(host)))
         })
         .collect()
@@ -222,6 +214,11 @@ pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Ve
 
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
+
+/// The shield id of a VM name that [`Microsandbox`] gave.
+pub fn shield_id(vm_name: &str) -> Option<&str> {
+    vm_name.strip_prefix(NAME_PREFIX)
+}
 
 /// `pi` is the host copy of the pi bundle, from [`crate::agent::pi::install_pi`].
 #[derive(Clone)]
@@ -269,9 +266,13 @@ impl SandboxRuntime for Microsandbox {
             builder = builder.volume(&bind.guest, |m| m.bind(&bind.host).readonly());
         }
         // Secrets turn on TLS interception. Node does not read the system
-        // trust store, so it gets the interception CA explicitly.
+        // trust store, so it gets the interception CA explicitly. The builder
+        // env reaches every exec; a login shell resets only `PATH`.
         if !secrets.is_empty() {
-            builder = builder.env("NODE_EXTRA_CA_CERTS", GUEST_TLS_CA_PATH);
+            builder = builder.env("NODE_EXTRA_CA_CERTS", launch::GUEST_TLS_CA_PATH);
+            for name in CA_ENV {
+                builder = builder.env(name, launch::CA_BUNDLE);
+            }
         }
         for secret in secrets {
             builder = builder.secret_entry(secret.build());
@@ -288,7 +289,7 @@ impl SandboxRuntime for Microsandbox {
         Ok(vm.kill_with_timeout(KILL_LIMIT).await?)
     }
 
-    async fn reap(&self) -> Result<()> {
+    async fn reap(&self) -> Result<Vec<String>> {
         // Sandboxes from round 01 have no label, so the name prefix also counts.
         let mut found = BTreeMap::new();
         for labelled in [true, false] {
@@ -317,13 +318,17 @@ impl SandboxRuntime for Microsandbox {
             }
         }
         // One stuck sandbox must not keep the others alive.
-        let mut result = Ok(());
-        for handle in found.into_values() {
-            if let Err(e) = handle.destroy().await {
-                result = Err(e.into());
+        let (mut reaped, mut failed) = (Vec::new(), None);
+        for (name, handle) in found {
+            match handle.destroy().await {
+                Ok(()) => reaped.push(name),
+                Err(e) => failed = Some(e),
             }
         }
-        result
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(reaped),
+        }
     }
 
     /// Tails `runtime.log` itself: `follow_logs` returns a `futures` Stream,
@@ -389,9 +394,7 @@ impl SandboxRuntime for Microsandbox {
     /// Each process runs in the group wrapper, so a kill also ends its children.
     async fn open_pipe(&self, vm: &Sandbox, argv: &[String], cwd: &str) -> Result<Pipe> {
         let argv = group_argv(argv);
-        let mut handle = vm
-            .exec_stream_with(&argv[0], |e| e.args(&argv[1..]).cwd(cwd).stdin_pipe())
-            .await?;
+        let mut handle = vm.exec_stream_with(&argv[0], |e| e.args(&argv[1..]).cwd(cwd).stdin_pipe()).await?;
         let sink = handle.take_stdin().ok_or(Error::AgentClosed)?;
         let control = handle.control();
 
@@ -462,7 +465,9 @@ fn group_argv(argv: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 pub mod fake {
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use microsandbox::HostPattern;
 
@@ -497,6 +502,17 @@ pub mod fake {
         pub probe_fail: Arc<Mutex<Vec<String>>>,
         /// The root execs that wrote the profile file.
         pub profiles: Arc<Mutex<Vec<Vec<String>>>>,
+        /// The count of the root execs that trusted the interception CA.
+        pub trusts: Arc<Mutex<usize>>,
+        /// The trust exec fails as in an image with no system bundle.
+        pub trust_fail: Arc<Mutex<bool>>,
+        /// The VM names that `reap` removes.
+        pub reaped: Arc<Mutex<Vec<String>>>,
+        /// How long each stop takes.
+        pub stop_delay: Arc<Mutex<Duration>>,
+        /// The stops that run now, and the most that ran at once.
+        pub stopping: Arc<std::sync::atomic::AtomicUsize>,
+        pub most_stopping: Arc<std::sync::atomic::AtomicUsize>,
         /// The other ends of the pipes from `open_pipe`, except the Node
         /// check. The test plays the process: it reads stdin, and sends output
         /// in chunks of its choice and the exit when it wants.
@@ -555,22 +571,27 @@ pub mod fake {
                 let entry = secret.build();
                 started.push((entry.env_var, entry.allowed_hosts));
             }
-            Ok(FakeVm {
-                shield_id: shield.id.clone(),
-            })
+            Ok(FakeVm { shield_id: shield.id.clone() })
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {
             if *self.fail_stop.lock().unwrap() {
                 return Err(Error::Io(std::io::Error::other("stop failed")));
             }
+            let now = self.stopping.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_stopping.fetch_max(now, Ordering::SeqCst);
+            let delay = *self.stop_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            self.stopping.fetch_sub(1, Ordering::SeqCst);
             self.log.lock().unwrap().push(format!("stop {}", vm.shield_id));
             Ok(())
         }
 
-        async fn reap(&self) -> Result<()> {
+        async fn reap(&self) -> Result<Vec<String>> {
             self.log.lock().unwrap().push("reap".into());
-            Ok(())
+            Ok(self.reaped.lock().unwrap().clone())
         }
 
         async fn net_lines(&self, _: &FakeVm) -> Result<Receiver<String>> {
@@ -591,7 +612,8 @@ pub mod fake {
                 let (input, _) = mpsc::unbounded_channel();
                 let (tx, events) = mpsc::channel(PTY_QUEUE);
                 if argv.iter().any(|a| self.probe_fail.lock().unwrap().contains(a)) {
-                    let _ = tx.try_send(PtyEvent::Output(b"Error: Cannot find module './darwin-arm64.node'\r\n".to_vec()));
+                    let _ =
+                        tx.try_send(PtyEvent::Output(b"Error: Cannot find module './darwin-arm64.node'\r\n".to_vec()));
                     let _ = tx.try_send(PtyEvent::Exit(1));
                 } else {
                     let _ = tx.try_send(PtyEvent::Exit(0));
@@ -662,9 +684,20 @@ pub mod fake {
                 let _ = out.try_send(PipeEvent::Exit(0));
                 return Ok(Pipe { input, events });
             }
+            if argv == launch::trust_argv() {
+                *self.trusts.lock().unwrap() += 1;
+                if *self.trust_fail.lock().unwrap() {
+                    let _ = out.try_send(PipeEvent::Stderr(b"the image has no system CA bundle\n".to_vec()));
+                    let _ = out.try_send(PipeEvent::Exit(3));
+                } else {
+                    let _ = out.try_send(PipeEvent::Exit(0));
+                }
+                return Ok(Pipe { input, events });
+            }
             if argv.len() == 3 && argv[0] == "node" && argv[2] == "--version" {
                 if self.probe_fail.lock().unwrap().contains(&argv[1]) {
-                    let _ = out.try_send(PipeEvent::Stderr(b"Error: Cannot find module './darwin-arm64.node'\n".to_vec()));
+                    let _ =
+                        out.try_send(PipeEvent::Stderr(b"Error: Cannot find module './darwin-arm64.node'\n".to_vec()));
                     let _ = out.try_send(PipeEvent::Exit(1));
                 } else {
                     let _ = out.try_send(PipeEvent::Stdout(b"1.0.0\n".to_vec()));
@@ -677,11 +710,7 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.pipes.lock().unwrap().push(FakePipe {
-                argv: argv.to_vec(),
-                stdin,
-                out,
-            });
+            self.pipes.lock().unwrap().push(FakePipe { argv: argv.to_vec(), stdin, out });
             Ok(Pipe { input, events })
         }
     }
@@ -701,10 +730,7 @@ mod tests {
 
     fn denying(mode: NetworkMode, domains: &[&str], denied: &[&str]) -> microsandbox::NetworkPolicy {
         sandbox_policy(
-            &shield::NetworkPolicy {
-                mode,
-                domains: domains.iter().map(|d| (*d).to_owned()).collect(),
-            },
+            &shield::NetworkPolicy { mode, domains: domains.iter().map(|d| (*d).to_owned()).collect() },
             denied,
         )
         .unwrap()
@@ -716,11 +742,7 @@ mod tests {
 
     /// The DNS interceptor's decision for a UDP/53 query.
     fn dns(policy: &microsandbox::NetworkPolicy, name: &str) -> NetworkAction {
-        policy.evaluate_dns_query(
-            &name.parse().unwrap(),
-            serde_json::from_value(json!("udp")).unwrap(),
-            53,
-        )
+        policy.evaluate_dns_query(&name.parse().unwrap(), serde_json::from_value(json!("udp")).unwrap(), 53)
     }
 
     fn deny(destination: Value, protocols: Value, ports: Value) -> Value {
@@ -819,10 +841,7 @@ mod tests {
         }));
         expected.push(allow(json!({ "group": "public" })));
         assert_eq!(rules(&policy), Value::Array(expected));
-        assert_eq!(
-            rules(&policy)[6],
-            serde_json::to_value(microsandbox::NetworkRule::allow_dns()).unwrap()
-        );
+        assert_eq!(rules(&policy)[6], serde_json::to_value(microsandbox::NetworkRule::allow_dns()).unwrap());
         assert_eq!(dns(&policy, "example.com"), NetworkAction::Allow);
     }
 
@@ -842,30 +861,19 @@ mod tests {
             Secret {
                 name: "MAPS_KEY".into(),
                 hosts: vec!["maps.example.com".into()],
-                places: Places {
-                    header_fields: vec![],
-                    query: true,
-                    body: true,
-                },
+                places: Places { header_fields: vec![], query: true, body: true },
                 origin: Origin::User,
             },
         ];
         let values = vec![SecretValue::new("sk-1"), SecretValue::new("mk-2")];
-        let entries: Vec<_> = secret_entries(&secrets, values)
-            .unwrap()
-            .into_iter()
-            .map(SecretBuilder::build)
-            .collect();
+        let entries: Vec<_> = secret_entries(&secrets, values).unwrap().into_iter().map(SecretBuilder::build).collect();
 
         assert_eq!(entries[0].env_var, "OPENAI_API_KEY");
         assert_eq!(*entries[0].value, "sk-1");
         assert_eq!(entries[0].placeholder, "$MSB_OPENAI_API_KEY$");
         assert_eq!(
             entries[0].allowed_hosts,
-            [
-                HostPattern::Exact("api.openai.com".into()),
-                HostPattern::Exact("openai.com".into())
-            ]
+            [HostPattern::Exact("api.openai.com".into()), HostPattern::Exact("openai.com".into())]
         );
         let s = &entries[0].substitution;
         assert!(s.headers && !s.query && !s.body);
@@ -919,12 +927,7 @@ mod tests {
 
         let run = |script: &str| {
             let argv = group_argv(&["sh".to_owned(), "-c".to_owned(), script.to_owned()]);
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap()
+            Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap()
         };
         let mut echo = run("read line; echo \"got $line\"; exit 3");
         echo.stdin.take().unwrap().write_all(b"hi\n").unwrap();
@@ -971,10 +974,7 @@ mod tests {
     #[test]
     fn invalid_domain_is_rejected() {
         let result = sandbox_policy(
-            &shield::NetworkPolicy {
-                mode: NetworkMode::List,
-                domains: vec!["not a domain".into()],
-            },
+            &shield::NetworkPolicy { mode: NetworkMode::List, domains: vec!["not a domain".into()] },
             &[],
         );
         assert!(matches!(result, Err(Error::InvalidDomain(..))));

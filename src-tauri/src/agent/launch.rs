@@ -14,6 +14,16 @@ pub const PATH: &str = "/opt/zwinger/bin:/usr/local/sbin:/usr/local/bin:/usr/sbi
 /// Debian's `/etc/profile` resets `PATH` for login shells, then sources
 /// this dir. So this file puts the wrappers back on `PATH`.
 pub const PROFILE: &str = "/etc/profile.d/zwinger.sh";
+/// Where microsandbox puts its TLS interception CA in the guest
+/// (`microsandbox_protocol::GUEST_TLS_CA_PATH`, not re-exported).
+pub const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
+/// Debian's system CA bundle. The CA env vars of a shield with secrets point here.
+pub const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+/// The interception CA as a local CA of Debian, so a later install of
+/// `ca-certificates` also adds it to the bundle.
+const LOCAL_CA: &str = "/usr/local/share/ca-certificates/zwinger-msb.crt";
+/// The exit code of [`trust_argv`] when the image has no system bundle.
+const NO_BUNDLE: i32 = 3;
 
 /// What the shield start found: the facts that pick an agent's program.
 #[derive(Debug, Clone, Copy, Default)]
@@ -95,11 +105,9 @@ fn added(kind: AgentKind, unprompted: bool) -> Option<Added> {
             user: "--dangerously-bypass-approvals-and-sandbox|--yolo|--full-auto|-s|--sandbox|--sandbox=*",
             subcommands: CODEX_SUBCOMMANDS,
         }),
-        (AgentKind::Gemini, true) => Some(Added {
-            flag: &["--yolo"],
-            user: "-y|--yolo|--approval-mode|--approval-mode=*",
-            subcommands: None,
-        }),
+        (AgentKind::Gemini, true) => {
+            Some(Added { flag: &["--yolo"], user: "-y|--yolo|--approval-mode|--approval-mode=*", subcommands: None })
+        }
         _ => None,
     }
 }
@@ -121,10 +129,7 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
         program.extend(["--session-dir".to_owned(), pi::SESSION_DIR.to_owned()]);
     }
     let env: Vec<String> = env(kind).iter().map(|(name, value)| format!("{name}={}", quote(value))).collect();
-    let mut script = format!(
-        "#!/bin/sh\n# zwinger writes this file at each shield start.\nexport {}\n",
-        env.join(" ")
-    );
+    let mut script = format!("#!/bin/sh\n# zwinger writes this file at each shield start.\nexport {}\n", env.join(" "));
     if let Some(added) = added(kind, unprompted) {
         script.push_str("add=1\n");
         if let Some(subcommands) = added.subcommands {
@@ -146,6 +151,31 @@ pub fn profile() -> String {
 pub fn profile_argv() -> Vec<String> {
     let script = format!("mkdir -p /etc/profile.d && printf '%s' \"$1\" > {PROFILE}");
     ["/bin/sh", "-c", &script, "sh", &profile()].map(str::to_owned).into()
+}
+
+/// The root exec that adds the interception CA to the system trust. With no
+/// system bundle it makes none: a bundle with only this CA would break TLS to
+/// the hosts that the proxy does not intercept.
+pub fn trust_argv() -> Vec<String> {
+    let dir = LOCAL_CA.rsplit_once('/').expect("a dir").0;
+    let script = [
+        "set -e".to_owned(),
+        format!("mkdir -p {dir}"),
+        format!("cp {GUEST_TLS_CA_PATH} {LOCAL_CA}"),
+        "if command -v update-ca-certificates >/dev/null 2>&1; then".to_owned(),
+        "  update-ca-certificates >/dev/null".to_owned(),
+        format!("elif [ -f {CA_BUNDLE} ]; then"),
+        // The second line of the PEM is unique to the CA, so a second run appends nothing.
+        format!(
+            "  grep -qF \"$(sed -n 2p {GUEST_TLS_CA_PATH})\" {CA_BUNDLE} || cat {GUEST_TLS_CA_PATH} >> {CA_BUNDLE}"
+        ),
+        "else".to_owned(),
+        "  echo 'the image has no system CA bundle; install ca-certificates in the shield to add one' >&2".to_owned(),
+        format!("  exit {NO_BUNDLE}"),
+        "fi".to_owned(),
+    ]
+    .join("\n");
+    ["/bin/sh", "-c", &script].map(str::to_owned).into()
 }
 
 /// Writes the wrapper of each agent in `kinds` to the host dir `dir`, which
@@ -175,8 +205,16 @@ mod tests {
     fn run(kind: AgentKind, unprompted: bool, args: &[&str]) -> String {
         let script = wrapper(kind, HOST, unprompted).unwrap();
         let program = program(kind, HOST).unwrap().iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
-        let script = script.replace(&format!("exec {program}"), "exec printf '%s\\n' \"$HOME$CODEX_HOME$PI_CODING_AGENT_DIR\"");
-        let out = std::process::Command::new("/bin/sh").env_clear().arg("-c").arg(script).arg("sh").args(args).output().unwrap();
+        let script =
+            script.replace(&format!("exec {program}"), "exec printf '%s\\n' \"$HOME$CODEX_HOME$PI_CODING_AGENT_DIR\"");
+        let out = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .args(args)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
     }
@@ -193,9 +231,15 @@ mod tests {
              [ -n \"$add\" ] && set -- --dangerously-skip-permissions \"$@\"\n\
              exec /opt/zwinger/claude/claude \"$@\"\n"
         );
-        assert_eq!(run(AgentKind::Claude, true, &["-c"]), "/opt/zwinger/state/claude\n--dangerously-skip-permissions\n-c\n");
+        assert_eq!(
+            run(AgentKind::Claude, true, &["-c"]),
+            "/opt/zwinger/state/claude\n--dangerously-skip-permissions\n-c\n"
+        );
         // The user's own permission flag stays, and nothing is added.
-        assert_eq!(run(AgentKind::Claude, true, &["--permission-mode", "plan"]), "/opt/zwinger/state/claude\n--permission-mode\nplan\n");
+        assert_eq!(
+            run(AgentKind::Claude, true, &["--permission-mode", "plan"]),
+            "/opt/zwinger/state/claude\n--permission-mode\nplan\n"
+        );
         assert_eq!(run(AgentKind::Claude, true, &["mcp", "list"]), "/opt/zwinger/state/claude\nmcp\nlist\n");
         assert_eq!(run(AgentKind::Claude, false, &["-c"]), "/opt/zwinger/state/claude\n-c\n");
         assert!(!wrapper(AgentKind::Claude, HOST, false).unwrap().contains("dangerously"));
@@ -214,8 +258,14 @@ mod tests {
         assert_eq!(run(AgentKind::Codex, true, &["login"]), "/opt/zwinger/state/codex\nlogin\n");
         // Off: the approvals come back, but Codex's own sandbox stays off.
         assert_eq!(run(AgentKind::Codex, false, &[]), "/opt/zwinger/state/codex\n--sandbox\ndanger-full-access\n");
-        assert_eq!(run(AgentKind::Codex, false, &["-a", "never"]), "/opt/zwinger/state/codex\n--sandbox\ndanger-full-access\n-a\nnever\n");
-        assert_eq!(run(AgentKind::Codex, false, &["--sandbox=read-only"]), "/opt/zwinger/state/codex\n--sandbox=read-only\n");
+        assert_eq!(
+            run(AgentKind::Codex, false, &["-a", "never"]),
+            "/opt/zwinger/state/codex\n--sandbox\ndanger-full-access\n-a\nnever\n"
+        );
+        assert_eq!(
+            run(AgentKind::Codex, false, &["--sandbox=read-only"]),
+            "/opt/zwinger/state/codex\n--sandbox=read-only\n"
+        );
         assert_eq!(run(AgentKind::Codex, false, &["logout"]), "/opt/zwinger/state/codex\nlogout\n");
     }
 
@@ -225,18 +275,29 @@ mod tests {
         assert!(pi.contains("export PI_CODING_AGENT_DIR=/opt/zwinger/state/agent\n"), "{pi}");
         assert!(!pi.contains("add="), "{pi}");
         assert!(
-            pi.ends_with("exec node /opt/zwinger/host/pi/dist/cli.js --session-dir /opt/zwinger/state/sessions \"$@\"\n"),
+            pi.ends_with(
+                "exec node /opt/zwinger/host/pi/dist/cli.js --session-dir /opt/zwinger/state/sessions \"$@\"\n"
+            ),
             "{pi}"
         );
         let bundled = wrapper(AgentKind::Pi, Found::default(), true).unwrap();
         assert!(bundled.contains("exec node /opt/zwinger/pi/cli.js "), "{bundled}");
-        assert_eq!(run(AgentKind::Pi, true, &["-c"]), "/opt/zwinger/state/agent\n--session-dir\n/opt/zwinger/state/sessions\n-c\n");
+        assert_eq!(
+            run(AgentKind::Pi, true, &["-c"]),
+            "/opt/zwinger/state/agent\n--session-dir\n/opt/zwinger/state/sessions\n-c\n"
+        );
 
         let gemini = wrapper(AgentKind::Gemini, HOST, true).unwrap();
         assert!(gemini.contains("export HOME=/opt/zwinger/state/gemini\n"), "{gemini}");
         assert!(gemini.ends_with("exec node /opt/zwinger/host/gemini/bundle/gemini.js \"$@\"\n"), "{gemini}");
-        assert_eq!(run(AgentKind::Gemini, true, &["--resume", "latest"]), "/opt/zwinger/state/gemini\n--yolo\n--resume\nlatest\n");
-        assert_eq!(run(AgentKind::Gemini, true, &["--approval-mode=auto_edit"]), "/opt/zwinger/state/gemini\n--approval-mode=auto_edit\n");
+        assert_eq!(
+            run(AgentKind::Gemini, true, &["--resume", "latest"]),
+            "/opt/zwinger/state/gemini\n--yolo\n--resume\nlatest\n"
+        );
+        assert_eq!(
+            run(AgentKind::Gemini, true, &["--approval-mode=auto_edit"]),
+            "/opt/zwinger/state/gemini\n--approval-mode=auto_edit\n"
+        );
         assert_eq!(run(AgentKind::Gemini, false, &[]), "/opt/zwinger/state/gemini\n");
         assert_eq!(wrapper(AgentKind::Gemini, Found::default(), true), None);
     }
@@ -278,6 +339,71 @@ mod tests {
         assert_eq!(argv[2], "mkdir -p /etc/profile.d && printf '%s' \"$1\" > /etc/profile.d/zwinger.sh");
         assert_eq!(argv[3..], ["sh".to_owned(), profile()]);
         assert!(PATH.starts_with(&format!("{BIN_DIR}:")));
+    }
+
+    /// Runs the trust script with its paths below a temp root. `tools` is a
+    /// dir on `PATH` before the system dirs.
+    fn trust(root: &Path, tools: &Path) -> std::process::Output {
+        let script = trust_argv()[2]
+            .replace(GUEST_TLS_CA_PATH, &root.join("ca.pem").display().to_string())
+            .replace("/usr/local/share", &root.join("local").display().to_string())
+            .replace(CA_BUNDLE, &root.join("bundle.crt").display().to_string());
+        std::process::Command::new("/bin/sh")
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap()
+    }
+
+    fn trust_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("zwinger-trust-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("tools")).unwrap();
+        std::fs::write(root.join("ca.pem"), "-----BEGIN CERTIFICATE-----\nZWINGERCA\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        root
+    }
+
+    #[test]
+    fn trust_appends_the_ca_to_the_bundle_once() {
+        let root = trust_root();
+        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
+        for _ in 0..2 {
+            let out = trust(&root, &root.join("tools"));
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let bundle = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
+        assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
+        assert_eq!(bundle.matches("ZWINGERCA").count(), 1, "{bundle}");
+        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-msb.crt")).unwrap();
+        assert!(local.contains("ZWINGERCA"));
+    }
+
+    #[test]
+    fn trust_prefers_update_ca_certificates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = trust_root();
+        let tool = root.join("tools/update-ca-certificates");
+        std::fs::write(&tool, format!("#!/bin/sh\necho ran > {}\n", root.join("ran").display())).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(root.join("ran").exists());
+        assert_eq!(std::fs::read_to_string(root.join("bundle.crt")).unwrap(), "SYSTEM ROOTS\n");
+    }
+
+    #[test]
+    fn trust_makes_no_bundle_with_only_the_ca() {
+        let root = trust_root();
+        let out = trust(&root, &root.join("tools"));
+        assert_eq!(out.status.code(), Some(NO_BUNDLE));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no system CA bundle"));
+        assert!(!root.join("bundle.crt").exists());
+        // A later install of ca-certificates picks it up.
+        assert!(root.join("local/ca-certificates/zwinger-msb.crt").exists());
     }
 
     #[test]

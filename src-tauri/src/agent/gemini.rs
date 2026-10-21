@@ -121,9 +121,7 @@ mod tests {
         assert!(mapper.map(&init).is_empty());
         assert!(mapper.map(&event(r#"{"type":"message","role":"user","content":"List the files"}"#)).is_empty());
 
-        let delta = |text: &str| {
-            json!({ "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": text } })
-        };
+        let delta = |text: &str| json!({ "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": text } });
         let first = event(r#"{"type":"message","role":"assistant","content":"I will ","delta":true}"#);
         assert_eq!(
             mapper.map(&first),
@@ -132,7 +130,9 @@ mod tests {
         let more = event(r#"{"type":"message","role":"assistant","content":"look.","delta":true}"#);
         assert_eq!(mapper.map(&more), [delta("look.")]);
 
-        let call = event(r#"{"type":"tool_use","tool_name":"list_directory","tool_id":"ls-1","parameters":{"path":"/workspace"}}"#);
+        let call = event(
+            r#"{"type":"tool_use","tool_name":"list_directory","tool_id":"ls-1","parameters":{"path":"/workspace"}}"#,
+        );
         let records = mapper.map(&call);
         assert_eq!(records[0]["message"]["content"], json!([{ "type": "text", "text": "I will look." }]));
         assert_eq!(
@@ -150,9 +150,13 @@ mod tests {
                 json!({ "type": "message_end", "message": { "role": "toolResult", "toolCallId": "ls-1", "content": content, "isError": false } }),
             ]
         );
-        let failed = event(r#"{"type":"tool_result","tool_id":"w-1","status":"error","error":{"type":"x","message":"EROFS"}}"#);
+        let failed =
+            event(r#"{"type":"tool_result","tool_id":"w-1","status":"error","error":{"type":"x","message":"EROFS"}}"#);
         let records = mapper.map(&failed);
-        assert_eq!((records[0]["isError"].clone(), records[0]["result"]["content"][0]["text"].clone()), (json!(true), json!("EROFS")));
+        assert_eq!(
+            (records[0]["isError"].clone(), records[0]["result"]["content"][0]["text"].clone()),
+            (json!(true), json!("EROFS"))
+        );
 
         mapper.map(&event(r#"{"type":"message","role":"assistant","content":"Two files.","delta":true}"#));
         let done = event(r#"{"type":"result","status":"success","stats":{"total_tokens":10}}"#);

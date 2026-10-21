@@ -24,6 +24,13 @@ pub struct Shield {
     pub id: String,
     pub name: String,
     pub folder: PathBuf,
+    /// The identity of `folder` when the user picked it.
+    #[serde(default)]
+    pub folder_id: Option<FileId>,
+    /// The load after the update to folder identities is done. After it, a
+    /// folder with no identity gets one only when the user confirms it.
+    #[serde(default)]
+    pub ids_migrated: bool,
     pub mounts: Vec<Mount>,
     pub network: NetworkPolicy,
     /// The guest folder where agent sessions start: below `/workspace` or a mount.
@@ -146,8 +153,26 @@ pub struct TaskDraft {
 #[serde(rename_all = "camelCase")]
 pub struct Mount {
     pub host: PathBuf,
+    /// The identity of `host` when the user picked it.
+    #[serde(default)]
+    pub id: Option<FileId>,
     pub guest: String,
     pub readonly: bool,
+}
+
+/// The identity of a host folder: a folder that is swapped for another one
+/// at the same path has a different identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self { dev: metadata.dev(), ino: metadata.ino() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,10 +211,9 @@ impl From<StoredNetworkPolicy> for NetworkPolicy {
     fn from(stored: StoredNetworkPolicy) -> Self {
         match stored {
             StoredNetworkPolicy::Current { mode, domains } => Self { mode, domains },
-            StoredNetworkPolicy::Legacy { allow_all, domains } => Self {
-                mode: if allow_all { NetworkMode::Public } else { NetworkMode::List },
-                domains,
-            },
+            StoredNetworkPolicy::Legacy { allow_all, domains } => {
+                Self { mode: if allow_all { NetworkMode::Public } else { NetworkMode::List }, domains }
+            }
         }
     }
 }
@@ -211,14 +235,15 @@ impl NetworkPolicy {
 
 impl Shield {
     pub fn new(folder: &str) -> Result<Self> {
-        let folder = host_dir(folder)?;
-        let name = folder
-            .file_name()
-            .map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let (folder, folder_id) = host_dir_with_id(folder)?;
+        let name =
+            folder.file_name().map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned());
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
             folder,
+            folder_id: Some(folder_id),
+            ids_migrated: true,
             mounts: Vec::new(),
             network: NetworkPolicy::default(),
             harness: None,
@@ -337,11 +362,10 @@ impl Shield {
                 return Err(invalid(format!("the model {model} is not valid")));
             }
         }
-        let gates: Vec<String> = draft.gates.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).map(str::to_owned).collect();
+        let gates: Vec<String> =
+            draft.gates.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).map(str::to_owned).collect();
         if gates.len() > GATE_COUNT
-            || gates
-                .iter()
-                .any(|g| g.chars().count() > COMMAND_LIMIT || g.chars().any(|c| c.is_control() && c != '\t'))
+            || gates.iter().any(|g| g.chars().count() > COMMAND_LIMIT || g.chars().any(|c| c.is_control() && c != '\t'))
         {
             return Err(invalid(format!(
                 "use at most {GATE_COUNT} gates, each one line of at most {COMMAND_LIMIT} characters"
@@ -408,11 +432,7 @@ impl Shield {
         if let Ok(rel) = path.strip_prefix(WORKSPACE) {
             return Some((self.folder.clone(), rel.to_owned(), true));
         }
-        let mount = self
-            .mounts
-            .iter()
-            .filter(|m| path.starts_with(&m.guest))
-            .max_by_key(|m| m.guest.len())?;
+        let mount = self.mounts.iter().filter(|m| path.starts_with(&m.guest)).max_by_key(|m| m.guest.len())?;
         let rel = path.strip_prefix(&mount.guest).ok()?;
         Some((mount.host.clone(), rel.to_owned(), !mount.readonly))
     }
@@ -518,7 +538,8 @@ impl Shield {
             if self.network.domains.iter().any(|d| d == host) {
                 return Err(Error::RefreshHostConflict(host.to_owned(), "the allow-list entry".to_owned()));
             }
-            if let Some(secret) = self.secrets.iter().find(|s| s.origin.is_user() && s.hosts.iter().any(|h| h == host)) {
+            if let Some(secret) = self.secrets.iter().find(|s| s.origin.is_user() && s.hosts.iter().any(|h| h == host))
+            {
                 return Err(Error::RefreshHostConflict(host.to_owned(), format!("the secret {}", secret.name)));
             }
         }
@@ -548,11 +569,7 @@ impl Shield {
     /// whose guest path contains it. `None` for `/workspace` or no harness.
     fn harness_mount(&self) -> Option<&str> {
         let harness = Path::new(self.harness.as_deref()?);
-        self.mounts
-            .iter()
-            .filter(|m| harness.starts_with(&m.guest))
-            .map(|m| m.guest.as_str())
-            .max_by_key(|g| g.len())
+        self.mounts.iter().filter(|m| harness.starts_with(&m.guest)).map(|m| m.guest.as_str()).max_by_key(|g| g.len())
     }
 
     /// Refuses a mount change that moves the harness to a different mount, so
@@ -570,17 +587,13 @@ impl Shield {
     }
 
     pub fn add_mount(&mut self, host: &str, guest: &str, readonly: bool) -> Result<()> {
-        let host = host_dir(host)?;
+        let (host, id) = host_dir_with_id(host)?;
         let guest = guest_path(guest)?;
         if self.mounts.iter().any(|m| m.guest == guest) {
             return Err(Error::DuplicateMount(guest));
         }
         self.keep_harness_mount(|s| {
-            s.mounts.push(Mount {
-                host,
-                guest,
-                readonly,
-            });
+            s.mounts.push(Mount { host, id: Some(id), guest, readonly });
             Ok(())
         })?;
         self.check_overlap().inspect_err(|_| {
@@ -606,10 +619,7 @@ impl Shield {
         for (i, (a, a_rw)) in paths.iter().enumerate() {
             for (b, b_rw) in &paths[i + 1..] {
                 if (*a_rw || *b_rw) && (a.starts_with(b) || b.starts_with(a)) {
-                    return Err(Error::MountOverlap(
-                        a.display().to_string(),
-                        b.display().to_string(),
-                    ));
+                    return Err(Error::MountOverlap(a.display().to_string(), b.display().to_string()));
                 }
             }
         }
@@ -620,18 +630,14 @@ impl Shield {
     /// shield, in either direction: a guest of one shield could then swap a
     /// folder that the other shield binds at start.
     pub fn check_overlap_with<'a>(&self, others: impl IntoIterator<Item = &'a Shield>) -> Result<()> {
-        let ours: Vec<&Path> = std::iter::once(self.folder.as_path())
-            .chain(self.mounts.iter().map(|m| m.host.as_path()))
-            .collect();
+        let ours: Vec<&Path> =
+            std::iter::once(self.folder.as_path()).chain(self.mounts.iter().map(|m| m.host.as_path())).collect();
         for other in others {
             let theirs = std::iter::once(other.folder.as_path())
                 .chain(other.mounts.iter().filter(|m| !m.readonly).map(|m| m.host.as_path()));
             for b in theirs {
                 if let Some(a) = ours.iter().find(|a| a.starts_with(b) || b.starts_with(a)) {
-                    return Err(Error::MountOverlap(
-                        a.display().to_string(),
-                        b.display().to_string(),
-                    ));
+                    return Err(Error::MountOverlap(a.display().to_string(), b.display().to_string()));
                 }
             }
         }
@@ -650,24 +656,44 @@ impl Shield {
         Ok(())
     }
 
-    /// Resolves the stored host paths again before a start. A path that now
-    /// resolves elsewhere (for example, a swapped symlink) is refused.
+    /// Resolves the stored host paths again, around a start. A path that now
+    /// resolves elsewhere (for example, a swapped symlink), or to another
+    /// folder at the same path (a swapped folder), is refused. A path with no
+    /// stored identity is refused until the user confirms it.
     pub fn verify_paths(&self) -> Result<()> {
-        let stored = std::iter::once(&self.folder).chain(self.mounts.iter().map(|m| &m.host));
-        for path in stored {
+        let stored = std::iter::once((&self.folder, self.folder_id)).chain(self.mounts.iter().map(|m| (&m.host, m.id)));
+        for (path, id) in stored {
             let display = path.display().to_string();
-            if host_dir(&display)? != *path {
+            let Some(id) = id else {
+                return Err(Error::PathUnverified(display));
+            };
+            let (now, now_id) = host_dir_with_id(&display)?;
+            if now != *path || id != now_id {
                 return Err(Error::PathChanged(display));
             }
         }
         self.check_overlap()
     }
 
+    /// Sets the missing identities from the folders as they are now, if they
+    /// still resolve to their stored paths. Returns true if it set one.
+    pub fn fill_ids(&mut self) -> bool {
+        let mut filled = false;
+        let paths = std::iter::once((&self.folder, &mut self.folder_id))
+            .chain(self.mounts.iter_mut().map(|m| (&m.host, &mut m.id)));
+        for (path, id) in paths.filter(|(_, id)| id.is_none()) {
+            if let Ok((now, now_id)) = host_dir_with_id(&path.display().to_string())
+                && now == *path
+            {
+                *id = Some(now_id);
+                filled = true;
+            }
+        }
+        filled
+    }
+
     pub fn mount_mut(&mut self, guest: &str) -> Result<&mut Mount> {
-        self.mounts
-            .iter_mut()
-            .find(|m| m.guest == guest)
-            .ok_or(Error::MountNotFound)
+        self.mounts.iter_mut().find(|m| m.guest == guest).ok_or(Error::MountNotFound)
     }
 }
 
@@ -701,26 +727,27 @@ pub fn reorder<T>(items: &mut Vec<T>, ids: &[String], id: impl Fn(&T) -> &String
 /// Resolves a host folder to its canonical path, so symlinks are followed once here
 /// and the stored path is the real directory.
 pub fn host_dir(path: &str) -> Result<PathBuf> {
+    Ok(host_dir_with_id(path)?.0)
+}
+
+/// [`host_dir`] and the identity of the folder.
+fn host_dir_with_id(path: &str) -> Result<(PathBuf, FileId)> {
     let raw = Path::new(path);
     if !raw.is_absolute() {
         return Err(Error::RelativePath(path.to_owned()));
     }
-    let canonical = raw
-        .canonicalize()
-        .map_err(|_| Error::MissingPath(path.to_owned()))?;
-    if !canonical.is_dir() {
+    let canonical = raw.canonicalize().map_err(|_| Error::MissingPath(path.to_owned()))?;
+    let metadata = std::fs::metadata(&canonical).map_err(|_| Error::MissingPath(path.to_owned()))?;
+    if !metadata.is_dir() {
         return Err(Error::NotDirectory(path.to_owned()));
     }
-    Ok(canonical)
+    Ok((canonical, FileId::of(&metadata)))
 }
 
 /// The canonical dir of a host path, as [`host_dir`] mounts it. A confirm
 /// step shows it, so the user sees where a link points.
 pub fn resolve_folder(path: &str) -> Result<String> {
-    host_dir(path)?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| Error::MissingPath(path.to_owned()))
+    host_dir(path)?.into_os_string().into_string().map_err(|_| Error::MissingPath(path.to_owned()))
 }
 
 /// Accepts a hostname with at least two labels, or `*.` and such a hostname
@@ -764,9 +791,7 @@ pub fn wildcard_for(host: &str) -> Option<String> {
 fn normalize(path: &str) -> Option<PathBuf> {
     let p = Path::new(path);
     let normalized = p.is_absolute()
-        && p.components()
-            .skip(1)
-            .all(|c| matches!(c, Component::Normal(_)))
+        && p.components().skip(1).all(|c| matches!(c, Component::Normal(_)))
         && p.components().count() > 1;
     normalized.then(|| p.components().collect())
 }
@@ -820,20 +845,14 @@ mod tests {
     #[test]
     fn host_dir_rejects_missing_path() {
         let missing = temp_dir("missing").join("nope");
-        assert!(matches!(
-            host_dir(missing.to_str().unwrap()),
-            Err(Error::MissingPath(_))
-        ));
+        assert!(matches!(host_dir(missing.to_str().unwrap()), Err(Error::MissingPath(_))));
     }
 
     #[test]
     fn host_dir_rejects_file() {
         let file = temp_dir("file").join("f.txt");
         std::fs::write(&file, "x").unwrap();
-        assert!(matches!(
-            host_dir(file.to_str().unwrap()),
-            Err(Error::NotDirectory(_))
-        ));
+        assert!(matches!(host_dir(file.to_str().unwrap()), Err(Error::NotDirectory(_))));
     }
 
     #[test]
@@ -843,10 +862,7 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         let link = dir.join("alias");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(
-            host_dir(link.to_str().unwrap()).unwrap(),
-            target.canonicalize().unwrap()
-        );
+        assert_eq!(host_dir(link.to_str().unwrap()).unwrap(), target.canonicalize().unwrap());
     }
 
     #[test]
@@ -868,19 +884,13 @@ mod tests {
         for path in ["/workspace", "/workspace/sub", "/"] {
             assert!(guest_path(path).is_err(), "{path}");
         }
-        assert!(matches!(
-            guest_path("/workspace/x"),
-            Err(Error::WorkspaceOverlap(_))
-        ));
+        assert!(matches!(guest_path("/workspace/x"), Err(Error::WorkspaceOverlap(_))));
     }
 
     #[test]
     fn guest_path_rejects_relative_and_dot_segments() {
         for path in ["data", "/data/../workspace", "/mnt/.."] {
-            assert!(
-                matches!(guest_path(path), Err(Error::InvalidGuestPath(_))),
-                "{path}"
-            );
+            assert!(matches!(guest_path(path), Err(Error::InvalidGuestPath(_))), "{path}");
         }
     }
 
@@ -914,10 +924,7 @@ mod tests {
         let mut shield = Shield::new(temp_dir("dup").to_str().unwrap()).unwrap();
         let data = temp_dir("dup-data");
         shield.add_mount(data.to_str().unwrap(), "/mnt/a", true).unwrap();
-        assert!(matches!(
-            shield.add_mount(data.to_str().unwrap(), "/mnt/a/", false),
-            Err(Error::DuplicateMount(_))
-        ));
+        assert!(matches!(shield.add_mount(data.to_str().unwrap(), "/mnt/a/", false), Err(Error::DuplicateMount(_))));
     }
 
     fn shield_with_dirs(names: &[&str]) -> (Shield, PathBuf) {
@@ -946,10 +953,7 @@ mod tests {
     #[test]
     fn mount_containing_folder_is_rejected() {
         let (mut shield, root) = shield_with_dirs(&["project"]);
-        assert!(matches!(
-            shield.add_mount(root.to_str().unwrap(), "/mnt/root", true),
-            Err(Error::MountOverlap(..))
-        ));
+        assert!(matches!(shield.add_mount(root.to_str().unwrap(), "/mnt/root", true), Err(Error::MountOverlap(..))));
     }
 
     #[test]
@@ -1001,6 +1005,44 @@ mod tests {
     }
 
     #[test]
+    fn verify_paths_detects_a_swapped_folder_at_the_same_path() {
+        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        assert!(shield.folder_id.is_some() && shield.mounts[0].id.is_some());
+
+        std::fs::rename(root.join("data"), root.join("old")).unwrap();
+        std::fs::create_dir(root.join("data")).unwrap();
+        assert!(matches!(shield.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("data")));
+
+        std::fs::remove_dir(root.join("data")).unwrap();
+        std::fs::rename(root.join("old"), root.join("data")).unwrap();
+        shield.verify_paths().unwrap();
+        std::fs::rename(root.join("project"), root.join("was")).unwrap();
+        std::fs::create_dir(root.join("project")).unwrap();
+        assert!(matches!(shield.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("project")));
+    }
+
+    #[test]
+    fn fill_ids_sets_only_missing_ids_of_unmoved_folders() {
+        let (mut shield, root) = shield_with_dirs(&["project", "data", "gone"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        shield.add_mount(&path(&root, "gone"), "/mnt/gone", true).unwrap();
+        let ids = (shield.folder_id, shield.mounts[0].id);
+        shield.folder_id = None;
+        shield.mounts[0].id = None;
+        shield.mounts[1].id = None;
+        std::fs::remove_dir(root.join("gone")).unwrap();
+        assert!(shield.fill_ids());
+        assert_eq!((shield.folder_id, shield.mounts[0].id, shield.mounts[1].id), (ids.0, ids.1, None));
+        assert!(!shield.fill_ids());
+        // A folder that appears later at the path is refused until it is confirmed.
+        std::fs::create_dir(root.join("gone")).unwrap();
+        assert!(matches!(shield.verify_paths(), Err(Error::PathUnverified(p)) if p.ends_with("gone")));
+        assert!(shield.fill_ids());
+        shield.verify_paths().unwrap();
+    }
+
+    #[test]
     fn verify_paths_detects_missing_folder() {
         let (shield, root) = shield_with_dirs(&["project"]);
         std::fs::remove_dir(root.join("project")).unwrap();
@@ -1011,11 +1053,9 @@ mod tests {
     fn set_harness_accepts_workspace_folders_and_mounts() {
         let (mut shield, root) = shield_with_dirs(&["project/agent", "data"]);
         shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        for (input, stored) in [
-            ("//workspace/agent/", "/workspace/agent"),
-            ("/mnt/data", "/mnt/data"),
-            ("/mnt/data/sub", "/mnt/data/sub"),
-        ] {
+        for (input, stored) in
+            [("//workspace/agent/", "/workspace/agent"), ("/mnt/data", "/mnt/data"), ("/mnt/data/sub", "/mnt/data/sub")]
+        {
             shield.set_harness(Some(input)).unwrap();
             assert_eq!(shield.harness.as_deref(), Some(stored));
         }
@@ -1027,20 +1067,11 @@ mod tests {
     fn set_harness_rejects_other_paths() {
         let (mut shield, _) = shield_with_dirs(&["project"]);
         for input in ["agent", "/workspace/../etc", "/"] {
-            assert!(
-                matches!(shield.set_harness(Some(input)), Err(Error::InvalidGuestPath(_))),
-                "{input}"
-            );
+            assert!(matches!(shield.set_harness(Some(input)), Err(Error::InvalidGuestPath(_))), "{input}");
         }
-        assert!(matches!(
-            shield.set_harness(Some("/workspace/missing")),
-            Err(Error::MissingPath(_))
-        ));
+        assert!(matches!(shield.set_harness(Some("/workspace/missing")), Err(Error::MissingPath(_))));
         for input in ["/workspace", "/mnt/data", "/etc"] {
-            assert!(
-                matches!(shield.set_harness(Some(input)), Err(Error::HarnessTarget(_))),
-                "{input}"
-            );
+            assert!(matches!(shield.set_harness(Some(input)), Err(Error::HarnessTarget(_))), "{input}");
         }
     }
 
@@ -1075,13 +1106,7 @@ mod tests {
     }
 
     fn draft(name: &str, command: &str, cwd: &str) -> AppDraft {
-        AppDraft {
-            id: None,
-            name: name.into(),
-            command: command.into(),
-            cwd: cwd.into(),
-            autostart: false,
-        }
+        AppDraft { id: None, name: name.into(), command: command.into(), cwd: cwd.into(), autostart: false }
     }
 
     #[test]
@@ -1113,20 +1138,13 @@ mod tests {
         let (mut shield, _) = shield_with_dirs(&["project"]);
         let id = shield.put_app(draft("web", "pnpm dev", "/workspace")).unwrap();
         shield
-            .put_app(AppDraft {
-                id: Some(id.clone()),
-                autostart: true,
-                ..draft("api", "cargo run", "/workspace")
-            })
+            .put_app(AppDraft { id: Some(id.clone()), autostart: true, ..draft("api", "cargo run", "/workspace") })
             .unwrap();
         assert_eq!(shield.apps.len(), 1);
         assert_eq!((shield.apps[0].id.as_str(), shield.apps[0].name.as_str()), (id.as_str(), "api"));
         assert!(shield.apps[0].autostart);
         assert!(matches!(
-            shield.put_app(AppDraft {
-                id: Some("nope".into()),
-                ..draft("a", "x", "/workspace")
-            }),
+            shield.put_app(AppDraft { id: Some("nope".into()), ..draft("a", "x", "/workspace") }),
             Err(Error::AppNotFound)
         ));
         shield.remove_app(&id).unwrap();
@@ -1209,13 +1227,7 @@ mod tests {
         for (allow_all, mode) in [(false, NetworkMode::List), (true, NetworkMode::Public)] {
             let json = format!(r#"{{"allowAll":{allow_all},"domains":["registry.npmjs.org"]}}"#);
             let policy: NetworkPolicy = serde_json::from_str(&json).unwrap();
-            assert_eq!(
-                policy,
-                NetworkPolicy {
-                    mode,
-                    domains: vec!["registry.npmjs.org".into()],
-                }
-            );
+            assert_eq!(policy, NetworkPolicy { mode, domains: vec!["registry.npmjs.org".into()] });
         }
         let current: NetworkPolicy = serde_json::from_str(r#"{"mode":"deny","domains":["a.io"]}"#).unwrap();
         assert_eq!(current.mode, NetworkMode::Deny);

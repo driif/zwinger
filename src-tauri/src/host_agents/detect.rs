@@ -116,7 +116,8 @@ fn codex(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
         let (path, _) = package(fs, &root.join("@openai/codex"), "")?;
         Some((root, path))
     })?;
-    let mut bins: Vec<PathBuf> = root.parent().and_then(Path::parent).map(|p| p.join("bin/codex")).into_iter().collect();
+    let mut bins: Vec<PathBuf> =
+        root.parent().and_then(Path::parent).map(|p| p.join("bin/codex")).into_iter().collect();
     bins.extend(fs.path_dirs().into_iter().map(|d| d.join("codex")));
     let version = bins.iter().filter(|bin| fs.is_file(bin)).find_map(|bin| version_in(&fs.version(bin)?))?;
     Some((path, version))
@@ -132,9 +133,7 @@ fn claude(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
         bins.push(target);
     }
     bins.extend(fs.path_dirs().into_iter().map(|d| d.join("claude")));
-    bins.into_iter()
-        .filter(|bin| fs.is_file(bin))
-        .find_map(|bin| Some((bin.clone(), version_in(&fs.version(&bin)?)?)))
+    bins.into_iter().filter(|bin| fs.is_file(bin)).find_map(|bin| Some((bin.clone(), version_in(&fs.version(&bin)?)?)))
 }
 
 /// Gemini CLI's entry points when `package.json` names none that exists:
@@ -189,7 +188,9 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
         let found = match kind {
             AgentKind::Claude => claude(fs).map(|(path, version)| (path, version, None)),
             AgentKind::Codex => codex(fs).map(|(path, version)| (path, version, None)),
-            AgentKind::Pi => npm(fs, "@earendil-works/pi-coding-agent", pi::HOST_ENTRY).map(|(path, version)| (path, version, None)),
+            AgentKind::Pi => {
+                npm(fs, "@earendil-works/pi-coding-agent", pi::HOST_ENTRY).map(|(path, version)| (path, version, None))
+            }
             AgentKind::Gemini => gemini(fs).map(|(path, version, entry)| (path, version, Some(entry))),
         };
         let Some((path, version, entry)) = found else {
@@ -226,11 +227,7 @@ mod tests {
     use super::*;
 
     fn home() -> FakeFs {
-        FakeFs {
-            home: PathBuf::from("/Users/me"),
-            path: vec![PathBuf::from("/usr/bin")],
-            ..FakeFs::default()
-        }
+        FakeFs { home: PathBuf::from("/Users/me"), path: vec![PathBuf::from("/usr/bin")], ..FakeFs::default() }
     }
 
     fn data() -> PathBuf {
@@ -334,11 +331,23 @@ mod tests {
             let found = detect(&fs, &FakeLogins::default(), 0, &data());
             found.agent(AgentKind::Gemini).and_then(|a| a.entry.clone())
         };
-        assert_eq!(entry(r#"{"version":"1.0.0","bin":"./cli/main.js"}"#, &["cli/main.js"], &[]).as_deref(), Some("cli/main.js"));
-        assert_eq!(entry(r#"{"version":"1.0.0","bin":{"gemini":"bundle/gemini.js"}}"#, &["bundle/gemini.js"], &[]).as_deref(), Some("bundle/gemini.js"));
+        assert_eq!(
+            entry(r#"{"version":"1.0.0","bin":"./cli/main.js"}"#, &["cli/main.js"], &[]).as_deref(),
+            Some("cli/main.js")
+        );
+        assert_eq!(
+            entry(r#"{"version":"1.0.0","bin":{"gemini":"bundle/gemini.js"}}"#, &["bundle/gemini.js"], &[]).as_deref(),
+            Some("bundle/gemini.js")
+        );
         // A path out of the package is refused, and a known path is used.
-        assert_eq!(entry(r#"{"version":"1.0.0","bin":"../evil.js"}"#, &["dist/index.js"], &[]).as_deref(), Some("dist/index.js"));
-        assert_eq!(entry(r#"{"version":"1.0.0","bin":"/bin/sh"}"#, &["bundle/gemini.js"], &[]).as_deref(), Some("bundle/gemini.js"));
+        assert_eq!(
+            entry(r#"{"version":"1.0.0","bin":"../evil.js"}"#, &["dist/index.js"], &[]).as_deref(),
+            Some("dist/index.js")
+        );
+        assert_eq!(
+            entry(r#"{"version":"1.0.0","bin":"/bin/sh"}"#, &["bundle/gemini.js"], &[]).as_deref(),
+            Some("bundle/gemini.js")
+        );
         assert_eq!(entry(r#"{"version":"1.0.0","bin":"x.js"}"#, &["x.js"], &[("x.js", "/etc/x.js")]), None);
         // No entry point: no Gemini CLI.
         assert_eq!(entry(r#"{"version":"1.0.0"}"#, &[], &[]), None);

@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::task::AbortHandle;
-
 
 use crate::agent::AgentKind;
 use crate::error::Result;
@@ -127,13 +126,7 @@ pub fn list_folders(shields: Shields<'_>, id: String) -> Result<Vec<String>> {
 }
 
 #[tauri::command]
-pub fn add_mount(
-    shields: Shields<'_>,
-    id: String,
-    host: String,
-    guest: String,
-    readonly: bool,
-) -> Result<()> {
+pub fn add_mount(shields: Shields<'_>, id: String, host: String, guest: String, readonly: bool) -> Result<()> {
     shields.add_mount(&id, &host, &guest, readonly)
 }
 
@@ -143,12 +136,7 @@ pub fn remove_mount(shields: Shields<'_>, id: String, guest: String) -> Result<(
 }
 
 #[tauri::command]
-pub fn set_mount_readonly(
-    shields: Shields<'_>,
-    id: String,
-    guest: String,
-    readonly: bool,
-) -> Result<()> {
+pub fn set_mount_readonly(shields: Shields<'_>, id: String, guest: String, readonly: bool) -> Result<()> {
     shields.set_mount_readonly(&id, &guest, readonly)
 }
 
@@ -185,12 +173,7 @@ pub fn remove_domain(shields: Shields<'_>, id: String, domain: String) -> Result
 // The secret commands are async, so the Keychain calls do not block the main thread.
 
 #[tauri::command]
-pub async fn put_secret(
-    shields: Shields<'_>,
-    id: String,
-    secret: Secret,
-    value: Option<SecretValue>,
-) -> Result<()> {
+pub async fn put_secret(shields: Shields<'_>, id: String, secret: Secret, value: Option<SecretValue>) -> Result<()> {
     shields.put_secret(&id, secret, value)
 }
 
@@ -285,18 +268,14 @@ type Host<'a> = State<'a, Arc<HostAgents>>;
 #[tauri::command]
 pub async fn host_agents(host: Host<'_>) -> Result<Detection> {
     let host = host.inner().clone();
-    tokio::task::spawn_blocking(move || host.last())
-        .await
-        .map_err(|e| std::io::Error::other(e).into())
+    tokio::task::spawn_blocking(move || host.last()).await.map_err(|e| std::io::Error::other(e).into())
 }
 
 /// Looks for the host agents again.
 #[tauri::command]
 pub async fn detect_host_agents(host: Host<'_>) -> Result<Detection> {
     let host = host.inner().clone();
-    tokio::task::spawn_blocking(move || host.detect())
-        .await
-        .map_err(|e| std::io::Error::other(e).into())
+    tokio::task::spawn_blocking(move || host.detect()).await.map_err(|e| std::io::Error::other(e).into())
 }
 
 #[tauri::command]
@@ -307,6 +286,22 @@ pub async fn put_host_agent(shields: Shields<'_>, id: String, agent: HostAgentUs
 #[tauri::command]
 pub fn remove_host_agent(shields: Shields<'_>, id: String, agent: AgentKind) -> Result<()> {
     shields.remove_host_agent(&id, agent)
+}
+
+#[tauri::command]
+pub fn remove_guest_login(shields: Shields<'_>, id: String, agent: AgentKind) -> Result<()> {
+    shields.remove_guest_login(&id, agent)
+}
+
+#[tauri::command]
+pub fn confirm_paths(shields: Shields<'_>, id: String) -> Result<()> {
+    shields.confirm_paths(&id)
+}
+
+/// Each notice comes once, so a reload does not show it again.
+#[tauri::command]
+pub fn take_app_notices(shields: Shields<'_>) -> Vec<String> {
+    shields.take_app_notices()
 }
 
 #[tauri::command]
@@ -398,10 +393,9 @@ pub async fn watch_room(
     on_event: Channel<RoomEvent>,
 ) -> Result<u64> {
     let (dir, run) = match source {
-        RoomSource::Run { shield_id, task_id, run } => (
-            shields.round_dir(&shield_id, &task_id, &run)?,
-            shields.run_handle(&shield_id, &task_id, &run),
-        ),
+        RoomSource::Run { shield_id, task_id, run } => {
+            (shields.round_dir(&shield_id, &task_id, &run)?, shields.run_handle(&shield_id, &task_id, &run))
+        }
         RoomSource::Folder { path } => {
             let dir = shield::host_dir(&path)?;
             if !task_artifacts::is_round(&dir) {
@@ -435,12 +429,7 @@ pub async fn watch_room(
     let status = move || run.as_ref().map(|r| r.status());
     tasks.push(
         tokio::spawn(task_artifacts::watch(dir, status, move |room, run| {
-            on_event
-                .send(RoomEvent::Room {
-                    room: Box::new(room),
-                    run: run.clone(),
-                })
-                .is_ok()
+            on_event.send(RoomEvent::Room { room: Box::new(room), run: run.clone() }).is_ok()
         }))
         .abort_handle(),
     );

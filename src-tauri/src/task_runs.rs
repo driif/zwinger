@@ -44,14 +44,20 @@ const PROMPT_LIMIT: usize = 256 << 10;
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Control {
     /// A message that every following stage prompt includes.
-    Message { text: String },
+    Message {
+        text: String,
+    },
     /// Pauses after the current stage.
     Pause,
     Resume,
     /// Overrides the exchange, until the implementation starts.
-    PickImplementer { agent: String },
+    PickImplementer {
+        agent: String,
+    },
     /// Answers the open questions of a waiting run.
-    Answer { text: String },
+    Answer {
+        text: String,
+    },
     Cancel {
         /// Set by the app, as for a shield stop. The user's cancel has none.
         #[serde(skip)]
@@ -105,13 +111,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            turns: TURNS,
-            limits: Limits {
-                idle: Duration::from_secs(600),
-                hard: Duration::from_secs(1800),
-            },
-        }
+        Self { turns: TURNS, limits: Limits { idle: Duration::from_secs(600), hard: Duration::from_secs(1800) } }
     }
 }
 
@@ -135,11 +135,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Live {
     fn send(&self, agent: &str, stage: &str, record: Value) {
-        let record = LiveRecord {
-            agent: agent.to_owned(),
-            stage: stage.to_owned(),
-            record,
-        };
+        let record = LiveRecord { agent: agent.to_owned(), stage: stage.to_owned(), record };
         let mut recent = lock(&self.recent);
         if recent.len() == RECENT {
             recent.pop_front();
@@ -197,7 +193,9 @@ impl RunHandle {
             return Err(Error::RunState("the run has ended"));
         }
         match &control {
-            Control::Message { text } | Control::Answer { text } if text.trim().is_empty() || text.len() > MESSAGE_LIMIT => {
+            Control::Message { text } | Control::Answer { text }
+                if text.trim().is_empty() || text.len() > MESSAGE_LIMIT =>
+            {
                 return Err(Error::RunState("the message must have 1 to 16384 bytes"));
             }
             Control::Answer { .. } if status.state != RunState::Waiting => {
@@ -255,16 +253,11 @@ pub struct Spec<R: SandboxRuntime> {
 
 impl Registry {
     pub fn find(&self, shield_id: &str, task_id: &str, run: &str) -> Option<Arc<RunHandle>> {
-        lock(&self.runs)
-            .iter()
-            .find(|r| r.shield_id == shield_id && r.task_id == task_id && r.run == run)
-            .cloned()
+        lock(&self.runs).iter().find(|r| r.shield_id == shield_id && r.task_id == task_id && r.run == run).cloned()
     }
 
     pub fn is_running(&self, shield_id: &str, task_id: &str) -> bool {
-        lock(&self.runs)
-            .iter()
-            .any(|r| r.shield_id == shield_id && r.task_id == task_id && r.status().state.is_live())
+        lock(&self.runs).iter().any(|r| r.shield_id == shield_id && r.task_id == task_id && r.status().state.is_live())
     }
 
     /// A run of the shield is not done.
@@ -285,10 +278,7 @@ impl Registry {
             ship: None,
             base: None,
         });
-        let live = Arc::new(Live {
-            tx: broadcast::channel(LIVE_QUEUE).0,
-            recent: Mutex::new(VecDeque::new()),
-        });
+        let live = Arc::new(Live { tx: broadcast::channel(LIVE_QUEUE).0, recent: Mutex::new(VecDeque::new()) });
         let handle = Arc::new(RunHandle {
             shield_id: spec.shield_id.clone(),
             task_id: spec.task.id.clone(),
@@ -297,10 +287,7 @@ impl Registry {
             control,
             status,
             live: live.clone(),
-            cancel: Arc::new(Cancel {
-                flag: watch::channel(false).0,
-                reason: Mutex::new(None),
-            }),
+            cancel: Arc::new(Cancel { flag: watch::channel(false).0, reason: Mutex::new(None) }),
             messages: Mutex::new((0, 0)),
         });
         let actor = Actor {
@@ -422,9 +409,7 @@ enum Stop {
 }
 
 fn compose(template: &str, pairs: &[(&str, &str)]) -> String {
-    pairs
-        .iter()
-        .fold(template.to_owned(), |text, (key, value)| text.replace(&format!("{{{{{key}}}}}"), value))
+    pairs.iter().fold(template.to_owned(), |text, (key, value)| text.replace(&format!("{{{{{key}}}}}"), value))
 }
 
 /// The newest part of `text` within `limit` bytes, with a line that says
@@ -476,10 +461,7 @@ fn text(value: &Value) -> String {
 }
 
 fn strings(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|items| items.iter().map(text).filter(|s| !s.trim().is_empty()).collect())
-        .unwrap_or_default()
+    value.as_array().map(|items| items.iter().map(text).filter(|s| !s.trim().is_empty()).collect()).unwrap_or_default()
 }
 
 impl Book {
@@ -503,10 +485,8 @@ impl Book {
 
     fn message(&mut self, kind: &'static str, text: String) {
         let stage = self.stage_id();
-        self.writer.append(
-            "messages.jsonl",
-            &json!({ "at": iso(now_ms()), "stage": stage, "kind": kind, "body": text }),
-        );
+        self.writer
+            .append("messages.jsonl", &json!({ "at": iso(now_ms()), "stage": stage, "kind": kind, "body": text }));
         let label = if kind == "answer" { "answer" } else { "message" };
         self.add([Entry {
             from: "user".to_owned(),
@@ -571,10 +551,8 @@ impl<R: SandboxRuntime> Io<R> {
         let name = self.name(i).to_owned();
         let live = |record: Value| self.live.send(&name, stage, record);
         let mut cancel = self.cancel.clone();
-        let mut reply = self
-            .exec
-            .call_json(&self.task.agents[i], access, prompt, self.config.limits, &mut cancel, &live)
-            .await;
+        let mut reply =
+            self.exec.call_json(&self.task.agents[i], access, prompt, self.config.limits, &mut cancel, &live).await;
         // A process that ends because of a cancel, such as with a stopped VM, is no degraded agent.
         if reply.failure.is_some() && *self.cancel.borrow() {
             reply.failure = Some(Failure::Cancelled);
@@ -598,7 +576,9 @@ impl<R: SandboxRuntime> Io<R> {
     async fn change(&self, base: Option<&str>) -> String {
         match self.exec.diff(base, &mut self.cancel.clone()).await {
             Some(diff) => {
-                let since = base.map_or("Only the uncommitted change is known.".to_owned(), |b| format!("The run started at commit `{b}`."));
+                let since = base.map_or("Only the uncommitted change is known.".to_owned(), |b| {
+                    format!("The run started at commit `{b}`.")
+                });
                 format!("{since} Read it again with `git log` and `git diff`.\n\n````diff\n{diff}\n````")
             }
             None => "The working dir is not a git work tree, so the run cannot show the change.".to_owned(),
@@ -778,13 +758,16 @@ impl<R: SandboxRuntime> Actor<R> {
             Ok((before, after)) => {
                 self.run.detection = Some(true);
                 if before.hash != after.hash {
-                    let mut changed: Vec<&str> = after.status.lines().filter(|l| !before.status.lines().any(|b| b == *l)).collect();
+                    let mut changed: Vec<&str> =
+                        after.status.lines().filter(|l| !before.status.lines().any(|b| b == *l)).collect();
                     changed.extend(before.status.lines().filter(|l| !after.status.lines().any(|a| a == *l)));
                     let files = if changed.is_empty() { "file contents".to_owned() } else { changed.join(", ") };
                     self.violation(format!("the repository changed during the read-only stage {stage}: {files}"));
                 }
             }
-            Err(SnapshotError::Failed(why)) => self.violation(format!("the read-only check of the stage {stage} failed: {why}")),
+            Err(SnapshotError::Failed(why)) => {
+                self.violation(format!("the read-only check of the stage {stage} failed: {why}"))
+            }
             Err(SnapshotError::NotGit) if self.run.detection.is_none() => {
                 self.run.detection = Some(false);
                 self.book.writer.event(
@@ -804,20 +787,21 @@ impl<R: SandboxRuntime> Actor<R> {
 
     async fn drive(&mut self) -> std::result::Result<(), Stop> {
         let a = self.name(0);
-        self.book
-            .writer
-            .write("task.md", format!("# {}\n\n{}\n", self.io.task.title, self.io.task.request).as_bytes());
+        self.book.writer.write("task.md", format!("# {}\n\n{}\n", self.io.task.title, self.io.task.request).as_bytes());
 
         // 1. Blind plans, in parallel.
         self.stage("plan", "plan")?;
         let prompts = [0, 1].map(|i| {
-            fit(PLAN, &[
-                ("ME", &self.name(i)),
-                ("PEER", &self.name(Self::peer(i))),
-                ("AGENTS", &self.agents_choice()),
-                ("CONTEXT", &self.context()),
-                ("MESSAGES", &self.messages()),
-            ])
+            fit(
+                PLAN,
+                &[
+                    ("ME", &self.name(i)),
+                    ("PEER", &self.name(Self::peer(i))),
+                    ("AGENTS", &self.agents_choice()),
+                    ("CONTEXT", &self.context()),
+                    ("MESSAGES", &self.messages()),
+                ],
+            )
         });
         for (name, prompt) in self.io.names.iter().zip(&prompts) {
             self.book.writer.write(&format!("turns/plan-{name}.prompt.md"), prompt.as_bytes());
@@ -860,14 +844,17 @@ impl<R: SandboxRuntime> Actor<R> {
                 }
                 self.stage(&format!("exchange turn {turn}"), &format!("exchange-{turn}"))?;
                 let prompts = [0, 1].map(|i| {
-                    fit(EXCHANGE, &[
-                        ("ME", &self.name(i)),
-                        ("PEER", &self.name(Self::peer(i))),
-                        ("AGENTS", &self.agents_choice()),
-                        ("CONTEXT", &self.context()),
-                        ("MESSAGES", &self.messages()),
-                        ("TRANSCRIPT", &self.transcript()),
-                    ])
+                    fit(
+                        EXCHANGE,
+                        &[
+                            ("ME", &self.name(i)),
+                            ("PEER", &self.name(Self::peer(i))),
+                            ("AGENTS", &self.agents_choice()),
+                            ("CONTEXT", &self.context()),
+                            ("MESSAGES", &self.messages()),
+                            ("TRANSCRIPT", &self.transcript()),
+                        ],
+                    )
                 });
                 for (name, prompt) in self.io.names.iter().zip(&prompts) {
                     self.book.writer.write(&format!("turns/t{turn}-{name}.prompt.md"), prompt.as_bytes());
@@ -898,14 +885,19 @@ impl<R: SandboxRuntime> Actor<R> {
             }
             if implementer.is_none() && self.picked().is_none() {
                 self.stage(&format!("tiebreak by {a}"), "tiebreak")?;
-                let prompt = fit(TIEBREAK, &[
-                    ("AGENTS", &self.agents_choice()),
-                    ("CONTEXT", &self.context()),
-                    ("MESSAGES", &self.messages()),
-                    ("TRANSCRIPT", &self.transcript()),
-                ]);
+                let prompt = fit(
+                    TIEBREAK,
+                    &[
+                        ("AGENTS", &self.agents_choice()),
+                        ("CONTEXT", &self.context()),
+                        ("MESSAGES", &self.messages()),
+                        ("TRANSCRIPT", &self.transcript()),
+                    ],
+                );
                 self.book.writer.write("tiebreak.prompt.md", prompt.as_bytes());
-                let reply = self.read_only("tiebreak", async |io: &Io<R>| io.call(0, "tiebreak", Access::Read, &prompt).await).await;
+                let reply = self
+                    .read_only("tiebreak", async |io: &Io<R>| io.call(0, "tiebreak", Access::Read, &prompt).await)
+                    .await;
                 let Some(json) = self.record(0, "tiebreak", "tiebreak", reply) else {
                     return Err(if self.book.cancelled() {
                         Stop::Cancelled
@@ -954,17 +946,26 @@ impl<R: SandboxRuntime> Actor<R> {
 
         // 4. Implement.
         self.stage("implement", "implement")?;
-        let prompt = fit(IMPLEMENT, &[
-            ("ME", &me),
-            ("CONTEXT", &self.context()),
-            ("MESSAGES", &self.messages()),
-            ("PLAN", &plan),
-            ("GATES", &self.gate_list()),
-            ("TRANSCRIPT", &self.transcript()),
-        ]);
+        let prompt = fit(
+            IMPLEMENT,
+            &[
+                ("ME", &me),
+                ("CONTEXT", &self.context()),
+                ("MESSAGES", &self.messages()),
+                ("PLAN", &plan),
+                ("GATES", &self.gate_list()),
+                ("TRANSCRIPT", &self.transcript()),
+            ],
+        );
         self.book.writer.write("implement.prompt.md", prompt.as_bytes());
         let io = &self.io;
-        let reply = during(&mut self.book, &mut self.control, &io.names, io.call(implementer, "implement", Access::Write, &prompt)).await;
+        let reply = during(
+            &mut self.book,
+            &mut self.control,
+            &io.names,
+            io.call(implementer, "implement", Access::Write, &prompt),
+        )
+        .await;
         let result = self.record(implementer, "implement", "implementation", reply);
         if self.book.cancelled() {
             return Err(Stop::Cancelled);
@@ -982,7 +983,9 @@ impl<R: SandboxRuntime> Actor<R> {
         for gate in &gates {
             let io = &self.io;
             let mut cancel = io.cancel.clone();
-            let ran = during(&mut self.book, &mut self.control, &io.names, io.exec.sh(gate, io.config.limits, &mut cancel)).await;
+            let ran =
+                during(&mut self.book, &mut self.control, &io.names, io.exec.sh(gate, io.config.limits, &mut cancel))
+                    .await;
             let Ok(shell) = ran else {
                 return Err(Stop::Cancelled);
             };
@@ -1001,22 +1004,25 @@ impl<R: SandboxRuntime> Actor<R> {
 
         // 6. Cross review.
         self.stage(&format!("crossreview by {peer}"), "crossreview")?;
-        let result_text = result
-            .as_ref()
-            .map_or("The implementer returned no report.".to_owned(), |r| format!("```json\n{}\n```", serde_json::to_string_pretty(r).unwrap_or_default()));
+        let result_text = result.as_ref().map_or("The implementer returned no report.".to_owned(), |r| {
+            format!("```json\n{}\n```", serde_json::to_string_pretty(r).unwrap_or_default())
+        });
         let base = self.run.base.clone();
         let change = self.io.change(base.as_deref()).await;
-        let prompt = fit(CROSSREVIEW, &[
-            ("ME", &peer),
-            ("PEER", &me),
-            ("CONTEXT", &self.context()),
-            ("MESSAGES", &self.messages()),
-            ("PLAN", &plan),
-            ("RESULT", &result_text),
-            ("GATES", &gates_text),
-            ("TRANSCRIPT", &self.transcript()),
-            ("CHANGE", &change),
-        ]);
+        let prompt = fit(
+            CROSSREVIEW,
+            &[
+                ("ME", &peer),
+                ("PEER", &me),
+                ("CONTEXT", &self.context()),
+                ("MESSAGES", &self.messages()),
+                ("PLAN", &plan),
+                ("RESULT", &result_text),
+                ("GATES", &gates_text),
+                ("TRANSCRIPT", &self.transcript()),
+                ("CHANGE", &change),
+            ],
+        );
         self.book.writer.write("crossreview.prompt.md", prompt.as_bytes());
         let reply = self
             .read_only("crossreview", async |io: &Io<R>| io.call(reviewer, "crossreview", Access::Read, &prompt).await)
@@ -1044,19 +1050,28 @@ impl<R: SandboxRuntime> Actor<R> {
         if verdict == "revise" {
             self.stage("revise", "revise")?;
             let review_text = format!("```json\n{}\n```", serde_json::to_string_pretty(&review).unwrap_or_default());
-            let prompt = fit(REVISE, &[
-                ("ME", &me),
-                ("PEER", &peer),
-                ("CONTEXT", &self.context()),
-                ("MESSAGES", &self.messages()),
-                ("PLAN", &plan),
-                ("REVIEW", &review_text),
-                ("GATES", &self.gate_list()),
-                ("TRANSCRIPT", &self.transcript()),
-            ]);
+            let prompt = fit(
+                REVISE,
+                &[
+                    ("ME", &me),
+                    ("PEER", &peer),
+                    ("CONTEXT", &self.context()),
+                    ("MESSAGES", &self.messages()),
+                    ("PLAN", &plan),
+                    ("REVIEW", &review_text),
+                    ("GATES", &self.gate_list()),
+                    ("TRANSCRIPT", &self.transcript()),
+                ],
+            );
             self.book.writer.write("revise.prompt.md", prompt.as_bytes());
             let io = &self.io;
-            let reply = during(&mut self.book, &mut self.control, &io.names, io.call(implementer, "revise", Access::Write, &prompt)).await;
+            let reply = during(
+                &mut self.book,
+                &mut self.control,
+                &io.names,
+                io.call(implementer, "revise", Access::Write, &prompt),
+            )
+            .await;
             revision = self.record(implementer, "revise", "revision", reply);
             revised = true;
             if self.book.cancelled() {
@@ -1076,17 +1091,20 @@ impl<R: SandboxRuntime> Actor<R> {
         // A revision that returned no JSON can still have changed files.
         let change = if revised { self.io.change(base.as_deref()).await } else { change };
         let prompts = [0, 1].map(|i| {
-            fit(FINAL, &[
-                ("ME", &self.name(i)),
-                ("PEER", &self.name(Self::peer(i))),
-                ("CONTEXT", &self.context()),
-                ("MESSAGES", &self.messages()),
-                ("PLAN", &plan),
-                ("HISTORY", &history),
-                ("GATES", &gates_text),
-                ("TRANSCRIPT", &self.transcript()),
-                ("CHANGE", &change),
-            ])
+            fit(
+                FINAL,
+                &[
+                    ("ME", &self.name(i)),
+                    ("PEER", &self.name(Self::peer(i))),
+                    ("CONTEXT", &self.context()),
+                    ("MESSAGES", &self.messages()),
+                    ("PLAN", &plan),
+                    ("HISTORY", &history),
+                    ("GATES", &gates_text),
+                    ("TRANSCRIPT", &self.transcript()),
+                    ("CHANGE", &change),
+                ],
+            )
         });
         let replies = self.read_only("final", async |io: &Io<R>| io.both("final", &prompts).await).await;
         for (i, reply) in replies.into_iter().enumerate() {
@@ -1124,7 +1142,9 @@ impl<R: SandboxRuntime> Actor<R> {
         let end = self.written(end);
         let stopped = match &end {
             Ok(()) => None,
-            Err(Stop::Cancelled) => Some(lock(&self.book.cancel.reason).clone().unwrap_or_else(|| "cancelled".to_owned())),
+            Err(Stop::Cancelled) => {
+                Some(lock(&self.book.cancel.reason).clone().unwrap_or_else(|| "cancelled".to_owned()))
+            }
             Err(Stop::Failed(why)) => Some(why.clone()),
         };
         let manifest = self.manifest(stopped.as_deref());
@@ -1162,12 +1182,8 @@ impl<R: SandboxRuntime> Actor<R> {
             && mirror_error.is_none()
             && reported.len() == 2
             && self.run.finals.iter().all(|(_, f)| f["ship"] == true);
-        let blocking: Vec<Value> = self
-            .run
-            .finals
-            .iter()
-            .flat_map(|(_, f)| f["blocking"].as_array().cloned().unwrap_or_default())
-            .collect();
+        let blocking: Vec<Value> =
+            self.run.finals.iter().flat_map(|(_, f)| f["blocking"].as_array().cloned().unwrap_or_default()).collect();
         let ship_basis = if let Some(e) = mirror_error {
             format!("withheld — the harness copy failed: {e}")
         } else if reported.len() == 2 {
@@ -1341,7 +1357,13 @@ fn history(review: Option<&Value>, revision: Option<&Value>) -> String {
     if let Some(cr) = review {
         let mut lines = vec![format!("**Verdict:** {}", text(&cr["verdict"])), String::new(), text(&cr["message"])];
         for f in cr["findings"].as_array().map(Vec::as_slice).unwrap_or_default() {
-            lines.push(format!("- [{}] {}:{} — {}", text(&f["severity"]), text(&f["file"]), text(&f["line"]), text(&f["what"])));
+            lines.push(format!(
+                "- [{}] {}:{} — {}",
+                text(&f["severity"]),
+                text(&f["file"]),
+                text(&f["line"]),
+                text(&f["what"])
+            ));
         }
         out.push(format!("### Cross review\n\n{}\n", lines.join("\n")));
     }
@@ -1477,7 +1499,9 @@ mod tests {
                 prompt: prompt.clone(),
             });
             match script(agent, stage, &prompt) {
-                Fake::Reply(text) if agent == "codex" => Fake::Reply(String::from_utf8(codex_result_lines(&text)).unwrap()),
+                Fake::Reply(text) if agent == "codex" => {
+                    Fake::Reply(String::from_utf8(codex_result_lines(&text)).unwrap())
+                }
                 Fake::Reply(text) => Fake::Reply(String::from_utf8(claude_result_line(&text)).unwrap()),
                 Fake::After(gate, text) => {
                     gate.notified().await;
@@ -1517,15 +1541,21 @@ mod tests {
     }
 
     fn plan(claim: &str) -> Fake {
-        Fake::Reply(fenced(json!({ "plan": format!("Plan that {claim} builds."), "claim": claim, "touches": ["rust"], "risks": [], "unknowns": [], "backlog": ["an idea"] })))
+        Fake::Reply(fenced(
+            json!({ "plan": format!("Plan that {claim} builds."), "claim": claim, "touches": ["rust"], "risks": [], "unknowns": [], "backlog": ["an idea"] }),
+        ))
     }
 
     fn turn(implementer: &str, agreed: bool) -> Fake {
-        Fake::Reply(fenced(json!({ "message": "My reply.", "plan": format!("Agreed plan by {implementer}."), "implementer": implementer, "agreed": agreed, "conceded": ["a point"], "unknowns": [], "backlog": [] })))
+        Fake::Reply(fenced(
+            json!({ "message": "My reply.", "plan": format!("Agreed plan by {implementer}."), "implementer": implementer, "agreed": agreed, "conceded": ["a point"], "unknowns": [], "backlog": [] }),
+        ))
     }
 
     fn done() -> Fake {
-        Fake::Reply(fenced(json!({ "summary": "Built it.", "files": ["a.rs"], "gates": {}, "deviations": [], "left_undone": [], "missing_dependencies": [], "backlog": [] })))
+        Fake::Reply(fenced(
+            json!({ "summary": "Built it.", "files": ["a.rs"], "gates": {}, "deviations": [], "left_undone": [], "missing_dependencies": [], "backlog": [] }),
+        ))
     }
 
     fn review(verdict: &str) -> Fake {
@@ -1534,11 +1564,15 @@ mod tests {
         } else {
             json!([])
         };
-        Fake::Reply(fenced(json!({ "verdict": verdict, "findings": findings, "plan_gaps": [], "message": "Looks right." })))
+        Fake::Reply(fenced(
+            json!({ "verdict": verdict, "findings": findings, "plan_gaps": [], "message": "Looks right." }),
+        ))
     }
 
     fn revised() -> Fake {
-        Fake::Reply(fenced(json!({ "fixed": [{ "finding": "Bug.", "what_changed": "Fixed." }], "rebuttals": [], "files": ["a.rs"], "gates": {}, "missing_dependencies": [], "message": "Fixed it." })))
+        Fake::Reply(fenced(
+            json!({ "fixed": [{ "finding": "Bug.", "what_changed": "Fixed." }], "rebuttals": [], "files": ["a.rs"], "gates": {}, "missing_dependencies": [], "message": "Fixed it." }),
+        ))
     }
 
     fn ship(ship: bool) -> Fake {
@@ -1619,22 +1653,9 @@ mod tests {
                 gemini: None,
             },
             writer: RoundWriter::create(dir.clone(), Some(mirror)).unwrap(),
-            config: Config {
-                turns: 2,
-                limits: Limits {
-                    idle,
-                    hard: Duration::from_secs(10),
-                },
-            },
+            config: Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } },
         });
-        Started {
-            registry,
-            handle,
-            dir,
-            mirror: root.join(".zwinger/tasks/fix/01"),
-            calls,
-            shells,
-        }
+        Started { registry, handle, dir, mirror: root.join(".zwinger/tasks/fix/01"), calls, shells }
     }
 
     async fn settled(run: &Started) -> Value {
@@ -1678,7 +1699,16 @@ mod tests {
         assert_eq!(manifest["ship_basis"], "both reviewers");
         assert_eq!(manifest["degraded"], json!([]));
         assert_eq!(manifest["backlog"], json!(["an idea"]));
-        for file in ["turns/plan-claude.json", "turns/plan-codex.json", "turns/t1-claude.json", "implementation.json", "gates.json", "crossreview.json", "final-claude.json", "final-codex.json"] {
+        for file in [
+            "turns/plan-claude.json",
+            "turns/plan-codex.json",
+            "turns/t1-claude.json",
+            "implementation.json",
+            "gates.json",
+            "crossreview.json",
+            "final-claude.json",
+            "final-codex.json",
+        ] {
             assert!(run.dir.join(file).is_file(), "{file}");
             assert!(run.mirror.join(file).is_file(), "mirror {file}");
         }
@@ -1719,7 +1749,9 @@ mod tests {
     async fn no_agreement_goes_to_the_tiebreak_of_the_first_agent() {
         let run = start(|agent, stage, prompt| match stage {
             Stage::Exchange => turn(agent, false),
-            Stage::Tiebreak => Fake::Reply(fenced(json!({ "implementer": "codex", "why": "Codex named the files.", "plan": "The tiebreak plan.", "open_questions": [] }))),
+            Stage::Tiebreak => Fake::Reply(fenced(
+                json!({ "implementer": "codex", "why": "Codex named the files.", "plan": "The tiebreak plan.", "open_questions": [] }),
+            )),
             _ => happy(agent, stage, prompt),
         });
         let manifest = settled(&run).await;
@@ -1732,13 +1764,16 @@ mod tests {
         assert_eq!(calls_of(&run, Stage::Implement)[0].agent, "codex");
         let room = read_room(&run.dir);
         assert_eq!(room.decided_by.as_deref(), Some("tiebreak"));
-        assert!(room.disagreements.iter().any(|d| d.about == "implementer" && d.resolved.as_deref() == Some("tiebreak")));
+        assert!(
+            room.disagreements.iter().any(|d| d.about == "implementer" && d.resolved.as_deref() == Some("tiebreak"))
+        );
         assert_eq!(room.messages.iter().find(|m| m.kind == "tiebreak").unwrap().from, "claude");
     }
 
     #[tokio::test]
     async fn a_failed_agent_gives_a_walkover_and_no_ship() {
-        let run = start(|agent, stage, prompt| if agent == "codex" { Fake::Exit(1) } else { happy(agent, stage, prompt) });
+        let run =
+            start(|agent, stage, prompt| if agent == "codex" { Fake::Exit(1) } else { happy(agent, stage, prompt) });
         let manifest = settled(&run).await;
         assert_eq!(manifest["implementer"], "claude");
         assert_eq!(manifest["planned"], json!(["claude"]));
@@ -1776,7 +1811,9 @@ mod tests {
     #[tokio::test]
     async fn an_oversize_reply_degrades_the_agent() {
         let run = start(|agent, stage, prompt| match stage {
-            Stage::Implement => Fake::Reply(fenced(json!({ "summary": "x".repeat(task_agents::REPLY_LIMIT), "files": [] }))),
+            Stage::Implement => {
+                Fake::Reply(fenced(json!({ "summary": "x".repeat(task_agents::REPLY_LIMIT), "files": [] })))
+            }
             _ => happy(agent, stage, prompt),
         });
         tokio::time::timeout(Duration::from_secs(60), run.handle.settled()).await.expect("the run settles");
@@ -1784,7 +1821,10 @@ mod tests {
         assert!(!run.dir.join("implementation.json").exists());
         assert!(run.dir.join("implementation.raw").is_file());
         let events = events(&run);
-        assert!(events.iter().any(|(k, d)| k == "agent_degraded" && d.starts_with("claude implement replied")), "{events:?}");
+        assert!(
+            events.iter().any(|(k, d)| k == "agent_degraded" && d.starts_with("claude implement replied")),
+            "{events:?}"
+        );
         assert!(calls_of(&run, Stage::Crossreview)[0].prompt.contains("The implementer returned no report."));
     }
 
@@ -1866,10 +1906,13 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let held = gate.clone();
         let run = start(move |agent, stage, prompt| match stage {
-            Stage::Plan if agent == "claude" => Fake::After(held.clone(), match plan("claude") {
-                Fake::Reply(text) => text,
-                _ => unreachable!(),
-            }),
+            Stage::Plan if agent == "claude" => Fake::After(
+                held.clone(),
+                match plan("claude") {
+                    Fake::Reply(text) => text,
+                    _ => unreachable!(),
+                },
+            ),
             _ => happy(agent, stage, prompt),
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1903,14 +1946,18 @@ mod tests {
         assert!(events.iter().any(|(k, _)| k == "paused"));
         let room = read_room(&run.dir);
         assert_eq!(room.decided_by.as_deref(), Some("user"));
-        assert!(room.messages.iter().any(|m| m.kind == "user" && m.body == "Use SQLite, not files." && m.stage == "plan"));
+        assert!(
+            room.messages.iter().any(|m| m.kind == "user" && m.body == "Use SQLite, not files." && m.stage == "plan")
+        );
         assert!(run.handle.status().decided);
     }
 
     #[tokio::test]
     async fn open_questions_wait_for_the_answer() {
         let run = start(|agent, stage, prompt| match stage {
-            Stage::Exchange => Fake::Reply(fenced(json!({ "message": "Ok.", "plan": "P.", "implementer": "claude", "agreed": true, "conceded": [], "unknowns": ["Which database?"], "backlog": [] }))),
+            Stage::Exchange => Fake::Reply(fenced(
+                json!({ "message": "Ok.", "plan": "P.", "implementer": "claude", "agreed": true, "conceded": [], "unknowns": ["Which database?"], "backlog": [] }),
+            )),
             _ => happy(agent, stage, prompt),
         });
         until(&run, |s| s.state == RunState::Waiting).await;
@@ -1976,7 +2023,10 @@ mod tests {
             happy,
         );
         let manifest = settled(&run).await;
-        assert_eq!(strings(&manifest["violations"]), ["the read-only check of the stage plan failed: git ended with code 4"]);
+        assert_eq!(
+            strings(&manifest["violations"]),
+            ["the read-only check of the stage plan failed: git ended with code 4"]
+        );
         // plan, exchange 1, crossreview and final: two snapshots each.
         assert_eq!(snapshots.load(Ordering::SeqCst), 8);
     }
@@ -1989,7 +2039,9 @@ mod tests {
             Duration::from_secs(5),
             move |script| match script {
                 s if is_snapshot(s) => clean(if head.load(Ordering::SeqCst) { COMMIT } else { BASE }),
-                s if s.contains("Commits since") => Fake::Reply(format!("Commits since the start of the run:\n{COMMIT} feat: the fix\n")),
+                s if s.contains("Commits since") => {
+                    Fake::Reply(format!("Commits since the start of the run:\n{COMMIT} feat: the fix\n"))
+                }
                 s => no_git(s),
             },
             move |agent, stage, prompt| {
@@ -2018,10 +2070,13 @@ mod tests {
         let held = gate.clone();
         let run = start(move |agent, stage, prompt| match (agent, stage) {
             ("codex", _) => Fake::Exit(1),
-            ("claude", Stage::Plan) => Fake::After(held.clone(), match plan("claude") {
-                Fake::Reply(text) => text,
-                _ => unreachable!(),
-            }),
+            ("claude", Stage::Plan) => Fake::After(
+                held.clone(),
+                match plan("claude") {
+                    Fake::Reply(text) => text,
+                    _ => unreachable!(),
+                },
+            ),
             _ => happy(agent, stage, prompt),
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2044,7 +2099,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_stops_a_running_gate_at_once() {
-        let run = start_full(Duration::from_secs(5), |script| if script.contains("pnpm build") { Fake::Hang } else { no_git(script) }, happy);
+        let run = start_full(
+            Duration::from_secs(5),
+            |script| if script.contains("pnpm build") { Fake::Hang } else { no_git(script) },
+            happy,
+        );
         until(&run, |s| s.stage.as_deref() == Some("gates")).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !run.shells.lock().unwrap().iter().any(|a| a[2].contains("pnpm build")) {
@@ -2054,14 +2113,19 @@ mod tests {
         .await
         .unwrap();
         run.handle.control(Control::Cancel { reason: None }).unwrap();
-        let manifest = tokio::time::timeout(Duration::from_secs(3), settled(&run)).await.expect("the cancel is at once");
+        let manifest =
+            tokio::time::timeout(Duration::from_secs(3), settled(&run)).await.expect("the cancel is at once");
         assert_eq!(manifest["stopped"], "cancelled by the user");
         assert!(!run.dir.join("gates.json").exists());
     }
 
     #[tokio::test]
     async fn a_shield_stop_cancels_a_snapshot_with_its_reason() {
-        let run = start_full(Duration::from_secs(5), |script| if is_snapshot(script) { Fake::Hang } else { no_git(script) }, happy);
+        let run = start_full(
+            Duration::from_secs(5),
+            |script| if is_snapshot(script) { Fake::Hang } else { no_git(script) },
+            happy,
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while run.shells.lock().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2084,10 +2148,13 @@ mod tests {
         let gate = Arc::new(Notify::new());
         let held = gate.clone();
         let run = start(move |agent, stage, prompt| match stage {
-            Stage::Plan => Fake::After(held.clone(), match plan(agent) {
-                Fake::Reply(text) => text,
-                _ => unreachable!(),
-            }),
+            Stage::Plan => Fake::After(
+                held.clone(),
+                match plan(agent) {
+                    Fake::Reply(text) => text,
+                    _ => unreachable!(),
+                },
+            ),
             _ => happy(agent, stage, prompt),
         });
         for _ in 0..MESSAGES_COUNT {
@@ -2108,17 +2175,23 @@ mod tests {
         assert!(start_within(&text, 101).starts_with('é'));
         assert_eq!(newest_within("short", 10), "short");
 
-        let prompt = fit(IMPLEMENT, &[("ME", "claude"), ("PLAN", &"p".repeat(PROMPT_LIMIT)), ("TRANSCRIPT", &"t".repeat(TRANSCRIPT_LIMIT))]);
+        let prompt = fit(
+            IMPLEMENT,
+            &[("ME", "claude"), ("PLAN", &"p".repeat(PROMPT_LIMIT)), ("TRANSCRIPT", &"t".repeat(TRANSCRIPT_LIMIT))],
+        );
         assert!(prompt.len() <= PROMPT_LIMIT);
         assert!(prompt.contains("## Output") && prompt.contains("bytes are omitted"));
 
         let messages = format!("\n\n## Messages from the user\n{}newest", "m".repeat(MESSAGES_BYTES - 16));
-        let prompt = fit(IMPLEMENT, &[
-            ("ME", "claude"),
-            ("CONTEXT", &"c".repeat(PROMPT_LIMIT)),
-            ("MESSAGES", &messages),
-            ("PLAN", &"p".repeat(PROMPT_LIMIT / 2)),
-        ]);
+        let prompt = fit(
+            IMPLEMENT,
+            &[
+                ("ME", "claude"),
+                ("CONTEXT", &"c".repeat(PROMPT_LIMIT)),
+                ("MESSAGES", &messages),
+                ("PLAN", &"p".repeat(PROMPT_LIMIT / 2)),
+            ],
+        );
         assert!(prompt.len() <= PROMPT_LIMIT);
         assert!(prompt.contains(&messages));
     }

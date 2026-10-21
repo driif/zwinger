@@ -14,6 +14,7 @@ import {
   ShieldView,
 } from "./api";
 import type { Run } from "./App";
+import { echoHost } from "./echoHost";
 
 const PRESETS = [
   { label: "Anthropic", name: "ANTHROPIC_API_KEY", hosts: ["api.anthropic.com"], fields: ["x-api-key", "authorization"] },
@@ -206,10 +207,20 @@ export function SecretsSection({ shield, run }: Props) {
             />
             <FloatingField
               label="Hosts, separated by commas"
+              hint="Never list a host that echoes requests back: it would show the value to the agent."
               className="mono"
               value={draft.hosts}
               onChange={(e) => setDraft({ ...draft, hosts: e.target.value, error: undefined })}
             />
+            {draft.hosts
+              .split(/[\s,]+/)
+              .filter(echoHost)
+              .map((host) => (
+                <span key={host} className="warn row">
+                  <TriangleAlert size={14} />
+                  {host} echoes requests back, so the agent can read the value.
+                </span>
+              ))}
             <FloatingField
               label="Header fields, separated by commas"
               className="mono"

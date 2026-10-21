@@ -48,7 +48,16 @@ fn is_denied(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     matches!(
         name.as_str(),
-        "projects" | "projects.json" | "sessions" | "todos" | "shell-snapshots" | "statsig" | "auth.json" | "oauth_creds.json" | "google_accounts.json" | "trust.json"
+        "projects"
+            | "projects.json"
+            | "sessions"
+            | "todos"
+            | "shell-snapshots"
+            | "statsig"
+            | "auth.json"
+            | "oauth_creds.json"
+            | "google_accounts.json"
+            | "trust.json"
     ) || ["history", ".credentials", "antigravity"].iter().any(|prefix| name.starts_with(prefix))
 }
 
@@ -132,14 +141,7 @@ fn copy_entries(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapsho
     let Ok(root) = config.canonicalize() else {
         return Ok(Snapshot::default());
     };
-    let mut copy = Copy {
-        root,
-        kind,
-        home,
-        size: 0,
-        files: 0,
-        skipped: Vec::new(),
-    };
+    let mut copy = Copy { root, kind, home, size: 0, files: 0, skipped: Vec::new() };
     let mut copied = Vec::new();
     for name in entries(kind) {
         let src = config.join(name);
@@ -158,10 +160,7 @@ fn copy_entries(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapsho
             copied.push((*name).to_owned());
         }
     }
-    Ok(Snapshot {
-        entries: copied,
-        skipped: copy.skipped,
-    })
+    Ok(Snapshot { entries: copied, skipped: copy.skipped })
 }
 
 impl Copy<'_> {
@@ -295,8 +294,17 @@ fn rewrite(value: &mut Value, change: &dyn Fn(&str) -> Option<String>) {
 /// names a key, token, secret, password or credential.
 fn is_credential(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['_', '-'], "");
-    matches!(key.as_str(), "env" | "headers" | "httpheaders" | "envhttpheaders" | "apikeyhelper" | "awsauthrefresh" | "awscredentialexport" | "otelheadershelper")
-        || ["apikey", "token", "secret", "password", "credential"].iter().any(|word| key.contains(word))
+    matches!(
+        key.as_str(),
+        "env"
+            | "headers"
+            | "httpheaders"
+            | "envhttpheaders"
+            | "apikeyhelper"
+            | "awsauthrefresh"
+            | "awscredentialexport"
+            | "otelheadershelper"
+    ) || ["apikey", "token", "secret", "password", "credential"].iter().any(|word| key.contains(word))
 }
 
 fn strip(value: &mut Value) {
@@ -381,7 +389,8 @@ mod tests {
     }
 
     fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> =
+            fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         names.sort();
         names
     }
@@ -432,7 +441,9 @@ mod tests {
         assert_eq!(names(&dest.join("skills/review")), ["SKILL.md"]);
         assert_eq!(names(&dest.join("agents")), ["SKILL.md"]);
         for name in ["p", "c", "history.jsonl", "Sessions", "auth.json"] {
-            fs::remove_file(claude.join("skills/review").join(name)).or_else(|_| fs::remove_dir(claude.join("skills/review").join(name))).unwrap();
+            fs::remove_file(claude.join("skills/review").join(name))
+                .or_else(|_| fs::remove_dir(claude.join("skills/review").join(name)))
+                .unwrap();
         }
         fs::remove_file(claude.join("plugins")).unwrap();
 
@@ -516,11 +527,19 @@ name = "n"
 
         let dest = temp_dir().join("claude");
         snapshot(AgentKind::Claude, &home, &dest).unwrap();
-        let read = |name: &str| serde_json::from_str::<Value>(&fs::read_to_string(dest.join("plugins").join(name)).unwrap()).unwrap();
+        let read = |name: &str| {
+            serde_json::from_str::<Value>(&fs::read_to_string(dest.join("plugins").join(name)).unwrap()).unwrap()
+        };
         let plugins = read("installed_plugins.json")["plugins"]["a@m"].clone();
-        assert_eq!(plugins[0], json!({ "installPath": "/opt/zwinger/profile/claude/plugins/cache/m/a/1", "version": "1" }));
+        assert_eq!(
+            plugins[0],
+            json!({ "installPath": "/opt/zwinger/profile/claude/plugins/cache/m/a/1", "version": "1" })
+        );
         assert_eq!(plugins[1]["projectPath"], "/opt/zwinger/profile/claude/plugins/local");
-        assert_eq!(read("known_marketplaces.json")["m"]["installLocation"], "/opt/zwinger/profile/claude/plugins/marketplaces/m");
+        assert_eq!(
+            read("known_marketplaces.json")["m"]["installLocation"],
+            "/opt/zwinger/profile/claude/plugins/marketplaces/m"
+        );
         assert_eq!(read("known_marketplaces.json")["m"]["source"]["repo"], "o/m");
     }
 
@@ -574,7 +593,10 @@ name = "n"
 
         link(AgentKind::Claude, &state, &["skills".to_owned(), "settings.json".to_owned()]).unwrap();
         assert_eq!(fs::read_link(home.join("skills")).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
-        assert_eq!(fs::read_link(home.join("settings.json")).unwrap(), Path::new("/opt/zwinger/profile/claude/settings.json"));
+        assert_eq!(
+            fs::read_link(home.join("settings.json")).unwrap(),
+            Path::new("/opt/zwinger/profile/claude/settings.json")
+        );
         // A stale link into the mount goes; the guest's own files stay.
         assert!(fs::symlink_metadata(home.join("plugins")).is_err());
         assert_eq!(fs::read_to_string(home.join("history.jsonl")).unwrap(), "own");

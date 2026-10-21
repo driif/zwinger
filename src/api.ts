@@ -4,8 +4,15 @@ import { listen } from "@tauri-apps/api/event";
 /** A login shell in /workspace, or an agent's own TUI in the harness. `resume` continues the agent's last session. */
 export type SessionKind = { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
 
+/** The identity of a host folder. `null`: not verified since the update. */
+export interface FileId {
+  dev: number;
+  ino: number;
+}
+
 export interface Mount {
   host: string;
+  id: FileId | null;
   guest: string;
   readonly: boolean;
 }
@@ -116,6 +123,7 @@ export interface ShieldView {
   id: string;
   name: string;
   folder: string;
+  folderId: FileId | null;
   mounts: Mount[];
   network: NetworkPolicy;
   harness: string | null;
@@ -143,6 +151,8 @@ export interface ShieldView {
   renewDue: boolean;
   /** What the start did differently for the host agents, such as a fallback. */
   hostNotices: string[];
+  /** The agents of the running VM with a login made in the guest: the agent can read its real token. */
+  guestLogins: AgentKind[];
 }
 
 /** Output bytes, or the exit. Tauri can send small raw bodies as a number array. */
@@ -357,6 +367,19 @@ export const setAutoRenew = (id: string, on: boolean) => invoke<void>("set_auto_
 /** Resolves to the function that stops the listener. */
 export const onRenewDue = (handler: (shieldId: string) => void) =>
   listen<string>("renew-due", ({ payload }) => handler(payload));
+
+/** The user confirms the folders that are not verified since the update. */
+export const confirmPaths = (id: string) => invoke<void>("confirm_paths", { id });
+
+/** Deletes the agent's login that was made in the guest. */
+export const removeGuestLogin = (id: string, agent: AgentKind) => invoke<void>("remove_guest_login", { id, agent });
+
+/** Resolves to the function that stops the listener. */
+export const onGuestLogin = (handler: (shieldId: string) => void) =>
+  listen<string>("guest-login", ({ payload }) => handler(payload));
+
+/** Each notice comes once, such as the VMs that the app start removed. */
+export const takeAppNotices = () => invoke<string[]>("take_app_notices");
 
 /** Stops the download. The install then fails with a cancel error. */
 export const cancelRuntimeInstall = (name: RuntimeName) => invoke<void>("cancel_runtime_install", { name });

@@ -18,12 +18,10 @@ use serde_json::{Map, Value};
 
 use crate::agent::{AgentKind, cli};
 use crate::error::{Error, Result};
-use crate::secrets::{Origin, Places, Secret, SecretValue};
+use crate::secrets::{self, Origin, Places, Secret, SecretValue};
 
 /// The Keychain item of Claude Code's login.
 const CLAUDE_SERVICE: &str = "Claude Code-credentials";
-/// The longest wait for the Keychain, which can show the macOS access prompt.
-const KEYCHAIN_LIMIT: Duration = Duration::from_secs(60);
 /// A login file over this size is refused.
 const FILE_LIMIT: u64 = 1 << 20;
 /// The refresh token in the guest. No secret replaces it.
@@ -44,34 +42,21 @@ struct Provider {
     refresh: &'static [&'static str],
 }
 
-const ANTHROPIC: Provider = Provider {
-    pi: "anthropic",
-    host: "api.anthropic.com",
-    refresh: &["console.anthropic.com", "platform.claude.com"],
-};
+const ANTHROPIC: Provider =
+    Provider { pi: "anthropic", host: "api.anthropic.com", refresh: &["console.anthropic.com", "platform.claude.com"] };
 /// The Codex backend of a ChatGPT login (`chatgpt.com/backend-api/codex`).
-const CHATGPT: Provider = Provider {
-    pi: "openai-codex",
-    host: "chatgpt.com",
-    refresh: &["auth.openai.com"],
-};
+const CHATGPT: Provider = Provider { pi: "openai-codex", host: "chatgpt.com", refresh: &["auth.openai.com"] };
 /// The Copilot API of an individual account. Other accounts get their
 /// host from the token, see [`copilot_host`].
-const COPILOT: Provider = Provider {
-    pi: "github-copilot",
-    host: "api.individual.githubcopilot.com",
-    refresh: &[GITHUB_API],
-};
+const COPILOT: Provider =
+    Provider { pi: "github-copilot", host: "api.individual.githubcopilot.com", refresh: &[GITHUB_API] };
 /// Copilot's refresh host. It is also the API of `gh` and of other GitHub
 /// tools, so a shield with pi's Copilot login cannot use them.
 pub const GITHUB_API: &str = "api.github.com";
 const COPILOT_DOMAIN: &str = ".githubcopilot.com";
 /// The Code Assist API of a Google login.
-const GOOGLE: Provider = Provider {
-    pi: "google-gemini-cli",
-    host: "cloudcode-pa.googleapis.com",
-    refresh: &["oauth2.googleapis.com"],
-};
+const GOOGLE: Provider =
+    Provider { pi: "google-gemini-cli", host: "cloudcode-pa.googleapis.com", refresh: &["oauth2.googleapis.com"] };
 /// In this order, pi uses the first provider that has a login.
 const PI_PROVIDERS: [&Provider; 4] = [&ANTHROPIC, &CHATGPT, &COPILOT, &GOOGLE];
 
@@ -191,32 +176,30 @@ fn read_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// In a thread, so a macOS access prompt that nobody answers ends the wait
-/// after `KEYCHAIN_LIMIT`.
+/// On the Keychain worker, so a macOS access prompt that nobody answers ends
+/// the wait after `KEYCHAIN_LIMIT`.
 #[cfg(target_os = "macos")]
 fn read_keychain() -> Result<Option<String>> {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let found = secrets::bounded(secrets::KEYCHAIN_LIMIT, || {
         let mut query = security_framework::item::ItemSearchOptions::new();
         query
             .class(security_framework::item::ItemClass::generic_password())
             .service(CLAUDE_SERVICE)
             .load_data(true)
             .limit(1);
-        let found = match query.search() {
+        match query.search() {
             Ok(mut items) => match items.pop() {
                 Some(security_framework::item::SearchResult::Data(data)) => Ok(Some(data)),
                 _ => Ok(None),
             },
             Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
             Err(e) => Err(Error::Keychain(e.to_string())),
-        };
-        let _ = tx.send(found);
+        }
     });
-    match rx.recv_timeout(KEYCHAIN_LIMIT) {
-        Ok(found) => Ok(found?.map(|data| String::from_utf8_lossy(&data).into_owned())),
-        Err(_) => Err(Error::Keychain(
+    match found {
+        Some(found) => Ok(found?.map(|data| String::from_utf8_lossy(&data).into_owned())),
+        None => Err(Error::Keychain(
             "no answer from the Keychain; allow access to \"Claude Code-credentials\" in the macOS prompt".into(),
         )),
     }
@@ -227,16 +210,20 @@ fn read_keychain() -> Result<Option<String>> {
     Ok(None)
 }
 
+/// No answer in time counts as no login.
 #[cfg(target_os = "macos")]
 fn keychain_exists() -> bool {
-    let mut query = security_framework::item::ItemSearchOptions::new();
-    query
-        .class(security_framework::item::ItemClass::generic_password())
-        .service(CLAUDE_SERVICE)
-        .load_attributes(true)
-        .load_data(false)
-        .limit(1);
-    query.search().is_ok_and(|items| !items.is_empty())
+    secrets::bounded(secrets::KEYCHAIN_LIMIT, || {
+        let mut query = security_framework::item::ItemSearchOptions::new();
+        query
+            .class(security_framework::item::ItemClass::generic_password())
+            .service(CLAUDE_SERVICE)
+            .load_attributes(true)
+            .load_data(false)
+            .limit(1);
+        query.search().is_ok_and(|items| !items.is_empty())
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -315,7 +302,8 @@ pub fn parse(kind: AgentKind, text: &str) -> Result<HostToken> {
             let entry = &doc[provider.pi];
             let mut token = access(&entry["access"]);
             let mut host = provider.host.to_owned();
-            let endpoint = token.as_ref().filter(|_| provider.pi == COPILOT.pi).and_then(|t| copilot_endpoint(t.expose()));
+            let endpoint =
+                token.as_ref().filter(|_| provider.pi == COPILOT.pi).and_then(|t| copilot_endpoint(t.expose()));
             if let Some((api, end)) = endpoint.filter(|(api, _)| api != COPILOT.host) {
                 let full = token.take().expect("the endpoint is in the token");
                 let (start, rest) = full.expose().split_at(end);
@@ -330,15 +318,7 @@ pub fn parse(kind: AgentKind, text: &str) -> Result<HostToken> {
         AgentKind::Gemini => return Err(bad(kind, GEMINI_UNSUPPORTED)),
     };
     let access = access.ok_or_else(|| bad(kind, "the login has no access token"))?;
-    Ok(HostToken {
-        kind,
-        access,
-        expires,
-        host,
-        doc,
-        pi,
-        prefix,
-    })
+    Ok(HostToken { kind, access, expires, host, doc, pi, prefix })
 }
 
 /// The host login of the agent, checked for its expiry.
@@ -389,11 +369,7 @@ pub fn secret(kind: AgentKind, host: &str) -> Secret {
     Secret {
         name: secret_name(kind).to_owned(),
         hosts: vec![host.to_owned()],
-        places: Places {
-            header_fields: vec!["authorization".to_owned()],
-            query: false,
-            body: false,
-        },
+        places: Places { header_fields: vec!["authorization".to_owned()], query: false, body: false },
         origin: Origin::HostLogin { agent: kind },
     }
 }
@@ -408,20 +384,12 @@ pub struct GuestFile {
 }
 
 fn json_file(dir: &'static [&'static str], name: &'static str, value: &Value) -> GuestFile {
-    GuestFile {
-        dir,
-        name,
-        body: serde_json::to_vec_pretty(value).expect("JSON value"),
-    }
+    GuestFile { dir, name, body: serde_json::to_vec_pretty(value).expect("JSON value") }
 }
 
 /// The fields `names` of `from` that are set.
 fn keep(from: &Value, names: &[&str]) -> Map<String, Value> {
-    names
-        .iter()
-        .filter(|name| !from[**name].is_null())
-        .map(|name| ((*name).to_owned(), from[*name].clone()))
-        .collect()
+    names.iter().filter(|name| !from[**name].is_null()).map(|name| ((*name).to_owned(), from[*name].clone())).collect()
 }
 
 /// The guest login of the agent, from an allow-list of fields: the real
@@ -545,11 +513,17 @@ mod tests {
     #[test]
     fn claude_uses_the_keychain_token_and_needs_no_file() {
         let token = parse(AgentKind::Claude, &claude_doc("sk-ant-oat-1", NOW + 1000)).unwrap();
-        assert_eq!((token.access.expose(), token.expires, token.host.as_str()), ("sk-ant-oat-1", Some(NOW + 1000), "api.anthropic.com"));
+        assert_eq!(
+            (token.access.expose(), token.expires, token.host.as_str()),
+            ("sk-ant-oat-1", Some(NOW + 1000), "api.anthropic.com")
+        );
         assert!(guest_files(&token, "$MSB_X$", NOW).is_empty());
         let secret = secret(token.kind, api_host(AgentKind::Claude).unwrap());
         assert_eq!(secret.name, "CLAUDE_CODE_OAUTH_TOKEN");
-        assert_eq!((secret.hosts, secret.places.header_fields), (vec!["api.anthropic.com".to_owned()], vec!["authorization".to_owned()]));
+        assert_eq!(
+            (secret.hosts, secret.places.header_fields),
+            (vec!["api.anthropic.com".to_owned()], vec!["authorization".to_owned()])
+        );
         assert!(!secret.places.query && !secret.places.body);
     }
 
@@ -593,17 +567,33 @@ mod tests {
             auth,
             json!({ "github-copilot": { "type": "oauth", "availableModelIds": ["gpt-5"], "access": "$MSB_X$", "refresh": INERT_REFRESH, "expires": FAR_FUTURE_MS } })
         );
-        assert!(matches!(parse(AgentKind::Pi, r#"{"openai":{"type":"api_key","key":"k"}}"#), Err(Error::HostLogin(..))));
+        assert!(matches!(
+            parse(AgentKind::Pi, r#"{"openai":{"type":"api_key","key":"k"}}"#),
+            Err(Error::HostLogin(..))
+        ));
     }
 
     #[test]
     fn copilot_takes_its_api_host_from_the_token() {
-        let doc = |access: &str| json!({ "github-copilot": { "type": "oauth", "refresh": "r", "access": access, "expires": NOW + 1000 } }).to_string();
+        let doc = |access: &str| {
+            json!({ "github-copilot": { "type": "oauth", "refresh": "r", "access": access, "expires": NOW + 1000 } })
+                .to_string()
+        };
         let login = |access: &str| parse(AgentKind::Pi, &doc(access)).unwrap();
         // The guest's access names the host for pi; the proxy adds the rest.
         for (access, host, guest, value) in [
-            ("tid=1;exp=2;proxy-ep=proxy.business.githubcopilot.com;st=x:sig", "api.business.githubcopilot.com", "tid=1;exp=2;proxy-ep=proxy.business.githubcopilot.com$MSB_X$", ";st=x:sig"),
-            ("tid=1;proxy-ep=proxy.enterprise.githubcopilot.com;8kp=1:sig", "api.enterprise.githubcopilot.com", "tid=1;proxy-ep=proxy.enterprise.githubcopilot.com$MSB_X$", ";8kp=1:sig"),
+            (
+                "tid=1;exp=2;proxy-ep=proxy.business.githubcopilot.com;st=x:sig",
+                "api.business.githubcopilot.com",
+                "tid=1;exp=2;proxy-ep=proxy.business.githubcopilot.com$MSB_X$",
+                ";st=x:sig",
+            ),
+            (
+                "tid=1;proxy-ep=proxy.enterprise.githubcopilot.com;8kp=1:sig",
+                "api.enterprise.githubcopilot.com",
+                "tid=1;proxy-ep=proxy.enterprise.githubcopilot.com$MSB_X$",
+                ";8kp=1:sig",
+            ),
         ] {
             let token = login(access);
             assert_eq!(token.host, host);
@@ -611,7 +601,10 @@ mod tests {
             assert_eq!(token.access.expose(), value);
             assert_eq!(format!("{}{}", token.prefix, token.access.expose()), access);
         }
-        assert!(matches!(parse(AgentKind::Pi, &doc("tid=1;proxy-ep=proxy.business.githubcopilot.com")), Err(Error::HostLogin(..))));
+        assert!(matches!(
+            parse(AgentKind::Pi, &doc("tid=1;proxy-ep=proxy.business.githubcopilot.com")),
+            Err(Error::HostLogin(..))
+        ));
         // A missing, individual or foreign host: the individual host, and
         // the guest gets only the placeholder.
         for access in [
@@ -623,7 +616,11 @@ mod tests {
             "proxy-ep=api.githubcopilot.com",
         ] {
             let token = login(access);
-            assert_eq!((token.host.as_str(), token.access.expose()), ("api.individual.githubcopilot.com", access), "{access}");
+            assert_eq!(
+                (token.host.as_str(), token.access.expose()),
+                ("api.individual.githubcopilot.com", access),
+                "{access}"
+            );
             assert_eq!(files(&token)[0].1["github-copilot"]["access"], "$MSB_X$");
         }
         // Each Copilot host denies the refresh host.
@@ -652,7 +649,9 @@ mod tests {
         assert!(matches!(token(&logins, AgentKind::Claude, NOW), Err(Error::HostLoginExpired(_))));
         // The Keychain is not read for detection.
         assert_eq!(state(&logins, AgentKind::Claude, NOW), LoginState::Found { expires: None });
-        let pi = |expires: i64| json!({ "github-copilot": { "type": "oauth", "access": "a", "expires": expires } }).to_string();
+        let pi = |expires: i64| {
+            json!({ "github-copilot": { "type": "oauth", "access": "a", "expires": expires } }).to_string()
+        };
         logins.docs.lock().unwrap().insert(AgentKind::Pi, pi(NOW - 1));
         assert_eq!(state(&logins, AgentKind::Pi, NOW), LoginState::Expired);
         logins.docs.lock().unwrap().insert(AgentKind::Pi, pi(NOW + 5));
@@ -661,7 +660,13 @@ mod tests {
 
     #[test]
     fn refresh_hosts_follow_the_providers_of_the_host_logins() {
-        for host in ["console.anthropic.com", "platform.claude.com", "auth.openai.com", "api.github.com", "oauth2.googleapis.com"] {
+        for host in [
+            "console.anthropic.com",
+            "platform.claude.com",
+            "auth.openai.com",
+            "api.github.com",
+            "oauth2.googleapis.com",
+        ] {
             assert!(is_refresh_host(host), "{host}");
         }
         assert!(!is_refresh_host("api.anthropic.com"));

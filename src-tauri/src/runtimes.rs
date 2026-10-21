@@ -32,10 +32,30 @@ const CODEX_VERSION: &str = "0.163.0";
 pub const NAMES: [&str; 2] = ["claude", "codex"];
 /// The SRI hash of each pinned version per npm arch.
 const PINS: [(&str, &str, &str, &str); 4] = [
-    ("claude", CLAUDE_VERSION, "arm64", "sha512-AePKWuymgDSCh7nScJ4dx/pF1Kppzk4IwQuh6JCROiqQdBVGaaHw6jVf/fY5PhbSjy9EQML6yOiUfc50aFpnTA=="),
-    ("claude", CLAUDE_VERSION, "x64", "sha512-4gsb0IQhxzi1NhoUETXkNZb1t6wJ9tnfAYBKmb0+NmsAwOG37Dacq7bLqsooEkusaT0PyQRFUMt0SgWxx9LEEA=="),
-    ("codex", CODEX_VERSION, "arm64", "sha512-IH2/R+4OarjGvsAf1ll3fdyLwrPgYLl3uzp6u9CyD9sj2Lw+ViDSe3QBZVHdcHJs0eIiZFg6Wprcuy4CRZaUGw=="),
-    ("codex", CODEX_VERSION, "x64", "sha512-uwRaOsrYogLQhcxAM/GoeWrw0QIWEMRo7c9gM8sKAviVkZQHlu9kRLJ5PkufbV+ABGjyZgIwiFdJ0LCJ0N6e8w=="),
+    (
+        "claude",
+        CLAUDE_VERSION,
+        "arm64",
+        "sha512-AePKWuymgDSCh7nScJ4dx/pF1Kppzk4IwQuh6JCROiqQdBVGaaHw6jVf/fY5PhbSjy9EQML6yOiUfc50aFpnTA==",
+    ),
+    (
+        "claude",
+        CLAUDE_VERSION,
+        "x64",
+        "sha512-4gsb0IQhxzi1NhoUETXkNZb1t6wJ9tnfAYBKmb0+NmsAwOG37Dacq7bLqsooEkusaT0PyQRFUMt0SgWxx9LEEA==",
+    ),
+    (
+        "codex",
+        CODEX_VERSION,
+        "arm64",
+        "sha512-IH2/R+4OarjGvsAf1ll3fdyLwrPgYLl3uzp6u9CyD9sj2Lw+ViDSe3QBZVHdcHJs0eIiZFg6Wprcuy4CRZaUGw==",
+    ),
+    (
+        "codex",
+        CODEX_VERSION,
+        "x64",
+        "sha512-uwRaOsrYogLQhcxAM/GoeWrw0QIWEMRo7c9gM8sKAviVkZQHlu9kRLJ5PkufbV+ABGjyZgIwiFdJ0LCJ0N6e8w==",
+    ),
 ];
 /// The unpinned versions that the user confirmed, as `<name>@<version>`.
 const CONFIRMED: &str = "confirmed.json";
@@ -112,11 +132,7 @@ fn package(name: &str, version: &str) -> Result<Package> {
             npm: format!("@anthropic-ai/claude-code-linux-{arch}"),
             npm_version: version.to_owned(),
             sha512,
-            files: vec![Wanted {
-                from: "package/claude".to_owned(),
-                to: "claude",
-                required: true,
-            }],
+            files: vec![Wanted { from: "package/claude".to_owned(), to: "claude", required: true }],
         }),
         _ => Ok(Package {
             name: "codex",
@@ -125,17 +141,9 @@ fn package(name: &str, version: &str) -> Result<Package> {
             npm_version: format!("{version}-linux-{arch}"),
             sha512,
             files: vec![
-                Wanted {
-                    from: format!("package/vendor/{target}/bin/codex"),
-                    to: "bin/codex",
-                    required: true,
-                },
+                Wanted { from: format!("package/vendor/{target}/bin/codex"), to: "bin/codex", required: true },
                 // Codex finds files with it; it falls back without.
-                Wanted {
-                    from: format!("package/vendor/{target}/codex-path/rg"),
-                    to: "codex-path/rg",
-                    required: false,
-                },
+                Wanted { from: format!("package/vendor/{target}/codex-path/rg"), to: "codex-path/rg", required: false },
             ],
         }),
     }
@@ -188,11 +196,7 @@ pub fn installed(data: &Path, wanted: &HashMap<&str, String>) -> Vec<Installed> 
             let versions = wanted.get(name).into_iter().cloned().chain([pinned]);
             versions.filter_map(|v| package(name, &v).ok()).find_map(|package| {
                 let dir = runtime_dir(data, &package);
-                is_installed(&dir, &package).then_some(Installed {
-                    name: package.name,
-                    version: package.version,
-                    dir,
-                })
+                is_installed(&dir, &package).then_some(Installed { name: package.name, version: package.version, dir })
             })
         })
         .collect()
@@ -229,10 +233,7 @@ impl Runtimes {
                 }
             }
         }
-        Self {
-            data,
-            installing: Mutex::new(HashMap::new()),
-        }
+        Self { data, installing: Mutex::new(HashMap::new()) }
     }
 
     pub fn list(&self) -> Result<Vec<RuntimeView>> {
@@ -241,11 +242,7 @@ impl Runtimes {
             .map(|name| {
                 let package = package(name, pinned_version(name)?)?;
                 let installed = is_installed(&runtime_dir(&self.data, &package), &package);
-                Ok(RuntimeView {
-                    name: package.name,
-                    version: package.version,
-                    installed,
-                })
+                Ok(RuntimeView { name: package.name, version: package.version, installed })
             })
             .collect()
     }
@@ -301,10 +298,7 @@ impl Runtimes {
             installing.insert(package.name, cancel.clone());
         }
         // Held until the work dir is removed, so a new install waits for that.
-        let _claim = Claim {
-            installing: &self.installing,
-            name: package.name,
-        };
+        let _claim = Claim { installing: &self.installing, name: package.name };
         let parent = dest.parent().expect("runtime dir has a parent").to_owned();
         std::fs::create_dir_all(&parent)?;
         let tmp = parent.join(format!("{TMP}{}", uuid::Uuid::new_v4()));
@@ -343,15 +337,8 @@ async fn fetch(
     progress(Progress::Extract);
     let root = tmp.join("root");
     let name = package.name;
-    let files: Vec<Wanted> = package
-        .files
-        .iter()
-        .map(|f| Wanted {
-            from: f.from.clone(),
-            to: f.to,
-            required: f.required,
-        })
-        .collect();
+    let files: Vec<Wanted> =
+        package.files.iter().map(|f| Wanted { from: f.from.clone(), to: f.to, required: f.required }).collect();
     let unpacked = root.clone();
     tokio::task::spawn_blocking(move || {
         check_integrity(name, &sha512, &digest)?;
@@ -378,11 +365,8 @@ async fn download(
     progress: &(impl Fn(Progress) + Send + Sync),
 ) -> Result<(Vec<u8>, String)> {
     let bad = |why: &str| Error::BadPackage(package.name.to_owned(), why.to_owned());
-    let client = reqwest::Client::builder()
-        .https_only(true)
-        .connect_timeout(CONNECT_LIMIT)
-        .read_timeout(READ_LIMIT)
-        .build()?;
+    let client =
+        reqwest::Client::builder().https_only(true).connect_timeout(CONNECT_LIMIT).read_timeout(READ_LIMIT).build()?;
     let url = format!("{REGISTRY}/{}/{}", package.npm, package.npm_version);
     let meta: Value = client.get(&url).send().await?.error_for_status()?.json().await?;
     let tarball = meta["dist"]["tarball"].as_str().ok_or_else(|| bad("no dist.tarball"))?;
@@ -438,11 +422,7 @@ fn check_integrity(name: &str, integrity: &str, digest: &[u8]) -> Result<()> {
         return Err(Error::BadPackage(name.to_owned(), format!("no sha512 integrity: {integrity}")));
     }
     let actual = base64::engine::general_purpose::STANDARD.encode(digest);
-    if expected.contains(&actual.as_str()) {
-        Ok(())
-    } else {
-        Err(Error::IntegrityMismatch(name.to_owned()))
-    }
+    if expected.contains(&actual.as_str()) { Ok(()) } else { Err(Error::IntegrityMismatch(name.to_owned())) }
 }
 
 /// Writes only the wanted files of the tarball into `root`, each one to the
@@ -531,16 +511,8 @@ mod tests {
 
     fn files() -> Vec<Wanted> {
         vec![
-            Wanted {
-                from: "package/bin/tool".into(),
-                to: "bin/tool",
-                required: true,
-            },
-            Wanted {
-                from: "package/rg".into(),
-                to: "rg",
-                required: false,
-            },
+            Wanted { from: "package/bin/tool".into(), to: "bin/tool", required: true },
+            Wanted { from: "package/rg".into(), to: "rg", required: false },
         ]
     }
 
@@ -596,9 +568,7 @@ mod tests {
     #[test]
     fn the_pinned_hash_must_match_the_registry_and_the_download() {
         let pinned = package("claude", CLAUDE_VERSION).unwrap().sha512.unwrap();
-        let hash = base64::engine::general_purpose::STANDARD
-            .decode(pinned.strip_prefix("sha512-").unwrap())
-            .unwrap();
+        let hash = base64::engine::general_purpose::STANDARD.decode(pinned.strip_prefix("sha512-").unwrap()).unwrap();
         assert_eq!(hash.len(), 64);
         check_pinned(pinned, "claude", &format!("sha1-abc {pinned}")).unwrap();
         let other = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b"x")));
@@ -690,7 +660,10 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].name, &found[0].dir), ("codex", &dir));
         let list = Runtimes::new(data.clone()).list().unwrap();
-        assert_eq!(list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(), [("claude", false), ("codex", true)]);
+        assert_eq!(
+            list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(),
+            [("claude", false), ("codex", true)]
+        );
 
         // The host version wins when it is cached; else the pinned version is the fallback.
         let host = HashMap::from([("codex", "0.170.1".to_owned())]);
@@ -698,7 +671,10 @@ mod tests {
         fake_install_version(&data, "codex", "0.170.1");
         assert!(is_cached(&data, "codex", "0.170.1"));
         let found = installed(&data, &host);
-        assert_eq!((found[0].version.as_str(), found[0].dir.clone()), ("0.170.1", runtime_dir(&data, &package("codex", "0.170.1").unwrap())));
+        assert_eq!(
+            (found[0].version.as_str(), found[0].dir.clone()),
+            ("0.170.1", runtime_dir(&data, &package("codex", "0.170.1").unwrap()))
+        );
     }
 
     /// Downloads the real pinned Codex from the npm registry. Needs network:

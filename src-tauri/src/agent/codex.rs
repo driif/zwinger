@@ -84,7 +84,9 @@ impl Mapper {
         let id = &item["id"];
         match event["type"].as_str() {
             Some("thread.started" | "turn.started") => Vec::new(),
-            Some("item.started" | "item.updated") if matches!(item["type"].as_str(), Some("agent_message" | "reasoning")) => {
+            Some("item.started" | "item.updated")
+                if matches!(item["type"].as_str(), Some("agent_message" | "reasoning")) =>
+            {
                 self.stream(item)
             }
             Some("item.started") => match call(item) {
@@ -172,7 +174,9 @@ impl Mapper {
         };
         match text.strip_prefix(old) {
             Some("") => {}
-            Some(delta) => records.push(update(json!({ "type": format!("{kind}_delta"), "contentIndex": 0, "delta": delta }))),
+            Some(delta) => {
+                records.push(update(json!({ "type": format!("{kind}_delta"), "contentIndex": 0, "delta": delta })))
+            }
             None => records.push(update(json!({ "type": format!("{kind}_end"), "contentIndex": 0, "content": text }))),
         }
         self.streamed.insert(id.to_owned(), text.to_owned());
@@ -197,13 +201,18 @@ mod tests {
         assert!(mapper.map(&thread).is_empty());
         assert!(mapper.map(&event(r#"{"type":"turn.started"}"#)).is_empty());
 
-        let reasoning = event(r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"List the files."}}"#);
+        let reasoning =
+            event(r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"List the files."}}"#);
         assert_eq!(
             mapper.map(&reasoning),
-            [json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "List the files." }] } })]
+            [
+                json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "List the files." }] } })
+            ]
         );
 
-        let started = event(r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#);
+        let started = event(
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
+        );
         assert_eq!(
             mapper.map(&started),
             [
@@ -217,7 +226,9 @@ mod tests {
                 json!({ "type": "tool_execution_start", "toolCallId": "item_1" }),
             ]
         );
-        let done = event(r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"a\nb\n","exit_code":0,"status":"completed"}}"#);
+        let done = event(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"a\nb\n","exit_code":0,"status":"completed"}}"#,
+        );
         let content = json!([{ "type": "text", "text": "a\nb\n" }]);
         assert_eq!(
             mapper.map(&done),
@@ -231,17 +242,21 @@ mod tests {
         );
 
         // Seen only at completion: the call comes first.
-        let edit = event(r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/workspace/a.txt","kind":"add"}],"status":"failed"}}"#);
+        let edit = event(
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/workspace/a.txt","kind":"add"}],"status":"failed"}}"#,
+        );
         let records = mapper.map(&edit);
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["message"]["content"][0]["arguments"], json!({ "path": "/workspace/a.txt" }));
         assert_eq!(records[2]["message"]["content"][0]["text"], "add /workspace/a.txt");
         assert_eq!(records[2]["message"]["isError"], true);
 
-        let message = event(r#"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Two files."}}"#);
+        let message =
+            event(r#"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Two files."}}"#);
         assert_eq!(mapper.map(&message)[0]["message"]["content"], json!([{ "type": "text", "text": "Two files." }]));
 
-        let usage = event(r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}"#);
+        let usage =
+            event(r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}"#);
         assert_eq!(mapper.map(&usage), [json!({ "type": "agent_settled" })]);
     }
 
@@ -250,16 +265,17 @@ mod tests {
     #[test]
     fn streams_only_the_new_text_of_each_item() {
         let mut mapper = Mapper::default();
-        let delta = |kind: &str, text: &str| {
-            json!({ "type": "message_update", "assistantMessageEvent": { "type": kind, "contentIndex": 0, "delta": text } })
-        };
+        let delta = |kind: &str, text: &str| json!({ "type": "message_update", "assistantMessageEvent": { "type": kind, "contentIndex": 0, "delta": text } });
         let start = json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } });
         let reasoning = event(r#"{"type":"item.started","item":{"id":"item_0","type":"reasoning","text":"Look"}}"#);
         assert_eq!(mapper.map(&reasoning), [start.clone(), delta("thinking_delta", "Look")]);
         let more = event(r#"{"type":"item.updated","item":{"id":"item_0","type":"reasoning","text":"Look first."}}"#);
         assert_eq!(mapper.map(&more), [delta("thinking_delta", " first.")]);
         let done = event(r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Look first."}}"#);
-        assert_eq!(mapper.map(&done)[0]["message"]["content"], json!([{ "type": "thinking", "thinking": "Look first." }]));
+        assert_eq!(
+            mapper.map(&done)[0]["message"]["content"],
+            json!([{ "type": "thinking", "thinking": "Look first." }])
+        );
 
         let empty = event(r#"{"type":"item.started","item":{"id":"item_1","type":"agent_message","text":""}}"#);
         assert_eq!(mapper.map(&empty), [start]);
@@ -267,14 +283,21 @@ mod tests {
         assert_eq!(mapper.map(&part), [delta("text_delta", "Two")]);
         assert!(mapper.map(&part).is_empty());
         // Not a continuation: the whole text replaces the block.
-        let changed = event(r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"Three files."}}"#);
+        let changed =
+            event(r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"Three files."}}"#);
         assert_eq!(
             mapper.map(&changed),
-            [json!({ "type": "message_update", "assistantMessageEvent": { "type": "text_end", "contentIndex": 0, "content": "Three files." } })]
+            [
+                json!({ "type": "message_update", "assistantMessageEvent": { "type": "text_end", "contentIndex": 0, "content": "Three files." } })
+            ]
         );
-        let tail = event(r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"Three files. Done."}}"#);
+        let tail = event(
+            r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"Three files. Done."}}"#,
+        );
         assert_eq!(mapper.map(&tail), [delta("text_delta", " Done.")]);
-        let message = event(r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Three files. Done."}}"#);
+        let message = event(
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Three files. Done."}}"#,
+        );
         assert_eq!(mapper.map(&message)[0]["type"], "message_end");
         assert!(mapper.streamed.is_empty());
     }
@@ -282,12 +305,15 @@ mod tests {
     #[test]
     fn maps_errors_and_passes_unknown_events_through() {
         let mut mapper = Mapper::default();
-        let retry = event(r#"{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion)"}"#);
+        let retry =
+            event(r#"{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion)"}"#);
         assert_eq!(
             mapper.map(&retry),
             [json!({ "type": "status", "message": "Reconnecting... 2/5 (stream disconnected before completion)" })]
         );
-        let warning = event(r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Falling back from WebSockets to HTTPS transport."}}"#);
+        let warning = event(
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Falling back from WebSockets to HTTPS transport."}}"#,
+        );
         assert_eq!(mapper.map(&warning)[0]["type"], "status");
 
         let failed = event(r#"{"type":"turn.failed","error":{"message":"401 Unauthorized"}}"#);

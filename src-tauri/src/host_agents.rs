@@ -145,13 +145,7 @@ pub struct HostAgents {
 
 impl HostAgents {
     pub fn new(fs: Arc<dyn HostFs>, logins: Arc<dyn LoginSource>, clock: Arc<dyn Clock>, data: PathBuf) -> Self {
-        Self {
-            fs,
-            logins,
-            clock,
-            data,
-            last: Mutex::new(None),
-        }
+        Self { fs, logins, clock, data, last: Mutex::new(None) }
     }
 
     /// Looks for the agents again. It runs `--version`, so call it on a
@@ -191,7 +185,7 @@ impl HostAgents {
 // with O_NOFOLLOW from a trusted host root, and each change is relative to
 // the folder's descriptor.
 
-fn dir_flags() -> OFlags {
+pub fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC
 }
 

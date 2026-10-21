@@ -4,11 +4,13 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import {
   AGENT_NAMES,
   AgentKind,
+  confirmPaths,
   Detection,
   GEMINI_NO_LOGIN,
   listFolders,
   NetEvent,
   putHostAgent,
+  removeGuestLogin,
   removeHostAgent,
   RunSummary,
   SessionKind,
@@ -132,6 +134,8 @@ interface Props {
   adding?: AgentKind;
   onAdding: (kind?: AgentKind) => void;
   onRestart: () => void;
+  /** Opens the Host agents settings. */
+  onHostAgents: () => void;
   /** The runs of the shield's tasks. */
   runs: RunSummary[];
   onRunsChange: () => void;
@@ -164,6 +168,7 @@ export function ShieldPage({
   adding,
   onAdding,
   onRestart,
+  onHostAgents,
   runs,
   onRunsChange,
   onRefresh,
@@ -210,6 +215,7 @@ export function ShieldPage({
   const running = status.state === "running" || status.state === "stopping";
   const sessions = shield.sessions.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
+  const unverified = [...(shield.folderId ? [] : [shield.folder]), ...shield.mounts.filter((m) => !m.id).map((m) => m.host)];
   const app = view.kind === "app" ? shield.apps.find((a) => a.id === view.appId) : undefined;
   const task = view.kind === "task" ? shield.tasks.find((t) => t.id === view.taskId) : undefined;
 
@@ -251,6 +257,18 @@ export function ShieldPage({
       {adding && detection && (
         <AddAgent key={adding} shield={shield} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
       )}
+      {unverified.length > 0 && (
+        <Card variant="outlined" padding="sm" className="banner row">
+          <TriangleAlert size={16} className="warn" />
+          <span className="grow">
+            Not verified since the update: <span className="mono">{unverified.join(", ")}</span>. Check that each one is
+            the folder that you added, then confirm it.
+          </span>
+          <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(shield.id).then(onRefresh))}>
+            Confirm folders
+          </Button>
+        </Card>
+      )}
       {shield.renewDue && (
         <Card variant="outlined" padding="sm" className="banner row">
           <RotateCw size={16} className="warn" />
@@ -265,6 +283,22 @@ export function ShieldPage({
           <Card key={notice} variant="outlined" padding="sm" className="banner row">
             <TriangleAlert size={16} className="warn" />
             <span className="grow">{notice}</span>
+          </Card>
+        ))}
+      {status.state === "running" &&
+        shield.guestLogins.map((agent) => (
+          <Card key={agent} variant="outlined" padding="sm" className="banner row">
+            <TriangleAlert size={16} className="warn" />
+            <span className="grow">
+              {AGENT_NAMES[agent]} has its own login in this shield. Its real token is in the shield, where the agent can
+              read and send it.
+            </span>
+            <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(shield.id, agent).then(onRefresh))}>
+              Remove it
+            </Button>
+            <Button size="sm" variant="outline" onClick={onHostAgents}>
+              Use my Mac login instead
+            </Button>
           </Card>
         ))}
       <ElasticTabs

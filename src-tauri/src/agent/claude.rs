@@ -68,7 +68,9 @@ impl Mapper {
                     "assistantMessageEvent": { "type": kind, "contentIndex": index, "delta": text },
                 })]
             }
-            Some("content_block_start" | "content_block_stop" | "message_delta" | "message_stop" | "ping") => Vec::new(),
+            Some("content_block_start" | "content_block_stop" | "message_delta" | "message_stop" | "ping") => {
+                Vec::new()
+            }
             _ => vec![event.clone()],
         }
     }
@@ -94,7 +96,8 @@ fn map(event: &Value) -> Vec<Value> {
                     _ => None,
                 })
                 .collect();
-            let mut records = vec![json!({ "type": "message_end", "message": { "role": "assistant", "content": content } })];
+            let mut records =
+                vec![json!({ "type": "message_end", "message": { "role": "assistant", "content": content } })];
             records.extend(started);
             records
         }
@@ -147,16 +150,24 @@ mod tests {
     // Hand-written fixtures in the stream-json format of Claude Code.
     #[test]
     fn maps_a_turn_with_a_tool_call() {
-        let init = event(r#"{"type":"system","subtype":"init","session_id":"0b1c","model":"claude-opus","tools":["Bash"],"cwd":"/workspace"}"#);
+        let init = event(
+            r#"{"type":"system","subtype":"init","session_id":"0b1c","model":"claude-opus","tools":["Bash"],"cwd":"/workspace"}"#,
+        );
         assert!(map(&init).is_empty());
 
-        let thinking = event(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"Look first."}]},"session_id":"0b1c"}"#);
+        let thinking = event(
+            r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"Look first."}]},"session_id":"0b1c"}"#,
+        );
         assert_eq!(
             map(&thinking),
-            [json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "Look first." }] } })]
+            [
+                json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "thinking", "thinking": "Look first." }] } })
+            ]
         );
 
-        let tool = event(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":"0b1c"}"#);
+        let tool = event(
+            r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"session_id":"0b1c"}"#,
+        );
         assert_eq!(
             map(&tool),
             [
@@ -171,7 +182,9 @@ mod tests {
             ]
         );
 
-        let result = event(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a\nb"}],"is_error":false}]},"session_id":"0b1c"}"#);
+        let result = event(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"a\nb"}],"is_error":false}]},"session_id":"0b1c"}"#,
+        );
         let content = json!([{ "type": "text", "text": "a\nb" }]);
         assert_eq!(
             map(&result),
@@ -184,20 +197,28 @@ mod tests {
             ]
         );
 
-        let failed = event(r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"No such file","is_error":true}]}}"#);
+        let failed = event(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"No such file","is_error":true}]}}"#,
+        );
         assert_eq!(map(&failed)[1]["message"]["content"], json!([{ "type": "text", "text": "No such file" }]));
         assert_eq!(map(&failed)[1]["message"]["isError"], true);
 
-        let text = event(r#"{"type":"assistant","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"Two files."}]}}"#);
+        let text = event(
+            r#"{"type":"assistant","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"Two files."}]}}"#,
+        );
         assert_eq!(map(&text)[0]["message"]["content"], json!([{ "type": "text", "text": "Two files." }]));
 
-        let done = event(r#"{"type":"result","subtype":"success","is_error":false,"result":"Two files.","session_id":"0b1c","total_cost_usd":0.01}"#);
+        let done = event(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Two files.","session_id":"0b1c","total_cost_usd":0.01}"#,
+        );
         assert_eq!(map(&done), [json!({ "type": "agent_settled" })]);
     }
 
     /// One line of `--include-partial-messages` output.
     fn stream(inner: &str, parent: &str) -> Value {
-        event(&format!(r#"{{"type":"stream_event","event":{inner},"parent_tool_use_id":{parent},"session_id":"0b1c"}}"#))
+        event(&format!(
+            r#"{{"type":"stream_event","event":{inner},"parent_tool_use_id":{parent},"session_id":"0b1c"}}"#
+        ))
     }
 
     fn delta(kind: &str, index: usize, text: &str) -> Value {
@@ -209,18 +230,45 @@ mod tests {
     #[test]
     fn streams_one_block() {
         let mut mapper = Mapper::default();
-        let start = stream(r#"{"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[]}}"#, "null");
-        assert_eq!(mapper.map(&start), [json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } })]);
-        assert!(mapper.map(&stream(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "null")).is_empty());
+        let start =
+            stream(r#"{"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[]}}"#, "null");
+        assert_eq!(
+            mapper.map(&start),
+            [json!({ "type": "message_start", "message": { "role": "assistant", "content": [] } })]
+        );
+        assert!(
+            mapper
+                .map(&stream(
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                    "null"
+                ))
+                .is_empty()
+        );
         for (text, piece) in [("Two", "Two"), (" files.", " files.")] {
-            let line = stream(&format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#), "null");
+            let line = stream(
+                &format!(
+                    r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}"#
+                ),
+                "null",
+            );
             assert_eq!(mapper.map(&line), [delta("text_delta", 0, piece)]);
         }
         assert!(mapper.map(&stream(r#"{"type":"content_block_stop","index":0}"#, "null")).is_empty());
         // The whole message ends the streamed one, so its text is shown once.
-        let whole = event(r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"Two files."}]},"parent_tool_use_id":null}"#);
-        assert_eq!(mapper.map(&whole), [json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "text", "text": "Two files." }] } })]);
-        assert!(mapper.map(&stream(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}"#, "null")).is_empty());
+        let whole = event(
+            r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"Two files."}]},"parent_tool_use_id":null}"#,
+        );
+        assert_eq!(
+            mapper.map(&whole),
+            [
+                json!({ "type": "message_end", "message": { "role": "assistant", "content": [{ "type": "text", "text": "Two files." }] } })
+            ]
+        );
+        assert!(
+            mapper
+                .map(&stream(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}"#, "null"))
+                .is_empty()
+        );
         assert!(mapper.map(&stream(r#"{"type":"message_stop"}"#, "null")).is_empty());
     }
 
@@ -228,20 +276,39 @@ mod tests {
     fn streams_several_blocks_from_index_zero_after_each_end() {
         let mut mapper = Mapper::default();
         mapper.map(&stream(r#"{"type":"message_start","message":{"role":"assistant","content":[]}}"#, "null"));
-        let thinking = stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Look."}}"#, "null");
+        let thinking = stream(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Look."}}"#,
+            "null",
+        );
         assert_eq!(mapper.map(&thinking), [delta("thinking_delta", 0, "Look.")]);
-        assert!(mapper.map(&stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"x"}}"#, "null")).is_empty());
+        assert!(
+            mapper
+                .map(&stream(
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"x"}}"#,
+                    "null"
+                ))
+                .is_empty()
+        );
         mapper.map(&event(r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Look."}]},"parent_tool_use_id":null}"#));
-        let text = stream(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I list."}}"#, "null");
+        let text = stream(
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I list."}}"#,
+            "null",
+        );
         assert_eq!(mapper.map(&text), [delta("text_delta", 0, "I list.")]);
         mapper.map(&event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I list."}]},"parent_tool_use_id":null}"#));
-        let input = stream(r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"[1"}}"#, "null");
+        let input = stream(
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"[1"}}"#,
+            "null",
+        );
         assert!(mapper.map(&input).is_empty());
         mapper.map(&event(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":null}"#));
 
         // A subagent streams while the tool runs: nothing of it is shown, and
         // its messages do not move the count.
-        let sub = stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sub"}}"#, r#""toolu_1""#);
+        let sub = stream(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sub"}}"#,
+            r#""toolu_1""#,
+        );
         assert!(mapper.map(&sub).is_empty());
         assert!(mapper.map(&stream(r#"{"type":"message_start","message":{}}"#, r#""toolu_1""#)).is_empty());
         mapper.map(&event(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_1"}"#));
@@ -249,7 +316,8 @@ mod tests {
 
         // The next model message counts from zero again.
         mapper.map(&stream(r#"{"type":"message_start","message":{"role":"assistant","content":[]}}"#, "null"));
-        let next = stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}"#, "null");
+        let next =
+            stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done."}}"#, "null");
         assert_eq!(mapper.map(&next), [delta("text_delta", 0, "Done.")]);
         let unknown = stream(r#"{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta"}}"#, "null");
         assert_eq!(mapper.map(&unknown), std::slice::from_ref(&unknown));
@@ -259,7 +327,9 @@ mod tests {
 
     #[test]
     fn maps_errors_and_passes_unknown_events_through() {
-        let failed = event(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"0b1c"}"#);
+        let failed = event(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","session_id":"0b1c"}"#,
+        );
         assert_eq!(
             map(&failed),
             [
@@ -273,7 +343,10 @@ mod tests {
         let auth = event(r#"{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key"}"#);
         assert_eq!(map(&auth)[0]["message"]["errorMessage"], "Invalid API key");
 
-        assert!(map(&event(r#"{"type":"control_response","response":{"subtype":"success","request_id":"zw-1"}}"#)).is_empty());
+        assert!(
+            map(&event(r#"{"type":"control_response","response":{"subtype":"success","request_id":"zw-1"}}"#))
+                .is_empty()
+        );
         let unknown = event(r#"{"type":"system","subtype":"compact_boundary","x":1}"#);
         assert_eq!(map(&unknown), std::slice::from_ref(&unknown));
         let future = event(r#"{"type":"rate_limit_event","info":{}}"#);
