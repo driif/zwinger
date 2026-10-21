@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 /// The installed runtime, mounted read-only.
 pub const DIR: &str = "/opt/zwinger/claude";
 /// Its `HOME`, so `~/.claude` is in the shield's state and never the host's.
-const HOME: &str = "/opt/zwinger/state/claude";
+pub const HOME: &str = "/opt/zwinger/state/claude";
 
 /// `session` resumes an earlier chat.
 pub fn argv(session: Option<&str>, model: Option<&str>) -> Vec<String> {

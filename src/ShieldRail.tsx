@@ -20,6 +20,7 @@ import {
   Bot,
   ChevronRight,
   Ellipsis,
+  ListChecks,
   MessageSquare,
   Pencil,
   Play,
@@ -31,19 +32,42 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import { AGENT_NAMES, Chat, removeApp, reorderApps, reorderShields, restartApp, ShieldView, startApp, stopApp } from "./api";
+import {
+  AGENT_NAMES,
+  Chat,
+  isLive,
+  removeApp,
+  removeTask,
+  reorderApps,
+  reorderShields,
+  restartApp,
+  RunSummary,
+  ShieldView,
+  startApp,
+  startTaskRun,
+  stopApp,
+} from "./api";
 import { AGENT_ICONS } from "./AgentsTab";
 import type { ChatAction, DroppedFolder, Intent, Pane, Run, View } from "./App";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
 const FORBIDDEN = "Not allowed: a shield is a security boundary. Items stay in their shield.";
 
-type Group = "agents" | "terminals" | "apps";
+type Group = "agents" | "terminals" | "apps" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
   { group: "agents", label: "Agents" },
   { group: "terminals", label: "Terminals" },
   { group: "apps", label: "Apps" },
+  { group: "tasks", label: "Tasks" },
 ];
+
+/** The badge of a task: its latest run. */
+function runBadge(run: RunSummary | undefined) {
+  if (!run) return undefined;
+  if (run.state === "running") return run.stage ?? "running";
+  if (run.state === "done") return run.ship ? "ship" : "no ship";
+  return run.state;
+}
 
 /** What dnd-kit carries per sortable row. Only rows of the same container can swap. */
 interface DragData {
@@ -233,12 +257,15 @@ interface Props {
   /** Per shield, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
   chats: Record<string, Chat[]>;
+  /** Per shield, the runs of its tasks. */
+  runs: Record<string, RunSummary[]>;
   panes: Pane[];
   run: Run;
   onSelect: (id: string) => void;
   onOpen: (shieldId: string, view: View) => void;
   onIntent: (shieldId: string, kind: Intent["kind"], appId?: string) => void;
   onChatAction: (shieldId: string, action: ChatAction) => void;
+  onRunsChange: (shieldId: string) => void;
   onToggle: (shield: ShieldView) => void;
   onNewShell: (shieldId: string) => void;
   onClosePane: (key: string) => void;
@@ -257,12 +284,14 @@ export function ShieldRail({
   view,
   blocked,
   chats,
+  runs,
   panes,
   run,
   onSelect,
   onOpen,
   onIntent,
   onChatAction,
+  onRunsChange,
   onToggle,
   onNewShell,
   onClosePane,
@@ -370,6 +399,47 @@ export function ShieldRail({
           };
         });
     const shieldRunning = shield.status.state === "running";
+    if (group === "tasks")
+      return shield.tasks.map((task) => {
+        const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
+        const latest = taskRuns[taskRuns.length - 1];
+        const live = taskRuns.some((r) => isLive(r.state));
+        const badge = runBadge(latest);
+        return {
+          entity: task.id,
+          label: (
+            <>
+              <span className="grow">{task.title}</span>
+              {badge && <span className={latest?.state === "done" && !latest.ship ? "danger tree-state" : "muted tree-state"}>{badge}</span>}
+            </>
+          ),
+          name: task.title,
+          title: task.request,
+          icon: <ListChecks size={14} className={live ? "ok" : undefined} />,
+          view: { kind: "task", taskId: task.id },
+          menu: [
+            {
+              label: "Start run",
+              icon: <Play size={14} />,
+              disabled: !shieldRunning || live,
+              run: () =>
+                run(async () => {
+                  const next = await startTaskRun(sid, task.id);
+                  onOpen(sid, { kind: "task", taskId: task.id, run: next });
+                  onRunsChange(sid);
+                }),
+            },
+            { label: "Edit", icon: <Pencil size={14} />, run: () => onOpen(sid, { kind: "taskEdit", taskId: task.id }) },
+            {
+              label: "Delete",
+              icon: <Trash2 size={14} />,
+              disabled: live,
+              confirm: `Delete the task ${task.title} and its runs?`,
+              run: () => run(() => removeTask(sid, task.id).then(() => onRunsChange(sid))),
+            },
+          ],
+        };
+      });
     return shield.apps.map((app) => {
       const appRun = shield.appRuns.find((r) => r.appId === app.id);
       const state = !appRun ? "stopped" : appRun.exitCode === null ? "running" : `exited ${appRun.exitCode}`;
@@ -450,7 +520,9 @@ export function ShieldRail({
         ? `i|${selectedId}|terminals|${view.key}`
         : view.kind === "app"
           ? `i|${selectedId}|apps|${view.appId}`
-          : `s|${selectedId}`;
+          : view.kind === "task" || (view.kind === "taskEdit" && view.taskId)
+            ? `i|${selectedId}|tasks|${view.taskId}`
+            : `s|${selectedId}`;
 
   function focus(id: string | undefined, event: KeyboardEvent) {
     if (!id) return;
@@ -561,7 +633,9 @@ export function ShieldRail({
         ? [<MessageSquare size={12} />, "Open agent", () => onOpen(shield.id, { kind: "chat" })]
         : group === "terminals"
           ? [<Plus size={12} />, "New shell", () => onNewShell(shield.id)]
-          : [<Plus size={12} />, "Add app", () => onIntent(shield.id, "app")];
+          : group === "apps"
+            ? [<Plus size={12} />, "Add app", () => onIntent(shield.id, "app")]
+            : [<Plus size={12} />, "New task", () => onOpen(shield.id, { kind: "taskEdit" })];
     return (
       <IconButton
         icon={icon}
@@ -718,7 +792,8 @@ export function ShieldRail({
                                         key={item.entity}
                                         id={rowId}
                                         level={3}
-                                        drag={{ container, shieldId: shield.id, entity: item.entity, label: item.name }}
+                                        // Tasks have no saved order.
+                                        drag={group === "tasks" ? undefined : { container, shieldId: shield.id, entity: item.entity, label: item.name }}
                                         selected={selectedRow === rowId}
                                         tabStop={tabStop === rowId}
                                         onOpen={() => onOpen(shield.id, item.view)}

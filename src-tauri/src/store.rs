@@ -40,7 +40,8 @@ impl Store {
 mod tests {
     use super::*;
     use crate::secrets::{Places, Secret};
-    use crate::shield::{App, Mount, NetworkMode, NetworkPolicy, Pos};
+    use crate::agent::AgentKind;
+    use crate::shield::{App, Mount, NetworkMode, NetworkPolicy, Pos, Task, TaskAgent};
 
     #[test]
     fn round_trip() {
@@ -79,6 +80,18 @@ mod tests {
                 cwd: "/workspace".into(),
                 autostart: true,
             }],
+            tasks: vec![Task {
+                id: "task-1".into(),
+                slug: "fix-it".into(),
+                title: "Fix it".into(),
+                request: "Fix the bug.".into(),
+                agents: [
+                    TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
+                    TaskAgent { kind: AgentKind::Codex, model: None },
+                ],
+                gates: vec!["pnpm build".into()],
+                workdir: "/workspace".into(),
+            }],
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
@@ -101,5 +114,6 @@ mod tests {
         assert!(shield.secrets.is_empty());
         assert!(shield.layout.is_empty());
         assert!(shield.apps.is_empty());
+        assert!(shield.tasks.is_empty());
     }
 }

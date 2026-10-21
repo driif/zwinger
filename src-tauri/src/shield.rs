@@ -3,13 +3,16 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent;
+use crate::agent::{self, AgentKind};
 use crate::error::{Error, Result};
 use crate::secrets::{self, Secret};
 
 pub const WORKSPACE: &str = "/workspace";
 const FOLDER_LIMIT: usize = 50;
 const COMMAND_LIMIT: usize = 4096;
+const REQUEST_LIMIT: usize = 64 << 10;
+const MODEL_LIMIT: usize = 128;
+const GATE_COUNT: usize = 16;
 /// The saved map positions per shield; more entries are dropped.
 const LAYOUT_LIMIT: usize = 1000;
 
@@ -32,6 +35,8 @@ pub struct Shield {
     pub layout: BTreeMap<String, Pos>,
     #[serde(default)]
     pub apps: Vec<App>,
+    #[serde(default)]
+    pub tasks: Vec<Task>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,6 +65,43 @@ pub struct AppDraft {
     pub command: String,
     pub cwd: String,
     pub autostart: bool,
+}
+
+/// A request that two agents of a shield plan, build and review together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub id: String,
+    /// The folder name of its runs. It is set once, so a rename keeps the runs.
+    pub slug: String,
+    pub title: String,
+    pub request: String,
+    /// Two agents of different kinds. The first one decides a tiebreak.
+    pub agents: [TaskAgent; 2],
+    /// Shell lines that the run executes after the implementation.
+    pub gates: Vec<String>,
+    /// The guest folder where the agents and the gates run.
+    pub workdir: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAgent {
+    pub kind: AgentKind,
+    /// `None` uses the default model of the CLI.
+    pub model: Option<String>,
+}
+
+/// A task as the UI sends it. No `id` adds a new task.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDraft {
+    pub id: Option<String>,
+    pub title: String,
+    pub request: String,
+    pub agents: [TaskAgent; 2],
+    pub gates: Vec<String>,
+    pub workdir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +187,7 @@ impl Shield {
             secrets: Vec::new(),
             layout: BTreeMap::new(),
             apps: Vec::new(),
+            tasks: Vec::new(),
         })
     }
 
@@ -211,6 +254,106 @@ impl Shield {
         self.apps.iter_mut().find(|a| a.id == id).ok_or(Error::AppNotFound)
     }
 
+    /// Adds the task, or replaces the task with the draft's id. Returns its id.
+    pub fn put_task(&mut self, draft: TaskDraft) -> Result<String> {
+        let title = display_name(&draft.title)?;
+        let invalid = |reason: String| Error::InvalidTask(title.clone(), reason);
+        let request = draft.request.trim();
+        if request.is_empty() || request.len() > REQUEST_LIMIT {
+            return Err(invalid(format!("the request must have 1 to {REQUEST_LIMIT} bytes")));
+        }
+        if draft.agents[0].kind == draft.agents[1].kind {
+            return Err(invalid("the two agents must be of different kinds".into()));
+        }
+        let mut agents = draft.agents.clone();
+        for agent in &mut agents {
+            agent.model = agent.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
+            if let Some(model) = &agent.model
+                && (model.len() > MODEL_LIMIT || !model.bytes().all(|b| b.is_ascii_graphic()))
+            {
+                return Err(invalid(format!("the model {model} is not valid")));
+            }
+        }
+        let gates: Vec<String> = draft.gates.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).map(str::to_owned).collect();
+        if gates.len() > GATE_COUNT
+            || gates
+                .iter()
+                .any(|g| g.chars().count() > COMMAND_LIMIT || g.chars().any(|c| c.is_control() && c != '\t'))
+        {
+            return Err(invalid(format!(
+                "use at most {GATE_COUNT} gates, each one line of at most {COMMAND_LIMIT} characters"
+            )));
+        }
+        let workdir = self.guest_dir(&draft.workdir)?;
+        let slug = match &draft.id {
+            Some(existing) => self.task(existing)?.slug.clone(),
+            None => self.new_slug(&title),
+        };
+        let task = Task {
+            id: draft.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            slug,
+            title,
+            request: request.to_owned(),
+            agents,
+            gates,
+            workdir,
+        };
+        let id = task.id.clone();
+        match draft.id {
+            Some(existing) => *self.tasks.iter_mut().find(|t| t.id == existing).ok_or(Error::TaskNotFound)? = task,
+            None => self.tasks.push(task),
+        }
+        Ok(id)
+    }
+
+    /// A kebab-case slug of the title that no other task of the shield has.
+    fn new_slug(&self, title: &str) -> String {
+        let mut base = String::new();
+        for c in title.chars().flat_map(char::to_lowercase) {
+            if c.is_ascii_alphanumeric() {
+                base.push(c);
+            } else if !base.is_empty() && !base.ends_with('-') {
+                base.push('-');
+            }
+        }
+        let base = match base.trim_end_matches('-') {
+            "" => "task".to_owned(),
+            b => b.chars().take(40).collect::<String>().trim_end_matches('-').to_owned(),
+        };
+        let taken = |slug: &str| self.tasks.iter().any(|t| t.slug == slug);
+        (1..)
+            .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
+            .find(|slug| !taken(slug))
+            .expect("a free slug")
+    }
+
+    pub fn remove_task(&mut self, id: &str) -> Result<()> {
+        self.task(id)?;
+        self.tasks.retain(|t| t.id != id);
+        Ok(())
+    }
+
+    pub fn task(&self, id: &str) -> Result<&Task> {
+        self.tasks.iter().find(|t| t.id == id).ok_or(Error::TaskNotFound)
+    }
+
+    /// The host folder that holds a guest path (`/workspace` or a mount),
+    /// the path below it, and if the guest can write it. The deepest mount
+    /// that holds the path wins.
+    pub fn host_of(&self, guest: &str) -> Option<(PathBuf, PathBuf, bool)> {
+        let path = Path::new(guest);
+        if let Ok(rel) = path.strip_prefix(WORKSPACE) {
+            return Some((self.folder.clone(), rel.to_owned(), true));
+        }
+        let mount = self
+            .mounts
+            .iter()
+            .filter(|m| path.starts_with(&m.guest))
+            .max_by_key(|m| m.guest.len())?;
+        let rel = path.strip_prefix(&mount.guest).ok()?;
+        Some((mount.host.clone(), rel.to_owned(), !mount.readonly))
+    }
+
     /// A guest folder that a process can start in: `/workspace` or a
     /// sub-path whose host folder exists, or a path below a mount.
     fn guest_dir(&self, input: &str) -> Result<String> {
@@ -273,6 +416,9 @@ impl Shield {
         secrets::check_unique(&self.secrets)?;
         if let Some(app) = self.apps.iter().find(|a| !self.guest_target_exists(Path::new(&a.cwd))) {
             return Err(Error::AppCwd(app.name.clone(), app.cwd.clone()));
+        }
+        if let Some(task) = self.tasks.iter().find(|t| !self.guest_target_exists(Path::new(&t.workdir))) {
+            return Err(Error::TaskWorkdir(task.title.clone(), task.workdir.clone()));
         }
         match &self.harness {
             Some(harness) if !self.harness_target_exists(Path::new(harness)) => {

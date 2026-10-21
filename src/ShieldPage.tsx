@@ -1,13 +1,15 @@
 import { Button, ElasticTabs } from "@driif/motiv";
 import { Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
-import { AgentKind, listFolders, NetEvent, SessionKind, ShieldView } from "./api";
+import { AgentKind, listFolders, NetEvent, RunSummary, SessionKind, ShieldView } from "./api";
 import { AgentsTab } from "./AgentsTab";
 import type { ChatAction, Intent, Pane, Run, Runtimes, TabView, View } from "./App";
 import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
 import { ShieldMap } from "./ShieldMap";
+import { TaskDialog } from "./TaskDialog";
+import { TaskRoom } from "./TaskRoom";
 import { TerminalTab } from "./TerminalTab";
 
 // Agents and Terminal are no tabs: the tree names each chat and terminal, so tabs would show them twice.
@@ -34,6 +36,11 @@ interface Props {
   onDropFolder: (path: string) => void;
   runtimes: Runtimes;
   onRestart: () => void;
+  /** The runs of the shield's tasks. */
+  runs: RunSummary[];
+  onRunsChange: () => void;
+  /** Reads the shields again. Resolves when the new state is set. */
+  onRefresh: () => Promise<unknown>;
   panes: Pane[];
   activePanes: Record<string, string>;
   run: Run;
@@ -60,6 +67,9 @@ export function ShieldPage({
   onDropFolder,
   runtimes,
   onRestart,
+  runs,
+  onRunsChange,
+  onRefresh,
   panes,
   activePanes,
   run,
@@ -111,6 +121,7 @@ export function ShieldPage({
   const sessions = shield.sessions.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
   const app = view.kind === "app" ? shield.apps.find((a) => a.id === view.appId) : undefined;
+  const task = view.kind === "task" ? shield.tasks.find((t) => t.id === view.taskId) : undefined;
 
   return (
     <section className="page">
@@ -231,6 +242,35 @@ export function ShieldPage({
             run={run}
             onExit={terminal.onPaneExit}
             onError={(e) => run(() => Promise.reject(e))}
+          />
+        </div>
+      )}
+      {task && view.kind === "task" && (
+        <div className="view task-view">
+          <TaskRoom
+            key={task.id}
+            kind="task"
+            shield={shield}
+            task={task}
+            runs={runs.filter((r) => r.taskId === task.id)}
+            run={view.run}
+            onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
+            onRunsChange={onRunsChange}
+            onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
+          />
+        </div>
+      )}
+      {view.kind === "taskEdit" && (
+        <div className="view task-view">
+          <TaskDialog
+            key={view.taskId ?? "new"}
+            shield={shield}
+            taskId={view.taskId}
+            onDone={async (taskId) => {
+              // The tree and the task view need the saved task.
+              await onRefresh();
+              onView(taskId ? { kind: "task", taskId } : { kind: "overview" });
+            }}
           />
         </div>
       )}

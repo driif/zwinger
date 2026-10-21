@@ -12,16 +12,20 @@ import {
   InstallProgress,
   installRuntime,
   isBlocked,
+  isLive,
+  isRoundFolder,
   listChats,
   listNetEvents,
   listRuntimes,
   listShields,
+  listTaskRuns,
   NetEvent,
   onNetEvent,
   renameChat,
   resolveFolder,
   RuntimeName,
   RuntimeView,
+  RunSummary,
   SessionKind,
   ShieldView,
   startShield,
@@ -30,6 +34,7 @@ import {
 import { CommandBar } from "./CommandBar";
 import { ShieldPage } from "./ShieldPage";
 import { ShieldRail } from "./ShieldRail";
+import { TaskRoom } from "./TaskRoom";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
 
@@ -45,7 +50,11 @@ export type View =
   | { kind: "chat"; agent?: AgentKind; chat?: string }
   /** No `key` shows the empty terminal view. */
   | { kind: "terminal"; key?: string }
-  | { kind: "app"; appId: string };
+  | { kind: "app"; appId: string }
+  /** No `run` shows the latest run. */
+  | { kind: "task"; taskId: string; run?: string }
+  /** No `taskId` adds a task. */
+  | { kind: "taskEdit"; taskId?: string };
 
 export interface Pane {
   key: string;
@@ -104,6 +113,9 @@ export default function App() {
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
   const [chats, setChats] = useState<Record<string, Chat[]>>({});
+  const [runs, setRuns] = useState<Record<string, RunSummary[]>>({});
+  /** A duo round folder on the host that the main area shows instead of a shield. */
+  const [roundFolder, setRoundFolder] = useState<string>();
   const [dropFolder, setDropFolder] = useState<DroppedFolder>();
   const [chatAction, setChatAction] = useState<{ shieldId: string; action: ChatAction }>();
   const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
@@ -183,10 +195,22 @@ export default function App() {
   const reloadChats = (id: string) =>
     listChats(id).then((list) => setChats((current) => ({ ...current, [id]: list })), () => {});
 
+  const reloadRuns = (id: string) =>
+    listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
+
   const shieldIds = shields.map((s) => s.id).join(" ");
   useEffect(() => {
     for (const { id } of shields) if (!(id in chats)) reloadChats(id);
+    for (const { id } of shields) if (!(id in runs)) reloadRuns(id);
   }, [shieldIds]);
+
+  // The tree shows the stage of each live run, so the list polls while one runs.
+  const liveRunShields = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
+  useEffect(() => {
+    if (!liveRunShields) return;
+    const timer = setInterval(() => liveRunShields.split(" ").forEach(reloadRuns), 2000);
+    return () => clearInterval(timer);
+  }, [liveRunShields]);
 
   // An app can exit while no view is attached, so the list polls while one runs.
   const appsRunning = shields.some((s) => s.appRuns.some((r) => r.exitCode === null));
@@ -201,9 +225,10 @@ export default function App() {
   const activePane = shield && activePanes[shield.id];
   const events = (shield && net[shield.id]) ?? [];
 
-  // A deleted app has no view.
+  // A deleted app or task has no view.
   useEffect(() => {
     if (view.kind === "app" && shield && !shield.apps.some((a) => a.id === view.appId)) setView({ kind: "overview" });
+    if (view.kind === "task" && shield && !shield.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
   }, [view, shield]);
 
   const blocked = Object.fromEntries(
@@ -218,11 +243,13 @@ export default function App() {
 
   /** Items belong to one shield, so another shield shows its Overview instead. */
   function select(id: string) {
+    setRoundFolder(undefined);
     setSelectedId(id);
     if (id === shield?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
   function openView(shieldId: string, next: View) {
+    setRoundFolder(undefined);
     setSelectedId(shieldId);
     if (next.kind === "terminal") showPane(next.key, shieldId);
     else setView(next);
@@ -231,6 +258,11 @@ export default function App() {
   async function addShield(folder: string) {
     setSelectedId(await createShield(folder));
     setView({ kind: "overview" });
+  }
+
+  async function openRoundFolder() {
+    const folder = await open({ directory: true, title: "Choose a duo round folder, such as docs/tasks/<slug>/<round>" });
+    if (folder !== null) setRoundFolder(folder);
   }
 
   async function newShield() {
@@ -247,14 +279,19 @@ export default function App() {
     showPane(key, target.id);
   }
 
-  // A folder dropped on empty rail space creates a shield. The map has its own listener.
+  // A duo round folder dropped anywhere opens its room. Another folder dropped on
+  // empty rail space creates a shield. The map has its own listener.
   useEffect(() => {
-    const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+    const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
       const { x, y } = payload.position.toLogical(window.devicePixelRatio);
       const element = document.elementFromPoint(x, y);
-      if (!element?.closest("[data-drop=rail]") || element.closest("[role=treeitem]")) return;
       const dropped = payload.paths[0];
+      if (await isRoundFolder(dropped)) {
+        setRoundFolder(dropped);
+        return;
+      }
+      if (!element?.closest("[data-drop=rail]") || element.closest("[role=treeitem]")) return;
       setError(undefined);
       resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder }), (e) => setError(String(e)));
     });
@@ -358,6 +395,7 @@ export default function App() {
         view={view}
         blocked={blocked}
         chats={chats}
+        runs={runs}
         panes={panes}
         run={run}
         onSelect={select}
@@ -370,6 +408,7 @@ export default function App() {
           const target = shields.find((s) => s.id === id);
           if (target) run(() => startChatAction(target, action));
         }}
+        onRunsChange={reloadRuns}
         onToggle={toggle}
         onNewShell={(id) => run(() => newSession("shell", shields.find((s) => s.id === id)))}
         onClosePane={closePane}
@@ -390,15 +429,25 @@ export default function App() {
           actions={actions}
           onSelect={select}
           onShowPane={showPane}
-          onView={setView}
+          onView={(next) => {
+            setRoundFolder(undefined);
+            setView(next);
+          }}
           onToggle={toggle}
           onRestart={restart}
           onIntent={startIntent}
+          onOpenRound={() => run(openRoundFolder)}
           run={run}
         />
       </ShieldRail>
       <main className="main">
-        {shield ? (
+        {roundFolder ? (
+          <section className="page">
+            <div className="view task-view">
+              <TaskRoom key={roundFolder} kind="folder" path={roundFolder} />
+            </div>
+          </section>
+        ) : shield ? (
           <>
             {shield.pendingRestart && (
               <Card variant="outlined" padding="sm" className="banner row">
@@ -428,6 +477,9 @@ export default function App() {
               onDropFolder={dropMount}
               runtimes={runtimes}
               onRestart={() => restart(shield.id)}
+              runs={runs[shield.id] ?? []}
+              onRunsChange={() => reloadRuns(shield.id)}
+              onRefresh={refresh}
               panes={panes}
               activePanes={activePanes}
               run={run}

@@ -17,7 +17,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Maximize, Minus, Network, Plus, Shield } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { NetEvent, Pos, setLayout, ShieldView } from "./api";
+import { isRoundFolder, NetEvent, Pos, setLayout, ShieldView } from "./api";
 import type { Run } from "./App";
 import { BoundaryData, ItemData, Jump, MapNode, mapLayout } from "./mapLayout";
 
@@ -179,10 +179,12 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   const onDrop = useRef(onDropFolder);
   onDrop.current = onDropFolder;
   useEffect(() => {
-    const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+    const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
       const point = payload.position.toLogical(window.devicePixelRatio);
       if (!container.current?.contains(document.elementFromPoint(point.x, point.y))) return;
+      // The App listener opens the room of a round folder.
+      if (await isRoundFolder(payload.paths[0])) return;
       const { x, y } = screenToFlowPosition(point);
       const box = getNode("boundary");
       const width = box?.measured?.width ?? box?.width;

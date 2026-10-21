@@ -26,6 +26,7 @@ interface Props {
   onToggle: (shield: ShieldView) => void;
   onRestart: (id: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
+  onOpenRound: () => void;
   run: Run;
 }
 
@@ -42,6 +43,7 @@ export function CommandBar({
   onToggle,
   onRestart,
   onIntent,
+  onOpenRound,
   run,
 }: Props) {
   const action = (id: ShortcutAction, label: string): CommandMenuItem => ({
@@ -101,6 +103,9 @@ export function CommandBar({
         });
     }
     commands.push(intent("app", "Add app…"));
+    commands.push({ id: "new-task", label: "New task…", onSelect: () => onView({ kind: "taskEdit" }) });
+    for (const task of shield.tasks)
+      commands.push({ id: `task-${task.id}`, label: `Show task ${task.title}`, onSelect: () => onView({ kind: "task", taskId: task.id }) });
     const modes: [NetworkMode, string][] = [
       ["deny", "Network: deny all"],
       ["list", "Network: allow list only"],
@@ -120,7 +125,7 @@ export function CommandBar({
       commands.push({ id: `unmount-${mount.guest}`, label: `Remove mount ${mount.guest}`, onSelect: () => run(() => removeMount(id, mount.guest)) });
     }
   }
-  commands.push(action("newShield", "New shield"));
+  commands.push(action("newShield", "New shield"), { id: "open-round", label: "Open round folder…", onSelect: onOpenRound });
   for (const other of shields)
     if (other.id !== shield?.id)
       commands.push({ id: `shield-${other.id}`, label: `Switch to ${other.name}`, onSelect: () => onSelect(other.id) });

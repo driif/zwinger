@@ -209,14 +209,14 @@ pub fn rename_chat(dir: &Path, kind: AgentKind, id: &str, title: &str) -> Result
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// The ISO 8601 form of a time in ms since the epoch, as pi writes it.
-fn iso(ms: i64) -> String {
+pub fn iso(ms: i64) -> String {
     let (secs, millis) = (ms.div_euclid(1000), ms.rem_euclid(1000));
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // The civil date of a day number (Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms").

@@ -135,7 +135,7 @@ function ToolCard({ call, result, run }: { call: Extract<Block, { type: "toolCal
   );
 }
 
-function MessageView({ message, results, tools }: { message: Message; results: Map<string, Message>; tools: Record<string, ToolRun> }) {
+export function MessageView({ message, results, tools }: { message: Message; results: Map<string, Message>; tools: Record<string, ToolRun> }) {
   if (message.role === "user")
     return (
       <div className="msg user">

@@ -44,6 +44,22 @@ pub enum Error {
     AppStopped,
     #[error("the old run of the app did not exit")]
     AppStillRunning,
+    #[error("task {0} runs in {1}, which is not below /workspace or a mount")]
+    TaskWorkdir(String, String),
+    #[error("invalid task {0}: {1}")]
+    InvalidTask(String, String),
+    #[error("task not found")]
+    TaskNotFound,
+    #[error("the task has a run that is not done")]
+    TaskRunning,
+    #[error("run not found")]
+    RunNotFound,
+    #[error("the run cannot do this now: {0}")]
+    RunState(&'static str),
+    #[error("the run cannot write its artifacts to {0}: {1}")]
+    MirrorUnwritable(String, String),
+    #[error("not a round folder: {0}")]
+    NotRound(String),
     #[error("the order must name each item once")]
     InvalidOrder,
     #[error("invalid domain {0}: {1}")]

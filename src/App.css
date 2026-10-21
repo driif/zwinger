@@ -673,3 +673,65 @@ p {
   gap: calc(var(--motiv-space) * 2);
   padding-bottom: calc(var(--motiv-space) * 2);
 }
+
+.task-view {
+  overflow-y: auto;
+}
+
+.room {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 3);
+}
+
+.room-header {
+  flex-wrap: wrap;
+}
+
+.room-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(16rem, 2fr);
+  gap: calc(var(--motiv-space) * 4);
+  align-items: start;
+}
+
+.room-positions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: calc(var(--motiv-space) * 2);
+}
+
+.room-heading {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.room-message {
+  width: 100%;
+  min-width: 0;
+}
+
+.room-summary {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-agent {
+  gap: var(--motiv-space);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.room-chip {
+  padding: 0 calc(var(--motiv-space) * 1.5);
+  border-radius: var(--motiv-radius-full);
+  background: var(--motiv-color-surface);
+  color: var(--motiv-color-text-muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.room-diff {
+  max-height: 32rem;
+}

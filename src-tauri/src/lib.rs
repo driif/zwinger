@@ -8,6 +8,9 @@ mod secrets;
 mod sessions;
 mod shield;
 mod store;
+mod task_agents;
+mod task_artifacts;
+mod task_runs;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +103,7 @@ pub fn run() {
             }));
             app.manage(manager);
             app.manage(runtimes::Runtimes::new(data_dir));
+            app.manage(commands::Watches::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -147,6 +151,15 @@ pub fn run() {
             commands::list_runtimes,
             commands::install_runtime,
             commands::cancel_runtime_install,
+            commands::put_task,
+            commands::remove_task,
+            commands::start_task_run,
+            commands::control_task_run,
+            commands::list_task_runs,
+            commands::run_diff,
+            commands::is_round_folder,
+            commands::watch_room,
+            commands::unwatch_room,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

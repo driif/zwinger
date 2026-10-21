@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 pub const DIR: &str = "/opt/zwinger/codex";
 /// Its `CODEX_HOME`, so `~/.codex` is in the shield's state and never the
 /// host's. Codex refuses to make its helper binaries below `/tmp`.
-const HOME: &str = "/opt/zwinger/state/codex";
+pub const HOME: &str = "/opt/zwinger/state/codex";
 
 /// `thread` resumes an earlier chat. The prompt comes on stdin (`-`), so
 /// its size has no argv limit.
