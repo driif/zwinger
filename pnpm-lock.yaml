@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@driif/motiv':
-        specifier: ^0.6.0
-        version: 0.6.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+        specifier: ^0.7.0
+        version: 0.7.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@tauri-apps/api':
         specifier: ^2
         version: 2.12.4
@@ -54,8 +54,8 @@ importers:
 
 packages:
 
-  '@driif/motiv@0.6.0':
-    resolution: {integrity: sha512-U3fbZ5e7NGvZ5VKceWl+zO3rSNpdl+1AXGaBUAXKIcqdK0QHwvpfunowrdAJ35/4jgtI0NW/LDqRuI4uA1N1Og==}
+  '@driif/motiv@0.7.0':
+    resolution: {integrity: sha512-eajm9JbT4N05sDAz1X8OoEbgiF0NZAvu3ssQT3JfeDj+aXmK1wlr7l1DP+ouz6OgpyzbXt23yp+o/5mvE6k0xg==}
     peerDependencies:
       react: '>=19'
       react-dom: '>=19'
@@ -469,7 +469,7 @@ packages:
 
 snapshots:
 
-  '@driif/motiv@0.6.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
+  '@driif/motiv@0.7.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
     dependencies:
       react: 19.3.1
       react-dom: 19.3.1(react@19.3.1)
