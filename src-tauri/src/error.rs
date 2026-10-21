@@ -28,6 +28,18 @@ pub enum Error {
     HarnessMount(String, String),
     #[error("invalid domain {0}: {1}")]
     InvalidDomain(String, String),
+    #[error("invalid secret {0}: {1}")]
+    InvalidSecret(String, String),
+    #[error("secret {0} already exists")]
+    DuplicateSecret(String),
+    #[error("secret {0} needs a value")]
+    SecretValueRequired(String),
+    #[error("secret {0} not found")]
+    SecretNotFound(String),
+    #[error("secret {0} has no value in the Keychain; set it again")]
+    SecretMissing(String),
+    #[error("Keychain: {0}")]
+    Keychain(String),
     #[error("shield not found")]
     ShieldNotFound,
     #[error("mount not found")]

@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::secrets::{self, Secret};
 
 pub const WORKSPACE: &str = "/workspace";
 const FOLDER_LIMIT: usize = 50;
@@ -18,6 +19,9 @@ pub struct Shield {
     /// The guest folder where agent sessions start: below `/workspace` or a mount.
     #[serde(default)]
     pub harness: Option<String>,
+    /// The values are in the vault.
+    #[serde(default)]
+    pub secrets: Vec<Secret>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +104,7 @@ impl Shield {
             mounts: Vec::new(),
             network: NetworkPolicy::default(),
             harness: None,
+            secrets: Vec::new(),
         })
     }
 
@@ -130,9 +135,34 @@ impl Shield {
         self.check()
     }
 
+    /// Adds the secret, or replaces the secret with the same name. Returns
+    /// true if the secret is new.
+    pub fn put_secret(&mut self, secret: Secret) -> bool {
+        match self.secrets.iter_mut().find(|s| s.name == secret.name) {
+            Some(current) => {
+                *current = secret;
+                false
+            }
+            None => {
+                self.secrets.push(secret);
+                true
+            }
+        }
+    }
+
+    pub fn remove_secret(&mut self, name: &str) -> Result<()> {
+        let before = self.secrets.len();
+        self.secrets.retain(|s| s.name != name);
+        if self.secrets.len() == before {
+            return Err(Error::SecretNotFound(name.to_owned()));
+        }
+        Ok(())
+    }
+
     /// The rules that every stored config must meet.
     pub fn check(&self) -> Result<()> {
         self.check_overlap()?;
+        secrets::check_unique(&self.secrets)?;
         match &self.harness {
             Some(harness) if !self.harness_target_exists(Path::new(harness)) => {
                 Err(Error::HarnessTarget(harness.clone()))

@@ -3,6 +3,7 @@ import { Ban, Plus, TriangleAlert, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { addDomain, NetworkMode, removeDomain, setNetworkMode, ShieldView } from "./api";
 import type { Intent, Run } from "./App";
+import { SecretsSection } from "./SecretsSection";
 
 const NPM_REGISTRY = "registry.npmjs.org";
 const PROVIDERS = ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"];
@@ -157,6 +158,7 @@ export function NetworkTab({ shield, run, intent, onIntentDone }: Props) {
           )}
         </CardBody>
       </Card>
+      <SecretsSection shield={shield} run={run} />
       <Card variant="subtle" padding="md">
         <CardHeader title="Always blocked" titleAs="h2" description="Every mode blocks these groups. You cannot change this." />
         <CardBody>

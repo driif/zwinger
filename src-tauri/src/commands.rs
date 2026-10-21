@@ -3,7 +3,8 @@ use tauri::ipc::Channel;
 
 use crate::error::Result;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
-use crate::sessions::{Manager, ShieldView};
+use crate::secrets::{Secret, SecretValue};
+use crate::sessions::{Manager, SecretView, ShieldView};
 use crate::shield::NetworkMode;
 
 type Shields<'a> = State<'a, Manager<Microsandbox>>;
@@ -77,6 +78,28 @@ pub fn add_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()
 #[tauri::command]
 pub fn remove_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
     shields.remove_domain(&id, &domain)
+}
+
+// The secret commands are async, so the Keychain calls do not block the main thread.
+
+#[tauri::command]
+pub async fn put_secret(
+    shields: Shields<'_>,
+    id: String,
+    secret: Secret,
+    value: Option<SecretValue>,
+) -> Result<()> {
+    shields.put_secret(&id, secret, value)
+}
+
+#[tauri::command]
+pub async fn remove_secret(shields: Shields<'_>, id: String, name: String) -> Result<()> {
+    shields.remove_secret(&id, &name)
+}
+
+#[tauri::command]
+pub async fn list_secrets(shields: Shields<'_>, id: String) -> Result<Vec<SecretView>> {
+    shields.list_secrets(&id)
 }
 
 #[tauri::command]

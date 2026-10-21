@@ -1,7 +1,8 @@
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, LucideIcon, Network, Shield } from "lucide-react";
+import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Network, Shield } from "lucide-react";
 import { KeyboardEvent, ReactNode } from "react";
 import { ShieldView } from "./api";
 import type { Tab } from "./App";
+import { coveredBy, reachable } from "./SecretsSection";
 
 const WIDTH = 900;
 const HOST_X = 16;
@@ -206,6 +207,14 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
   }
   const boxBottom = y + H + 20;
 
+  const secretHosts = [...new Set(shield.secrets.flatMap((s) => s.hosts))];
+  const keyBadge = (domain: string) => (coveredBy(domain, secretHosts) ? ["key"] : []);
+  const secretNames = (host: string) =>
+    shield.secrets
+      .filter((s) => s.hosts.includes(host))
+      .map((s) => s.name)
+      .join(", ");
+
   const gateway: [number, number] = [BOX_X + BOX_W, center(TOP)];
   const net: ReactNode[] = [];
   let ny = TOP;
@@ -231,10 +240,47 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
     ny += ROW;
   } else {
     for (const domain of network.domains) {
-      net.push(<Node key={domain} x={NET_X} y={ny} width={NET_W} icon={Globe} label={domain} onJump={toNetwork} />);
+      net.push(
+        <Node
+          key={domain}
+          x={NET_X}
+          y={ny}
+          width={NET_W}
+          icon={Globe}
+          label={domain}
+          badges={keyBadge(domain)}
+          onJump={toNetwork}
+        />,
+      );
       lines.push(<Line key={domain} from={gateway} to={[NET_X, center(ny)]} />);
       ny += ROW;
     }
+  }
+  // In List mode the allow-list nodes carry the key badges. In Public mode the
+  // secret hosts are shown on their own, as nothing else names them.
+  for (const host of secretHosts) {
+    const ok = reachable(network, host);
+    if (ok && network.mode === "list") continue;
+    net.push(
+      <Node
+        key={`secret ${host}`}
+        x={NET_X}
+        y={ny}
+        width={NET_W}
+        icon={KeyRound}
+        label={host}
+        title={
+          ok
+            ? `${host} gets ${secretNames(host)}`
+            : `${host} gets ${secretNames(host)}, but it is not on the allow list`
+        }
+        tone={ok ? undefined : "warn"}
+        badges={["key"]}
+        onJump={toNetwork}
+      />,
+    );
+    if (ok) lines.push(<Line key={`secret ${host}`} from={gateway} to={[NET_X, center(ny)]} />);
+    ny += ROW;
   }
   ny += GAP;
   net.push(
@@ -251,7 +297,8 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
     />,
   );
   lines.push(<Line key="blocked" from={gateway} to={[NET_X, center(ny)]} blocked />);
-  const height = Math.max(boxBottom, ny + H) + 16;
+  const legendY = Math.max(boxBottom, ny + H) + 24;
+  const height = legendY + (secretHosts.length > 0 ? 48 : 0);
 
   return (
     <svg
@@ -284,6 +331,28 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
       {outside}
       {inside}
       {net}
+      {secretHosts.length > 0 && (
+        <g>
+          <g className="map-badge key">
+            <rect x={HOST_X} y={legendY - 12} width={50} height={16} rx={8} />
+            <text x={HOST_X + 25} y={legendY} textAnchor="middle">
+              key
+            </text>
+          </g>
+          <text className="map-more" x={HOST_X + 58} y={legendY}>
+            gets a secret
+          </text>
+          <g className="map-node warn">
+            <rect x={HOST_X + 170} y={legendY - 12} width={16} height={16} rx={4} />
+          </g>
+          <text className="map-more" x={HOST_X + 194} y={legendY}>
+            secret host that the network policy blocks
+          </text>
+          <text className="map-more" x={HOST_X} y={legendY + 22}>
+            Agent sees $MSB_…, the shield injects the real value.
+          </text>
+        </g>
+      )}
     </svg>
   );
 }

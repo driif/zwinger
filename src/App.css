@@ -326,6 +326,10 @@ p {
   fill: color-mix(in oklch, var(--motiv-color-warning) 20%, transparent);
 }
 
+.map-badge.key > rect {
+  fill: color-mix(in oklch, var(--motiv-color-success) 20%, transparent);
+}
+
 .map-line {
   fill: none;
   stroke: var(--motiv-color-border);

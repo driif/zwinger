@@ -30,6 +30,9 @@ dirs = "7.0.0"
 tauri-plugin-dialog = "2"
 keyring = { version = "3.6.3", features = ["apple-native"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

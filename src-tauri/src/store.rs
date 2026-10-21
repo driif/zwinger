@@ -12,6 +12,11 @@ impl Store {
         Self { path }
     }
 
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn load(&self) -> Result<Vec<Shield>> {
         match std::fs::read(&self.path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -34,6 +39,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{Places, Secret};
     use crate::shield::{Mount, NetworkMode, NetworkPolicy};
 
     #[test]
@@ -56,6 +62,15 @@ mod tests {
                 domains: vec!["registry.npmjs.org".into()],
             },
             harness: Some("/workspace/agent".into()),
+            secrets: vec![Secret {
+                name: "OPENAI_API_KEY".into(),
+                hosts: vec!["api.openai.com".into()],
+                places: Places {
+                    header_fields: vec!["authorization".into()],
+                    query: false,
+                    body: false,
+                },
+            }],
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
@@ -63,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_config_without_harness() {
+    fn loads_config_without_harness_and_secrets() {
         let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shields.json");
@@ -73,6 +88,8 @@ mod tests {
                 "network":{"allowAll":false,"domains":[]}}]"#,
         )
         .unwrap();
-        assert_eq!(Store::new(path).load().unwrap()[0].harness, None);
+        let shield = &Store::new(path).load().unwrap()[0];
+        assert_eq!(shield.harness, None);
+        assert!(shield.secrets.is_empty());
     }
 }

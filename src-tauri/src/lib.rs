@@ -1,10 +1,12 @@
 mod commands;
 mod error;
 mod runtime;
+mod secrets;
 mod sessions;
 mod shield;
 mod store;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -79,7 +81,8 @@ pub fn run() {
                 Err(_) => eprintln!("reap timed out"),
             }
             let path = app.path().app_data_dir()?.join("shields.json");
-            let manager = sessions::Manager::new(Microsandbox, store::Store::new(path))?;
+            let manager =
+                sessions::Manager::new(Microsandbox, store::Store::new(path), Arc::new(secrets::Keychain))?;
             app.manage(manager);
             Ok(())
         })
@@ -96,6 +99,9 @@ pub fn run() {
             commands::set_network_mode,
             commands::add_domain,
             commands::remove_domain,
+            commands::put_secret,
+            commands::remove_secret,
+            commands::list_secrets,
             commands::start_shield,
             commands::stop_shield,
             commands::open_session,

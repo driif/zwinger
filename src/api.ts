@@ -16,6 +16,27 @@ export interface NetworkPolicy {
   domains: string[];
 }
 
+/** The request locations where the proxy puts the value in place of the placeholder. */
+export interface Places {
+  /** Lowercase header names that get the value. Empty means no header. */
+  headerFields: string[];
+  query: boolean;
+  body: boolean;
+}
+
+/** The value is in the Keychain. The UI can write it but never reads it. */
+export interface Secret {
+  name: string;
+  hosts: string[];
+  places: Places;
+}
+
+export interface SecretView extends Secret {
+  placeholder: string;
+  /** The Keychain has a value. */
+  set: boolean;
+}
+
 export type ShieldStatus =
   | { state: "stopped" }
   | { state: "starting" }
@@ -36,6 +57,7 @@ export interface ShieldView {
   mounts: Mount[];
   network: NetworkPolicy;
   harness: string | null;
+  secrets: Secret[];
   status: ShieldStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
@@ -69,6 +91,14 @@ export const setNetworkMode = (id: string, mode: NetworkMode) => invoke<void>("s
 export const addDomain = (id: string, domain: string) => invoke<void>("add_domain", { id, domain });
 
 export const removeDomain = (id: string, domain: string) => invoke<void>("remove_domain", { id, domain });
+
+export const listSecrets = (id: string) => invoke<SecretView[]>("list_secrets", { id });
+
+/** `value` null keeps the current value of an existing secret. */
+export const putSecret = (id: string, secret: Secret, value: string | null) =>
+  invoke<void>("put_secret", { id, secret, value });
+
+export const removeSecret = (id: string, name: string) => invoke<void>("remove_secret", { id, name });
 
 export const startShield = (id: string) => invoke<void>("start_shield", { id });
 

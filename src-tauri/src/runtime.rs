@@ -2,16 +2,20 @@ use std::future::Future;
 
 use std::collections::BTreeMap;
 
-use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT};
+use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SecretBuilder};
 use microsandbox::{ExecEvent, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::error::{Error, Result};
+use crate::secrets::{Secret, SecretValue};
 use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Where microsandbox puts its TLS interception CA in the guest
+/// (`microsandbox_protocol::GUEST_TLS_CA_PATH`, not re-exported).
+const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
 const IMAGE: &str = "node:22-slim";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +49,12 @@ pub struct Pty {
 pub trait SandboxRuntime: Send + Sync + 'static {
     type Vm: Send + Sync + 'static;
 
-    fn start(&self, shield: &Shield) -> impl Future<Output = Result<Self::Vm>> + Send;
+    /// `secrets` comes from [`secret_entries`].
+    fn start(
+        &self,
+        shield: &Shield,
+        secrets: Vec<SecretBuilder>,
+    ) -> impl Future<Output = Result<Self::Vm>> + Send;
     fn stop(&self, vm: &Self::Vm) -> impl Future<Output = Result<()>> + Send;
     fn open_pty(
         &self,
@@ -89,6 +98,35 @@ pub fn sandbox_policy(policy: &shield::NetworkPolicy) -> Result<microsandbox::Ne
         .map_err(|e| Error::InvalidDomain(policy.domains.join(", "), e.to_string()))
 }
 
+/// Pairs each secret with its value. The guest gets the placeholder in the
+/// variable; the proxy replaces it with the value only in the selected places
+/// of requests to the secret's hosts, and only after the TLS identity check.
+/// Checks each secret again, because `SecretBuilder::allow` panics on an
+/// invalid host and the stored config can be edited by hand.
+pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Vec<SecretBuilder>> {
+    secrets
+        .iter()
+        .zip(values)
+        .map(|(secret, value)| {
+            let secret = secret.clone().normalize()?;
+            let builder = SecretBuilder::new()
+                .env(&secret.name)
+                .placeholder(secret.placeholder())
+                .value(value.expose());
+            // An empty field list means all header fields to microsandbox.
+            let builder = if secret.places.header_fields.is_empty() {
+                builder.substitute_in_headers(false)
+            } else {
+                builder.substitute_in_header_fields(&secret.places.header_fields)
+            };
+            let builder = builder
+                .substitute_in_query(secret.places.query)
+                .substitute_in_body(secret.places.body);
+            Ok(secret.hosts.iter().fold(builder, |b, host| b.allow(host)))
+        })
+        .collect()
+}
+
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
@@ -97,7 +135,7 @@ pub struct Microsandbox;
 impl SandboxRuntime for Microsandbox {
     type Vm = Sandbox;
 
-    async fn start(&self, shield: &Shield) -> Result<Sandbox> {
+    async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>) -> Result<Sandbox> {
         let policy = sandbox_policy(&shield.network)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", shield.id))
             .image(IMAGE)
@@ -113,7 +151,16 @@ impl SandboxRuntime for Microsandbox {
                 if mount.readonly { m.readonly() } else { m }
             });
         }
-        Ok(builder.network(|n| n.policy(policy)).create().await?)
+        builder = builder.network(|n| n.policy(policy));
+        // Secrets turn on TLS interception. Node does not read the system
+        // trust store, so it gets the interception CA explicitly.
+        if !secrets.is_empty() {
+            builder = builder.env("NODE_EXTRA_CA_CERTS", GUEST_TLS_CA_PATH);
+        }
+        for secret in secrets {
+            builder = builder.secret_entry(secret.build());
+        }
+        Ok(builder.create().await?)
     }
 
     /// A graceful stop has no deadline in microsandbox, so a stuck VM is
@@ -232,9 +279,14 @@ impl SandboxRuntime for Microsandbox {
 pub mod fake {
     use std::sync::{Arc, Mutex};
 
+    use microsandbox::HostPattern;
+
     use super::*;
 
     use tokio::sync::Notify;
+
+    /// The name and the hosts of a secret.
+    pub type StartedSecret = (String, Vec<HostPattern>);
 
     /// Echoes input back as output. `Kill` ends the process with code 137.
     #[derive(Default, Clone)]
@@ -243,9 +295,13 @@ pub mod fake {
         pub fail_stop: Arc<Mutex<bool>>,
         pub pty_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         pub cwds: Arc<Mutex<Vec<String>>>,
+        pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
+        /// The names and hosts of the secrets of the last start, never the values.
+        pub secrets: Arc<Mutex<Vec<StartedSecret>>>,
     }
 
-    /// Holds `open_pty` after it signals `entered`, until the test signals `release`.
+    /// Holds `open_pty` or `start` after it signals `entered`, until the test
+    /// signals `release`.
     #[derive(Default)]
     pub struct PtyGate {
         pub entered: Notify,
@@ -259,8 +315,19 @@ pub mod fake {
     impl SandboxRuntime for FakeRuntime {
         type Vm = FakeVm;
 
-        async fn start(&self, shield: &Shield) -> Result<FakeVm> {
+        async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>) -> Result<FakeVm> {
+            let gate = self.start_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             self.log.lock().unwrap().push(format!("start {}", shield.id));
+            let mut started = self.secrets.lock().unwrap();
+            started.clear();
+            for secret in secrets {
+                let entry = secret.build();
+                started.push((entry.env_var, entry.allowed_hosts));
+            }
             Ok(FakeVm {
                 shield_id: shield.id.clone(),
             })
@@ -321,10 +388,11 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
-    use microsandbox::NetworkAction;
+    use microsandbox::{HostPattern, NetworkAction};
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::secrets::Places;
 
     fn policy(mode: NetworkMode, domains: &[&str]) -> microsandbox::NetworkPolicy {
         sandbox_policy(&shield::NetworkPolicy {
@@ -448,6 +516,59 @@ mod tests {
             serde_json::to_value(microsandbox::NetworkRule::allow_dns()).unwrap()
         );
         assert_eq!(dns(&policy, "example.com"), NetworkAction::Allow);
+    }
+
+    #[test]
+    fn secret_entries_map_places_and_hosts() {
+        let secrets = [
+            Secret {
+                name: "OPENAI_API_KEY".into(),
+                hosts: vec!["api.openai.com".into(), "openai.com".into()],
+                places: Places {
+                    header_fields: vec!["Authorization".into(), "x-api-key".into()],
+                    query: false,
+                    body: false,
+                },
+            },
+            Secret {
+                name: "MAPS_KEY".into(),
+                hosts: vec!["maps.example.com".into()],
+                places: Places {
+                    header_fields: vec![],
+                    query: true,
+                    body: true,
+                },
+            },
+        ];
+        let values = vec![SecretValue::new("sk-1"), SecretValue::new("mk-2")];
+        let entries: Vec<_> = secret_entries(&secrets, values)
+            .unwrap()
+            .into_iter()
+            .map(SecretBuilder::build)
+            .collect();
+
+        assert_eq!(entries[0].env_var, "OPENAI_API_KEY");
+        assert_eq!(*entries[0].value, "sk-1");
+        assert_eq!(entries[0].placeholder, "$MSB_OPENAI_API_KEY$");
+        assert_eq!(
+            entries[0].allowed_hosts,
+            [
+                HostPattern::Exact("api.openai.com".into()),
+                HostPattern::Exact("openai.com".into())
+            ]
+        );
+        let s = &entries[0].substitution;
+        assert!(s.headers && !s.query && !s.body);
+        assert_eq!(s.header_fields, ["authorization", "x-api-key"]);
+
+        assert_eq!(*entries[1].value, "mk-2");
+        let s = &entries[1].substitution;
+        assert!(!s.headers && s.header_fields.is_empty() && s.query && s.body);
+
+        for entry in &entries {
+            assert!(entry.require_tls_identity);
+            assert!(entry.passthrough_hosts.is_empty());
+        }
     }
 
     #[test]
