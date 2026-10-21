@@ -83,7 +83,7 @@ export function TerminalTab({
                 New shell <kbd className="muted">⌘T</kbd>
               </Button>
               <Button size="sm" variant="ghost" role="menuitem" iconLeft={KIND_ICON.pi} onClick={() => create("pi")}>
-                New pi agent <kbd className="muted">⌘P</kbd>
+                New pi terminal
               </Button>
             </div>
           )}
@@ -99,7 +99,7 @@ export function TerminalTab({
               New shell
             </Button>
             <Button variant="outline" iconLeft={KIND_ICON.pi} onClick={() => onNewSession("pi")}>
-              New pi agent
+              New pi terminal
             </Button>
           </div>
         </div>

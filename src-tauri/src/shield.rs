@@ -2,6 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent;
 use crate::error::{Error, Result};
 use crate::secrets::{self, Secret};
 
@@ -270,6 +271,18 @@ impl Shield {
         Ok(())
     }
 
+    /// No host path may nest with the app data dir, in either direction, even
+    /// read-only: it holds the pi runtime and the chats of every shield.
+    pub fn check_app_data(&self, data: &Path) -> Result<()> {
+        let paths = std::iter::once(&self.folder).chain(self.mounts.iter().map(|m| &m.host));
+        for path in paths {
+            if path.starts_with(data) || data.starts_with(path) {
+                return Err(Error::AppDataOverlap(path.display().to_string(), data.display().to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves the stored host paths again before a start. A path that now
     /// resolves elsewhere (for example, a swapped symlink) is refused.
     pub fn verify_paths(&self) -> Result<()> {
@@ -348,6 +361,9 @@ pub fn guest_path(path: &str) -> Result<String> {
     let p = normalize(path).ok_or_else(|| Error::InvalidGuestPath(path.to_owned()))?;
     if p.starts_with(WORKSPACE) || Path::new(WORKSPACE).starts_with(&p) {
         return Err(Error::WorkspaceOverlap(path.to_owned()));
+    }
+    if p.starts_with(agent::RESERVED) || Path::new(agent::RESERVED).starts_with(&p) {
+        return Err(Error::ReservedGuestPath(path.to_owned()));
     }
     Ok(p.to_string_lossy().into_owned())
 }
@@ -438,6 +454,25 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn guest_path_rejects_the_zwinger_prefix() {
+        for path in ["/opt", "/opt/zwinger", "/opt/zwinger/pi", "/opt/zwinger/state/x"] {
+            assert!(matches!(guest_path(path), Err(Error::ReservedGuestPath(_))), "{path}");
+        }
+        assert_eq!(guest_path("/opt/tools").unwrap(), "/opt/tools");
+    }
+
+    #[test]
+    fn app_data_may_not_nest_with_any_path() {
+        let (mut shield, root) = shield_with_dirs(&["project", "data", "data/app", "other"]);
+        shield.add_mount(&path(&root, "other"), "/mnt/other", true).unwrap();
+        assert!(shield.check_app_data(&root.join("data/app")).is_ok());
+
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        assert!(matches!(shield.check_app_data(&root.join("data/app")), Err(Error::AppDataOverlap(..))));
+        assert!(matches!(shield.check_app_data(&shield.folder.join("x")), Err(Error::AppDataOverlap(..))));
     }
 
     #[test]

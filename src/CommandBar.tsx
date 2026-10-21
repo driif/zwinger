@@ -56,7 +56,7 @@ export function CommandBar({
       });
     if (shield.pendingRestart)
       commands.push({ id: "restart", label: `Restart ${shield.name}`, onSelect: () => onRestart(shield.id) });
-    commands.push(action("newShell", "New shell"), action("newPi", "New pi agent"));
+    commands.push(action("newPi", "Open pi agent"), action("newShell", "New shell"));
     panes.forEach((pane, index) =>
       commands.push({
         id: `pane-${pane.key}`,
@@ -68,6 +68,7 @@ export function CommandBar({
     if (panes.length > 1) commands.push(action("next", "Next session"), action("previous", "Previous session"));
     commands.push(
       action("overview", "Overview"),
+      action("agents", "Agents"),
       action("terminal", "Terminal"),
       action("network", "Network"),
       action("settings", "Settings"),

@@ -12,12 +12,16 @@ pub enum Error {
     NotDirectory(String),
     #[error("guest path must be absolute and normalized: {0}")]
     InvalidGuestPath(String),
+    #[error("guest path is reserved for zwinger (/opt/zwinger): {0}")]
+    ReservedGuestPath(String),
     #[error("guest path overlaps /workspace: {0}")]
     WorkspaceOverlap(String),
     #[error("guest path is already mounted: {0}")]
     DuplicateMount(String),
     #[error("host folders overlap and one is writable: {0} and {1}")]
     MountOverlap(String, String),
+    #[error("{0} overlaps the zwinger data folder {1}")]
+    AppDataOverlap(String, String),
     #[error("path now resolves to a different place: {0}")]
     PathChanged(String),
     #[error("name must have 1 to 64 characters and no control characters: {0}")]
@@ -56,6 +60,16 @@ pub enum Error {
     Stopping,
     #[error("session process ended")]
     SessionClosed,
+    #[error("the shield image has Node {0}, but pi needs Node 22.19 or newer")]
+    NodeTooOld(String),
+    #[error("agent not found")]
+    AgentNotFound,
+    #[error("the agent process ended")]
+    AgentClosed,
+    #[error("chat not found")]
+    ChatNotFound,
+    #[error("pi: {0}")]
+    Agent(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

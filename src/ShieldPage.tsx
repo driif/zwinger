@@ -2,6 +2,7 @@ import { Button, ElasticTabs } from "@driif/motiv";
 import { Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
 import { listFolders, SessionKind, ShieldView } from "./api";
+import { AgentsTab } from "./AgentsTab";
 import type { Intent, Pane, Run, Tab } from "./App";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
@@ -10,6 +11,7 @@ import { TerminalTab } from "./TerminalTab";
 
 const TABS = [
   { value: "overview", label: "Overview" },
+  { value: "agents", label: "Agents" },
   { value: "terminal", label: "Terminal" },
   { value: "network", label: "Network" },
   { value: "settings", label: "Settings" },
@@ -132,6 +134,7 @@ export function ShieldPage({
               </dl>
             </div>
           ),
+          agents: <AgentsTab key={shield.id} shield={shield} onJump={onTab} />,
           terminal: (
             <TerminalTab
               shield={shield}

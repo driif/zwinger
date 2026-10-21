@@ -1,12 +1,14 @@
 use std::future::Future;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SecretBuilder};
 use microsandbox::{ExecEvent, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use crate::agent::{self, AGENT_DIR, PI_DIR, STATE_DIR};
 use crate::error::{Error, Result};
 use crate::secrets::{Secret, SecretValue};
 use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
@@ -45,15 +47,38 @@ pub struct Pty {
     pub events: UnboundedReceiver<PtyEvent>,
 }
 
+#[derive(Debug)]
+pub enum PipeInput {
+    Data(Vec<u8>),
+    /// Closes stdin.
+    Close,
+    Kill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+}
+
+/// A running process with no terminal. `Exit` is the last event.
+pub struct Pipe {
+    pub input: UnboundedSender<PipeInput>,
+    pub events: UnboundedReceiver<PipeEvent>,
+}
+
 /// The seam between the shield manager and the VM backend, so tests do not boot VMs.
 pub trait SandboxRuntime: Send + Sync + 'static {
     type Vm: Send + Sync + 'static;
 
-    /// `secrets` comes from [`secret_entries`].
+    /// `secrets` comes from [`secret_entries`]. `state` is the host dir of the
+    /// shield's pi state.
     fn start(
         &self,
         shield: &Shield,
         secrets: Vec<SecretBuilder>,
+        state: &Path,
     ) -> impl Future<Output = Result<Self::Vm>> + Send;
     fn stop(&self, vm: &Self::Vm) -> impl Future<Output = Result<()>> + Send;
     fn open_pty(
@@ -64,6 +89,8 @@ pub trait SandboxRuntime: Send + Sync + 'static {
         rows: u16,
         cols: u16,
     ) -> impl Future<Output = Result<Pty>> + Send;
+    /// Runs `argv` with stdin, stdout and stderr as pipes.
+    fn open_pipe(&self, vm: &Self::Vm, argv: &[String], cwd: &str) -> impl Future<Output = Result<Pipe>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
     fn reap(&self) -> impl Future<Output = Result<()>> + Send;
 }
@@ -130,12 +157,15 @@ pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Ve
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-pub struct Microsandbox;
+/// `pi` is the host copy of the pi bundle, from [`agent::install_pi`].
+pub struct Microsandbox {
+    pub pi: PathBuf,
+}
 
 impl SandboxRuntime for Microsandbox {
     type Vm = Sandbox;
 
-    async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>) -> Result<Sandbox> {
+    async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>, state: &Path) -> Result<Sandbox> {
         let policy = sandbox_policy(&shield.network)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", shield.id))
             .image(IMAGE)
@@ -151,7 +181,11 @@ impl SandboxRuntime for Microsandbox {
                 if mount.readonly { m.readonly() } else { m }
             });
         }
-        builder = builder.network(|n| n.policy(policy));
+        builder = builder
+            .volume(PI_DIR, |m| m.bind(&self.pi).readonly())
+            .volume(STATE_DIR, |m| m.bind(state))
+            .env("PI_CODING_AGENT_DIR", AGENT_DIR)
+            .network(|n| n.policy(policy));
         // Secrets turn on TLS interception. Node does not read the system
         // trust store, so it gets the interception CA explicitly.
         if !secrets.is_empty() {
@@ -218,13 +252,13 @@ impl SandboxRuntime for Microsandbox {
         rows: u16,
         cols: u16,
     ) -> Result<Pty> {
-        let (cmd, args): (&str, &[&str]) = match kind {
-            SessionKind::Shell => ("/bin/bash", &["-l"]),
-            SessionKind::Pi => ("npx", &["-y", "@earendil-works/pi-coding-agent"]),
+        let argv = match kind {
+            SessionKind::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
+            SessionKind::Pi => agent::pi_argv(false),
         };
         let mut handle = vm
-            .exec_stream_with(cmd, |e| {
-                e.args(args.iter().copied())
+            .exec_stream_with(&argv[0], |e| {
+                e.args(&argv[1..])
                     .cwd(cwd)
                     .env("TERM", "xterm-256color")
                     .tty(true)
@@ -273,6 +307,55 @@ impl SandboxRuntime for Microsandbox {
 
         Ok(Pty { input, events })
     }
+
+    async fn open_pipe(&self, vm: &Sandbox, argv: &[String], cwd: &str) -> Result<Pipe> {
+        let mut handle = vm
+            .exec_stream_with(&argv[0], |e| e.args(&argv[1..]).cwd(cwd).stdin_pipe())
+            .await?;
+        let sink = handle.take_stdin().ok_or(Error::AgentClosed)?;
+        let control = handle.control();
+
+        let (input, mut input_rx) = mpsc::unbounded_channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            while let Some(msg) = input_rx.recv().await {
+                // A failed write only means the process is gone; the output
+                // task reports the exit.
+                let _ = match msg {
+                    PipeInput::Data(data) => sink.write(data).await,
+                    PipeInput::Close => sink.close().await,
+                    PipeInput::Kill => control.kill().await,
+                };
+            }
+        });
+        tokio::spawn(async move {
+            let mut code = -1;
+            while let Some(event) = handle.recv().await {
+                match event {
+                    ExecEvent::Stdout(bytes) => {
+                        let _ = events_tx.send(PipeEvent::Stdout(bytes.to_vec()));
+                    }
+                    ExecEvent::Stderr(bytes) => {
+                        let _ = events_tx.send(PipeEvent::Stderr(bytes.to_vec()));
+                    }
+                    ExecEvent::Exited { code: c } => {
+                        code = c;
+                        break;
+                    }
+                    ExecEvent::Failed(failed) => {
+                        let message = format!("{}\n", failed.message);
+                        let _ = events_tx.send(PipeEvent::Stderr(message.into_bytes()));
+                        break;
+                    }
+                    ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
+                }
+            }
+            let _ = events_tx.send(PipeEvent::Exit(code));
+        });
+
+        Ok(Pipe { input, events })
+    }
 }
 
 #[cfg(test)]
@@ -298,9 +381,22 @@ pub mod fake {
         pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// The names and hosts of the secrets of the last start, never the values.
         pub secrets: Arc<Mutex<Vec<StartedSecret>>>,
+        /// What `node --version` prints. `None` prints a supported version.
+        pub node_version: Arc<Mutex<Option<String>>>,
+        /// The other ends of the pipes from `open_pipe`, except the Node
+        /// check. The test plays the process: it reads stdin, and sends output
+        /// in chunks of its choice and the exit when it wants.
+        pub pipes: Arc<Mutex<Vec<FakePipe>>>,
     }
 
-    /// Holds `open_pty` or `start` after it signals `entered`, until the test
+    pub struct FakePipe {
+        pub argv: Vec<String>,
+        pub cwd: String,
+        pub stdin: UnboundedReceiver<PipeInput>,
+        pub out: UnboundedSender<PipeEvent>,
+    }
+
+    /// Holds `open_pty`, `open_pipe` or `start` after it signals `entered`, until the test
     /// signals `release`.
     #[derive(Default)]
     pub struct PtyGate {
@@ -315,7 +411,7 @@ pub mod fake {
     impl SandboxRuntime for FakeRuntime {
         type Vm = FakeVm;
 
-        async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>) -> Result<FakeVm> {
+        async fn start(&self, shield: &Shield, secrets: Vec<SecretBuilder>, _: &Path) -> Result<FakeVm> {
             let gate = self.start_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
@@ -382,6 +478,30 @@ pub mod fake {
                 }
             });
             Ok(Pty { input, events })
+        }
+
+        async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str) -> Result<Pipe> {
+            let (input, stdin) = mpsc::unbounded_channel();
+            let (out, events) = mpsc::unbounded_channel();
+            if argv == ["node", "--version"] {
+                let version = self.node_version.lock().unwrap().clone();
+                let version = version.unwrap_or_else(|| "v22.19.0\n".into());
+                let _ = out.send(PipeEvent::Stdout(version.into_bytes()));
+                let _ = out.send(PipeEvent::Exit(0));
+                return Ok(Pipe { input, events });
+            }
+            let gate = self.pty_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            self.pipes.lock().unwrap().push(FakePipe {
+                argv: argv.to_vec(),
+                cwd: cwd.to_owned(),
+                stdin,
+                out,
+            });
+            Ok(Pipe { input, events })
         }
     }
 }

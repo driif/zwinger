@@ -1,0 +1,17 @@
+2026-10-21T10:48:31.347602+00:00 DEBUG microsandbox_network::engine::tls::state: loaded persisted CA from "/Users/driif/.microsandbox/tls/ca.crt"
+2026-10-21T10:48:31.441949+00:00 WARN microsandbox_network::engine::dns::nameserver::scdynamicstore: skipping SCDynamicStore nameserver entry that isn't a parseable IP address=fe80::1%en0
+2026-10-21T10:48:31.762442+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("example.com."), query_type: AAAA, query_class: IN }]
+2026-10-21T10:48:31.771300+00:00 DEBUG microsandbox_network::engine::dns::forwarder: DNS query denied by network policy domain=google.com
+2026-10-21T10:48:31.771365+00:00 DEBUG microsandbox_network::engine::dns::forwarder: DNS query denied by network policy domain=google.com
+2026-10-21T10:48:31.859587+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("example.com."), query_type: AAAA, query_class: IN }]
+2026-10-21T10:48:31.859587+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("example.com."), query_type: A, query_class: IN }]
+2026-10-21T10:48:31.934484+00:00 DEBUG microsandbox_network::engine::tls::proxy: TLS intercept sni=example.com dst=104.20.23.154:443 guest_dst=104.20.23.154:443
+2026-10-21T10:48:32.223073+00:00 DEBUG microsandbox_network::engine::tls::proxy: TLS proxy task ended dst=104.20.23.154:443 guest_dst=104.20.23.154:443 error=peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+2026-10-21T10:48:32.252400+00:00 DEBUG microsandbox_network::engine::dns::forwarder: DNS query denied by network policy domain=google.com
+2026-10-21T10:48:32.252402+00:00 DEBUG microsandbox_network::engine::dns::forwarder: DNS query denied by network policy domain=google.com
+2026-10-21T10:48:32.304733+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("httpbin.org."), query_type: AAAA, query_class: IN }]
+2026-10-21T10:48:32.304733+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("httpbin.org."), query_type: A, query_class: IN }]
+2026-10-21T10:48:32.334447+00:00 DEBUG microsandbox_network::engine::tls::proxy: TLS intercept sni=httpbin.org dst=100.56.179.159:443 guest_dst=100.56.179.159:443
+2026-10-21T10:48:33.106009+00:00 DEBUG microsandbox_network::engine::tls::proxy: TLS proxy task ended dst=100.56.179.159:443 guest_dst=100.56.179.159:443 error=peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+2026-10-21T10:48:33.109582+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("example.com."), query_type: AAAA, query_class: IN }]
+2026-10-21T10:48:33.109582+00:00 DEBUG hickory_net::xfer: enqueueing message:QUERY:[Query { name: Name("example.com."), query_type: A, query_class: IN }]

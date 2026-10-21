@@ -1,6 +1,9 @@
 use tauri::State;
 use tauri::ipc::Channel;
 
+use serde_json::Value;
+
+use crate::agent::{AgentCommand, Chat};
 use crate::error::Result;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::secrets::{Secret, SecretValue};
@@ -142,4 +145,33 @@ pub fn resize_session(shields: Shields<'_>, id: String, rows: u16, cols: u16) ->
 #[tauri::command]
 pub fn close_session(shields: Shields<'_>, id: String) -> Result<()> {
     shields.close_session(&id)
+}
+
+#[tauri::command]
+pub async fn open_agent(shields: Shields<'_>, shield_id: String, on_event: Channel<Value>) -> Result<String> {
+    shields
+        .open_agent(
+            &shield_id,
+            Box::new(move |record| {
+                // The webview may have closed the channel; the agent keeps running.
+                let _ = on_event.send(record);
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn agent_call(shields: Shields<'_>, id: String, command: AgentCommand) -> Result<Value> {
+    shields.agent_call(&id, command).await
+}
+
+#[tauri::command]
+pub async fn close_agent(shields: Shields<'_>, id: String) -> Result<()> {
+    shields.close_agent(&id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_chats(shields: Shields<'_>, shield_id: String) -> Result<Vec<Chat>> {
+    shields.list_chats(&shield_id)
 }

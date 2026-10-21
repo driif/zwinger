@@ -1,3 +1,4 @@
+mod agent;
 mod commands;
 mod error;
 mod runtime;
@@ -69,20 +70,25 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .menu(menu)
         .setup(|app| {
+            let data = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data)?;
+            // Canonical, like the host paths of the shields it is compared with.
+            let data = data.canonicalize()?;
+            let pi = agent::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
+            let runtime = Microsandbox { pi };
             // VMs from an earlier run that did not exit cleanly. The manager
             // starts with no VMs, so every shield shows as stopped.
             // The timer must be made inside the runtime, so it is in the future.
             let reaped = tauri::async_runtime::block_on(async {
-                tokio::time::timeout(REAP_LIMIT, Microsandbox.reap()).await
+                tokio::time::timeout(REAP_LIMIT, runtime.reap()).await
             });
             match reaped {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("reap failed: {e}"),
                 Err(_) => eprintln!("reap timed out"),
             }
-            let path = app.path().app_data_dir()?.join("shields.json");
-            let manager =
-                sessions::Manager::new(Microsandbox, store::Store::new(path), Arc::new(secrets::Keychain))?;
+            let store = store::Store::new(data.join("shields.json"));
+            let manager = sessions::Manager::new(runtime, store, Arc::new(secrets::Keychain), data)?;
             app.manage(manager);
             Ok(())
         })
@@ -108,6 +114,10 @@ pub fn run() {
             commands::write_session,
             commands::resize_session,
             commands::close_session,
+            commands::open_agent,
+            commands::agent_call,
+            commands::close_agent,
+            commands::list_chats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

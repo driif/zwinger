@@ -9,9 +9,10 @@ export const SHORTCUTS = [
   { key: "]", label: "⌘]", action: "next" },
   { key: "[", label: "⌘[", action: "previous" },
   { key: "1", label: "⌘1", action: "overview" },
-  { key: "2", label: "⌘2", action: "terminal" },
-  { key: "3", label: "⌘3", action: "network" },
-  { key: "4", label: "⌘4", action: "settings" },
+  { key: "2", label: "⌘2", action: "agents" },
+  { key: "3", label: "⌘3", action: "terminal" },
+  { key: "4", label: "⌘4", action: "network" },
+  { key: "5", label: "⌘5", action: "settings" },
 ] as const;
 
 export type ShortcutAction = (typeof SHORTCUTS)[number]["action"];

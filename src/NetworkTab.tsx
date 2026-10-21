@@ -5,9 +5,8 @@ import { addDomain, NetworkMode, removeDomain, setNetworkMode, ShieldView } from
 import type { Intent, Run } from "./App";
 import { SecretsSection } from "./SecretsSection";
 
-const NPM_REGISTRY = "registry.npmjs.org";
 const PROVIDERS = ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"];
-const PRESETS = [NPM_REGISTRY, ...PROVIDERS];
+const PRESETS = [...PROVIDERS, "registry.npmjs.org"];
 
 /** The groups that `sandbox_policy` in the backend denies in every mode. */
 const ALWAYS_BLOCKED = [
@@ -46,7 +45,7 @@ export function NetworkTab({ shield, run, intent, onIntentDone }: Props) {
   const focusDomain = useRef(false);
   const presetPending = useRef(false);
   const presets = network.domains.filter((d) => PRESETS.includes(d));
-  const piReady = network.domains.includes(NPM_REGISTRY) && PROVIDERS.some((d) => network.domains.includes(d));
+  const piReady = PROVIDERS.some((d) => network.domains.includes(d));
 
   useEffect(() => {
     if (intent?.kind !== "allowList") return;
@@ -153,7 +152,7 @@ export function NetworkTab({ shield, run, intent, onIntentDone }: Props) {
                 value={presets}
                 onChange={setPresets}
               />
-              {!piReady && <p className="muted">pi needs {NPM_REGISTRY} and the API host of your LLM provider.</p>}
+              {!piReady && <p className="muted">pi needs the API host of your LLM provider.</p>}
             </>
           )}
         </CardBody>

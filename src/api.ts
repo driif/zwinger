@@ -122,3 +122,36 @@ export const resizeSession = (id: string, rows: number, cols: number) =>
   invoke<void>("resize_session", { id, rows, cols });
 
 export const closeSession = (id: string) => invoke<void>("close_session", { id });
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The pi RPC commands that the backend accepts. It builds the JSON for pi from these fields. */
+export type AgentCommand =
+  | { type: "prompt" | "steer" | "follow_up"; message: string }
+  | { type: "abort" | "get_state" | "get_messages" | "get_available_models" | "new_session" | "get_session_stats" }
+  | { type: "set_model"; provider: string; modelId: string }
+  | { type: "set_thinking_level"; level: ThinkingLevel }
+  | { type: "switch_session"; chat: string };
+
+/** A pi chat file of a shield. `id` is the file name. */
+export interface Chat {
+  id: string;
+  started: string;
+  title: string;
+}
+
+/** A pi stdout record, passed through as is, or the backend's `agent_exit`. */
+export type AgentRecord = { type: string } & Record<string, unknown>;
+
+/** Opens the shield's agent, or takes over the running one. */
+export function openAgent(shieldId: string, onEvent: (record: AgentRecord) => void) {
+  const channel = new Channel<AgentRecord>(onEvent);
+  return invoke<string>("open_agent", { shieldId, onEvent: channel });
+}
+
+/** Resolves to the `data` of pi's response. */
+export const agentCall = <T>(id: string, command: AgentCommand) => invoke<T>("agent_call", { id, command });
+
+export const closeAgent = (id: string) => invoke<void>("close_agent", { id });
+
+export const listChats = (shieldId: string) => invoke<Chat[]>("list_chats", { shieldId });

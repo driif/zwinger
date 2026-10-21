@@ -9,7 +9,7 @@ import { ShieldRail } from "./ShieldRail";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
 
-export type Tab = "overview" | "terminal" | "network" | "settings";
+export type Tab = "overview" | "agents" | "terminal" | "network" | "settings";
 
 export interface Pane {
   key: string;
@@ -29,7 +29,7 @@ export interface Intent {
 export default function App() {
   const [shields, setShields] = useState<ShieldView[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>("agents");
   const [panes, setPanes] = useState<Pane[]>([]);
   const [activePanes, setActivePanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
@@ -120,11 +120,16 @@ export default function App() {
     commands: () => commandBar.current?.querySelector("button")?.click(),
     newShield: () => run(newShield),
     newShell: () => run(() => newSession("shell")),
-    newPi: () => run(() => newSession("pi")),
+    newPi: () =>
+      run(async () => {
+        setTab("agents");
+        if (shield && shield.status.state !== "running") await startShield(shield.id);
+      }),
     close: () => activePane && closePane(activePane),
     next: () => cycle(1),
     previous: () => cycle(-1),
     overview: () => setTab("overview"),
+    agents: () => setTab("agents"),
     terminal: () => setTab("terminal"),
     network: () => setTab("network"),
     settings: () => setTab("settings"),

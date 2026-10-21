@@ -397,3 +397,118 @@ p {
 .command-bar {
   max-width: none;
 }
+
+.agents {
+  height: 100%;
+  display: grid;
+  grid-template-columns: 14rem minmax(0, 1fr);
+  gap: calc(var(--motiv-space) * 4);
+}
+
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 2);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.chat-item {
+  width: 100%;
+}
+
+.chat {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 2);
+}
+
+.chat-header {
+  flex-wrap: wrap;
+}
+
+.model-picker {
+  max-width: 18rem;
+}
+
+.chat-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 3);
+}
+
+.msg {
+  display: grid;
+  gap: calc(var(--motiv-space) * 2);
+  max-width: 48rem;
+  line-height: 1.5;
+}
+
+.msg.user {
+  align-self: flex-end;
+  padding: calc(var(--motiv-space) * 2) calc(var(--motiv-space) * 3);
+  border-radius: var(--motiv-radius-md);
+  background: var(--motiv-color-primary-subtle);
+}
+
+.tool-output {
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 0.75rem;
+}
+
+.md {
+  display: grid;
+  gap: calc(var(--motiv-space) * 2);
+  overflow-wrap: anywhere;
+}
+
+.md ul,
+.md ol,
+.md blockquote {
+  margin: 0;
+}
+
+.md blockquote {
+  padding-left: calc(var(--motiv-space) * 3);
+  border-left: 2px solid var(--motiv-color-border);
+  color: var(--motiv-color-text-muted);
+}
+
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.md-code {
+  margin: 0;
+  padding: calc(var(--motiv-space) * 2) calc(var(--motiv-space) * 3);
+  border-radius: var(--motiv-radius-md);
+  background: var(--motiv-color-surface);
+  overflow-x: auto;
+}
+
+.md-heading {
+  font-weight: 600;
+}
+
+.md-heading.h1,
+.md-heading.h2 {
+  font-size: 1rem;
+}
+
+.md a {
+  color: var(--motiv-color-primary);
+}
+
+.composer {
+  display: grid;
+  gap: calc(var(--motiv-space) * 2);
+  padding-bottom: calc(var(--motiv-space) * 2);
+}

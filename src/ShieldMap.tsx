@@ -1,4 +1,4 @@
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Network, Shield } from "lucide-react";
+import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Network, Package, Shield } from "lucide-react";
 import { KeyboardEvent, ReactNode } from "react";
 import { ShieldView } from "./api";
 import type { Tab } from "./App";
@@ -205,6 +205,21 @@ export function ShieldMap({ shield, folders, onJump }: Props) {
     );
     lines.push(<Line key={mount.guest} from={[HOST_X + HOST_W, center(y)]} to={[NODE_X, center(y)]} />);
   }
+  // Not a user mount: zwinger binds its own copy of pi, and the agent cannot change it.
+  y += GAP + ROW;
+  inside.push(
+    <Node
+      key="runtime"
+      x={NODE_X}
+      y={y}
+      width={NODE_W}
+      icon={Package}
+      label="agent runtime"
+      title="/opt/zwinger/pi, the pi bundled with zwinger, read-only"
+      tone="muted"
+      badges={["ro"]}
+    />,
+  );
   const boxBottom = y + H + 20;
 
   const secretHosts = [...new Set(shield.secrets.flatMap((s) => s.hosts))];
