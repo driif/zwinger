@@ -30,6 +30,15 @@ pub enum SessionKind {
     Pi,
 }
 
+impl SessionKind {
+    pub fn argv(self) -> Vec<String> {
+        match self {
+            Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
+            Self::Pi => agent::pi_argv(false),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PtyInput {
     Data(Vec<u8>),
@@ -88,7 +97,7 @@ pub trait SandboxRuntime: Send + Sync + 'static {
     fn open_pty(
         &self,
         vm: &Self::Vm,
-        kind: SessionKind,
+        argv: &[String],
         cwd: &str,
         rows: u16,
         cols: u16,
@@ -260,18 +269,7 @@ impl SandboxRuntime for Microsandbox {
         Ok(netlog::tail(path).await?)
     }
 
-    async fn open_pty(
-        &self,
-        vm: &Sandbox,
-        kind: SessionKind,
-        cwd: &str,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Pty> {
-        let argv = match kind {
-            SessionKind::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
-            SessionKind::Pi => agent::pi_argv(false),
-        };
+    async fn open_pty(&self, vm: &Sandbox, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
         let mut handle = vm
             .exec_stream_with(&argv[0], |e| {
                 e.args(&argv[1..])
@@ -395,7 +393,10 @@ pub mod fake {
         pub fail_stop: Arc<Mutex<bool>>,
         pub pty_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         pub cwds: Arc<Mutex<Vec<String>>>,
+        pub argvs: Arc<Mutex<Vec<Vec<String>>>>,
         pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
+        /// Holds the exit of a killed PTY process.
+        pub kill_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// The names and hosts of the secrets of the last start, never the values.
         pub secrets: Arc<Mutex<Vec<StartedSecret>>>,
         /// What `node --version` prints. `None` prints a supported version.
@@ -418,7 +419,7 @@ pub mod fake {
         pub out: Sender<PipeEvent>,
     }
 
-    /// Holds `open_pty`, `open_pipe` or `start` after it signals `entered`, until the test
+    /// Holds `open_pty`, `open_pipe`, `start` or a PTY kill after it signals `entered`, until the test
     /// signals `release`.
     #[derive(Default)]
     pub struct PtyGate {
@@ -474,21 +475,16 @@ pub mod fake {
             Ok(rx)
         }
 
-        async fn open_pty(
-            &self,
-            _: &FakeVm,
-            _: SessionKind,
-            cwd: &str,
-            rows: u16,
-            cols: u16,
-        ) -> Result<Pty> {
+        async fn open_pty(&self, _: &FakeVm, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
             self.cwds.lock().unwrap().push(cwd.to_owned());
+            self.argvs.lock().unwrap().push(argv.to_vec());
             let gate = self.pty_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
             let log = self.log.clone();
+            let kill_gate = self.kill_gate.clone();
             let (input, mut input_rx) = mpsc::unbounded_channel();
             let (tx, events) = mpsc::unbounded_channel();
             let _ = tx.send(PtyEvent::Output(format!("{rows}x{cols}").into_bytes()));
@@ -503,6 +499,11 @@ pub mod fake {
                         }
                         PtyInput::Kill => {
                             log.lock().unwrap().push("kill".into());
+                            let gate = kill_gate.lock().unwrap().clone();
+                            if let Some(gate) = gate {
+                                gate.entered.notify_one();
+                                gate.release.notified().await;
+                            }
                             let _ = tx.send(PtyEvent::Exit(137));
                             return;
                         }

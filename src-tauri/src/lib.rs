@@ -104,6 +104,17 @@ pub fn run() {
             commands::create_shield,
             commands::delete_shield,
             commands::rename_shield,
+            commands::reorder_shields,
+            commands::set_layout,
+            commands::put_app,
+            commands::remove_app,
+            commands::reorder_apps,
+            commands::start_app,
+            commands::stop_app,
+            commands::restart_app,
+            commands::attach_app,
+            commands::detach_app,
+            commands::resolve_folder,
             commands::set_harness,
             commands::list_folders,
             commands::add_mount,
@@ -128,6 +139,7 @@ pub fn run() {
             commands::agent_call,
             commands::close_agent,
             commands::list_chats,
+            commands::delete_chat,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

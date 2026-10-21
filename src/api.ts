@@ -51,6 +51,28 @@ export interface SessionView {
   exitCode: number | null;
 }
 
+export interface Pos {
+  x: number;
+  y: number;
+}
+
+/** A saved, named, long-running command of a shield. */
+export interface App {
+  id: string;
+  name: string;
+  command: string;
+  /** The guest folder where the command starts. */
+  cwd: string;
+  autostart: boolean;
+}
+
+/** An app that runs or has exited. An app with no run is stopped. */
+export interface AppRun {
+  appId: string;
+  sessionId: string;
+  exitCode: number | null;
+}
+
 export interface ShieldView {
   id: string;
   name: string;
@@ -59,9 +81,13 @@ export interface ShieldView {
   network: NetworkPolicy;
   harness: string | null;
   secrets: Secret[];
+  /** The map positions that the user dragged, by node id. */
+  layout: Record<string, Pos>;
+  apps: App[];
   status: ShieldStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
+  appRuns: AppRun[];
 }
 
 export type PtyEvent = { event: "output"; data: number[] } | { event: "exit"; data: number };
@@ -71,6 +97,38 @@ export const listShields = () => invoke<ShieldView[]>("list_shields");
 export const createShield = (folder: string) => invoke<string>("create_shield", { folder });
 
 export const deleteShield = (id: string) => invoke<void>("delete_shield", { id });
+
+/** `ids` must name each shield once. */
+export const reorderShields = (ids: string[]) => invoke<void>("reorder_shields", { ids });
+
+/** `null` restores the auto layout. */
+export const setLayout = (id: string, layout: Record<string, Pos> | null) => invoke<void>("set_layout", { id, layout });
+
+/** No `id` adds a new app. Resolves to the app id. */
+export const putApp = (id: string, app: Omit<App, "id"> & { id?: string }) => invoke<string>("put_app", { id, app });
+
+/** Also stops the app. */
+export const removeApp = (id: string, appId: string) => invoke<void>("remove_app", { id, appId });
+
+export const reorderApps = (id: string, appIds: string[]) => invoke<void>("reorder_apps", { id, appIds });
+
+/** Resolves to the session id of the run. */
+export const startApp = (id: string, appId: string) => invoke<string>("start_app", { id, appId });
+
+export const stopApp = (id: string, appId: string) => invoke<void>("stop_app", { id, appId });
+
+export const restartApp = (id: string, appId: string) => invoke<string>("restart_app", { id, appId });
+
+/** Sends the kept output of the run, then new output. A later attach takes over. Resolves to the token for `detachApp`. */
+export function attachApp(sessionId: string, onEvent: (event: PtyEvent) => void) {
+  return invoke<number>("attach_app", { sessionId, onEvent: new Channel<PtyEvent>(onEvent) });
+}
+
+/** Stops the output to the attach of `token`. A later attach keeps its output. */
+export const detachApp = (sessionId: string, token: number) => invoke<void>("detach_app", { sessionId, token });
+
+/** The canonical folder of a host path: a link resolves to its target. */
+export const resolveFolder = (path: string) => invoke<string>("resolve_folder", { path });
 
 export const renameShield = (id: string, name: string) => invoke<void>("rename_shield", { id, name });
 
@@ -158,7 +216,8 @@ export type AgentCommand =
   | { type: "abort" | "get_state" | "get_messages" | "get_available_models" | "new_session" | "get_session_stats" }
   | { type: "set_model"; provider: string; modelId: string }
   | { type: "set_thinking_level"; level: ThinkingLevel }
-  | { type: "switch_session"; chat: string };
+  | { type: "switch_session"; chat: string }
+  | { type: "set_session_name"; name: string };
 
 /** A pi chat file of a shield. `id` is the file name. */
 export interface Chat {
@@ -182,3 +241,6 @@ export const agentCall = <T>(id: string, command: AgentCommand) => invoke<T>("ag
 export const closeAgent = (id: string) => invoke<void>("close_agent", { id });
 
 export const listChats = (shieldId: string) => invoke<Chat[]>("list_chats", { shieldId });
+
+/** Only a listed chat; a link or another file is refused. */
+export const deleteChat = (shieldId: string, chat: string) => invoke<void>("delete_chat", { shieldId, chat });

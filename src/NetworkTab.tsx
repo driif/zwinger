@@ -37,15 +37,22 @@ interface Props {
   run: Run;
   intent?: Intent;
   onIntentDone: () => void;
+  /** The tab is the one on screen. Hidden tabs stay mounted and still intersect. */
+  active: boolean;
+  /** Gets the last `seq` while the Activity section is in view. */
+  onSeen: (seq: number) => void;
 }
 
-export function NetworkTab({ shield, events, run, intent, onIntentDone }: Props) {
+export function NetworkTab({ shield, events, run, intent, onIntentDone, active, onSeen }: Props) {
   const { id, network } = shield;
   const [domain, setDomain] = useState("");
   const [problem, setProblem] = useState<string>();
   const domainField = useRef<HTMLInputElement>(null);
   const focusDomain = useRef(false);
   const presetPending = useRef(false);
+  const activity = useRef<HTMLDivElement>(null);
+  const [activityVisible, setActivityVisible] = useState(false);
+  const latestSeq = events[events.length - 1]?.seq ?? 0;
   const presets = network.domains.filter((d) => PRESETS.includes(d));
   const piReady = PROVIDERS.some((d) => network.domains.includes(d));
 
@@ -55,6 +62,16 @@ export function NetworkTab({ shield, events, run, intent, onIntentDone }: Props)
     focusDomain.current = true;
     if (network.mode !== "list") run(() => setNetworkMode(id, "list"));
   }, [intent]);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(([entry]) => setActivityVisible(entry.isIntersecting));
+    observer.observe(activity.current!);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (active && activityVisible) onSeen(latestSeq);
+  }, [active, activityVisible, latestSeq]);
 
   // The domain field exists only in List mode, so the focus waits for it.
   useEffect(() => {
@@ -159,7 +176,9 @@ export function NetworkTab({ shield, events, run, intent, onIntentDone }: Props)
           )}
         </CardBody>
       </Card>
-      <NetworkActivity shield={shield} events={events} run={run} />
+      <div ref={activity}>
+        <NetworkActivity shield={shield} events={events} run={run} />
+      </div>
       <SecretsSection shield={shield} run={run} />
       <Card variant="subtle" padding="md">
         <CardHeader title="Always blocked" titleAs="h2" description="Every mode blocks these groups. You cannot change this." />

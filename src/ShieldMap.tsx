@@ -1,29 +1,28 @@
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Network, Package, Shield } from "lucide-react";
-import { KeyboardEvent, ReactNode, useEffect, useState } from "react";
-import { isBlocked, NetEvent, ShieldView } from "./api";
-import type { Tab } from "./App";
-import { coveredBy, reachable } from "./SecretsSection";
+import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import {
+  Background,
+  BackgroundVariant,
+  Handle,
+  Node,
+  NodeProps,
+  NodeTypes,
+  Panel,
+  Position,
+  ReactFlow,
+  ReactFlowProvider,
+  useNodesState,
+  useReactFlow,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { Maximize, Minus, Network, Plus, Shield } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { NetEvent, Pos, setLayout, ShieldView } from "./api";
+import type { Run } from "./App";
+import { BoundaryData, ItemData, Jump, MapNode, mapLayout } from "./mapLayout";
 
-const WIDTH = 900;
-const HOST_X = 16;
-const HOST_W = 230;
-const BOX_X = 300;
-const BOX_W = 300;
-const NODE_X = 320;
-const NODE_W = 260;
-const FOLDER_X = 344;
-const FOLDER_W = 236;
-const NET_X = 660;
-const NET_W = 224;
-const TOP = 72;
-const ROW = 36;
-const GAP = 12;
-const H = 28;
-const CAP = 6;
 const CHAR = 7.2;
-const ACTIVE_MS = 10_000;
 const BLOCKED_MS = 60_000;
-const BLOCKED_CAP = 5;
 
 /** Keeps the end of a path, which is the part that tells folders apart. */
 function fit(text: string, width: number) {
@@ -31,82 +30,92 @@ function fit(text: string, width: number) {
   return text.length > max ? `…${text.slice(-(max - 1))}` : text;
 }
 
-const under = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
-
-interface NodeProps {
-  x: number;
-  y: number;
-  width: number;
-  icon: LucideIcon;
-  label: string;
-  title?: string;
-  tone?: "warn" | "blocked" | "denied" | "harness" | "muted";
-  badges?: string[];
-  /** Shows a dot for recent traffic. */
-  active?: boolean;
-  onJump?: () => void;
-}
-
-function Node({ x, y, width, icon: Icon, label, title, tone, badges = [], active, onJump }: NodeProps) {
-  const textWidth = width - 36 - badges.length * 56;
-  const button = onJump && {
-    role: "button",
-    tabIndex: 0,
-    "aria-label": title ?? label,
-    onClick: onJump,
-    onKeyDown: (event: KeyboardEvent) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      onJump();
-    },
-  };
+function ItemNode({ data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
+  const { icon: Icon } = data;
   return (
-    <g className={`map-node ${tone ?? ""}`} {...button}>
-      <title>{title ?? label}</title>
-      <rect x={x} y={y} width={width} height={H} rx={6} />
-      <Icon x={x + 8} y={y + 7} size={14} />
-      <text x={x + 28} y={y + 18}>
-        {fit(label, textWidth)}
-      </text>
-      {badges.map((badge, i) => {
-        const bx = x + width - 56 * (i + 1);
-        return (
-          <g key={badge} className={`map-badge ${badge}`}>
-            <rect x={bx} y={y + 6} width={50} height={16} rx={8} />
-            <text x={bx + 25} y={y + 18} textAnchor="middle">
-              {badge}
-            </text>
-          </g>
-        );
-      })}
-      {active && <circle className="map-activity" cx={x + width - 8} cy={y + 8} r={3} />}
-    </g>
+    <div className={`map-node ${data.tone ?? ""}`} title={data.title}>
+      <Handle type="target" position={Position.Left} isConnectable={false} />
+      <Icon size={14} />
+      <span className="map-label">{fit(data.label, width - 36 - data.badges.length * 44)}</span>
+      {data.badges.map((badge) => (
+        <span key={badge} className={`map-badge ${badge}`}>
+          {badge}
+        </span>
+      ))}
+      {data.active && <span className="map-activity" aria-label="recent traffic" />}
+      <Handle type="source" position={Position.Right} isConnectable={false} />
+    </div>
   );
 }
 
-function Line({ from, to, blocked }: { from: [number, number]; to: [number, number]; blocked?: boolean }) {
-  const mid = (from[0] + to[0]) / 2;
+function BoundaryNode({ data }: NodeProps<Node<BoundaryData, "boundary">>) {
   return (
-    <path
-      className={blocked ? "map-line blocked" : "map-line"}
-      d={`M${from[0]} ${from[1]} C${mid} ${from[1]} ${mid} ${to[1]} ${to[0]} ${to[1]}`}
-    />
+    <div className={`map-boundary ${data.state}`}>
+      <div className="map-boundary-header">
+        <Shield size={18} />
+        <span className="map-title">{data.name}</span>
+        <span className="map-state">microVM · {data.state}</span>
+      </div>
+      <Handle type="source" position={Position.Right} isConnectable={false} className="map-gateway">
+        <Network size={14} />
+      </Handle>
+    </div>
   );
 }
+
+const nodeTypes: NodeTypes = {
+  item: ItemNode,
+  boundary: BoundaryNode,
+  caption: ({ data }: NodeProps<Node<{ label: string }>>) => <span className="map-caption">{data.label}</span>,
+};
+
+function MapControls() {
+  const { zoomIn, zoomOut, fitView } = useReactFlow();
+  return (
+    <IconButtonGroup label="Map view">
+      <IconButton icon={<Plus size={14} />} label="Zoom in" onClick={() => zoomIn()} />
+      <IconButton icon={<Minus size={14} />} label="Zoom out" onClick={() => zoomOut()} />
+      <IconButton icon={<Maximize size={14} />} label="Fit view" onClick={() => fitView()} />
+    </IconButtonGroup>
+  );
+}
+
+/** Arrays, such as the badges, are equal when their items are. */
+const sameData = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+  Object.keys({ ...a, ...b }).every(
+    (key) => a[key] === b[key] || (Array.isArray(a[key]) && Array.isArray(b[key]) && `${a[key]}` === `${b[key]}`),
+  );
 
 interface Props {
   shield: ShieldView;
-  folders: string[];
+  /** `undefined` until the folders of this shield are listed. */
+  folders?: string[];
   /** The shield's network events, oldest first. */
   events: NetEvent[];
-  onJump: (tab: Tab) => void;
+  visible: boolean;
+  run: Run;
+  onJump: (tab: Jump) => void;
+  /** A folder from Finder was dropped on the shield boundary. */
+  onDropFolder: (path: string) => void;
 }
 
-/** Host paths on the left, the microVM in the middle, egress on the right. */
-export function ShieldMap({ shield, folders, events, onJump }: Props) {
-  const { harness, network, status } = shield;
+/** Host paths on the left, the microVM in the middle, egress on the right. The user can drag the nodes. */
+export function ShieldMap(props: Props) {
+  return (
+    <ReactFlowProvider>
+      <MapCanvas {...props} />
+    </ReactFlowProvider>
+  );
+}
+
+function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder }: Props) {
+  const { fitView, getNode, screenToFlowPosition } = useReactFlow<MapNode>();
+  const container = useRef<HTMLDivElement>(null);
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
+  // The layout that the last save sent, until the shield list has it.
+  const [saved, setSaved] = useState<{ base: Record<string, Pos>; layout: Record<string, Pos> }>();
+  const layout = saved?.base === shield.layout ? saved.layout : shield.layout;
 
   // Ticks while an event is recent, so the activity dots and blocked hosts expire.
   useEffect(() => {
@@ -120,316 +129,116 @@ export function ShieldMap({ shield, folders, events, onJump }: Props) {
     return () => clearInterval(timer);
   }, [latest]);
 
-  const recent = (event: NetEvent, ms: number) => now - event.at < ms;
-  const active = (domain: string) =>
-    events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS) && coveredBy(domain, [e.host]));
-  const blockedHosts = [
-    ...new Set(
-      events
-        .filter((e) => isBlocked(e) && recent(e, BLOCKED_MS))
-        .reverse()
-        .map((e) => e.host),
-    ),
-  ].slice(0, BLOCKED_CAP);
-  const toSettings = () => onJump("settings");
-  const toNetwork = () => onJump("network");
-  const center = (y: number) => y + H / 2;
-
-  const allFolderPaths = folders.map((f) => `/workspace/${f}`);
-  const guests = shield.mounts.map((m) => m.guest);
-  // The deepest mount wins, as in the backend; mounts are never below /workspace.
-  const harnessAt =
-    harness === null
-      ? undefined
-      : (guests.filter((g) => under(harness, g)).sort((a, b) => b.length - a.length)[0] ??
-        allFolderPaths.find((p) => under(harness, p)));
-  const more = (paths: string[], noun: string) =>
-    `+${paths.length - CAP} more${noun}${harnessAt && paths.slice(CAP).includes(harnessAt) ? ", 1 with harness" : ""}`;
-  const folderPaths = allFolderPaths.slice(0, CAP);
-  const mounts = shield.mounts;
-  const harnessBadge = (path: string) => (path === harnessAt ? ["harness"] : []);
-
-  const inside: ReactNode[] = [];
-  const outside: ReactNode[] = [];
-  const lines: ReactNode[] = [];
-  let y = TOP;
-
-  inside.push(
-    <Node
-      key="workspace"
-      x={NODE_X}
-      y={y}
-      width={NODE_W}
-      icon={FolderOpen}
-      label="/workspace"
-      badges={["rw"]}
-      onJump={toSettings}
-    />,
+  const map = useMemo(
+    () => mapLayout({ ...shield, layout }, folders ?? [], events, now),
+    [shield, layout, folders, events, now],
   );
-  outside.push(
-    <Node key="folder" x={HOST_X} y={y} width={HOST_W} icon={FolderOpen} label={shield.folder} onJump={toSettings} />,
-  );
-  lines.push(<Line key="folder" from={[HOST_X + HOST_W, center(y)]} to={[NODE_X, center(y)]} />);
+  const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 
-  for (const path of folderPaths) {
-    y += ROW;
-    inside.push(
-      <Node
-        key={path}
-        x={FOLDER_X}
-        y={y}
-        width={FOLDER_W}
-        icon={path === harnessAt ? Bot : Folder}
-        label={path.slice("/workspace/".length)}
-        title={path === harnessAt ? `${path}, harness ${harness}` : path}
-        tone={path === harnessAt ? "harness" : "muted"}
-        badges={harnessBadge(path)}
-        onJump={toSettings}
-      />,
-    );
-  }
-  if (folders.length > CAP) {
-    y += ROW;
-    inside.push(
-      <text key="folders-more" className="map-more" x={FOLDER_X + 8} y={y + 18}>
-        {more(allFolderPaths, "")}
-      </text>,
-    );
+  // Keeps the current node objects, with their measured size, unless something
+  // that they show changed. A dragged node stays where the user holds it.
+  useEffect(() => {
+    setNodes((current) => {
+      const byId = new Map(current.map((n) => [n.id, n]));
+      return map.nodes.map((next) => {
+        const node = byId.get(next.id);
+        if (!node || node.type !== next.type) return next;
+        if (node.dragging) return node;
+        const same =
+          node.position.x === next.position.x &&
+          node.position.y === next.position.y &&
+          node.width === next.width &&
+          node.height === next.height &&
+          sameData(node.data, next.data);
+        if (same) return node;
+        const { position, width, height, ariaLabel, data } = next;
+        return { ...node, position, width, height, ariaLabel, data } as MapNode;
+      });
+    });
+  }, [map]);
+
+  function save(next: Record<string, Pos> | null) {
+    setSaved({ base: shield.layout, layout: next ?? {} });
+    run(() => setLayout(shield.id, next));
   }
 
-  // A hidden folder, a folder past the listing limit, or folders that are still loading.
-  if (harness !== null && harnessAt === undefined) {
-    y += ROW;
-    inside.push(
-      <Node
-        key="harness"
-        x={FOLDER_X}
-        y={y}
-        width={FOLDER_W}
-        icon={Bot}
-        label={harness.slice("/workspace/".length)}
-        title={`harness ${harness}`}
-        tone="harness"
-        badges={["harness"]}
-        onJump={toSettings}
-      />,
-    );
-  }
+  // Positions of nodes that no longer exist are dropped. Folder nodes are
+  // unknown until the folders are listed, so their positions stay until then.
+  useEffect(() => {
+    const ids = new Set(map.nodes.map((n) => n.id));
+    const keep = (id: string) => ids.has(id) || (folders === undefined && id.startsWith("folder:"));
+    if (Object.keys(layout).every(keep)) return;
+    save(Object.fromEntries(Object.entries(layout).filter(([id]) => keep(id))));
+  }, [map]);
 
-  if (mounts.length > 0) y += GAP;
-  for (const mount of mounts) {
-    y += ROW;
-    const access = mount.readonly ? "ro" : "rw";
-    inside.push(
-      <Node
-        key={mount.guest}
-        x={NODE_X}
-        y={y}
-        width={NODE_W}
-        icon={mount.guest === harnessAt ? Bot : FolderSymlink}
-        label={mount.guest}
-        title={`${mount.guest}, ${mount.readonly ? "read-only" : "read-write"}${mount.guest === harnessAt ? `, harness ${harness}` : ""}`}
-        tone={mount.guest === harnessAt ? "harness" : undefined}
-        badges={[...harnessBadge(mount.guest), access]}
-        onJump={toSettings}
-      />,
-    );
-    outside.push(
-      <Node key={mount.guest} x={HOST_X} y={y} width={HOST_W} icon={Folder} label={mount.host} onJump={toSettings} />,
-    );
-    lines.push(<Line key={mount.guest} from={[HOST_X + HOST_W, center(y)]} to={[NODE_X, center(y)]} />);
-  }
-  // Not a user mount: zwinger binds its own copy of pi, and the agent cannot change it.
-  y += GAP + ROW;
-  inside.push(
-    <Node
-      key="runtime"
-      x={NODE_X}
-      y={y}
-      width={NODE_W}
-      icon={Package}
-      label="agent runtime"
-      title="/opt/zwinger/pi, the pi bundled with zwinger, read-only"
-      tone="muted"
-      badges={["ro"]}
-    />,
-  );
-  const boxBottom = y + H + 20;
+  useEffect(() => {
+    if (visible) requestAnimationFrame(() => fitView());
+  }, [visible]);
 
-  const secretHosts = [...new Set(shield.secrets.flatMap((s) => s.hosts))];
-  const keyBadge = (domain: string) => (coveredBy(domain, secretHosts) ? ["key"] : []);
-  const secretNames = (host: string) =>
-    shield.secrets
-      .filter((s) => s.hosts.includes(host))
-      .map((s) => s.name)
-      .join(", ");
+  // Child nodes cover the boundary, so the drop point is tested against its rect.
+  const onDrop = useRef(onDropFolder);
+  onDrop.current = onDropFolder;
+  useEffect(() => {
+    const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type !== "drop" || payload.paths.length === 0) return;
+      const point = payload.position.toLogical(window.devicePixelRatio);
+      if (!container.current?.contains(document.elementFromPoint(point.x, point.y))) return;
+      const { x, y } = screenToFlowPosition(point);
+      const box = getNode("boundary");
+      const width = box?.measured?.width ?? box?.width;
+      const height = box?.measured?.height ?? box?.height;
+      if (!box || width === undefined || height === undefined) return;
+      const { x: left, y: top } = box.position;
+      if (x >= left && x <= left + width && y >= top && y <= top + height) onDrop.current(payload.paths[0]);
+    });
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
 
-  const gateway: [number, number] = [BOX_X + BOX_W, center(TOP)];
-  const net: ReactNode[] = [];
-  let ny = TOP;
-  if (network.mode === "public") {
-    net.push(
-      <Node
-        key="internet"
-        x={NET_X}
-        y={ny}
-        width={NET_W}
-        icon={Globe}
-        label="Public internet"
-        tone="warn"
-        active={events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS))}
-        onJump={toNetwork}
-      />,
-    );
-    lines.push(<Line key="internet" from={gateway} to={[NET_X, center(ny)]} />);
-    ny += ROW;
-  } else if (network.mode === "deny" || network.domains.length === 0) {
-    net.push(
-      <Node
-        key="none"
-        x={NET_X}
-        y={ny}
-        width={NET_W}
-        icon={Globe}
-        label={network.mode === "deny" ? "Deny all" : "No hosts allowed"}
-        tone="muted"
-        onJump={toNetwork}
-      />,
-    );
-    ny += ROW;
-  } else {
-    for (const domain of network.domains) {
-      net.push(
-        <Node
-          key={domain}
-          x={NET_X}
-          y={ny}
-          width={NET_W}
-          icon={Globe}
-          label={domain}
-          badges={keyBadge(domain)}
-          active={active(domain)}
-          onJump={toNetwork}
-        />,
-      );
-      lines.push(<Line key={domain} from={gateway} to={[NET_X, center(ny)]} />);
-      ny += ROW;
-    }
-  }
-  // In List mode the allow-list nodes carry the key badges. In Public mode the
-  // secret hosts are shown on their own, as nothing else names them.
-  for (const host of secretHosts) {
-    const ok = reachable(network, host);
-    if (ok && network.mode === "list") continue;
-    net.push(
-      <Node
-        key={`secret ${host}`}
-        x={NET_X}
-        y={ny}
-        width={NET_W}
-        icon={KeyRound}
-        label={host}
-        title={
-          ok
-            ? `${host} gets ${secretNames(host)}`
-            : `${host} gets ${secretNames(host)}, but it is not on the allow list`
-        }
-        tone={ok ? undefined : "warn"}
-        badges={["key"]}
-        onJump={toNetwork}
-      />,
-    );
-    if (ok) lines.push(<Line key={`secret ${host}`} from={gateway} to={[NET_X, center(ny)]} />);
-    ny += ROW;
-  }
-  ny += GAP;
-  net.push(
-    <Node
-      key="blocked"
-      x={NET_X}
-      y={ny}
-      width={NET_W}
-      icon={Ban}
-      label="Host · LAN · metadata"
-      title="Always blocked: this computer, local network, loopback, link-local and cloud metadata"
-      tone="blocked"
-      onJump={toNetwork}
-    />,
-  );
-  lines.push(<Line key="blocked" from={gateway} to={[NET_X, center(ny)]} blocked />);
-  for (const host of blockedHosts) {
-    ny += ROW;
-    net.push(
-      <Node
-        key={`denied ${host}`}
-        x={NET_X}
-        y={ny}
-        width={NET_W}
-        icon={Ban}
-        label={host}
-        title={`${host} was blocked in the last minute`}
-        tone="denied"
-        onJump={toNetwork}
-      />,
-    );
-    lines.push(<Line key={`denied ${host}`} from={gateway} to={[NET_X, center(ny)]} blocked />);
-  }
-  const legendY = Math.max(boxBottom, ny + H) + 24;
-  const height = legendY + (secretHosts.length > 0 ? 48 : 0);
+  const jump = (node?: MapNode) => node?.type === "item" && node.data.jump && onJump(node.data.jump);
 
   return (
-    <svg
-      className="map"
-      viewBox={`0 0 ${WIDTH} ${height}`}
-      role="group"
-      aria-label={`Map of shield ${shield.name}`}
-    >
-      <text className="map-caption" x={HOST_X} y={40}>
-        HOST
-      </text>
-      <text className="map-caption" x={NET_X} y={40}>
-        NETWORK
-      </text>
-      <g className={`map-boundary ${status.state}`}>
-        <rect x={BOX_X} y={16} width={BOX_W} height={boxBottom - 16} rx={14} />
-        <Shield x={BOX_X + 16} y={26} size={18} />
-        <text className="map-title" x={BOX_X + 42} y={40}>
-          {fit(shield.name, BOX_W - 140)}
-        </text>
-        <text className="map-state" x={BOX_X + BOX_W - 16} y={40} textAnchor="end">
-          microVM · {status.state}
-        </text>
-      </g>
-      {lines}
-      <g className="map-gateway">
-        <circle cx={gateway[0]} cy={gateway[1]} r={11} />
-        <Network x={gateway[0] - 7} y={gateway[1] - 7} size={14} />
-      </g>
-      {outside}
-      {inside}
-      {net}
-      {secretHosts.length > 0 && (
-        <g>
-          <g className="map-badge key">
-            <rect x={HOST_X} y={legendY - 12} width={50} height={16} rx={8} />
-            <text x={HOST_X + 25} y={legendY} textAnchor="middle">
-              key
-            </text>
-          </g>
-          <text className="map-more" x={HOST_X + 58} y={legendY}>
-            gets a secret
-          </text>
-          <g className="map-node warn">
-            <rect x={HOST_X + 170} y={legendY - 12} width={16} height={16} rx={4} />
-          </g>
-          <text className="map-more" x={HOST_X + 194} y={legendY}>
-            secret host that the network policy blocks
-          </text>
-          <text className="map-more" x={HOST_X} y={legendY + 22}>
-            Agent sees $MSB_…, the shield injects the real value.
-          </text>
-        </g>
-      )}
-    </svg>
+    <div ref={container} className="map" role="group" aria-label={`Map of shield ${shield.name}`}>
+      <ReactFlow<MapNode>
+        nodes={nodes}
+        edges={map.edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onNodeDragStop={(_, __, dragged) =>
+          save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
+        }
+        onNodeClick={(_, node) => jump(node)}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
+          const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
+          jump(nodes.find((n) => n.id === id));
+        }}
+        nodesConnectable={false}
+        elementsSelectable={false}
+        deleteKeyCode={null}
+        minZoom={0.3}
+        fitView
+      >
+        <Background variant={BackgroundVariant.Dots} />
+        <Panel position="bottom-left">
+          <MapControls />
+        </Panel>
+        <Panel position="top-right">
+          <Button size="sm" variant="outline" disabled={Object.keys(layout).length === 0} onClick={() => save(null)}>
+            Reset layout
+          </Button>
+        </Panel>
+        {map.hasSecrets && (
+          <Panel position="bottom-right" className="map-legend">
+            <p className="row">
+              <span className="map-badge key">key</span> gets a secret
+              <span className="map-node warn map-swatch" /> secret host that the network policy blocks
+            </p>
+            <p>Agent sees $MSB_…, the shield injects the real value.</p>
+          </Panel>
+        )}
+      </ReactFlow>
+    </div>
   );
 }

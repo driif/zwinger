@@ -1,74 +1,765 @@
-import { Button, Card } from "@driif/motiv";
-import { KeyboardEvent, ReactNode, useRef } from "react";
-import { Plus } from "lucide-react";
-import { ShieldView } from "./api";
+import { Button, Card, FloatingField, IconButton } from "@driif/motiv";
+import {
+  Active,
+  Announcements,
+  closestCenter,
+  CollisionDetection,
+  DndContext,
+  DragEndEvent,
+  DragMoveEvent,
+  KeyboardSensor,
+  Over,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
+  AppWindow,
+  Bot,
+  ChevronRight,
+  Ellipsis,
+  MessageSquare,
+  Pencil,
+  Play,
+  Plus,
+  RotateCw,
+  Square,
+  SquareTerminal,
+  Trash2,
+  X,
+} from "lucide-react";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { Chat, removeApp, reorderApps, reorderShields, restartApp, ShieldView, startApp, stopApp } from "./api";
+import type { ChatAction, DroppedFolder, Intent, Pane, Run, View } from "./App";
+
+const COLLAPSED_KEY = "zwinger.tree.collapsed";
+const FORBIDDEN = "Not allowed: a shield is a security boundary. Items stay in their shield.";
+
+type Group = "agents" | "terminals" | "apps";
+const GROUPS: { group: Group; label: string }[] = [
+  { group: "agents", label: "Agents" },
+  { group: "terminals", label: "Terminals" },
+  { group: "apps", label: "Apps" },
+];
+
+/** What dnd-kit carries per sortable row. Only rows of the same container can swap. */
+interface DragData {
+  container: string;
+  shieldId: string;
+  entity: string;
+  label: string;
+}
+
+const dataOf = (item: Active | Over) => item.data.current as DragData;
+
+/** A row action. `confirm` asks first; `rename` asks for a new name first. */
+type MenuAction = { label: string; icon: ReactNode; disabled?: boolean } & (
+  | { run: () => void; confirm?: string }
+  | { rename: string; onRename: (name: string) => void }
+);
+
+interface Leaf {
+  entity: string;
+  label: ReactNode;
+  name: string;
+  title?: string;
+  icon: ReactNode;
+  view: View;
+  menu: MenuAction[];
+}
+
+/** The actions of a row. Arrow keys move between them; Escape and a click outside close it. */
+function RowMenu({ label, actions, onClose }: { label: string; actions: MenuAction[]; onClose: (refocus: boolean) => void }) {
+  const card = useRef<HTMLElement>(null);
+  const [step, setStep] = useState<MenuAction>();
+  const [name, setName] = useState("");
+  const close = useRef(onClose);
+  close.current = onClose;
+
+  useEffect(() => {
+    card.current?.querySelector<HTMLElement>("input, button:not(:disabled)")?.focus();
+  }, [step]);
+
+  useEffect(() => {
+    const outside = (event: PointerEvent) => !card.current?.contains(event.target as Node) && close.current(false);
+    document.addEventListener("pointerdown", outside);
+    return () => document.removeEventListener("pointerdown", outside);
+  }, []);
+
+  function onKeyDown(event: KeyboardEvent) {
+    // The tree and dnd-kit do not see the keys of the menu.
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      event.preventDefault();
+      return onClose(true);
+    }
+    if (step || (event.key !== "ArrowDown" && event.key !== "ArrowUp")) return;
+    event.preventDefault();
+    const items = [...(card.current?.querySelectorAll<HTMLElement>("[role=menuitem]:not(:disabled)") ?? [])];
+    const index = items.indexOf(document.activeElement as HTMLElement);
+    items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+  }
+
+  function choose(action: MenuAction) {
+    if ("rename" in action) {
+      setName(action.rename);
+      return setStep(action);
+    }
+    if (action.confirm) return setStep(action);
+    onClose(true);
+    action.run();
+  }
+
+  function rename(event: FormEvent) {
+    event.preventDefault();
+    if (!step || !("rename" in step) || !name.trim()) return;
+    onClose(true);
+    step.onRename(name.trim());
+  }
+
+  return (
+    <Card ref={card} padding="sm" className="tree-menu" onKeyDown={onKeyDown}>
+      {!step ? (
+        <div role="menu" aria-label={label} className="stack">
+          {actions.map((action) => (
+            <Button
+              key={action.label}
+              role="menuitem"
+              size="sm"
+              variant="ghost"
+              iconLeft={action.icon}
+              disabled={action.disabled}
+              onClick={() => choose(action)}
+            >
+              {action.label}
+            </Button>
+          ))}
+        </div>
+      ) : "rename" in step ? (
+        <form className="stack" onSubmit={rename}>
+          <FloatingField label="Name" value={name} maxLength={200} showValidity={false} onChange={(e) => setName(e.target.value)} />
+          <div className="row end">
+            <Button size="sm" variant="ghost" onClick={() => onClose(true)}>
+              Cancel
+            </Button>
+            <Button size="sm" type="submit" disabled={!name.trim()}>
+              Rename
+            </Button>
+          </div>
+        </form>
+      ) : (
+        <div className="stack" role="alertdialog" aria-label={step.label}>
+          <p>{step.confirm}</p>
+          <div className="row end">
+            <Button size="sm" variant="ghost" onClick={() => onClose(true)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="danger"
+              onClick={() => {
+                onClose(true);
+                step.run();
+              }}
+            >
+              {step.label}
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+interface RowProps {
+  id: string;
+  level: number;
+  drag?: DragData;
+  expanded?: boolean;
+  selected: boolean;
+  tabStop: boolean;
+  className?: string;
+  shieldDrop?: string;
+  row: ReactNode;
+  onOpen: () => void;
+  /** Opens the row menu on a right-click. */
+  onMenu?: () => void;
+  children?: ReactNode;
+}
+
+/** A treeitem. A sortable one is dragged by its own row only, so a drag in a child list does not move the parent. */
+function TreeRow({ id, level, drag, expanded, selected, tabStop, className, shieldDrop, row, onOpen, onMenu, children }: RowProps) {
+  const sortable = useSortable({ id, data: drag, disabled: !drag });
+  return (
+    <li
+      ref={sortable.setNodeRef}
+      role="treeitem"
+      aria-level={level}
+      aria-expanded={expanded}
+      aria-selected={selected}
+      aria-describedby={drag && sortable.attributes["aria-describedby"]}
+      tabIndex={tabStop ? 0 : -1}
+      data-tree-id={id}
+      data-shield-drop={shieldDrop}
+      className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""}`}
+      style={{ transform: CSS.Translate.toString(sortable.transform), transition: sortable.transition }}
+      onKeyDown={(event) => event.target === event.currentTarget && sortable.listeners?.onKeyDown?.(event)}
+    >
+      <div
+        ref={sortable.setActivatorNodeRef}
+        className={`tree-row level-${level}`}
+        onPointerDown={(event) => sortable.listeners?.onPointerDown?.(event)}
+        onClick={onOpen}
+        onContextMenu={(event) => {
+          if (!onMenu) return;
+          event.preventDefault();
+          onMenu();
+        }}
+      >
+        {row}
+      </div>
+      {children}
+    </li>
+  );
+}
 
 interface Props {
   shields: ShieldView[];
   selectedId?: string;
+  view: View;
   /** Per shield, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
+  chats: Record<string, Chat[]>;
+  panes: Pane[];
+  run: Run;
   onSelect: (id: string) => void;
+  onOpen: (shieldId: string, view: View) => void;
+  onIntent: (shieldId: string, kind: Intent["kind"], appId?: string) => void;
+  onChatAction: (shieldId: string, action: ChatAction) => void;
+  onToggle: (shield: ShieldView) => void;
+  onNewShell: (shieldId: string) => void;
+  onClosePane: (key: string) => void;
+  onMovePanes: (shieldId: string, keys: string[]) => void;
   onNew: () => void;
+  /** A folder dropped from Finder on empty rail space. */
+  dropFolder?: DroppedFolder;
+  onDropDone: (create: boolean) => void;
   children: ReactNode;
 }
 
-export function ShieldRail({ shields, selectedId, blocked, onSelect, onNew, children }: Props) {
-  const rows = useRef<HTMLElement[]>([]);
+/** The shields as a tree: shield → Agents / Terminals / Apps → items. */
+export function ShieldRail({
+  shields,
+  selectedId,
+  view,
+  blocked,
+  chats,
+  panes,
+  run,
+  onSelect,
+  onOpen,
+  onIntent,
+  onChatAction,
+  onToggle,
+  onNewShell,
+  onClosePane,
+  onMovePanes,
+  onNew,
+  dropFolder,
+  onDropDone,
+  children,
+}: Props) {
+  const tree = useRef<HTMLUListElement>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(
+    () => new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]),
+  );
+  const [focused, setFocused] = useState<string>();
+  /** Per shield, the chat order of this app session. */
+  const [chatOrder, setChatOrder] = useState<Record<string, string[]>>({});
+  const [dragging, setDragging] = useState(false);
+  /** The other shield that a dragged item is over. */
+  const [forbidden, setForbidden] = useState<string>();
+  const [announcement, setAnnouncement] = useState("");
+  /** The row whose menu is open. */
+  const [menu, setMenu] = useState<string>();
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    // Enter opens a row, so only Space picks up and drops.
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+      keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+    }),
+  );
 
-  // Roving tabindex: the selected row is in the tab order, the arrow keys move between rows.
-  function onKeyDown(event: KeyboardEvent, index: number) {
-    const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
-    if (step !== undefined) {
-      event.preventDefault();
-      rows.current[(index + step + shields.length) % shields.length]?.focus();
-    } else if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      onSelect(shields[index].id);
+  useEffect(() => {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed]));
+  }, [collapsed]);
+
+  const toggle = (id: string) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+
+  function leaves(shield: ShieldView, group: Group): Leaf[] {
+    const sid = shield.id;
+    if (group === "agents") {
+      const list = chats[sid] ?? [];
+      const order = chatOrder[sid] ?? [];
+      const rank = (c: Chat) => order.indexOf(c.id);
+      return [...list.filter((c) => rank(c) < 0), ...list.filter((c) => rank(c) >= 0).sort((a, b) => rank(a) - rank(b))].map(
+        (c) => ({
+          entity: c.id,
+          label: <span className="grow">{c.title}</span>,
+          name: c.title,
+          title: `${c.title} · ${new Date(c.started).toLocaleString()}`,
+          icon: <MessageSquare size={14} />,
+          view: { kind: "chat", chat: c.id },
+          menu: [
+            {
+              label: "Rename",
+              icon: <Pencil size={14} />,
+              rename: c.title,
+              onRename: (name) => onChatAction(sid, { kind: "rename", chat: c.id, name, at: Date.now() }),
+            },
+            {
+              label: "Delete",
+              icon: <Trash2 size={14} />,
+              confirm: `Delete the chat ${c.title}?`,
+              run: () => onChatAction(sid, { kind: "delete", chat: c.id, at: Date.now() }),
+            },
+          ],
+        }),
+      );
+    }
+    if (group === "terminals")
+      return panes
+        .filter((p) => p.shieldId === sid)
+        .map((pane, index) => {
+          const session = shield.sessions.find((s) => s.id === pane.sessionId);
+          const state =
+            pane.sessionId === undefined
+              ? "opening"
+              : session === undefined
+                ? "ended"
+                : session.exitCode !== null
+                  ? `exited ${session.exitCode}`
+                  : undefined;
+          const name = `${pane.kind} ${index + 1}`;
+          return {
+            entity: pane.key,
+            label: (
+              <span className="grow">
+                {name}
+                {state && <span className="muted"> · {state}</span>}
+              </span>
+            ),
+            name,
+            icon: pane.kind === "pi" ? <Bot size={14} /> : <SquareTerminal size={14} />,
+            view: { kind: "terminal", key: pane.key },
+            menu: [{ label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) }],
+          };
+        });
+    const shieldRunning = shield.status.state === "running";
+    return shield.apps.map((app) => {
+      const appRun = shield.appRuns.find((r) => r.appId === app.id);
+      const state = !appRun ? "stopped" : appRun.exitCode === null ? "running" : `exited ${appRun.exitCode}`;
+      const running = state === "running";
+      return {
+        entity: app.id,
+        label: (
+          <>
+            <span className="grow">{app.name}</span>
+            <span className="muted tree-state">{state}</span>
+          </>
+        ),
+        name: app.name,
+        title: app.command,
+        icon: <AppWindow size={14} className={running ? "ok" : undefined} />,
+        view: { kind: "app", appId: app.id },
+        menu: [
+          {
+            label: running ? "Stop" : "Start",
+            icon: running ? <Square size={14} /> : <Play size={14} />,
+            disabled: !shieldRunning,
+            run: () => run(() => (running ? stopApp(sid, app.id) : startApp(sid, app.id))),
+          },
+          {
+            label: "Restart",
+            icon: <RotateCw size={14} />,
+            disabled: !shieldRunning,
+            run: () => run(() => restartApp(sid, app.id)),
+          },
+          { label: "Edit", icon: <Pencil size={14} />, run: () => onIntent(sid, "app", app.id) },
+          {
+            label: "Delete",
+            icon: <Trash2 size={14} />,
+            confirm: `Delete the app ${app.name}? It stops.`,
+            run: () => run(() => removeApp(sid, app.id)),
+          },
+        ],
+      };
+    });
+  }
+
+  // The rows in tree order, for the arrow keys, and each row's parent.
+  const visible: string[] = [];
+  const parentOf: Record<string, string> = {};
+  const lists: Record<string, string[]> = { shields: shields.map((s) => s.id) };
+  const content = shields.map((shield) => {
+    const sid = shield.id;
+    const shieldRow = `s|${sid}`;
+    visible.push(shieldRow);
+    const groups = GROUPS.map(({ group, label }) => {
+      const id = `g|${sid}|${group}`;
+      const container = `${sid}|${group}`;
+      const items = leaves(shield, group);
+      lists[container] = items.map((i) => i.entity);
+      const open = items.length > 0 && !collapsed.has(id);
+      const showOpen = !collapsed.has(shieldRow);
+      if (showOpen) {
+        visible.push(id);
+        parentOf[id] = shieldRow;
+        if (open)
+          for (const item of items) {
+            visible.push(`i|${container}|${item.entity}`);
+            parentOf[`i|${container}|${item.entity}`] = id;
+          }
+      }
+      return { group, label, id, container, items, open };
+    });
+    return { shield, shieldRow, groups };
+  });
+  const tabStop = focused && visible.includes(focused) ? focused : (visible.find((id) => id === `s|${selectedId}`) ?? visible[0]);
+
+  const selectedRow =
+    view.kind === "chat"
+      ? view.chat
+        ? `i|${selectedId}|agents|${view.chat}`
+        : `g|${selectedId}|agents`
+      : view.kind === "terminal"
+        ? `i|${selectedId}|terminals|${view.key}`
+        : view.kind === "app"
+          ? `i|${selectedId}|apps|${view.appId}`
+          : `s|${selectedId}`;
+
+  function focus(id: string | undefined, event: KeyboardEvent) {
+    if (!id) return;
+    event.preventDefault();
+    setFocused(id);
+    tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(id)}"]`)?.focus();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLUListElement>) {
+    const item = event.target as HTMLElement;
+    if (dragging || event.defaultPrevented || item.getAttribute("role") !== "treeitem") return;
+    const id = item.dataset.treeId!;
+    const index = visible.indexOf(id);
+    const expanded = item.getAttribute("aria-expanded");
+    switch (event.key) {
+      case "ArrowDown":
+        return focus(visible[index + 1], event);
+      case "ArrowUp":
+        return focus(visible[index - 1], event);
+      case "Home":
+        return focus(visible[0], event);
+      case "End":
+        return focus(visible[visible.length - 1], event);
+      case "ArrowRight":
+        if (expanded === "true") return focus(visible[index + 1], event);
+        if (expanded === "false") {
+          event.preventDefault();
+          toggle(id);
+        }
+        return;
+      case "ArrowLeft":
+        if (expanded === "true") {
+          event.preventDefault();
+          return toggle(id);
+        }
+        return focus(parentOf[id], event);
+      case "Enter":
+        event.preventDefault();
+        item.querySelector<HTMLElement>(":scope > .tree-row")?.click();
+        return;
+      case "F10":
+      case "ContextMenu":
+        if (event.key === "F10" && !event.shiftKey) return;
+        if (!id.startsWith("i|")) return;
+        event.preventDefault();
+        setMenu(id);
     }
   }
 
+  function closeMenu(refocus: boolean) {
+    if (refocus && menu) tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(menu)}"]`)?.focus();
+    setMenu(undefined);
+  }
+
+  const collision: CollisionDetection = (args) =>
+    closestCenter({
+      ...args,
+      droppableContainers: args.droppableContainers.filter(
+        (c) => (c.data.current as DragData | undefined)?.container === dataOf(args.active).container,
+      ),
+    });
+
+  // An item over another shield shows a forbidden drop. The check uses the
+  // dragged row's rect, so it works for the pointer and the keyboard.
+  function onDragMove({ active }: DragMoveEvent) {
+    const data = dataOf(active);
+    const rect = active.rect.current.translated;
+    if (data.container === "shields" || !rect) return;
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-shield-drop]") ?? [])].find((el) => {
+      const r = el.getBoundingClientRect();
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    })?.dataset.shieldDrop;
+    const next = target && target !== data.shieldId ? target : undefined;
+    if (next === forbidden) return;
+    setForbidden(next);
+    if (next) setAnnouncement(FORBIDDEN);
+  }
+
+  function onDragEnd({ active, over }: DragEndEvent) {
+    setDragging(false);
+    if (forbidden) {
+      setForbidden(undefined);
+      setAnnouncement(`${dataOf(active).label} was not moved. ${FORBIDDEN}`);
+      return;
+    }
+    if (!over || over.id === active.id) return;
+    const { container, shieldId, entity } = dataOf(active);
+    const list = lists[container];
+    const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
+    if (container === "shields") run(() => reorderShields(next));
+    else if (container.endsWith("|apps")) run(() => reorderApps(shieldId, next));
+    else if (container.endsWith("|terminals")) onMovePanes(shieldId, next);
+    else setChatOrder((current) => ({ ...current, [shieldId]: next }));
+  }
+
+  const announcements: Announcements = {
+    onDragStart: ({ active }) => `Picked up ${dataOf(active).label}.`,
+    onDragOver: ({ active, over }) => (over ? `${dataOf(active).label} is over ${dataOf(over).label}.` : undefined),
+    onDragEnd: ({ active, over }) => (over ? `${dataOf(active).label} was dropped over ${dataOf(over).label}.` : undefined),
+    onDragCancel: ({ active }) => `Moving ${dataOf(active).label} was cancelled.`,
+  };
+
+  function groupAction(shield: ShieldView, group: Group) {
+    const [icon, label, action] =
+      group === "agents"
+        ? [<MessageSquare size={12} />, "Open agent", () => onOpen(shield.id, { kind: "chat" })]
+        : group === "terminals"
+          ? [<Plus size={12} />, "New shell", () => onNewShell(shield.id)]
+          : [<Plus size={12} />, "Add app", () => onIntent(shield.id, "app")];
+    return (
+      <IconButton
+        icon={icon}
+        label={label}
+        tabIndex={-1}
+        onClick={(e) => {
+          e.stopPropagation();
+          action();
+        }}
+      />
+    );
+  }
+
   return (
-    <aside className="rail">
+    <aside className={forbidden ? "rail forbidden" : "rail"}>
       {children}
-      <ul className="rail-list" aria-label="Shields">
-        {shields.map((shield, index) => (
-          <li key={shield.id}>
-            <Card
-              variant={shield.id === selectedId ? "outlined" : "subtle"}
-              padding="sm"
-              interactive
-              role="button"
-              aria-current={shield.id === selectedId}
-              tabIndex={shield.id === selectedId ? 0 : -1}
-              title={shield.status.state === "error" ? shield.status.message : shield.folder}
-              ref={(el: HTMLElement | null) => {
-                if (el) rows.current[index] = el;
-              }}
-              onClick={() => onSelect(shield.id)}
-              onKeyDown={(event) => onKeyDown(event, index)}
-            >
-              <div className="row">
-                <span className={`dot ${shield.status.state}`} aria-label={shield.status.state} />
-                <span className="grow">{shield.name}</span>
-                {blocked[shield.id] > 0 && (
-                  <span className="rail-blocked" title="Blocked network events since you last saw the Network tab">
-                    {blocked[shield.id]}
-                  </span>
-                )}
-              </div>
-              <p className="rail-counts muted">
-                {shield.mounts.length + 1} folders ·{" "}
-                {shield.network.mode === "public"
-                  ? "public internet"
-                  : shield.network.mode === "deny"
-                    ? "no egress"
-                    : `${shield.network.domains.length} hosts`}
+      <div className="rail-tree" data-drop="rail">
+        {dropFolder && (
+          <Card variant="outlined" padding="sm" className="stack">
+            <p>
+              Create a shield for <span className="mono">{dropFolder.folder}</span>?
+            </p>
+            {dropFolder.dropped !== dropFolder.folder && (
+              <p className="muted">
+                <span className="mono">{dropFolder.dropped}</span> is a link to{" "}
+                <span className="mono">{dropFolder.folder}</span>.
               </p>
-            </Card>
-          </li>
-        ))}
-      </ul>
+            )}
+            <div className="row end">
+              <Button size="sm" variant="ghost" onClick={() => onDropDone(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={() => onDropDone(true)}>
+                Create shield
+              </Button>
+            </div>
+          </Card>
+        )}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={collision}
+          accessibility={{
+            announcements,
+            screenReaderInstructions: {
+              draggable:
+                "To move a row, press Space. Use the arrow keys to move it in its group, then press Space to drop it or Escape to cancel.",
+            },
+          }}
+          onDragStart={() => setDragging(true)}
+          onDragMove={onDragMove}
+          onDragEnd={onDragEnd}
+          onDragCancel={() => {
+            setDragging(false);
+            setForbidden(undefined);
+          }}
+        >
+          <ul
+            ref={tree}
+            className="tree"
+            role="tree"
+            aria-label="Shields"
+            onKeyDown={onKeyDown}
+            onFocus={(e) => {
+              const id = (e.target as HTMLElement).dataset.treeId;
+              if (id) setFocused(id);
+            }}
+          >
+            <SortableContext items={shields.map((s) => `s|${s.id}`)} strategy={verticalListSortingStrategy}>
+              {content.map(({ shield, shieldRow, groups }) => {
+                const shieldOpen = !collapsed.has(shieldRow);
+                const running = shield.status.state === "running";
+                return (
+                  <TreeRow
+                    key={shield.id}
+                    id={shieldRow}
+                    level={1}
+                    drag={{ container: "shields", shieldId: shield.id, entity: shield.id, label: shield.name }}
+                    expanded={shieldOpen}
+                    selected={selectedRow === shieldRow}
+                    tabStop={tabStop === shieldRow}
+                    className={`tree-shield ${shield.id === selectedId ? "current" : ""} ${forbidden === shield.id ? "forbidden-target" : ""}`}
+                    shieldDrop={shield.id}
+                    onOpen={() => onSelect(shield.id)}
+                    row={
+                      <>
+                        <IconButton
+                          icon={<ChevronRight size={14} className={shieldOpen ? "tree-chevron open" : "tree-chevron"} />}
+                          label={shieldOpen ? `Collapse ${shield.name}` : `Expand ${shield.name}`}
+                          tabIndex={-1}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggle(shieldRow);
+                          }}
+                        />
+                        <span className={`dot ${shield.status.state}`} aria-label={shield.status.state} />
+                        <span
+                          className="grow tree-name"
+                          title={shield.status.state === "error" ? shield.status.message : shield.folder}
+                        >
+                          {shield.name}
+                        </span>
+                        {blocked[shield.id] > 0 && (
+                          <span className="rail-blocked" title="Blocked network events since you last saw them">
+                            {blocked[shield.id]}
+                          </span>
+                        )}
+                        <IconButton
+                          icon={running ? <Square size={12} /> : <Play size={12} />}
+                          label={running ? `Stop ${shield.name}` : `Start ${shield.name}`}
+                          tabIndex={-1}
+                          disabled={shield.status.state === "starting" || shield.status.state === "stopping"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onToggle(shield);
+                          }}
+                        />
+                      </>
+                    }
+                  >
+                    {shieldOpen && (
+                      <ul role="group">
+                        {groups.map(({ group, label, id, container, items, open }) => (
+                          <TreeRow
+                            key={group}
+                            id={id}
+                            level={2}
+                            expanded={items.length > 0 ? open : undefined}
+                            selected={selectedRow === id}
+                            tabStop={tabStop === id}
+                            onOpen={() => items.length > 0 && toggle(id)}
+                            row={
+                              <>
+                                <ChevronRight
+                                  size={12}
+                                  className={open ? "tree-chevron open" : "tree-chevron"}
+                                  visibility={items.length > 0 ? "visible" : "hidden"}
+                                />
+                                <span className="grow">{label}</span>
+                                <span className="muted tree-state">{items.length}</span>
+                                {groupAction(shield, group)}
+                              </>
+                            }
+                          >
+                            {open && (
+                              <ul role="group">
+                                <SortableContext
+                                  items={items.map((i) => `i|${container}|${i.entity}`)}
+                                  strategy={verticalListSortingStrategy}
+                                >
+                                  {items.map((item) => {
+                                    const rowId = `i|${container}|${item.entity}`;
+                                    return (
+                                      <TreeRow
+                                        key={item.entity}
+                                        id={rowId}
+                                        level={3}
+                                        drag={{ container, shieldId: shield.id, entity: item.entity, label: item.name }}
+                                        selected={selectedRow === rowId}
+                                        tabStop={tabStop === rowId}
+                                        onOpen={() => onOpen(shield.id, item.view)}
+                                        onMenu={() => setMenu(rowId)}
+                                        row={
+                                          <>
+                                            {item.icon}
+                                            <span className="row grow" title={item.title ?? item.name}>
+                                              {item.label}
+                                            </span>
+                                            <IconButton
+                                              icon={<Ellipsis size={12} />}
+                                              label={`Actions for ${item.name}`}
+                                              aria-haspopup="menu"
+                                              aria-expanded={menu === rowId}
+                                              tabIndex={-1}
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                setMenu(rowId);
+                                              }}
+                                            />
+                                          </>
+                                        }
+                                      >
+                                        {menu === rowId && (
+                                          <RowMenu label={`Actions for ${item.name}`} actions={item.menu} onClose={closeMenu} />
+                                        )}
+                                      </TreeRow>
+                                    );
+                                  })}
+                                </SortableContext>
+                              </ul>
+                            )}
+                          </TreeRow>
+                        ))}
+                      </ul>
+                    )}
+                  </TreeRow>
+                );
+              })}
+            </SortableContext>
+          </ul>
+        </DndContext>
+        <div className="sr-only" aria-live="assertive">
+          {announcement}
+        </div>
+      </div>
       <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
         New shield
       </Button>

@@ -20,6 +20,7 @@ import {
   ShieldView,
 } from "./api";
 import type { Intent, Run } from "./App";
+import { AppsSection } from "./AppsSection";
 
 const WORKSPACE = "/workspace";
 
@@ -34,6 +35,8 @@ function guestError(path: string) {
 
 interface MountDraft {
   host: string;
+  /** The dropped path, if it is a link to `host`. */
+  link?: string;
   guest: string;
   readonly: boolean;
   error?: string;
@@ -67,15 +70,18 @@ export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Prop
     run(() => renameShield(id, name).catch((e) => setNameError(String(e))));
   }
 
+  function draftMount(host: string, dropped?: string) {
+    const base = host.split("/").filter(Boolean).pop() ?? "data";
+    setDraft({ host, link: dropped !== host ? dropped : undefined, guest: `/mnt/${base}`, readonly: true });
+  }
+
   async function pickMount() {
     const host = await open({ directory: true, title: "Mount a folder into the shield" });
-    if (host === null) return;
-    const base = host.split("/").filter(Boolean).pop() ?? "data";
-    setDraft({ host, guest: `/mnt/${base}`, readonly: true });
+    if (host !== null) draftMount(host);
   }
 
   useEffect(() => {
-    if (!intent) return;
+    if (!intent || intent.kind === "app") return;
     onIntentDone();
     switch (intent.kind) {
       case "rename":
@@ -83,7 +89,9 @@ export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Prop
         nameField.current?.select();
         break;
       case "mount":
-        run(pickMount);
+        // A folder dropped on the map comes with its canonical path.
+        if (intent.host) draftMount(intent.host, intent.dropped);
+        else run(pickMount);
         break;
       case "harness":
         harnessGroup.current?.querySelector<HTMLInputElement>("input:checked")?.focus();
@@ -160,6 +168,11 @@ export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Prop
               <p className="mono" title={draft.host}>
                 {draft.host}
               </p>
+              {draft.link && (
+                <p className="muted">
+                  <span className="mono">{draft.link}</span> is a link to <span className="mono">{draft.host}</span>.
+                </p>
+              )}
               <FloatingField
                 label="Guest path"
                 className="mono"
@@ -237,6 +250,13 @@ export function SettingsTab({ shield, folders, run, intent, onIntentDone }: Prop
           />
         </CardBody>
       </Card>
+
+      <AppsSection
+        shield={shield}
+        run={run}
+        intent={intent?.kind === "app" ? intent : undefined}
+        onIntentDone={onIntentDone}
+      />
 
       <Card variant="outlined" padding="md">
         <CardHeader title="Delete shield" titleAs="h2" description="Stops the shield. Your folders stay on disk." />

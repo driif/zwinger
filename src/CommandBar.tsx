@@ -1,7 +1,16 @@
 import { CommandMenu, CommandMenuItem } from "@driif/motiv";
 import { Ref } from "react";
-import { NetworkMode, removeDomain, removeMount, setMountReadonly, setNetworkMode, ShieldView } from "./api";
-import type { Intent, Pane, Run } from "./App";
+import {
+  NetworkMode,
+  removeDomain,
+  removeMount,
+  setMountReadonly,
+  setNetworkMode,
+  ShieldView,
+  startApp,
+  stopApp,
+} from "./api";
+import type { Intent, Pane, Run, View } from "./App";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
 interface Props {
@@ -13,6 +22,7 @@ interface Props {
   actions: Record<ShortcutAction, () => void>;
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
+  onView: (view: View) => void;
   onToggle: (shield: ShieldView) => void;
   onRestart: (id: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
@@ -28,6 +38,7 @@ export function CommandBar({
   actions,
   onSelect,
   onShowPane,
+  onView,
   onToggle,
   onRestart,
   onIntent,
@@ -68,7 +79,7 @@ export function CommandBar({
     if (panes.length > 1) commands.push(action("next", "Next session"), action("previous", "Previous session"));
     commands.push(
       action("overview", "Overview"),
-      action("agents", "Agents"),
+      action("agents", "Agent chat"),
       action("terminal", "Terminal"),
       action("network", "Network"),
       action("settings", "Settings"),
@@ -79,6 +90,17 @@ export function CommandBar({
       intent("delete", "Delete shield…"),
     );
     const { id, network } = shield;
+    for (const app of shield.apps) {
+      const running = shield.appRuns.some((r) => r.appId === app.id && r.exitCode === null);
+      commands.push({ id: `app-${app.id}`, label: `Show app ${app.name}`, onSelect: () => onView({ kind: "app", appId: app.id }) });
+      if (state === "running")
+        commands.push({
+          id: `app-run-${app.id}`,
+          label: running ? `Stop app ${app.name}` : `Start app ${app.name}`,
+          onSelect: () => run(() => (running ? stopApp(id, app.id) : startApp(id, app.id))),
+        });
+    }
+    commands.push(intent("app", "Add app…"));
     const modes: [NetworkMode, string][] = [
       ["deny", "Network: deny all"],
       ["list", "Network: allow list only"],

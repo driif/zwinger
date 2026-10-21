@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,11 @@ use crate::secrets::{self, Secret};
 
 pub const WORKSPACE: &str = "/workspace";
 const FOLDER_LIMIT: usize = 50;
+const COMMAND_LIMIT: usize = 4096;
+/// The saved map positions per shield; more entries are dropped.
+const LAYOUT_LIMIT: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Shield {
     pub id: String,
@@ -23,6 +27,39 @@ pub struct Shield {
     /// The values are in the vault.
     #[serde(default)]
     pub secrets: Vec<Secret>,
+    /// The map positions that the user dragged, by node id.
+    #[serde(default)]
+    pub layout: BTreeMap<String, Pos>,
+    #[serde(default)]
+    pub apps: Vec<App>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Pos {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A saved, named, long-running command of a shield.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct App {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub cwd: String,
+    pub autostart: bool,
+}
+
+/// An app as the UI sends it. No `id` adds a new app.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDraft {
+    pub id: Option<String>,
+    pub name: String,
+    pub command: String,
+    pub cwd: String,
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,16 +143,86 @@ impl Shield {
             network: NetworkPolicy::default(),
             harness: None,
             secrets: Vec::new(),
+            layout: BTreeMap::new(),
+            apps: Vec::new(),
         })
     }
 
     pub fn rename(&mut self, name: &str) -> Result<()> {
-        let name = name.trim();
-        if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
-            return Err(Error::InvalidName(name.to_owned()));
-        }
-        name.clone_into(&mut self.name);
+        self.name = display_name(name)?;
         Ok(())
+    }
+
+    /// Keeps only finite positions. `None` restores the auto layout.
+    pub fn set_layout(&mut self, layout: Option<BTreeMap<String, Pos>>) {
+        self.layout = layout
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, p)| p.x.is_finite() && p.y.is_finite())
+            .take(LAYOUT_LIMIT)
+            .collect();
+    }
+
+    /// Adds the app, or replaces the app with the draft's id. Returns its id.
+    pub fn put_app(&mut self, draft: AppDraft) -> Result<String> {
+        let name = display_name(&draft.name)?;
+        let command = draft.command.trim();
+        if command.is_empty() {
+            return Err(Error::InvalidApp(name, "the command is empty".into()));
+        }
+        if command.chars().count() > COMMAND_LIMIT || command.chars().any(|c| c.is_control() && c != '\t') {
+            return Err(Error::InvalidApp(
+                name,
+                format!("the command must be one line of at most {COMMAND_LIMIT} characters"),
+            ));
+        }
+        let cwd = self.guest_dir(&draft.cwd)?;
+        let app = App {
+            id: draft.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            name,
+            command: command.to_owned(),
+            cwd,
+            autostart: draft.autostart,
+        };
+        let id = app.id.clone();
+        match draft.id {
+            Some(existing) => *self.app_mut(&existing)? = app,
+            None => self.apps.push(app),
+        }
+        Ok(id)
+    }
+
+    pub fn remove_app(&mut self, id: &str) -> Result<()> {
+        self.app_mut(id)?;
+        self.apps.retain(|a| a.id != id);
+        Ok(())
+    }
+
+    /// `ids` must name each app once.
+    pub fn reorder_apps(&mut self, ids: &[String]) -> Result<()> {
+        reorder(&mut self.apps, ids, |a| &a.id)
+    }
+
+    pub fn app(&self, id: &str) -> Result<&App> {
+        self.apps.iter().find(|a| a.id == id).ok_or(Error::AppNotFound)
+    }
+
+    fn app_mut(&mut self, id: &str) -> Result<&mut App> {
+        self.apps.iter_mut().find(|a| a.id == id).ok_or(Error::AppNotFound)
+    }
+
+    /// A guest folder that a process can start in: `/workspace` or a
+    /// sub-path whose host folder exists, or a path below a mount.
+    fn guest_dir(&self, input: &str) -> Result<String> {
+        let path = normalize(input).ok_or_else(|| Error::InvalidGuestPath(input.to_owned()))?;
+        if let Ok(rel) = path.strip_prefix(WORKSPACE) {
+            if !self.folder.join(rel).is_dir() {
+                return Err(Error::MissingPath(path.display().to_string()));
+            }
+        } else if !self.guest_target_exists(&path) {
+            return Err(Error::GuestDirTarget(path.display().to_string()));
+        }
+        Ok(path.to_string_lossy().into_owned())
     }
 
     /// Accepts a sub-path of `/workspace` whose host folder exists, or a mount's
@@ -164,6 +271,9 @@ impl Shield {
     pub fn check(&self) -> Result<()> {
         self.check_overlap()?;
         secrets::check_unique(&self.secrets)?;
+        if let Some(app) = self.apps.iter().find(|a| !self.guest_target_exists(Path::new(&a.cwd))) {
+            return Err(Error::AppCwd(app.name.clone(), app.cwd.clone()));
+        }
         match &self.harness {
             Some(harness) if !self.harness_target_exists(Path::new(harness)) => {
                 Err(Error::HarnessTarget(harness.clone()))
@@ -173,8 +283,11 @@ impl Shield {
     }
 
     fn harness_target_exists(&self, harness: &Path) -> bool {
-        harness.starts_with(WORKSPACE) && harness != Path::new(WORKSPACE)
-            || self.mounts.iter().any(|m| harness.starts_with(&m.guest))
+        harness != Path::new(WORKSPACE) && self.guest_target_exists(harness)
+    }
+
+    fn guest_target_exists(&self, path: &Path) -> bool {
+        path.starts_with(WORKSPACE) || self.mounts.iter().any(|m| path.starts_with(&m.guest))
     }
 
     /// The guest path of the mount that holds the harness: the deepest mount
@@ -304,6 +417,33 @@ impl Shield {
     }
 }
 
+/// A trimmed name of 1 to 64 characters with no control characters.
+fn display_name(input: &str) -> Result<String> {
+    let name = input.trim();
+    if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
+        return Err(Error::InvalidName(name.to_owned()));
+    }
+    Ok(name.to_owned())
+}
+
+/// Puts `items` in the order of `ids`, which must name each item once.
+/// `items` does not change on an error.
+pub fn reorder<T>(items: &mut Vec<T>, ids: &[String], id: impl Fn(&T) -> &String) -> Result<()> {
+    let order = ids
+        .iter()
+        .map(|wanted| items.iter().position(|item| id(item) == wanted).ok_or(Error::InvalidOrder))
+        .collect::<Result<Vec<usize>>>()?;
+    let mut unique = order.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != items.len() || order.len() != items.len() {
+        return Err(Error::InvalidOrder);
+    }
+    let mut slots: Vec<Option<T>> = items.drain(..).map(Some).collect();
+    *items = order.into_iter().map(|i| slots[i].take().expect("unique index")).collect();
+    Ok(())
+}
+
 /// Resolves a host folder to its canonical path, so symlinks are followed once here
 /// and the stored path is the real directory.
 pub fn host_dir(path: &str) -> Result<PathBuf> {
@@ -318,6 +458,15 @@ pub fn host_dir(path: &str) -> Result<PathBuf> {
         return Err(Error::NotDirectory(path.to_owned()));
     }
     Ok(canonical)
+}
+
+/// The canonical dir of a host path, as [`host_dir`] mounts it. A confirm
+/// step shows it, so the user sees where a link points.
+pub fn resolve_folder(path: &str) -> Result<String> {
+    host_dir(path)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| Error::MissingPath(path.to_owned()))
 }
 
 /// Accepts a hostname with at least two labels, or `*.` and such a hostname
@@ -444,6 +593,20 @@ mod tests {
             host_dir(link.to_str().unwrap()).unwrap(),
             target.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn resolve_folder_returns_the_link_target() {
+        let dir = temp_dir("resolve");
+        let target = dir.join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.join("alias");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let canonical = target.canonicalize().unwrap();
+        assert_eq!(resolve_folder(link.to_str().unwrap()).unwrap(), canonical.to_str().unwrap());
+        assert_eq!(resolve_folder(canonical.to_str().unwrap()).unwrap(), canonical.to_str().unwrap());
+        assert!(matches!(resolve_folder("rel"), Err(Error::RelativePath(_))));
+        assert!(matches!(resolve_folder(dir.join("nope").to_str().unwrap()), Err(Error::MissingPath(_))));
     }
 
     #[test]
@@ -655,6 +818,102 @@ mod tests {
             Err(Error::HarnessMount(..))
         ));
         assert_eq!(shield.mounts.len(), 1);
+    }
+
+    fn draft(name: &str, command: &str, cwd: &str) -> AppDraft {
+        AppDraft {
+            id: None,
+            name: name.into(),
+            command: command.into(),
+            cwd: cwd.into(),
+            autostart: false,
+        }
+    }
+
+    #[test]
+    fn put_app_validates_name_command_and_cwd() {
+        let (mut shield, root) = shield_with_dirs(&["project/web", "data"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        for cwd in ["/workspace", "//workspace/web/", "/mnt/data", "/mnt/data/sub"] {
+            shield.put_app(draft(" web ", " pnpm dev ", cwd)).unwrap();
+        }
+        assert_eq!(shield.apps[0].name, "web");
+        assert_eq!(shield.apps[0].command, "pnpm dev");
+        assert_eq!(shield.apps[1].cwd, "/workspace/web");
+
+        assert!(matches!(shield.put_app(draft("", "x", "/workspace")), Err(Error::InvalidName(_))));
+        for command in ["", "   ", "a\nb", &"x".repeat(COMMAND_LIMIT + 1)] {
+            assert!(
+                matches!(shield.put_app(draft("a", command, "/workspace")), Err(Error::InvalidApp(..))),
+                "{command:?}"
+            );
+        }
+        assert!(matches!(shield.put_app(draft("a", "x", "workspace")), Err(Error::InvalidGuestPath(_))));
+        assert!(matches!(shield.put_app(draft("a", "x", "/workspace/missing")), Err(Error::MissingPath(_))));
+        assert!(matches!(shield.put_app(draft("a", "x", "/etc")), Err(Error::GuestDirTarget(_))));
+        assert_eq!(shield.apps.len(), 4);
+    }
+
+    #[test]
+    fn put_app_with_id_replaces_and_unknown_id_fails() {
+        let (mut shield, _) = shield_with_dirs(&["project"]);
+        let id = shield.put_app(draft("web", "pnpm dev", "/workspace")).unwrap();
+        shield
+            .put_app(AppDraft {
+                id: Some(id.clone()),
+                autostart: true,
+                ..draft("api", "cargo run", "/workspace")
+            })
+            .unwrap();
+        assert_eq!(shield.apps.len(), 1);
+        assert_eq!((shield.apps[0].id.as_str(), shield.apps[0].name.as_str()), (id.as_str(), "api"));
+        assert!(shield.apps[0].autostart);
+        assert!(matches!(
+            shield.put_app(AppDraft {
+                id: Some("nope".into()),
+                ..draft("a", "x", "/workspace")
+            }),
+            Err(Error::AppNotFound)
+        ));
+        shield.remove_app(&id).unwrap();
+        assert!(matches!(shield.remove_app(&id), Err(Error::AppNotFound)));
+    }
+
+    #[test]
+    fn check_refuses_an_app_without_its_mount() {
+        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
+        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        shield.put_app(draft("web", "x", "/mnt/data")).unwrap();
+        shield.remove_mount("/mnt/data").unwrap();
+        assert!(matches!(shield.check(), Err(Error::AppCwd(n, c)) if n == "web" && c == "/mnt/data"));
+    }
+
+    #[test]
+    fn reorder_needs_each_id_once() {
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut items = ids(&["a", "b", "c"]);
+        reorder(&mut items, &ids(&["c", "a", "b"]), |s| s).unwrap();
+        assert_eq!(items, ["c", "a", "b"]);
+        for bad in [&["c", "a"][..], &["c", "a", "a"], &["c", "a", "b", "b"], &["c", "a", "x"]] {
+            assert!(matches!(reorder(&mut items, &ids(bad), |s| s), Err(Error::InvalidOrder)), "{bad:?}");
+            assert_eq!(items, ["c", "a", "b"]);
+        }
+    }
+
+    #[test]
+    fn set_layout_keeps_finite_positions() {
+        let (mut shield, _) = shield_with_dirs(&["project"]);
+        shield.set_layout(Some(
+            [
+                ("harness".to_owned(), Pos { x: 1.0, y: 2.0 }),
+                ("host:a.io".to_owned(), Pos { x: f64::NAN, y: 0.0 }),
+                ("host:b.io".to_owned(), Pos { x: 0.0, y: f64::INFINITY }),
+            ]
+            .into(),
+        ));
+        assert_eq!(shield.layout.keys().collect::<Vec<_>>(), ["harness"]);
+        shield.set_layout(None);
+        assert!(shield.layout.is_empty());
     }
 
     #[test]

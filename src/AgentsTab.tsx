@@ -1,8 +1,8 @@
 import { Accordion, Button, Card, CommandMenu, IconButton, SegmentedControl, Textarea } from "@driif/motiv";
 import { ArrowUp, Bot, KeyRound, MessageSquarePlus, RotateCw, Square, TriangleAlert, Wrench } from "lucide-react";
 import { KeyboardEvent, useEffect, useReducer, useRef, useState } from "react";
-import { agentCall, AgentCommand, Chat, closeAgent, listChats, openAgent, ShieldView, ThinkingLevel } from "./api";
-import type { Tab } from "./App";
+import { agentCall, AgentCommand, closeAgent, deleteChat, openAgent, ShieldView, ThinkingLevel } from "./api";
+import type { ChatAction, TabView } from "./App";
 import { Block, chatReducer, initialChat, Message, textOf, ToolRun } from "./agentChat";
 import { Markdown } from "./Markdown";
 import { reachable } from "./SecretsSection";
@@ -91,11 +91,21 @@ function MessageView({ message, results, tools }: { message: Message; results: M
 
 interface Props {
   shield: ShieldView;
-  onJump: (tab: Tab) => void;
+  /** The chat that the tree selected. `undefined` keeps pi's current chat. */
+  chat?: string;
+  onJump: (tab: TabView) => void;
+  /** Gets pi's current chat when it changes. */
+  onChat: (chat: string) => void;
+  /** The chat files may have changed. */
+  onChatsChange: () => void;
+  /** A rename or delete from the tree, which needs pi. */
+  chatAction?: ChatAction;
+  /** Gets the work of `chatAction` when it starts. */
+  onChatActionDone: (work: Promise<unknown>) => void;
 }
 
 /** The chat with the shield's pi agent. pi runs in the shield, in its harness. */
-export function AgentsTab({ shield, onJump }: Props) {
+export function AgentsTab({ shield, chat: wanted, onJump, onChat, onChatsChange, chatAction, onChatActionDone }: Props) {
   const running = shield.status.state === "running";
   const [agentId, setAgentId] = useState<string>();
   const [opens, setOpens] = useState(0);
@@ -103,7 +113,6 @@ export function AgentsTab({ shield, onJump }: Props) {
   const [state, setState] = useState<AgentState>();
   const [stats, setStats] = useState<Stats>();
   const [models, setModels] = useState<Model[]>([]);
-  const [chats, setChats] = useState<Chat[]>([]);
   const [draft, setDraft] = useState("");
   const [mode, setMode] = useState<"steer" | "follow_up">("steer");
   const [error, setError] = useState<string>();
@@ -114,7 +123,7 @@ export function AgentsTab({ shield, onJump }: Props) {
   const stick = useRef(true);
 
   const fail = (e: unknown) => setError(String(e));
-  const reloadChats = () => listChats(shield.id).then(setChats, fail);
+  const reloadChats = onChatsChange;
 
   async function refresh(id: string) {
     const [next, nextStats] = await Promise.all([
@@ -217,6 +226,34 @@ export function AgentsTab({ shield, onJump }: Props) {
   const results = new Map(chat.messages.filter((m) => m.role === "toolResult").map((m) => [m.toolCallId!, m]));
   const shown = chat.partial ? [...chat.messages, chat.partial] : chat.messages;
   const currentChat = state?.sessionFile?.split("/").pop();
+
+  useEffect(() => {
+    if (currentChat) onChat(currentChat);
+  }, [currentChat]);
+
+  useEffect(() => {
+    if (wanted && ready && !chat.running && wanted !== currentChat) thenLoad({ type: "switch_session", chat: wanted });
+  }, [wanted, ready, chat.running]);
+
+  // pi renames only its current chat, and must not delete the file that it writes.
+  async function doChatAction(id: string, action: ChatAction) {
+    const now = await agentCall<AgentState & { isStreaming: boolean }>(id, { type: "get_state" });
+    if (now.isStreaming) throw "pi is busy. Wait until it is done, or stop it.";
+    const holds = now.sessionFile?.split("/").pop() === action.chat;
+    if (action.kind === "rename") {
+      if (!holds) await agentCall(id, { type: "switch_session", chat: action.chat });
+      await agentCall(id, { type: "set_session_name", name: action.name });
+    } else {
+      if (holds) await agentCall(id, { type: "new_session" });
+      await deleteChat(shield.id, action.chat);
+    }
+    await load(id);
+  }
+
+  useEffect(() => {
+    if (chatAction && ready) onChatActionDone(doChatAction(agentId, chatAction));
+  }, [chatAction, ready]);
+
   const providerReady = shield.secrets.some(
     (s) => PROVIDER_KEYS.has(s.name) && s.hosts.some((h) => reachable(shield.network, h)),
   );
@@ -229,37 +266,17 @@ export function AgentsTab({ shield, onJump }: Props) {
 
   return (
     <div className="agents">
-      <aside className="chat-list">
-        <Button
-          variant="outline"
-          size="sm"
-          iconLeft={<MessageSquarePlus size={14} />}
-          disabled={!ready || chat.running}
-          onClick={() => thenLoad({ type: "new_session" })}
-        >
-          New chat
-        </Button>
-        <ul className="list">
-          {chats.map((c) => (
-            <li key={c.id}>
-              <Button
-                size="sm"
-                variant={c.id === currentChat ? "secondary" : "ghost"}
-                className="chat-item"
-                aria-pressed={c.id === currentChat}
-                disabled={!ready || chat.running}
-                title={c.title}
-                onClick={() => thenLoad({ type: "switch_session", chat: c.id })}
-              >
-                <span className="grow">{c.title}</span>
-                <span className="muted">{new Date(c.started).toLocaleDateString()}</span>
-              </Button>
-            </li>
-          ))}
-        </ul>
-      </aside>
       <section className="chat">
         <header className="chat-header row">
+          <Button
+            variant="outline"
+            size="sm"
+            iconLeft={<MessageSquarePlus size={14} />}
+            disabled={!ready || chat.running}
+            onClick={() => thenLoad({ type: "new_session" })}
+          >
+            New chat
+          </Button>
           <CommandMenu
             className="model-picker"
             menuLabel="Models"

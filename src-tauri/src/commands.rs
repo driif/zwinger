@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tauri::State;
 use tauri::ipc::Channel;
 
@@ -9,7 +11,7 @@ use crate::netlog::NetEvent;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::secrets::{Secret, SecretValue};
 use crate::sessions::{Manager, SecretView, ShieldView};
-use crate::shield::{self, NetworkMode};
+use crate::shield::{self, AppDraft, NetworkMode, Pos};
 
 type Shields<'a> = State<'a, Manager<Microsandbox>>;
 
@@ -31,6 +33,64 @@ pub async fn delete_shield(shields: Shields<'_>, id: String) -> Result<()> {
 #[tauri::command]
 pub fn rename_shield(shields: Shields<'_>, id: String, name: String) -> Result<()> {
     shields.rename(&id, &name)
+}
+
+#[tauri::command]
+pub fn reorder_shields(shields: Shields<'_>, ids: Vec<String>) -> Result<()> {
+    shields.reorder_shields(&ids)
+}
+
+#[tauri::command]
+pub fn set_layout(shields: Shields<'_>, id: String, layout: Option<BTreeMap<String, Pos>>) -> Result<()> {
+    shields.set_layout(&id, layout)
+}
+
+#[tauri::command]
+pub fn put_app(shields: Shields<'_>, id: String, app: AppDraft) -> Result<String> {
+    shields.put_app(&id, app)
+}
+
+#[tauri::command]
+pub fn remove_app(shields: Shields<'_>, id: String, app_id: String) -> Result<()> {
+    shields.remove_app(&id, &app_id)
+}
+
+#[tauri::command]
+pub fn reorder_apps(shields: Shields<'_>, id: String, app_ids: Vec<String>) -> Result<()> {
+    shields.reorder_apps(&id, &app_ids)
+}
+
+#[tauri::command]
+pub async fn start_app(shields: Shields<'_>, id: String, app_id: String) -> Result<String> {
+    shields.start_app(&id, &app_id).await
+}
+
+#[tauri::command]
+pub fn stop_app(shields: Shields<'_>, id: String, app_id: String) -> Result<()> {
+    shields.stop_app(&id, &app_id)
+}
+
+#[tauri::command]
+pub async fn restart_app(shields: Shields<'_>, id: String, app_id: String) -> Result<String> {
+    shields.restart_app(&id, &app_id).await
+}
+
+#[tauri::command]
+pub fn attach_app(shields: Shields<'_>, session_id: String, on_event: Channel<PtyEvent>) -> Result<u64> {
+    shields.attach_app(&session_id, move |event| {
+        // The webview may have closed the channel; the app keeps running.
+        let _ = on_event.send(event);
+    })
+}
+
+#[tauri::command]
+pub fn detach_app(shields: Shields<'_>, session_id: String, token: u64) {
+    shields.detach_app(&session_id, token);
+}
+
+#[tauri::command]
+pub fn resolve_folder(path: String) -> Result<String> {
+    shield::resolve_folder(&path)
 }
 
 #[tauri::command]
@@ -190,4 +250,9 @@ pub async fn close_agent(shields: Shields<'_>, id: String) -> Result<()> {
 #[tauri::command]
 pub async fn list_chats(shields: Shields<'_>, shield_id: String) -> Result<Vec<Chat>> {
     shields.list_chats(&shield_id).await
+}
+
+#[tauri::command]
+pub async fn delete_chat(shields: Shields<'_>, shield_id: String, chat: String) -> Result<()> {
+    shields.delete_chat(&shield_id, &chat).await
 }

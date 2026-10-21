@@ -3,16 +3,16 @@ import { Play, Square } from "lucide-react";
 import { useEffect, useState } from "react";
 import { listFolders, NetEvent, SessionKind, ShieldView } from "./api";
 import { AgentsTab } from "./AgentsTab";
-import type { Intent, Pane, Run, Tab } from "./App";
+import type { ChatAction, Intent, Pane, Run, TabView, View } from "./App";
+import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
 import { SettingsTab } from "./SettingsTab";
 import { ShieldMap } from "./ShieldMap";
 import { TerminalTab } from "./TerminalTab";
 
+// Agents and Terminal are no tabs: the tree names each chat and terminal, so tabs would show them twice.
 const TABS = [
   { value: "overview", label: "Overview" },
-  { value: "agents", label: "Agents" },
-  { value: "terminal", label: "Terminal" },
   { value: "network", label: "Network" },
   { value: "settings", label: "Settings" },
 ];
@@ -21,30 +21,41 @@ interface Props {
   shield: ShieldView;
   /** The shield's network events, oldest first. */
   events: NetEvent[];
-  tab: Tab;
-  onTab: (tab: Tab) => void;
+  view: View;
+  onView: (view: View) => void;
   intent?: Intent;
   onIntentDone: () => void;
+  onNetSeen: (seq: number) => void;
+  onChat: (chat: string) => void;
+  onChatsChange: () => void;
+  chatAction?: ChatAction;
+  onChatActionDone: (work: Promise<unknown>) => void;
+  /** A folder from Finder was dropped on the shield boundary of the map. */
+  onDropFolder: (path: string) => void;
   panes: Pane[];
   activePanes: Record<string, string>;
   run: Run;
   onToggle: () => void;
-  onShowPane: (key: string) => void;
   onNewSession: (kind: SessionKind) => void;
-  onClosePane: (key: string) => void;
   onPaneOpen: (key: string, sessionId: string) => void;
   onPaneExit: () => void;
   onPaneError: (key: string, error: unknown) => void;
 }
 
-// Not keyed by shield: the terminal tab keeps the panes of every shield mounted.
+// Not keyed by shield: the terminal view keeps the panes of every shield mounted.
 export function ShieldPage({
   shield,
   events,
-  tab,
-  onTab,
+  view,
+  onView,
   intent,
   onIntentDone,
+  onNetSeen,
+  onChat,
+  onChatsChange,
+  chatAction,
+  onChatActionDone,
+  onDropFolder,
   panes,
   activePanes,
   run,
@@ -54,7 +65,12 @@ export function ShieldPage({
   const { status } = shield;
   const [listed, setListed] = useState<{ id: string; folders: string[] }>();
   const [reloads, setReloads] = useState(0);
-  const folders = listed?.id === shield.id ? listed.folders : [];
+  const folders = listed?.id === shield.id ? listed.folders : undefined;
+  // The tab that shows again after a chat, terminal or app view. The tabs stay
+  // mounted meanwhile, so a draft in them is kept.
+  const [tab, setTab] = useState<TabView>("overview");
+  const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
+  if (isTab && view.kind !== tab) setTab(view.kind);
 
   // Folders change outside the app, so the list reloads on focus and after each edit.
   useEffect(() => {
@@ -82,6 +98,8 @@ export function ShieldPage({
 
   const running = status.state === "running" || status.state === "stopping";
   const sessions = shield.sessions.filter((s) => s.exitCode === null).length;
+  const jump = (kind: TabView) => onView({ kind });
+  const app = view.kind === "app" ? shield.apps.find((a) => a.id === view.appId) : undefined;
 
   return (
     <section className="page">
@@ -106,69 +124,109 @@ export function ShieldPage({
         </Button>
       </header>
       <ElasticTabs
-        className="tabs"
-        label="Shield"
-        tabs={TABS}
-        value={tab}
-        onChange={(value) => onTab(value as Tab)}
-        panels={{
-          overview: (
-            <div className="overview">
-              <ShieldMap shield={shield} folders={folders} events={events} onJump={onTab} />
-              <dl className="facts">
-                <div>
-                  <dt>Agent starts in</dt>
-                  <dd className="mono">{shield.harness ?? "/workspace"}</dd>
-                </div>
-                <div>
-                  <dt>Network</dt>
-                  <dd>
-                    {shield.network.mode === "public"
-                      ? "Public internet"
-                      : shield.network.mode === "deny" || shield.network.domains.length === 0
-                        ? "No egress"
-                        : `${shield.network.domains.length} allowed hosts`}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Sessions</dt>
-                  <dd>{sessions}</dd>
-                </div>
-              </dl>
-            </div>
-          ),
-          agents: <AgentsTab key={shield.id} shield={shield} onJump={onTab} />,
-          terminal: (
-            <TerminalTab
-              shield={shield}
-              panes={panes}
-              activePane={activePanes[shield.id]}
-              visible={tab === "terminal"}
-              {...terminal}
-            />
-          ),
-          network: (
-            <NetworkTab
-              key={shield.id}
-              shield={shield}
-              events={events}
-              run={edit}
-              intent={tab === "network" ? intent : undefined}
-              onIntentDone={onIntentDone}
-            />
-          ),
-          settings: (
-            <SettingsTab
-              key={shield.id}
-              shield={shield}
-              folders={folders}
-              run={edit}
-              intent={tab === "settings" ? intent : undefined}
-              onIntentDone={onIntentDone}
-            />
-          ),
-        }}
-      />
+          className="tabs"
+          hidden={!isTab}
+          label="Shield"
+          tabs={TABS}
+          value={tab}
+          onChange={(value) => jump(value as TabView)}
+          panels={{
+            overview: (
+              <div className="overview">
+                <ShieldMap
+                  key={shield.id}
+                  shield={shield}
+                  folders={folders}
+                  events={events}
+                  visible={isTab && tab === "overview"}
+                  run={run}
+                  onJump={jump}
+                  onDropFolder={onDropFolder}
+                />
+                <dl className="facts">
+                  <div>
+                    <dt>Agent starts in</dt>
+                    <dd className="mono">{shield.harness ?? "/workspace"}</dd>
+                  </div>
+                  <div>
+                    <dt>Network</dt>
+                    <dd>
+                      {shield.network.mode === "public"
+                        ? "Public internet"
+                        : shield.network.mode === "deny" || shield.network.domains.length === 0
+                          ? "No egress"
+                          : `${shield.network.domains.length} allowed hosts`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Sessions</dt>
+                    <dd>{sessions}</dd>
+                  </div>
+                  <div>
+                    <dt>Apps running</dt>
+                    <dd>{shield.appRuns.filter((r) => r.exitCode === null).length}</dd>
+                  </div>
+                </dl>
+              </div>
+            ),
+            network: (
+              <NetworkTab
+                key={shield.id}
+                shield={shield}
+                events={events}
+                run={edit}
+                intent={tab === "network" ? intent : undefined}
+                onIntentDone={onIntentDone}
+                active={isTab && tab === "network"}
+                onSeen={onNetSeen}
+              />
+            ),
+            settings: (
+              <SettingsTab
+                key={shield.id}
+                shield={shield}
+                folders={folders ?? []}
+                run={edit}
+                intent={tab === "settings" ? intent : undefined}
+                onIntentDone={onIntentDone}
+              />
+            ),
+          }}
+        />
+      {/* Stays mounted, so the chat keeps its state while another view shows. */}
+      <div className="view" hidden={view.kind !== "chat"}>
+        <AgentsTab
+          key={shield.id}
+          shield={shield}
+          chat={view.kind === "chat" ? view.chat : undefined}
+          onJump={jump}
+          onChat={onChat}
+          onChatsChange={onChatsChange}
+          chatAction={chatAction}
+          onChatActionDone={onChatActionDone}
+        />
+      </div>
+      {app && (
+        <div className="view">
+          <AppView
+            key={app.id}
+            shield={shield}
+            app={app}
+            run={run}
+            onExit={terminal.onPaneExit}
+            onError={(e) => run(() => Promise.reject(e))}
+          />
+        </div>
+      )}
+      <div className="view" hidden={view.kind !== "terminal"}>
+        <TerminalTab
+          shield={shield}
+          panes={panes}
+          activePane={activePanes[shield.id]}
+          visible={view.kind === "terminal"}
+          {...terminal}
+        />
+      </div>
     </section>
   );
 }

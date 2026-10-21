@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::AbortHandle;
 
 use crate::agent::{self, Agent, AgentCommand, Chat, Sink};
@@ -15,7 +16,7 @@ use crate::runtime::{
     PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
 };
 use crate::secrets::{self, Places, Secret, SecretValue, Vault};
-use crate::shield::{self, NetworkMode, NetworkPolicy, Shield, WORKSPACE};
+use crate::shield::{self, AppDraft, NetworkMode, NetworkPolicy, Pos, Shield, WORKSPACE};
 use crate::store::Store;
 
 const NODE_LIMIT: Duration = Duration::from_secs(15);
@@ -25,6 +26,10 @@ const NODE_OUT: usize = 1 << 10;
 const CLOSE_LIMIT: Duration = Duration::from_secs(5);
 /// The network events kept per shield.
 const NET_RING: usize = 500;
+/// The output bytes kept per app run, for a view that attaches later.
+const APP_RING: usize = 256 << 10;
+/// The terminal size of an app until a view attaches and resizes it.
+const APP_SIZE: (u16, u16) = (24, 80);
 
 /// Gets each new network event with its shield id.
 pub type NetSink = Box<dyn Fn(&str, &NetEvent) + Send + Sync>;
@@ -56,6 +61,9 @@ struct State<V> {
     /// Per shield, the last network events. They stay after a stop, so the
     /// user can still allow a blocked host.
     net: HashMap<String, VecDeque<NetEvent>>,
+    /// Per shield and app, counts the app stops. A start that saw an older
+    /// count was stopped while its process opened.
+    app_stops: HashMap<(String, String), u64>,
 }
 
 enum Vm<V> {
@@ -67,7 +75,7 @@ enum Vm<V> {
     /// log could not be opened.
     Running {
         vm: Arc<V>,
-        applied: Shield,
+        applied: Box<Shield>,
         applied_rev: u64,
         net: Option<AbortHandle>,
     },
@@ -82,6 +90,43 @@ struct Session {
     kind: SessionKind,
     input: UnboundedSender<PtyInput>,
     exit_code: Option<i32>,
+    /// Set for an app run. The backend owns it, not a view.
+    app: Option<AppRun>,
+}
+
+struct AppRun {
+    app_id: String,
+    output: Arc<Mutex<AppOutput>>,
+    /// Becomes `true` when the process has exited.
+    exited: watch::Receiver<bool>,
+}
+
+/// The kept output of an app run and the view that gets new output.
+#[derive(Default)]
+struct AppOutput {
+    ring: VecDeque<u8>,
+    exit: Option<i32>,
+    /// The view that gets new output, with the token of its attach.
+    sink: Option<(u64, PtySink)>,
+    attaches: u64,
+}
+
+type PtySink = Box<dyn Fn(PtyEvent) + Send>;
+
+impl AppOutput {
+    fn push(&mut self, event: PtyEvent) {
+        match &event {
+            PtyEvent::Output(bytes) => {
+                self.ring.extend(bytes);
+                let excess = self.ring.len().saturating_sub(APP_RING);
+                self.ring.drain(..excess);
+            }
+            PtyEvent::Exit(code) => self.exit = Some(*code),
+        }
+        if let Some((_, sink)) = &self.sink {
+            sink(event);
+        }
+    }
 }
 
 struct AgentEntry {
@@ -101,6 +146,8 @@ pub struct ShieldView {
     pub status: Status,
     pub pending_restart: bool,
     pub sessions: Vec<SessionView>,
+    /// The apps that run or have exited. An app with no entry is stopped.
+    pub app_runs: Vec<AppRunView>,
 }
 
 /// A secret as the UI sees it. It has no value, only if the vault has one.
@@ -129,6 +176,14 @@ pub enum Status {
 pub struct SessionView {
     pub id: String,
     pub kind: SessionKind,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppRunView {
+    pub app_id: String,
+    pub session_id: String,
     pub exit_code: Option<i32>,
 }
 
@@ -209,6 +264,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 agents: Vec::new(),
                 secrets_rev: HashMap::new(),
                 net: HashMap::new(),
+                app_stops: HashMap::new(),
             })),
             net_sink: Arc::new(OnceLock::new()),
         })
@@ -234,32 +290,44 @@ impl<R: SandboxRuntime> Manager<R> {
                 let (status, pending_restart) = match state.vms.get(&shield.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting) => (Status::Starting, false),
-                    // A new name is visible at once, so it needs no restart.
+                    // A new name, layout or app list is used at once, so it
+                    // needs no restart.
                     Some(Vm::Running {
                         applied, applied_rev, ..
                     }) => (
                         Status::Running,
                         Shield {
                             name: shield.name.clone(),
-                            ..applied.clone()
+                            layout: shield.layout.clone(),
+                            apps: shield.apps.clone(),
+                            ..(**applied).clone()
                         } != *shield
                             || *applied_rev != state.secrets_rev(&shield.id),
                     ),
                     Some(Vm::Stopping) => (Status::Stopping, false),
                     Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
                 };
+                let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
                 ShieldView {
                     shield: shield.clone(),
                     status,
                     pending_restart,
-                    sessions: state
-                        .sessions
-                        .iter()
-                        .filter(|s| s.shield_id == shield.id)
+                    sessions: sessions
+                        .clone()
+                        .filter(|s| s.app.is_none())
                         .map(|s| SessionView {
                             id: s.id.clone(),
                             kind: s.kind,
                             exit_code: s.exit_code,
+                        })
+                        .collect(),
+                    app_runs: sessions
+                        .filter_map(|s| {
+                            s.app.as_ref().map(|run| AppRunView {
+                                app_id: run.app_id.clone(),
+                                session_id: s.id.clone(),
+                                exit_code: s.exit_code,
+                            })
                         })
                         .collect(),
                 }
@@ -278,6 +346,42 @@ impl<R: SandboxRuntime> Manager<R> {
         state.shields.push(shield);
         self.store.save(&state.shields)?;
         Ok(id)
+    }
+
+    /// `ids` must name each shield once.
+    pub fn reorder_shields(&self, ids: &[String]) -> Result<()> {
+        let mut state = lock(&self.state);
+        let mut shields = state.shields.clone();
+        shield::reorder(&mut shields, ids, |s| &s.id)?;
+        self.store.save(&shields)?;
+        state.shields = shields;
+        Ok(())
+    }
+
+    pub fn set_layout(&self, id: &str, layout: Option<BTreeMap<String, Pos>>) -> Result<()> {
+        self.edit(id, |s| {
+            s.set_layout(layout);
+            Ok(())
+        })
+    }
+
+    pub fn put_app(&self, id: &str, draft: AppDraft) -> Result<String> {
+        let mut app_id = String::new();
+        self.edit(id, |s| {
+            app_id = s.put_app(draft)?;
+            Ok(())
+        })?;
+        Ok(app_id)
+    }
+
+    /// Also stops the app.
+    pub fn remove_app(&self, id: &str, app_id: &str) -> Result<()> {
+        self.edit(id, |s| s.remove_app(app_id))?;
+        self.stop_app(id, app_id)
+    }
+
+    pub fn reorder_apps(&self, id: &str, app_ids: &[String]) -> Result<()> {
+        self.edit(id, |s| s.reorder_apps(app_ids))
     }
 
     /// Applies `edit` to the stored config and persists it. The change is kept
@@ -532,25 +636,36 @@ impl<R: SandboxRuntime> Manager<R> {
             Err(_) => None,
         };
 
-        let mut state = lock(&self.state);
-        match result {
-            Ok(vm) => {
-                state.vms.insert(
-                    id.to_owned(),
-                    Vm::Running {
-                        vm: Arc::new(vm),
-                        applied: shield,
-                        applied_rev,
-                        net,
-                    },
-                );
-                Ok(())
+        let autostart: Vec<String> = {
+            let mut state = lock(&self.state);
+            match result {
+                Ok(vm) => {
+                    state.vms.insert(
+                        id.to_owned(),
+                        Vm::Running {
+                            vm: Arc::new(vm),
+                            applied: Box::new(shield),
+                            applied_rev,
+                            net,
+                        },
+                    );
+                    let apps = state.shield_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
+                    apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
+                }
+                Err(e) => {
+                    state.vms.insert(id.to_owned(), Vm::Failed(e.to_string()));
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                state.vms.insert(id.to_owned(), Vm::Failed(e.to_string()));
-                Err(e)
+        };
+        // An app that cannot start, or a stop that ran meanwhile, does not
+        // fail the start. A bad command shows as an exit code.
+        for app_id in autostart {
+            if let Err(e) = self.start_app(id, &app_id).await {
+                eprintln!("autostart of app {app_id} in {id} failed: {e}");
             }
         }
+        Ok(())
     }
 
     /// Turns the runtime log lines into the shield's events.
@@ -729,7 +844,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             _ => return Err(Error::NotRunning),
         };
-        let mut pty = self.runtime.open_pty(&vm, kind, &cwd, rows, cols).await?;
+        let mut pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
         let id = uuid::Uuid::new_v4().to_string();
         {
             // The shield may have stopped, or stopped and started again, while
@@ -749,6 +864,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 kind,
                 input: pty.input,
                 exit_code: None,
+                app: None,
             });
         }
 
@@ -765,6 +881,168 @@ impl<R: SandboxRuntime> Manager<R> {
             }
         });
         Ok(id)
+    }
+
+    /// Runs the app's saved command as `/bin/sh -lc` in a PTY that the
+    /// backend owns, and returns its session id. A run that has exited is
+    /// replaced. Fails if the VM is not running, or if it stopped or started
+    /// again while the process opened.
+    pub async fn start_app(&self, shield_id: &str, app_id: &str) -> Result<String> {
+        let key = (shield_id.to_owned(), app_id.to_owned());
+        let (vm, app, stops) = {
+            let mut state = lock(&self.state);
+            let app = state.shield_mut(shield_id)?.app(app_id)?.clone();
+            let stops = state.app_stops.get(&key).copied().unwrap_or(0);
+            if state
+                .sessions
+                .iter()
+                .any(|s| s.app.as_ref().is_some_and(|r| r.app_id == app_id) && s.exit_code.is_none())
+            {
+                return Err(Error::AppRunning);
+            }
+            match state.vms.get(shield_id) {
+                Some(Vm::Running { vm, .. }) => (vm.clone(), app, stops),
+                _ => return Err(Error::NotRunning),
+            }
+        };
+        let argv = ["/bin/sh".to_owned(), "-lc".to_owned(), app.command];
+        let (rows, cols) = APP_SIZE;
+        let mut pty = self.runtime.open_pty(&vm, &argv, &app.cwd, rows, cols).await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let output = Arc::new(Mutex::new(AppOutput::default()));
+        let (exited_tx, exited) = watch::channel(false);
+        {
+            let mut state = lock(&self.state);
+            let same_vm = matches!(
+                state.vms.get(shield_id),
+                Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
+            );
+            let running = state
+                .sessions
+                .iter()
+                .any(|s| s.app.as_ref().is_some_and(|r| r.app_id == app_id) && s.exit_code.is_none());
+            // A stop or delete of the app, or a second start, ran while the
+            // process opened.
+            let error = if !same_vm {
+                Some(Error::NotRunning)
+            } else if state.shield_mut(shield_id).and_then(|s| s.app(app_id)).is_err() {
+                Some(Error::AppNotFound)
+            } else if state.app_stops.get(&key).copied().unwrap_or(0) != stops {
+                Some(Error::AppStopped)
+            } else if running {
+                Some(Error::AppRunning)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                let _ = pty.input.send(PtyInput::Kill);
+                return Err(error);
+            }
+            state.sessions.retain(|s| s.app.as_ref().is_none_or(|r| r.app_id != app_id));
+            state.sessions.push(Session {
+                id: id.clone(),
+                shield_id: shield_id.to_owned(),
+                kind: SessionKind::Shell,
+                input: pty.input,
+                exit_code: None,
+                app: Some(AppRun {
+                    app_id: app_id.to_owned(),
+                    output: output.clone(),
+                    exited,
+                }),
+            });
+        }
+
+        let state = self.state.clone();
+        let session_id = id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pty.events.recv().await {
+                if let PtyEvent::Exit(code) = event
+                    && let Some(s) = lock(&state).sessions.iter_mut().find(|s| s.id == session_id)
+                {
+                    s.exit_code = Some(code);
+                }
+                let exit = matches!(event, PtyEvent::Exit(_));
+                lock(&output).push(event);
+                if exit {
+                    let _ = exited_tx.send(true);
+                }
+            }
+        });
+        Ok(id)
+    }
+
+    /// Kills the app's run and forgets it, so the app shows as stopped. A start
+    /// that is in progress fails. An app with no run is not an error.
+    pub fn stop_app(&self, shield_id: &str, app_id: &str) -> Result<()> {
+        self.kill_app(shield_id, app_id);
+        Ok(())
+    }
+
+    /// Does the work of `stop_app` and returns the exit of the killed run.
+    fn kill_app(&self, shield_id: &str, app_id: &str) -> Option<watch::Receiver<bool>> {
+        let mut state = lock(&self.state);
+        *state
+            .app_stops
+            .entry((shield_id.to_owned(), app_id.to_owned()))
+            .or_default() += 1;
+        let mut exited = None;
+        state.sessions.retain(|s| match &s.app {
+            Some(run) if s.shield_id == shield_id && run.app_id == app_id => {
+                let _ = s.input.send(PtyInput::Kill);
+                exited = Some(run.exited.clone());
+                false
+            }
+            _ => true,
+        });
+        exited
+    }
+
+    /// Starts the app again after its old run has exited, so the new run can
+    /// take the ports of the old one.
+    pub async fn restart_app(&self, shield_id: &str, app_id: &str) -> Result<String> {
+        if let Some(mut exited) = self.kill_app(shield_id, app_id) {
+            // An error means that the run task ended, so the process is gone.
+            let wait = exited.wait_for(|done| *done);
+            if tokio::time::timeout(CLOSE_LIMIT, wait).await.is_err() {
+                return Err(Error::AppStillRunning);
+            }
+        }
+        self.start_app(shield_id, app_id).await
+    }
+
+    /// Sends the kept output of the app run to `on_event`, and its exit if it
+    /// has exited; then new output. A later attach takes over. Returns the
+    /// token for [`Manager::detach_app`].
+    pub fn attach_app(&self, session_id: &str, on_event: impl Fn(PtyEvent) + Send + 'static) -> Result<u64> {
+        let output = self.app_output(session_id)?;
+        let mut output = lock(&output);
+        on_event(PtyEvent::Output(output.ring.iter().copied().collect()));
+        if let Some(code) = output.exit {
+            on_event(PtyEvent::Exit(code));
+        }
+        output.attaches += 1;
+        let token = output.attaches;
+        output.sink = Some((token, Box::new(on_event)));
+        Ok(token)
+    }
+
+    /// Stops the output to the view of `token`. A later attach keeps its sink,
+    /// and an ended run is not an error.
+    pub fn detach_app(&self, session_id: &str, token: u64) {
+        let Ok(output) = self.app_output(session_id) else {
+            return;
+        };
+        let mut output = lock(&output);
+        if output.sink.as_ref().is_some_and(|(t, _)| *t == token) {
+            output.sink = None;
+        }
+    }
+
+    fn app_output(&self, session_id: &str) -> Result<Arc<Mutex<AppOutput>>> {
+        let state = lock(&self.state);
+        let run = state.session(session_id)?.app.as_ref().ok_or(Error::SessionNotFound)?;
+        Ok(run.output.clone())
     }
 
     pub fn write(&self, id: &str, data: Vec<u8>) -> Result<()> {
@@ -917,6 +1195,13 @@ impl<R: SandboxRuntime> Manager<R> {
         lock(&self.state).shield_mut(shield_id)?;
         let state = self.state_dir(shield_id);
         blocking(move || Ok(agent::list_chats(&state))).await
+    }
+
+    pub async fn delete_chat(&self, shield_id: &str, chat: &str) -> Result<()> {
+        lock(&self.state).shield_mut(shield_id)?;
+        let state = self.state_dir(shield_id);
+        let chat = chat.to_owned();
+        blocking(move || agent::delete_chat(&state, &chat)).await
     }
 }
 
@@ -1549,6 +1834,263 @@ mod tests {
             *runtime.cwds.lock().unwrap(),
             ["/workspace", "/workspace/agent", "/workspace"]
         );
+    }
+
+    fn app(manager: &Manager<FakeRuntime>, id: &str, command: &str, autostart: bool) -> String {
+        manager
+            .put_app(
+                id,
+                AppDraft {
+                    id: None,
+                    name: command.into(),
+                    command: command.into(),
+                    cwd: WORKSPACE.into(),
+                    autostart,
+                },
+            )
+            .unwrap()
+    }
+
+    fn runs(manager: &Manager<FakeRuntime>) -> Vec<(String, Option<i32>)> {
+        manager.list()[0].app_runs.iter().map(|r| (r.app_id.clone(), r.exit_code)).collect()
+    }
+
+    async fn until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition not met");
+    }
+
+    #[tokio::test]
+    async fn layout_app_and_order_edits_need_no_restart() {
+        let (manager, _, id) = manager();
+        manager.start(&id).await.unwrap();
+        manager.set_layout(&id, Some([("harness".to_owned(), Pos { x: 1.0, y: 2.0 })].into())).unwrap();
+        let web = app(&manager, &id, "pnpm dev", false);
+        app(&manager, &id, "cargo run", true);
+        let mut ids: Vec<String> = manager.list()[0].shield.apps.iter().map(|a| a.id.clone()).collect();
+        ids.reverse();
+        manager.reorder_apps(&id, &ids).unwrap();
+        manager.remove_app(&id, &web).unwrap();
+        manager.reorder_shields(std::slice::from_ref(&id)).unwrap();
+        let view = &manager.list()[0];
+        assert!(!view.pending_restart);
+        assert_eq!(view.shield.apps.len(), 1);
+        assert_eq!(view.shield.layout.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reorder_shields_persists() {
+        let dir = temp_dir();
+        let store = || Store::new(dir.join("shields.json"));
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
+        let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
+        assert!(matches!(manager.reorder_shields(std::slice::from_ref(&b)), Err(Error::InvalidOrder)));
+        manager.reorder_shields(&[b.clone(), a.clone()]).unwrap();
+
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir()).unwrap();
+        let order: Vec<String> = reloaded.list().into_iter().map(|v| v.shield.id).collect();
+        assert_eq!(order, [b, a]);
+    }
+
+    #[tokio::test]
+    async fn autostart_runs_apps_after_start() {
+        let (manager, runtime, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", true);
+        app(&manager, &id, "cargo run", false);
+        assert!(matches!(manager.start_app(&id, &web).await, Err(Error::NotRunning)));
+
+        manager.start(&id).await.unwrap();
+        assert_eq!(runs(&manager), [(web.clone(), None)]);
+        assert!(manager.list()[0].sessions.is_empty());
+        assert_eq!(
+            runtime.argvs.lock().unwrap().last().unwrap(),
+            &["/bin/sh", "-lc", "pnpm dev"]
+        );
+        assert_eq!(runtime.cwds.lock().unwrap().last().unwrap(), WORKSPACE);
+        assert!(matches!(manager.start_app(&id, &web).await, Err(Error::AppRunning)));
+    }
+
+    #[tokio::test]
+    async fn stop_ends_apps() {
+        let (manager, runtime, id) = manager();
+        app(&manager, &id, "pnpm dev", true);
+        manager.start(&id).await.unwrap();
+        manager.stop(&id).await.unwrap();
+        assert!(runs(&manager).is_empty());
+        until(|| runtime.log.lock().unwrap().contains(&"kill".to_owned())).await;
+    }
+
+    #[tokio::test]
+    async fn app_output_is_kept_for_a_later_attach() {
+        let (manager, _, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", false);
+        manager.start(&id).await.unwrap();
+        let session = manager.start_app(&id, &web).await.unwrap();
+        manager.write(&session, b"ready".to_vec()).unwrap();
+
+        let attach = || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            manager
+                .attach_app(&session, move |e| {
+                    let _ = tx.send(e);
+                })
+                .unwrap();
+            rx
+        };
+        let mut rx = attach();
+        // The echo of the write reaches the ring in a task.
+        while rx.try_recv() != Ok(output("24x80ready")) {
+            tokio::task::yield_now().await;
+            rx = attach();
+        }
+        manager.write(&session, b"!".to_vec()).unwrap();
+        assert_eq!(next(&mut rx).await, output("!"));
+
+        manager.send(&session, PtyInput::Kill).unwrap();
+        assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
+        assert_eq!(runs(&manager), [(web.clone(), Some(137))]);
+
+        let mut rx = attach();
+        assert_eq!(next(&mut rx).await, output("24x80ready!"));
+        assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
+
+        let restarted = manager.start_app(&id, &web).await.unwrap();
+        assert_ne!(restarted, session);
+        assert_eq!(runs(&manager), [(web.clone(), None)]);
+        manager.stop_app(&id, &web).unwrap();
+        assert!(runs(&manager).is_empty());
+        let session = manager.restart_app(&id, &web).await.unwrap();
+        let again = manager.restart_app(&id, &web).await.unwrap();
+        assert_ne!(again, session);
+        assert_eq!(runs(&manager), [(web, None)]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_detach_keeps_the_new_sink() {
+        let (manager, _, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", false);
+        manager.start(&id).await.unwrap();
+        let session = manager.start_app(&id, &web).await.unwrap();
+        let attach = || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let token = manager
+                .attach_app(&session, move |e| {
+                    let _ = tx.send(e);
+                })
+                .unwrap();
+            (token, rx)
+        };
+        let (old, _old_rx) = attach();
+        let (new, mut rx) = attach();
+        assert_ne!(old, new);
+        manager.detach_app(&session, old);
+        let _ = next(&mut rx).await;
+        manager.write(&session, b"x".to_vec()).unwrap();
+        while next(&mut rx).await != output("x") {}
+
+        manager.detach_app(&session, new);
+        manager.write(&session, b"y".to_vec()).unwrap();
+        manager.send(&session, PtyInput::Kill).unwrap();
+        until(|| runs(&manager) == [(web.clone(), Some(137))]).await;
+        assert!(rx.try_recv().is_err());
+        manager.detach_app("gone", new);
+    }
+
+    #[tokio::test]
+    async fn app_started_during_stop_is_killed() {
+        let (manager, runtime, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", false);
+        manager.start(&id).await.unwrap();
+        let gate = Arc::new(PtyGate::default());
+        *runtime.pty_gate.lock().unwrap() = Some(gate.clone());
+
+        let manager = Arc::new(manager);
+        let starting = tokio::spawn({
+            let (manager, id) = (manager.clone(), id.clone());
+            async move { manager.start_app(&id, &web).await }
+        });
+        gate.entered.notified().await;
+        manager.stop(&id).await.unwrap();
+        *runtime.pty_gate.lock().unwrap() = None;
+        manager.start(&id).await.unwrap();
+        gate.release.notify_one();
+
+        assert!(matches!(starting.await.unwrap(), Err(Error::NotRunning)));
+        assert!(runs(&manager).is_empty());
+        until(|| runtime.log.lock().unwrap().contains(&"kill".to_owned())).await;
+    }
+
+    async fn app_start_during(remove: bool) {
+        let (manager, runtime, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", false);
+        manager.start(&id).await.unwrap();
+        let gate = Arc::new(PtyGate::default());
+        *runtime.pty_gate.lock().unwrap() = Some(gate.clone());
+
+        let manager = Arc::new(manager);
+        let starting = tokio::spawn({
+            let (manager, id, web) = (manager.clone(), id.clone(), web.clone());
+            async move { manager.start_app(&id, &web).await }
+        });
+        gate.entered.notified().await;
+        if remove {
+            manager.remove_app(&id, &web).unwrap();
+        } else {
+            manager.stop_app(&id, &web).unwrap();
+        }
+        gate.release.notify_one();
+
+        let result = starting.await.unwrap();
+        if remove {
+            assert!(matches!(result, Err(Error::AppNotFound)), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(Error::AppStopped)), "{result:?}");
+        }
+        assert!(runs(&manager).is_empty());
+        until(|| runtime.log.lock().unwrap().contains(&"kill".to_owned())).await;
+    }
+
+    #[tokio::test]
+    async fn app_stopped_during_its_start_does_not_run() {
+        app_start_during(false).await;
+    }
+
+    #[tokio::test]
+    async fn app_removed_during_its_start_does_not_run() {
+        app_start_during(true).await;
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_the_old_run_to_exit() {
+        let (manager, runtime, id) = manager();
+        let web = app(&manager, &id, "pnpm dev", false);
+        manager.start(&id).await.unwrap();
+        let old = manager.start_app(&id, &web).await.unwrap();
+        let opened = runtime.argvs.lock().unwrap().len();
+        let gate = Arc::new(PtyGate::default());
+        *runtime.kill_gate.lock().unwrap() = Some(gate.clone());
+
+        let manager = Arc::new(manager);
+        let restarting = tokio::spawn({
+            let (manager, id, web) = (manager.clone(), id.clone(), web.clone());
+            async move { manager.restart_app(&id, &web).await }
+        });
+        gate.entered.notified().await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.argvs.lock().unwrap().len(), opened, "the new run started first");
+        gate.release.notify_one();
+
+        let new = restarting.await.unwrap().unwrap();
+        assert_ne!(new, old);
+        assert_eq!(runs(&manager), [(web, None)]);
     }
 
     #[test]

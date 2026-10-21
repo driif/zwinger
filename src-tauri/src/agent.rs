@@ -1,12 +1,12 @@
 //! The pi agent of a shield: `pi --mode rpc` in the VM, driven over JSONL pipes.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use rustix::fs::{Dir, Mode, OFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::error::TrySendError;
@@ -35,6 +35,8 @@ const STDERR_LINE: usize = 2 << 10;
 const CHAT_FILE: u64 = 64 << 20;
 /// Only this start of a chat file is read for its title.
 const CHAT_HEAD: u64 = 1 << 20;
+/// And only this end, for a name that was set late.
+const CHAT_TAIL: u64 = 1 << 20;
 /// A longer line of a chat file is skipped.
 const CHAT_LINE: usize = 64 << 10;
 const TITLE_CHARS: usize = 80;
@@ -137,6 +139,7 @@ pub enum AgentCommand {
         chat: String,
     },
     GetSessionStats,
+    SetSessionName { name: String },
 }
 
 impl AgentCommand {
@@ -414,9 +417,25 @@ pub fn list_chats(state: &Path) -> Vec<Chat> {
     chats
 }
 
+/// Deletes a chat file. Only a listed chat id counts, and the file is
+/// removed relative to the `sessions` dir, opened without following links,
+/// only while it is a regular file.
+pub fn delete_chat(state: &Path, chat: &str) -> Result<()> {
+    if !list_chats(state).iter().any(|c| c.id == chat) {
+        return Err(Error::ChatNotFound);
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let dir = rustix::fs::open(state.join(SESSIONS), flags, Mode::empty()).map_err(|_| Error::ChatNotFound)?;
+    let stat = rustix::fs::statat(&dir, chat, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| Error::ChatNotFound)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(Error::ChatNotFound);
+    }
+    rustix::fs::unlinkat(&dir, chat, AtFlags::empty()).map_err(|e| Error::Io(e.into()))
+}
+
 /// Reads the header timestamp and the title of an open chat file. Reads at
-/// most `CHAT_HEAD` bytes, so a name set late in a long chat is not seen and
-/// the title is the first user message.
+/// most `CHAT_HEAD` bytes from the start and `CHAT_TAIL` bytes from the end,
+/// so a name set in the middle of a long chat is not seen.
 fn read_chat(file: std::fs::File) -> Option<(String, String)> {
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > CHAT_FILE {
@@ -429,7 +448,25 @@ fn read_chat(file: std::fs::File) -> Option<(String, String)> {
     }
     let started = header["timestamp"].as_str()?.to_owned();
     let (mut name, mut first) = (None, None);
-    while let Some(line) = chat_line(&mut reader) {
+    title_lines(&mut reader, &mut name, &mut first);
+    if meta.len() > CHAT_HEAD {
+        let mut file = reader.into_inner().into_inner();
+        let start = CHAT_HEAD.max(meta.len() - CHAT_TAIL);
+        // From one byte before, so a line that starts at `start` is not cut off.
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        let mut reader = BufReader::new(file.take(CHAT_TAIL + 1));
+        chat_line(&mut reader);
+        // Names only: the first user message is in the head.
+        title_lines(&mut reader, &mut name, &mut Some(String::new()));
+    }
+    let title = name.or(first).unwrap_or_else(|| "New chat".to_owned());
+    Some((started, title.chars().take(TITLE_CHARS).collect()))
+}
+
+/// Reads the session name (the last one wins) and, while `first` is `None`,
+/// the first user message.
+fn title_lines(reader: &mut impl BufRead, name: &mut Option<String>, first: &mut Option<String>) {
+    while let Some(line) = chat_line(reader) {
         let Some(line) = line else {
             continue;
         };
@@ -442,15 +479,13 @@ fn read_chat(file: std::fs::File) -> Option<(String, String)> {
             continue;
         };
         match entry["type"].as_str() {
-            Some("session_info") => name = entry["name"].as_str().map(str::to_owned),
+            Some("session_info") => *name = entry["name"].as_str().map(str::to_owned),
             Some("message") if first.is_none() && entry["message"]["role"] == "user" => {
-                first = user_text(&entry["message"]["content"]);
+                *first = user_text(&entry["message"]["content"]);
             }
             _ => {}
         }
     }
-    let title = name.or(first).unwrap_or_else(|| "New chat".to_owned());
-    Some((started, title.chars().take(TITLE_CHARS).collect()))
 }
 
 /// The next line without its LF, or `Some(None)` for a line over
@@ -614,6 +649,10 @@ mod tests {
             json!({ "type": "set_thinking_level", "level": "xhigh" })
         );
         assert_eq!(command(json!({ "type": "abort" })).unwrap(), json!({ "type": "abort" }));
+        assert_eq!(
+            command(json!({ "type": "set_session_name", "name": "Auth" })).unwrap(),
+            json!({ "type": "set_session_name", "name": "Auth" })
+        );
         for refused in [
             json!({ "type": "bash", "command": "rm -rf /" }),
             json!({ "type": "export_html", "outputPath": "/tmp/x" }),
@@ -681,6 +720,35 @@ mod tests {
         std::os::unix::fs::symlink(&real, state.join(SESSIONS)).unwrap();
         assert!(list_chats(&state).is_empty());
         assert!(list_chats(&temp_dir()).is_empty());
+    }
+
+    #[test]
+    fn delete_chat_removes_only_a_listed_regular_file() {
+        let state = temp_dir();
+        let sessions = state.join(SESSIONS);
+        std::fs::create_dir(&sessions).unwrap();
+        let header = "{\"type\":\"session\",\"timestamp\":\"t\"}\n";
+        std::fs::write(sessions.join("a.jsonl"), header).unwrap();
+        let outside = temp_dir().join("secret.jsonl");
+        std::fs::write(&outside, header).unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("link.jsonl")).unwrap();
+        std::fs::create_dir(sessions.join("dir.jsonl")).unwrap();
+        std::fs::write(state.join("b.jsonl"), header).unwrap();
+
+        for chat in ["link.jsonl", "dir.jsonl", "../b.jsonl", "/etc/passwd", "", "missing.jsonl"] {
+            assert!(matches!(delete_chat(&state, chat), Err(Error::ChatNotFound)), "{chat}");
+        }
+        assert!(outside.exists() && sessions.join("dir.jsonl").is_dir() && state.join("b.jsonl").exists());
+        delete_chat(&state, "a.jsonl").unwrap();
+        assert!(!sessions.join("a.jsonl").exists());
+        assert!(matches!(delete_chat(&state, "a.jsonl"), Err(Error::ChatNotFound)));
+
+        let linked = temp_dir();
+        let real = temp_dir();
+        std::fs::write(real.join("c.jsonl"), header).unwrap();
+        std::os::unix::fs::symlink(&real, linked.join(SESSIONS)).unwrap();
+        assert!(matches!(delete_chat(&linked, "c.jsonl"), Err(Error::ChatNotFound)));
+        assert!(real.join("c.jsonl").exists());
     }
 
     #[test]
@@ -879,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn read_chat_skips_long_lines_and_reads_only_the_head() {
+    fn read_chat_skips_long_lines_and_reads_the_head_and_the_tail() {
         let state = temp_dir();
         let sessions = state.join(SESSIONS);
         std::fs::create_dir(&sessions).unwrap();
@@ -893,15 +961,23 @@ mod tests {
         while (late.len() as u64) < CHAT_HEAD {
             late.push_str(&filler);
         }
-        late.push_str("{\"type\":\"session_info\",\"name\":\"Too late\"}\n");
+        let mut middle = late.clone();
+        late.push_str("{\"type\":\"session_info\",\"name\":\"Late name\"}\n");
         std::fs::write(sessions.join("late.jsonl"), late).unwrap();
+        // A name between the head and the tail is not seen.
+        middle.push_str("{\"type\":\"session_info\",\"name\":\"Lost\"}\n");
+        while (middle.len() as u64) < 2 * CHAT_HEAD + CHAT_TAIL {
+            middle.push_str(&filler);
+        }
+        std::fs::write(sessions.join("middle.jsonl"), middle).unwrap();
         std::fs::write(sessions.join("one-line.jsonl"), "x".repeat(2 << 20)).unwrap();
         let big = std::fs::File::create(sessions.join("big.jsonl")).unwrap();
         std::io::Write::write_all(&mut &big, header.as_bytes()).unwrap();
         big.set_len(CHAT_FILE + 1).unwrap();
 
         let chats = list_chats(&state);
-        let got: Vec<(&str, &str)> = chats.iter().map(|c| (c.id.as_str(), c.title.as_str())).collect();
-        assert_eq!(got, [("late.jsonl", "Second")]);
+        let mut got: Vec<(&str, &str)> = chats.iter().map(|c| (c.id.as_str(), c.title.as_str())).collect();
+        got.sort();
+        assert_eq!(got, [("late.jsonl", "Late name"), ("middle.jsonl", "Second")]);
     }
 }

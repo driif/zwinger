@@ -40,7 +40,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::secrets::{Places, Secret};
-    use crate::shield::{Mount, NetworkMode, NetworkPolicy};
+    use crate::shield::{App, Mount, NetworkMode, NetworkPolicy, Pos};
 
     #[test]
     fn round_trip() {
@@ -71,6 +71,14 @@ mod tests {
                     body: false,
                 },
             }],
+            layout: [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into(),
+            apps: vec![App {
+                id: "app-1".into(),
+                name: "web".into(),
+                command: "pnpm dev".into(),
+                cwd: "/workspace".into(),
+                autostart: true,
+            }],
         }];
         store.save(&shields).unwrap();
         assert_eq!(store.load().unwrap(), shields);
@@ -78,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_config_without_harness_and_secrets() {
+    fn loads_config_without_newer_fields() {
         let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shields.json");
@@ -91,5 +99,7 @@ mod tests {
         let shield = &Store::new(path).load().unwrap()[0];
         assert_eq!(shield.harness, None);
         assert!(shield.secrets.is_empty());
+        assert!(shield.layout.is_empty());
+        assert!(shield.apps.is_empty());
     }
 }
