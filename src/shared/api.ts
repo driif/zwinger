@@ -19,9 +19,17 @@ export async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
   }
 }
 
-/** A login shell in /workspace, or an agent's own TUI in the harness. `resume` continues the agent's last session. */
+/**
+ * `host`: the user's login shell on the Mac, unsandboxed, in the shield folder. `shell`: a VM shell in /workspace.
+ * `agent`: an agent's own TUI in the harness; `resume` continues the agent's last session.
+ */
 export type SessionKind =
-  { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
+  { type: "host" } | { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
+
+/** The split tree of a shield's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
+export type PaneNode =
+  | { type: "split"; direction: "row" | "column"; ratio: number; a: PaneNode; b: PaneNode }
+  | { type: "leaf"; terminal: string };
 
 /** The identity of a host folder. `null`: not verified since the update. */
 export interface FileId {
@@ -101,7 +109,7 @@ export interface SessionView {
   terminalId: string | null;
 }
 
-/** A shell or agent terminal of a shield. With no session it is dormant, and it can open again. */
+/** A host shell, VM shell or agent terminal of a shield. With no session it is dormant, and it can open again. */
 export interface Terminal {
   id: string;
   kind: SessionKind;
@@ -170,6 +178,8 @@ export interface ShieldView {
   tasks: Task[];
   /** In tree order. */
   terminals: Terminal[];
+  /** `null`: no pane is open. */
+  paneLayout: PaneNode | null;
   status: ShieldStatus;
   pendingRestart: boolean;
   sessions: SessionView[];

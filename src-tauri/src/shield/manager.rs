@@ -13,7 +13,7 @@ use crate::network::{self, Action, RuleDraft, Target};
 use crate::proxy::ca::{self, Ca};
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
-use crate::runtime::SandboxRuntime;
+use crate::runtime::{SandboxRuntime, SessionKind};
 use crate::secrets::{self, SecretValue, Vault};
 use crate::shield::apps::AppRunView;
 use crate::shield::lifecycle::mounted;
@@ -262,6 +262,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             apps: shield.apps.clone(),
                             tasks: shield.tasks.clone(),
                             terminals: shield.terminals.clone(),
+                            pane_layout: shield.pane_layout.clone(),
                             agents_unprompted: shield.agents_unprompted,
                             network: shield.network.clone(),
                             ..(**applied).clone()
@@ -495,6 +496,15 @@ impl<R: SandboxRuntime> Manager<R> {
             state.net.remove(id);
             names
         };
+        // Delete accepts a stopped shield, whose host shells still run. Each
+        // kill waits for the hangup in its own thread, not in this task.
+        lock(&self.state).sessions.retain(|s| {
+            let killed = s.kind == SessionKind::Host && s.shield_id == id;
+            if killed {
+                s.kill();
+            }
+            !killed
+        });
         let mut result = Ok(());
         for name in &names {
             if let Err(e) = self.vault.delete(id, name)

@@ -1,5 +1,5 @@
 import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, SpringCheckbox } from "@driif/motiv";
-import { Bot, Info, Play, Square, SquareTerminal, TriangleAlert } from "lucide-react";
+import { Bot, Info, Laptop, Play, Square, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -14,6 +14,7 @@ import { RunSummary } from "../tasks/api";
 import {
   AGENT_NAMES,
   AgentKind,
+  PaneNode,
   SessionKind,
   ShieldView,
 } from "../../shared/api";
@@ -24,7 +25,7 @@ import { AppView } from "../apps/AppView";
 import { NetworkTab } from "../network/NetworkTab";
 import { SettingsTab } from "../settings/SettingsTab";
 import { TaskDialog } from "../tasks/TaskDialog";
-import { TerminalTab } from "../terminal/TerminalTab";
+import { TerminalTab } from "../terminal";
 import { Notice } from "../../shared/Notice";
 
 // React Flow and the run room are large and not on the first screen of every shield.
@@ -142,13 +143,16 @@ interface Props {
   /** Reads the shields again. Resolves when the new state is set. */
   onRefresh: () => Promise<unknown>;
   panes: Pane[];
-  activePanes: Record<string, string>;
+  /** The focused pane of this shield. */
+  focused?: string;
   run: Run;
   onToggle: () => void;
   /** `agent` opens the shield's first agent. */
   onNewSession: (kind: SessionKind | "agent") => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
+  onFocus: (key: string) => void;
+  onLayout: (layout: PaneNode) => void;
   onPaneExit: () => void;
   onPaneError: (error: unknown) => void;
 }
@@ -172,7 +176,7 @@ export function ShieldPage({
   onRunsChange,
   onRefresh,
   panes,
-  activePanes,
+  focused,
   run,
   onToggle,
   ...terminal
@@ -323,8 +327,8 @@ export function ShieldPage({
                     icon={<Info size={14} className="muted" />}
                     actions={
                       <>
-                        <Button size="sm" variant="outline" iconLeft={<SquareTerminal size={14} />} onClick={() => terminal.onNewSession({ type: "shell" })}>
-                          New shell
+                        <Button size="sm" variant="outline" iconLeft={<Laptop size={14} />} onClick={() => terminal.onNewSession({ type: "host" })}>
+                          New Mac shell
                         </Button>
                         <Button size="sm" iconLeft={<Bot size={14} />} onClick={() => terminal.onNewSession("agent")}>
                           New agent
@@ -334,7 +338,7 @@ export function ShieldPage({
                   >
                     {shield.hostAgents.length === 0 && detection && detection.agents.length > 0
                       ? "Next: add an agent from this Mac with Add agent, or open the built-in pi agent."
-                      : "Next: open an agent or a shell."}
+                      : "Next: open an agent, or a shell on this Mac in the shield folder."}
                   </Notice>
                 )}
                 <Suspense>
@@ -456,7 +460,7 @@ export function ShieldPage({
         <TerminalTab
           shield={shield}
           panes={panes}
-          activePane={activePanes[shield.id]}
+          focused={focused}
           visible={view.kind === "terminal"}
           {...terminal}
         />

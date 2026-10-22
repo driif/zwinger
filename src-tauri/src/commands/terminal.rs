@@ -2,12 +2,19 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::error::Result;
 use crate::runtime::{PtyEvent, SessionKind};
+use crate::shield::PaneNode;
 
 use super::Shields;
 
 #[tauri::command]
 pub fn reorder_terminals(shields: Shields<'_>, id: String, terminal_ids: Vec<String>) -> Result<()> {
     shields.reorder_terminals(&id, &terminal_ids)
+}
+
+/// Saves the split tree of the shield's terminal view. It needs no restart.
+#[tauri::command]
+pub fn set_pane_layout(shields: Shields<'_>, id: String, layout: Option<PaneNode>) -> Result<()> {
+    shields.set_pane_layout(&id, layout)
 }
 
 /// Output goes as raw bytes, the exit as `{"exit": code}`.

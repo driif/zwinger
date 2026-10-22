@@ -17,7 +17,7 @@ use crate::proxy::ca::Ca;
 use crate::proxy::inject::Login;
 use crate::proxy::log::Entry;
 use crate::proxy::{self, Live, Proxy};
-use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime};
+use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
 use crate::secrets::{self, SecretValue};
 use crate::shield::apps::APP_SIZE;
@@ -456,11 +456,13 @@ impl<R: SandboxRuntime> Manager<R> {
             else {
                 unreachable!("checked above");
             };
+            // A host shell runs on the Mac, so it outlives the VM.
             state.sessions.retain(|s| {
-                if s.shield_id == id {
+                let ends = s.shield_id == id && s.kind != SessionKind::Host;
+                if ends {
                     let _ = s.input.send(PtyInput::Kill);
                 }
-                s.shield_id != id
+                !ends
             });
             (vm, applied, proxy, net, runtimes, host)
         };

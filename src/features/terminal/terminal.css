@@ -9,11 +9,60 @@
   font: inherit;
 }
 
-.terminal {
+.pane-layout {
+  position: relative;
   flex: 1;
   min-height: 0;
 }
 
+.pane-layout[hidden] {
+  display: none;
+}
+
+/* The padding and the background come from the terminal settings, so the pane is the terminal edge to edge. */
+.terminal {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
 .terminal[hidden] {
   display: none;
+}
+
+.pane-dormant {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--zw-gap);
+  border: 1px solid var(--motiv-color-border);
+}
+
+.pane-divider {
+  position: absolute;
+  z-index: 1;
+  touch-action: none;
+}
+
+.pane-divider.row {
+  width: 6px;
+  margin-left: -3px;
+  cursor: col-resize;
+  background: linear-gradient(var(--motiv-color-border), var(--motiv-color-border)) center / 1px 100% no-repeat;
+}
+
+.pane-divider.column {
+  height: 6px;
+  margin-top: -3px;
+  cursor: row-resize;
+  background: linear-gradient(var(--motiv-color-border), var(--motiv-color-border)) center / 100% 1px no-repeat;
+}
+
+.pane-divider:hover,
+.pane-divider.dragging {
+  background: var(--motiv-color-primary-subtle);
 }

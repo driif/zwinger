@@ -15,11 +15,11 @@ the app and talks only to the Rust backend. It loads nothing from the network.
 | directive | value | for |
 |---|---|---|
 | `default-src` | `'self'` | All other resource types: only the files of the app bundle. |
-| `script-src` | `'self' 'wasm-unsafe-eval'` | The app scripts. `'wasm-unsafe-eval'` lets the terminal (ghostty-web) compile its WebAssembly. No inline script and no `eval`. |
-| `style-src` | `'self'` | The app stylesheet. motiv, React Flow, dnd-kit and ghostty-web inject no `<style>` element and set no `style` attribute as text; they set styles through the CSSOM, which CSP does not block. |
+| `script-src` | `'self'` | The app scripts. No inline script, no `eval` and no WebAssembly. |
+| `style-src` | `'self' 'unsafe-inline'` | The app stylesheet, and the `<style>` elements of the terminal (xterm.js), which sets its colors and cell size in them. Tauri adds no nonce or hash to `style-src` (`dangerousDisableAssetCspModification`), because a nonce makes the browser ignore `'unsafe-inline'`. An inline style can change the look only; it cannot run code. |
 | `img-src` | `'self' data:` | Images of the app and small images that the build inlines as `data:` URLs. |
 | `font-src` | `'self' data:` | The fonts of motiv, also when the build inlines a small one as a `data:` URL. |
-| `connect-src` | `ipc: http://ipc.localhost data:` | `ipc:` and `http://ipc.localhost` carry the Tauri commands, events and channels. `data:` is for ghostty-web, which loads its WebAssembly with `fetch` on a `data:` URL. |
+| `connect-src` | `ipc: http://ipc.localhost` | `ipc:` and `http://ipc.localhost` carry the Tauri commands, events and channels. |
 | `object-src` | `'none'` | No plugins. |
 | `base-uri` | `'none'` | No `<base>` element can change where relative URLs point. |
 | `form-action` | `'none'` | No form submits to a URL. |

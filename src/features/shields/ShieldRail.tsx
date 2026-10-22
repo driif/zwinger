@@ -17,9 +17,12 @@ import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, v
 import { CSS } from "@dnd-kit/utilities";
 import {
   AppWindow,
+  Box,
+  ChevronDown,
   ChevronRight,
   Ellipsis,
   History,
+  Laptop,
   ListChecks,
   Pencil,
   Play,
@@ -27,7 +30,6 @@ import {
   RotateCw,
   Settings,
   Square,
-  SquareTerminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -54,9 +56,8 @@ import "./rail.css";
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
 const FORBIDDEN = "Not allowed: a shield is a security boundary. Items stay in their shield.";
 
-type Group = "agents" | "terminals" | "apps" | "tasks";
+type Group = "terminals" | "apps" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
-  { group: "agents", label: "Agents" },
   { group: "terminals", label: "Terminals" },
   { group: "apps", label: "Apps" },
   { group: "tasks", label: "Tasks" },
@@ -75,9 +76,19 @@ export function agentsOf(shield: ShieldView): AgentKind[] {
   return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
 }
 
-const kindName = (kind: SessionKind) => (kind.type === "shell" ? "shell" : AGENT_NAMES[kind.agent]);
+const kindName = (kind: SessionKind) =>
+  kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
 
-/** The name of a pane: its shell or agent, and its number among the shield's panes of that kind. */
+/** Where a terminal runs: on this Mac, or in the shield's VM. An agent always runs in the VM. */
+function KindIcon({ kind }: { kind: SessionKind }) {
+  if (kind.type === "agent") {
+    const Icon = AGENT_ICONS[kind.agent];
+    return <Icon size={14} aria-label="In the VM" />;
+  }
+  return kind.type === "host" ? <Laptop size={14} aria-label="On this Mac" /> : <Box size={14} aria-label="In the VM" />;
+}
+
+/** The name of a terminal: its kind, and its number among the shield's terminals of that kind. */
 export function paneName(pane: Pane, panes: Pane[]) {
   const same = panes.filter((p) => p.shieldId === pane.shieldId && kindName(p.kind) === kindName(pane.kind));
   return `${kindName(pane.kind)} ${same.indexOf(pane) + 1}`;
@@ -302,7 +313,7 @@ interface Props {
   children: ReactNode;
 }
 
-/** The shields as a tree: shield → Agents / Terminals / Apps → items. */
+/** The shields as a tree: shield → Terminals / Apps / Tasks → items. */
 export function ShieldRail({
   shields,
   selectedId,
@@ -359,15 +370,14 @@ export function ShieldRail({
 
   function leaves(shield: ShieldView, group: Group): Leaf[] {
     const sid = shield.id;
-    if (group === "agents" || group === "terminals")
+    if (group === "terminals")
       return panes
-        .filter((p) => p.shieldId === sid && (p.kind.type === "agent") === (group === "agents"))
+        .filter((p) => p.shieldId === sid)
         .map((pane) => {
           const { kind } = pane;
-          const session = shield.sessions.find((s) => s.id === pane.sessionId);
+          const session = shield.sessions.find((s) => s.terminalId === pane.key);
           const state = !session ? "dormant" : session.exitCode !== null ? `exited ${session.exitCode}` : undefined;
           const name = paneName(pane, panes);
-          const Icon = kind.type === "agent" ? AGENT_ICONS[kind.agent] : SquareTerminal;
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
           const open: MenuAction[] = state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : [];
           return {
@@ -379,7 +389,7 @@ export function ShieldRail({
               </span>
             ),
             name,
-            icon: <Icon size={14} aria-hidden />,
+            icon: <KindIcon kind={kind} />,
             view: { kind: "terminal", key: pane.key },
             menu:
               kind.type === "agent"
@@ -508,10 +518,9 @@ export function ShieldRail({
   });
   const tabStop = focused && visible.includes(focused) ? focused : (visible.find((id) => id === `s|${selectedId}`) ?? visible[0]);
 
-  const selectedPane = view.kind === "terminal" ? panes.find((p) => p.key === view.key) : undefined;
   const selectedRow =
     view.kind === "terminal"
-      ? `i|${selectedId}|${selectedPane?.kind.type === "agent" ? "agents" : "terminals"}|${view.key}`
+      ? `i|${selectedId}|terminals|${view.key}`
       : view.kind === "app"
           ? `i|${selectedId}|apps|${view.appId}`
           : view.kind === "task" || (view.kind === "taskEdit" && view.taskId)
@@ -610,11 +619,7 @@ export function ShieldRail({
     const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
     if (container === "shields") run(() => reorderShields(next));
     else if (container.endsWith("|apps")) run(() => reorderApps(shieldId, next));
-    else {
-      // Agents and terminals are one saved list: the other group keeps its order.
-      const others = panes.filter((p) => p.shieldId === shieldId && !next.includes(p.key)).map((p) => p.key);
-      onMoveTerminals(shieldId, [...next, ...others]);
-    }
+    else onMoveTerminals(shieldId, next);
   }
 
   const announcements: Announcements = {
@@ -625,27 +630,38 @@ export function ShieldRail({
   };
 
   function groupAction(shield: ShieldView, group: Group) {
-    const id = `g|${shield.id}|agents`;
-    const [icon, label, action] =
-      group === "agents"
-        ? [<Plus size={12} />, "New agent", () => setMenu(id)]
-        : group === "terminals"
-          ? [<Plus size={12} />, "New shell", () => onNewSession(shield.id, { type: "shell" })]
-          : group === "apps"
-            ? [<Plus size={12} />, "Add app", () => onIntent(shield.id, "app")]
-            : [<Plus size={12} />, "New task", () => onOpen(shield.id, { kind: "taskEdit" })];
+    const id = `g|${shield.id}|terminals`;
+    const [label, action] =
+      group === "terminals"
+        ? ["New Mac shell", () => onNewSession(shield.id, { type: "host" })]
+        : group === "apps"
+          ? ["Add app", () => onIntent(shield.id, "app")]
+          : ["New task", () => onOpen(shield.id, { kind: "taskEdit" })];
     return (
-      <IconButton
-        icon={icon}
-        label={label}
-        aria-haspopup={group === "agents" ? "menu" : undefined}
-        aria-expanded={group === "agents" ? menu === id : undefined}
-        tabIndex={-1}
-        onClick={(e) => {
-          e.stopPropagation();
-          action();
-        }}
-      />
+      <>
+        <IconButton
+          icon={<Plus size={12} />}
+          label={label}
+          tabIndex={-1}
+          onClick={(e) => {
+            e.stopPropagation();
+            action();
+          }}
+        />
+        {group === "terminals" && (
+          <IconButton
+            icon={<ChevronDown size={12} />}
+            label="New terminal"
+            aria-haspopup="menu"
+            aria-expanded={menu === id}
+            tabIndex={-1}
+            onClick={(e) => {
+              e.stopPropagation();
+              setMenu(id);
+            }}
+          />
+        )}
+      </>
     );
   }
 
@@ -781,15 +797,27 @@ export function ShieldRail({
                           >
                             {menu === id && (
                               <RowMenu
-                                label="New agent"
-                                actions={agentsOf(shield).map((agent) => {
-                                  const Icon = AGENT_ICONS[agent];
-                                  return {
-                                    label: AGENT_NAMES[agent],
-                                    icon: <Icon size={14} />,
-                                    run: () => onNewSession(shield.id, { type: "agent", agent, resume: false }),
-                                  };
-                                })}
+                                label="New terminal"
+                                actions={[
+                                  {
+                                    label: "Mac shell",
+                                    icon: <Laptop size={14} />,
+                                    run: () => onNewSession(shield.id, { type: "host" }),
+                                  },
+                                  {
+                                    label: "VM shell",
+                                    icon: <Box size={14} />,
+                                    run: () => onNewSession(shield.id, { type: "shell" }),
+                                  },
+                                  ...agentsOf(shield).map((agent) => {
+                                    const Icon = AGENT_ICONS[agent];
+                                    return {
+                                      label: AGENT_NAMES[agent],
+                                      icon: <Icon size={14} />,
+                                      run: () => onNewSession(shield.id, { type: "agent", agent, resume: false }),
+                                    };
+                                  }),
+                                ]}
                                 onClose={closeMenu}
                               />
                             )}

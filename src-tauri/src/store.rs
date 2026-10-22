@@ -108,7 +108,7 @@ mod tests {
     use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, Rule, Target};
     use crate::runtime::SessionKind;
     use crate::secrets::{Origin, Places, Secret};
-    use crate::shield::{App, FileId, HostAgentUse, Mount, Pos, Task, TaskAgent, Terminal};
+    use crate::shield::{App, FileId, HostAgentUse, Mount, PaneNode, Pos, SplitDirection, Task, TaskAgent, Terminal};
 
     #[test]
     fn round_trip() {
@@ -172,7 +172,14 @@ mod tests {
             terminals: vec![
                 Terminal { id: "term-1".into(), kind: SessionKind::Agent { agent: AgentKind::Codex, resume: false } },
                 Terminal { id: "term-2".into(), kind: SessionKind::Shell },
+                Terminal { id: "term-3".into(), kind: SessionKind::Host },
             ],
+            pane_layout: Some(PaneNode::Split {
+                direction: SplitDirection::Row,
+                ratio: 0.5,
+                a: Box::new(PaneNode::Leaf { terminal: "term-3".into() }),
+                b: Box::new(PaneNode::Leaf { terminal: "term-1".into() }),
+            }),
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             agents_unprompted: false,
         }];
@@ -198,6 +205,7 @@ mod tests {
         assert!(shield.layout.is_empty());
         assert!(shield.apps.is_empty());
         assert!(shield.tasks.is_empty());
+        assert_eq!(shield.pane_layout, None);
         assert!(shield.terminals.is_empty());
         assert!(shield.host_agents.is_empty());
         assert_eq!(shield.network.default, DefaultAction::Block);

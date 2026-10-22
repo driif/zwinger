@@ -36,6 +36,13 @@ pub(crate) fn temp_dir() -> PathBuf {
     dir.canonicalize().unwrap()
 }
 
+/// Host shells run `/bin/sh`, so the tests do not run the user's login files.
+pub(crate) fn host_sh() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the tests read SHELL only to start a host shell.
+    SET.call_once(|| unsafe { std::env::set_var("SHELL", "/bin/sh") });
+}
+
 pub(crate) fn vault() -> Arc<MemoryVault> {
     Arc::new(MemoryVault::default())
 }

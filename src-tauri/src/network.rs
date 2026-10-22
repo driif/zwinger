@@ -562,7 +562,7 @@ pub struct AgentNeed {
 pub fn agent_needs(shield: &Shield) -> Vec<AgentNeed> {
     let terminals = shield.terminals.iter().filter_map(|t| match t.kind {
         SessionKind::Agent { agent, .. } => Some(agent),
-        SessionKind::Shell => None,
+        SessionKind::Shell | SessionKind::Host => None,
     });
     let used: Vec<AgentKind> = shield
         .host_agents

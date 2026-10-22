@@ -24,6 +24,7 @@ import { InstallControl } from "../tasks/roomParts";
 import { UpdateBanner } from "../updates/UpdateBanner";
 import { AppearancePage } from "../appearance/AppearancePage";
 import { Appearance } from "../appearance/themes";
+import { TerminalSettings } from "../terminal";
 
 const REPO = "https://github.com/driif/zwinger";
 
@@ -31,6 +32,7 @@ const TABS = [
   { value: "agents", label: "Agents on this Mac" },
   { value: "runtimes", label: "Runtimes" },
   { value: "appearance", label: "Appearance" },
+  { value: "terminal", label: "Terminal" },
   { value: "updates", label: "Updates" },
   { value: "storage", label: "Storage" },
   { value: "about", label: "About" },
@@ -319,6 +321,7 @@ export function AppSettings({
             </div>
           ),
           appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
+          terminal: <TerminalSettings appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
           updates: <Updates version={version} prefs={prefs} onPrefs={onPrefs} run={run} update={update} onUpdate={onUpdate} />,
           storage: <Storage />,
           about: <About version={version} />,

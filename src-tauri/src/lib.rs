@@ -259,6 +259,7 @@ pub fn run() {
             commands::apps::stop_app,
             commands::apps::restart_app,
             commands::terminal::reorder_terminals,
+            commands::terminal::set_pane_layout,
             commands::terminal::attach_session,
             commands::terminal::detach_session,
             commands::terminal::ack_session,
@@ -307,6 +308,7 @@ pub fn run() {
             commands::settings::startup_status,
             commands::settings::get_preferences,
             commands::settings::set_preferences,
+            commands::settings::import_ghostty_config,
             commands::settings::storage,
             commands::settings::clean_images,
             commands::settings::legacy_storage,
@@ -328,16 +330,25 @@ pub fn run() {
             api.prevent_exit();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                // The host shells are not VMs, so `stop_all` does not see them.
+                let hangup = app.clone();
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    if let Some(manager) = hangup.try_state::<Manager<Microsandbox>>() {
+                        manager.kill_host_sessions();
+                    }
+                })
+                .await;
                 if let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
                     manager.stop_all(STOP_ALL_LIMIT).await;
                 }
                 app.exit(0);
             });
         }
-        // ⌘Q on macOS ends the loop without ExitRequested. Stop the VMs here,
-        // before the process exits.
+        // ⌘Q on macOS ends the loop without ExitRequested. Kill the host
+        // shells and stop the VMs here, before the process exits.
         RunEvent::Exit => {
             if let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
+                manager.kill_host_sessions();
                 tauri::async_runtime::block_on(manager.stop_all(STOP_ALL_LIMIT));
             }
         }

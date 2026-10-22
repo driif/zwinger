@@ -3,7 +3,7 @@ import { Play, RotateCw, Square } from "lucide-react";
 import { restartApp, startApp, stopApp } from "./api";
 import { App, ShieldView } from "../../shared/api";
 import type { Run } from "../../App";
-import { TerminalPane } from "../terminal/TerminalPane";
+import { TerminalView } from "../terminal";
 
 interface Props {
   shield: ShieldView;
@@ -56,7 +56,9 @@ export function AppView({ shield, app, run, onExit, onError }: Props) {
         </Button>
       </header>
       {appRun ? (
-        <TerminalPane key={appRun.sessionId} sessionId={appRun.sessionId} active onExit={onExit} onError={onError} />
+        <div className="pane-layout">
+          <TerminalView key={appRun.sessionId} sessionId={appRun.sessionId} visible focused onExit={onExit} onError={onError} />
+        </div>
       ) : (
         <div className="empty">
           <p className="muted">

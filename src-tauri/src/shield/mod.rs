@@ -26,6 +26,8 @@ const MODEL_LIMIT: usize = 128;
 const GATE_COUNT: usize = 16;
 /// The saved map positions per shield; more entries are dropped.
 const LAYOUT_LIMIT: usize = 1000;
+/// The deepest split of a pane layout.
+const PANE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +66,9 @@ pub struct Shield {
     /// session is dormant: it opens again under the same id.
     #[serde(default)]
     pub terminals: Vec<Terminal>,
+    /// The split tree of the terminal view. `None`: no pane is open.
+    #[serde(default)]
+    pub pane_layout: Option<PaneNode>,
     /// The agents that the shield takes from the host. At most one per kind.
     #[serde(default)]
     pub host_agents: Vec<HostAgentUse>,
@@ -109,6 +114,67 @@ pub struct App {
 pub struct Terminal {
     pub id: String,
     pub kind: SessionKind,
+}
+
+/// A node of a pane layout: a split in two, or a pane with one terminal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PaneNode {
+    /// `ratio` is the share of `a`, the left or top side.
+    Split {
+        direction: SplitDirection,
+        ratio: f64,
+        a: Box<PaneNode>,
+        b: Box<PaneNode>,
+    },
+    Leaf {
+        terminal: String,
+    },
+}
+
+/// `Row` puts `b` to the right of `a`, `Column` below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SplitDirection {
+    Row,
+    Column,
+}
+
+impl PaneNode {
+    /// Removes the pane of `terminal`; its sibling takes the place of the
+    /// split. `None` if no pane stays.
+    fn without(self, terminal: &str) -> Option<Self> {
+        match self {
+            Self::Leaf { terminal: t } if t == terminal => None,
+            Self::Leaf { .. } => Some(self),
+            Self::Split { direction, ratio, a, b } => match (a.without(terminal), b.without(terminal)) {
+                (Some(a), Some(b)) => Some(Self::Split { direction, ratio, a: Box::new(a), b: Box::new(b) }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+
+    fn check<'a>(&'a self, depth: usize, terminals: &[Terminal], seen: &mut Vec<&'a str>) -> Result<()> {
+        let invalid = |why: &str| Err(Error::InvalidPaneLayout(why.to_owned()));
+        match self {
+            Self::Leaf { terminal } => {
+                if !terminals.iter().any(|t| &t.id == terminal) {
+                    return invalid("a pane names an unknown terminal");
+                }
+                if seen.contains(&terminal.as_str()) {
+                    return invalid("a terminal is in more than one pane");
+                }
+                seen.push(terminal);
+                Ok(())
+            }
+            Self::Split { .. } if depth >= PANE_DEPTH => invalid("the splits are too deep"),
+            Self::Split { ratio, .. } if !(0.1..=0.9).contains(ratio) => invalid("a split ratio is not 0.1 to 0.9"),
+            Self::Split { a, b, .. } => {
+                a.check(depth + 1, terminals, seen)?;
+                b.check(depth + 1, terminals, seen)
+            }
+        }
+    }
 }
 
 /// An app as the UI sends it. No `id` adds a new app.
@@ -205,6 +271,7 @@ impl Shield {
             apps: Vec::new(),
             tasks: Vec::new(),
             terminals: Vec::new(),
+            pane_layout: None,
             host_agents: Vec::new(),
             agents_unprompted: true,
         })
@@ -272,9 +339,21 @@ impl Shield {
         id
     }
 
-    /// An unknown id is not an error: the terminal is already gone.
+    /// Also removes its pane. An unknown id is not an error: the terminal is
+    /// already gone.
     pub fn remove_terminal(&mut self, id: &str) {
         self.terminals.retain(|t| t.id != id);
+        self.pane_layout = self.pane_layout.take().and_then(|layout| layout.without(id));
+    }
+
+    /// Each pane names a terminal of the shield, and each terminal is in at
+    /// most one pane.
+    pub fn set_pane_layout(&mut self, layout: Option<PaneNode>) -> Result<()> {
+        if let Some(layout) = &layout {
+            layout.check(0, &self.terminals, &mut Vec::new())?;
+        }
+        self.pane_layout = layout;
+        Ok(())
     }
 
     /// `ids` must name each terminal once.

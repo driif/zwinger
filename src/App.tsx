@@ -35,15 +35,26 @@ import {
 } from "./features/tasks/api";
 import {
   closeTerminal,
+  Direction,
+  fittedSize,
+  leaves,
+  neighbor,
   openSession,
+  remove,
   reopenTerminal,
   reorderTerminals,
-} from "./features/terminal/api";
+  replace,
+  setLook,
+  setPaneLayout,
+  split,
+  tooDeep,
+} from "./features/terminal";
 import { checkUpdate, UpdateInfo } from "./features/updates/api";
 import {
   AGENT_NAMES,
   AgentKind,
   INVALID_ORDER,
+  PaneNode,
   SessionKind,
   ShieldView,
 } from "./shared/api";
@@ -52,7 +63,6 @@ import { CommandBar } from "./shared/CommandBar";
 import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ShieldPage } from "./features/shields/ShieldPage";
 import { agentsOf, ShieldRail } from "./features/shields/ShieldRail";
-import { fittedSize } from "./features/terminal/TerminalPane";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
 import { Appearance, useAppearance } from "./features/appearance/themes";
 import { clampRail, RailHandle } from "./features/shields/RailHandle";
@@ -71,7 +81,7 @@ export type TabView = "overview" | "network" | "settings";
 /** What the main area shows for the selected shield. */
 export type View =
   | { kind: TabView }
-  /** No `key` shows the empty terminal view. */
+  /** `key` is the focused pane. No `key`: no pane is focused. */
   | { kind: "terminal"; key?: string }
   | { kind: "app"; appId: string }
   /** No `run` shows the latest run. */
@@ -79,7 +89,7 @@ export type View =
   /** No `taskId` adds a task. */
   | { kind: "taskEdit"; taskId?: string };
 
-/** A terminal of a shield. `key` is the terminal id. No `sessionId`: the terminal is dormant. */
+/** A terminal of a shield. `key` is the terminal id. No `sessionId`: the terminal is dormant or has exited. */
 export interface Pane {
   key: string;
   shieldId: string;
@@ -203,7 +213,8 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   const [shields, setShields] = useState<ShieldView[]>([]);
   const [selectedId, setSelectedId] = useState(firstShield);
   const [view, setView] = useState<View>({ kind: "overview" });
-  const [activePanes, setActivePanes] = useState<Record<string, string>>({});
+  /** Per shield, the terminal of the pane that has the focus. */
+  const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [appNotices, setAppNotices] = useState<string[]>([]);
   const [intent, setIntent] = useState<Intent>();
@@ -227,6 +238,10 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   /** Per shield, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
   const [railWidth, setRailWidth] = useState(() => clampRail(prefs.railWidth));
+
+  // As the workspace renders, before its terminals mount: they take the look when they open.
+  const terminalTheme = appearance.themes.find((t) => t.id === prefs.terminal.themeId) ?? appearance.theme;
+  setLook(prefs.terminal, terminalTheme.terminal);
 
   // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the list it read.
   const refresh = () => {
@@ -355,12 +370,17 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
       key: t.id,
       shieldId: s.id,
       kind: t.kind,
-      sessionId: s.sessions.find((session) => session.terminalId === t.id)?.id,
+      sessionId: s.sessions.find((session) => session.terminalId === t.id && session.exitCode === null)?.id,
     })),
   );
   const shield = shields.find((s) => s.id === selectedId) ?? shields[0];
   const shieldPanes = panes.filter((p) => p.shieldId === shield?.id);
-  const activePane = shield && activePanes[shield.id];
+  /** The focused pane of a shield; a stale one gives way to the first pane. */
+  const focusedOf = (target: ShieldView) => {
+    const shown = leaves(target.paneLayout);
+    return shown.includes(focusedPanes[target.id]) ? focusedPanes[target.id] : shown[0];
+  };
+  const focused = shield && focusedOf(shield);
   const events = (shield && net[shield.id]) ?? [];
 
   // A deleted app or task has no view.
@@ -373,10 +393,41 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     shields.map(({ id }) => [id, (net[id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[id] ?? 0)).length]),
   );
 
-  function showPane(key: string | undefined, shieldId = shield?.id) {
-    if (!shieldId) return;
-    setActivePanes((current) => ({ ...current, [shieldId]: key ?? "" }));
-    setView({ kind: "terminal", key });
+  /** Saves at once on the screen, then in the backend. */
+  function saveLayout(shieldId: string, layout: PaneNode | null) {
+    setShields((current) => current.map((s) => (s.id === shieldId ? { ...s, paneLayout: layout } : s)));
+    setPaneLayout(shieldId, layout).then(refresh, (e) => {
+      setError(errorMessage(e));
+      return refresh();
+    });
+  }
+
+  /** A focus event of the pane calls it too, so an unchanged focus keeps the state. */
+  function focusPane(key: string | undefined, shieldId = shield?.id) {
+    if (shieldId && key)
+      setFocusedPanes((current) => (current[shieldId] === key ? current : { ...current, [shieldId]: key }));
+    setView((current) => (current.kind === "terminal" && current.key === key ? current : { kind: "terminal", key }));
+  }
+
+  /** Focuses the pane of the terminal. A terminal with no pane takes the place of the focused pane; the replaced terminal keeps running. */
+  function showPane(key: string | undefined, target = shield) {
+    if (!target) return;
+    if (key && !leaves(target.paneLayout).includes(key))
+      saveLayout(target.id, replace(target.paneLayout, focusedOf(target), key));
+    focusPane(key, target.id);
+  }
+
+  /** ⌘W: hides the focused pane. The terminal and its process stay in the tree. */
+  function hidePane() {
+    if (!shield || !focused) return;
+    const layout = remove(shield.paneLayout, focused);
+    saveLayout(shield.id, layout);
+    focusPane(leaves(layout)[0]);
+  }
+
+  function moveFocus(direction: Direction) {
+    const next = shield?.paneLayout && focused && neighbor(shield.paneLayout, focused, direction);
+    if (next) focusPane(next);
   }
 
   /** Items belong to one shield, so another shield shows its Overview instead. */
@@ -391,7 +442,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     setRoundFolder(undefined);
     setShowSettings(false);
     setSelectedId(shieldId);
-    if (next.kind === "terminal") showPane(next.key, shieldId);
+    if (next.kind === "terminal") showPane(next.key, shields.find((s) => s.id === shieldId));
     else setView(next);
   }
 
@@ -410,11 +461,16 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     if (folder !== null) await addShield(folder);
   }
 
-  /** Opens a shell, or the first agent of the shield: host agents come first. */
-  async function newSession(kind: SessionKind | "agent", target = shield) {
+  /**
+   * Opens a terminal, or the first agent of the shield: host agents come first. It shows in the focused pane, or in a new
+   * pane right of it (`row`) or below it (`column`).
+   */
+  async function newSession(kind: SessionKind | "agent", target = shield, direction?: "row" | "column") {
     if (!target) return;
-    // A stopped shield does not know its mounted agents. Read them after the start.
-    if (target.status.state !== "running") {
+    if (direction && tooDeep(target.paneLayout, focusedOf(target)))
+      throw new Error("This pane cannot split again. Close a pane first.");
+    // A stopped shield does not know its mounted agents. Read them after the start. A Mac shell needs no start.
+    if (target.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
       await startShield(target.id);
       target = (await listShields()).find((s) => s.id === target!.id) ?? target;
     }
@@ -424,18 +480,24 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
       throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this shield.`);
     const { rows, cols } = fittedSize();
     const sessionId = await openSession(target.id, session, rows, cols);
-    const terminalId = (await refresh())?.flatMap((s) => s.sessions).find((s) => s.id === sessionId)?.terminalId;
+    const list = await refresh();
+    const terminalId = list?.flatMap((s) => s.sessions).find((s) => s.id === sessionId)?.terminalId;
+    const fresh = list?.find((s) => s.id === target!.id) ?? target;
     setSelectedId(target.id);
-    if (terminalId) showPane(terminalId, target.id);
+    if (!terminalId) return;
+    if (direction) {
+      saveLayout(target.id, split(fresh.paneLayout, focusedOf(fresh), terminalId, direction));
+      focusPane(terminalId, target.id);
+    } else showPane(terminalId, fresh);
   }
 
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
-    if (shields.find((s) => s.id === pane.shieldId)?.status.state !== "running") await startShield(pane.shieldId);
+    if (pane.kind.type !== "host" && shields.find((s) => s.id === pane.shieldId)?.status.state !== "running")
+      await startShield(pane.shieldId);
     const { rows, cols } = fittedSize();
     await reopenTerminal(pane.shieldId, pane.key, rows, cols);
-    await refresh();
-    showPane(pane.key, pane.shieldId);
+    showPane(pane.key, (await refresh())?.find((s) => s.id === pane.shieldId));
   }
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
@@ -468,17 +530,16 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
 
   function cycle(step: number) {
     if (shieldPanes.length === 0) return;
-    const index = shieldPanes.findIndex((p) => p.key === activePane);
+    const index = shieldPanes.findIndex((p) => p.key === focused);
     showPane(shieldPanes[(index + step + shieldPanes.length) % shieldPanes.length].key);
   }
 
+  /** Removes the terminal and ends its process. The backend also removes its pane. */
   function closePane(key: string) {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
     run(() => closeTerminal(pane.shieldId, key));
-    const rest = shieldPanes.filter((p) => p !== pane);
-    if (key === activePane && view.kind === "terminal") showPane(rest[rest.length - 1]?.key);
-    else if (key === activePane) setActivePanes((current) => ({ ...current, [pane.shieldId]: "" }));
+    if (view.kind === "terminal" && view.key === key) setView({ kind: "terminal" });
   }
 
   /** Saves the order of the shield's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
@@ -502,9 +563,9 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
     commands: () => commandBar.current?.querySelector("button")?.click(),
     newShield: () => run(newShield),
-    newShell: () => run(() => newSession({ type: "shell" })),
+    newShell: () => run(() => newSession({ type: "host" })),
     newAgent: () => run(() => newSession("agent")),
-    close: () => view.kind === "terminal" && activePane && closePane(activePane),
+    close: () => view.kind === "terminal" && hidePane(),
     next: () => cycle(1),
     previous: () => cycle(-1),
     overview: () => setView({ kind: "overview" }),
@@ -513,10 +574,16 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
       if (agents.length > 0) showPane(agents[agents.length - 1].key);
       else run(() => newSession("agent"));
     },
-    terminal: () => showPane(activePane || shieldPanes[shieldPanes.length - 1]?.key),
+    terminal: () => showPane(focused ?? shieldPanes[shieldPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
     appSettings: () => setShowSettings(true),
+    splitRight: () => run(() => newSession({ type: "host" }, shield, "row")),
+    splitDown: () => run(() => newSession({ type: "host" }, shield, "column")),
+    focusLeft: () => moveFocus("left"),
+    focusRight: () => moveFocus("right"),
+    focusUp: () => moveFocus("up"),
+    focusDown: () => moveFocus("down"),
   };
   useShortcuts(actions);
 
@@ -555,7 +622,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
           shields={shields}
           shield={shield}
           panes={shieldPanes}
-          activePane={activePane}
+          focused={focused}
           actions={actions}
           onSelect={select}
           onShowPane={showPane}
@@ -644,11 +711,13 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
             onRunsChange={() => reloadRuns(shield.id)}
             onRefresh={refresh}
             panes={panes}
-            activePanes={activePanes}
+            focused={focused}
             run={run}
             onToggle={() => toggle(shield)}
             onNewSession={(kind) => run(() => newSession(kind))}
             onReopen={(pane) => run(() => reopen(pane))}
+            onFocus={(key) => focusPane(key)}
+            onLayout={(layout) => saveLayout(shield.id, layout)}
             onPaneExit={refresh}
             onPaneError={(e) => setError(errorMessage(e))}
           />

@@ -125,6 +125,26 @@ export interface Prefs {
   darkTheme: string;
   /** The width of the shield rail, in px. */
   railWidth: number;
+  terminal: TerminalPrefs;
+}
+
+export type CursorStyle = "block" | "bar" | "underline";
+
+/** The look and keys of all terminals. Sizes in px. */
+export interface TerminalPrefs {
+  /** A CSS font-family list. */
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  cursorStyle: CursorStyle;
+  cursorBlink: boolean;
+  padding: number;
+  /** The lines that a terminal keeps above the screen. */
+  scrollback: number;
+  /** Option sends Meta, so Option+B and Option+F move by word. */
+  optionAsMeta: boolean;
+  /** The theme of the terminal colors. `null`: the app theme. */
+  themeId: string | null;
 }
 
 export const getPreferences = () => call<Prefs>("get_preferences");

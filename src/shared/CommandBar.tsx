@@ -17,7 +17,8 @@ interface Props {
   shields: ShieldView[];
   shield?: ShieldView;
   panes: Pane[];
-  activePane?: string;
+  /** The focused pane of the shield. */
+  focused?: string;
   actions: Record<ShortcutAction, () => void>;
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
@@ -34,7 +35,7 @@ export function CommandBar({
   shields,
   shield,
   panes,
-  activePane,
+  focused,
   actions,
   onSelect,
   onShowPane,
@@ -68,7 +69,7 @@ export function CommandBar({
       });
     if (shield.pendingRestart)
       commands.push({ id: "restart", label: `Restart ${shield.name}`, onSelect: () => onRestart(shield.id) });
-    commands.push(action("newAgent", "New agent"), action("newShell", "New shell"));
+    commands.push(action("newAgent", "New agent"), action("newShell", "New Mac shell"));
     panes.forEach((pane) =>
       commands.push({
         id: `pane-${pane.key}`,
@@ -76,7 +77,12 @@ export function CommandBar({
         onSelect: () => onShowPane(pane.key),
       }),
     );
-    if (activePane) commands.push(action("close", "Close terminal"));
+    if (focused)
+      commands.push(
+        action("close", "Hide pane"),
+        action("splitRight", "Split right with a Mac shell"),
+        action("splitDown", "Split down with a Mac shell"),
+      );
     if (panes.length > 1) commands.push(action("next", "Next session"), action("previous", "Previous session"));
     commands.push(
       action("overview", "Overview"),

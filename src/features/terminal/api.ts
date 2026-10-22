@@ -1,5 +1,38 @@
 import { Channel } from "@tauri-apps/api/core";
-import { call, SessionKind } from "../../shared/api";
+import { call, PaneNode, SessionKind } from "../../shared/api";
+import type { CursorStyle } from "../settings/api";
+
+/** Saves the split tree of the shield's terminal view. */
+export const setPaneLayout = (id: string, layout: PaneNode | null) =>
+  call<void>("set_pane_layout", { id, layout });
+
+/** The colors of a Ghostty config as `#rrggbb`. `ansi` has 16 entries, `null` where the config sets none. */
+export interface GhosttyPalette {
+  background: string | null;
+  foreground: string | null;
+  cursor: string | null;
+  selection: string | null;
+  ansi: (string | null)[];
+}
+
+/** The terminal settings that the config sets, its colors, and the keys that zwinger does not use. */
+export interface GhosttyImport {
+  settings: Partial<{
+    fontFamily: string;
+    fontSize: number;
+    lineHeight: number;
+    cursorStyle: CursorStyle;
+    cursorBlink: boolean;
+    padding: number;
+    scrollback: number;
+    optionAsMeta: boolean;
+  }>;
+  palette: GhosttyPalette | null;
+  ignored: string[];
+}
+
+/** Reads the user's Ghostty config files. Fails if there is none. */
+export const importGhosttyConfig = () => call<GhosttyImport>("import_ghostty_config");
 
 /** Output bytes, or the exit. Tauri can send small raw bodies as a number array. */
 export type SessionFrame = ArrayBuffer | number[] | { exit: number };

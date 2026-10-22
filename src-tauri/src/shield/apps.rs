@@ -111,6 +111,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 id: id.clone(),
                 shield_id: shield_id.to_owned(),
                 kind: SessionKind::Shell,
+                host_group: None,
                 input: pty.input,
                 exit_code: None,
                 output: output.clone(),

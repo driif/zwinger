@@ -1,3 +1,5 @@
+pub(crate) mod ghostty;
+pub(crate) mod host;
 pub(crate) mod output;
 
 use std::collections::HashMap;
@@ -8,12 +10,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::AgentKind;
 use crate::error::{Error, Result};
-use crate::runtime::{PtyEvent, PtyInput, SandboxRuntime, SessionKind};
+use crate::runtime::{Pty, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
-use crate::shield::WORKSPACE;
 use crate::shield::apps::AppRun;
 use crate::shield::lifecycle::mounted;
 use crate::shield::manager::{HostRun, Manager, State, Vm, lock};
+use crate::shield::{PaneNode, WORKSPACE};
 use output::{Output, pump};
 
 /// The backend owns each session, not a view: a view attaches to it and
@@ -29,6 +31,20 @@ pub(crate) struct Session {
     pub(crate) terminal_id: Option<String>,
     /// Set for an app run.
     pub(crate) app: Option<AppRun>,
+    /// Set for a host shell: its process group, which an app exit kills.
+    pub(crate) host_group: Option<host::HostGroup>,
+}
+
+impl Session {
+    /// A host shell gets a hangup first, so its background jobs end too.
+    pub(crate) fn kill(&self) {
+        match &self.host_group {
+            Some(group) => group.terminate(),
+            None => {
+                let _ = self.input.send(PtyInput::Kill);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +101,14 @@ impl<R: SandboxRuntime> Manager<R> {
         rows: u16,
         cols: u16,
     ) -> Result<String> {
+        if kind == SessionKind::Host {
+            let folder = lock(&self.state).shield_mut(shield_id)?.folder.clone();
+            if !folder.is_dir() {
+                return Err(Error::MissingPath(folder.display().to_string()));
+            }
+            let (pty, group) = host::open_host_pty(&folder, rows, cols)?;
+            return self.register(shield_id, terminal_id, kind, pty, Some(group), |_| true);
+        }
         let (vm, cwd) = match lock(&self.state).vms.get(shield_id) {
             Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
                 let cwd = match kind {
@@ -92,26 +116,41 @@ impl<R: SandboxRuntime> Manager<R> {
                         return Err(self.unmounted(agent, host));
                     }
                     SessionKind::Agent { .. } => applied.harness.as_deref(),
-                    SessionKind::Shell => None,
+                    SessionKind::Shell | SessionKind::Host => None,
                 };
                 (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
             }
             _ => return Err(Error::NotRunning),
         };
         let pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
+        // The shield may have stopped, or stopped and started again, while
+        // the process opened. Its stop did not see this session, so kill it.
+        self.register(shield_id, terminal_id, kind, pty, None, |state| {
+            matches!(
+                state.vms.get(shield_id),
+                Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
+            )
+        })
+    }
+
+    /// Adds the session of the opened process. If `same_vm` is false, or a
+    /// close or a second open of the terminal ran while the process opened,
+    /// it kills the process.
+    fn register(
+        &self,
+        shield_id: &str,
+        terminal_id: Option<&str>,
+        kind: SessionKind,
+        pty: Pty,
+        host_group: Option<host::HostGroup>,
+        same_vm: impl FnOnce(&State<R::Vm>) -> bool,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let output = Arc::new(Mutex::new(Output::default()));
         {
             let mut state = lock(&self.state);
-            // The shield may have stopped, or stopped and started again, while
-            // the process opened. Its stop did not see this session, so kill
-            // it. A close or a second open of the terminal may also have run.
-            let same_vm = matches!(
-                state.vms.get(shield_id),
-                Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
-            );
             let terminal = match terminal_id {
-                _ if !same_vm => Err(Error::NotRunning),
+                _ if !same_vm(&state) => Err(Error::NotRunning),
                 None => self.add_terminal(&mut state, shield_id, kind),
                 Some(tid) => match state.shield_mut(shield_id).and_then(|s| s.terminal(tid).map(|_| ())) {
                     Err(e) => Err(e),
@@ -122,7 +161,12 @@ impl<R: SandboxRuntime> Manager<R> {
             let terminal = match terminal {
                 Ok(terminal) => terminal,
                 Err(e) => {
-                    let _ = pty.input.send(PtyInput::Kill);
+                    match host_group {
+                        Some(group) => group.kill(),
+                        None => {
+                            let _ = pty.input.send(PtyInput::Kill);
+                        }
+                    }
                     return Err(e);
                 }
             };
@@ -136,6 +180,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 output: output.clone(),
                 terminal_id: Some(terminal),
                 app: None,
+                host_group,
             });
         }
         tokio::spawn(pump(self.state.clone(), id.clone(), output, pty.events));
@@ -201,11 +246,37 @@ impl<R: SandboxRuntime> Manager<R> {
         lock(&self.state).sessions.retain(|s| {
             let closed = s.terminal_id.as_deref() == Some(terminal_id);
             if closed {
-                let _ = s.input.send(PtyInput::Kill);
+                s.kill();
             }
             !closed
         });
         Ok(())
+    }
+
+    /// Hangs up all host shells, and kills the ones that have not exited
+    /// after [`host::HANGUP_LIMIT`]. It blocks for at most that limit and
+    /// needs no async runtime, so an app exit can call it.
+    pub fn kill_host_sessions(&self) {
+        let mut groups = Vec::new();
+        lock(&self.state).sessions.retain(|s| {
+            let killed = s.kind == SessionKind::Host;
+            if killed && let Some(group) = &s.host_group {
+                group.hangup();
+                groups.push(group.clone());
+            }
+            !killed
+        });
+        if groups.is_empty() {
+            return;
+        }
+        host::wait_retired(&groups, std::time::Instant::now() + host::HANGUP_LIMIT);
+        for group in &groups {
+            group.kill();
+        }
+    }
+
+    pub fn set_pane_layout(&self, shield_id: &str, layout: Option<PaneNode>) -> Result<()> {
+        self.edit(shield_id, |s| s.set_pane_layout(layout))
     }
 
     /// Why the running VM has no runtime of the agent.
@@ -228,6 +299,7 @@ impl<R: SandboxRuntime> Manager<R> {
 #[cfg(test)]
 mod tests {
     use crate::shield::testing::*;
+    use crate::shield::{PaneNode, SplitDirection};
 
     #[tokio::test]
     async fn session_lifecycle() {
@@ -320,6 +392,95 @@ mod tests {
         manager.open_session(&id, agent(AgentKind::Codex, true), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/codex", "resume", "--last"]);
         assert_eq!(manager.list()[0].sessions[0].kind, agent(AgentKind::Codex, true));
+    }
+
+    fn leaf(terminal: &str) -> Box<PaneNode> {
+        Box::new(PaneNode::Leaf { terminal: terminal.into() })
+    }
+
+    fn split(direction: SplitDirection, ratio: f64, a: Box<PaneNode>, b: Box<PaneNode>) -> PaneNode {
+        PaneNode::Split { direction, ratio, a, b }
+    }
+
+    #[tokio::test]
+    async fn pane_layouts_name_each_terminal_once_and_close_collapses_the_split() {
+        host_sh();
+        let (manager, _, id) = manager();
+        for _ in 0..3 {
+            manager.open_session(&id, SessionKind::Host, 24, 80).await.unwrap();
+        }
+        let t = terminal_ids(&manager);
+        let layout = split(
+            SplitDirection::Row,
+            0.4,
+            leaf(&t[0]),
+            Box::new(split(SplitDirection::Column, 0.5, leaf(&t[1]), leaf(&t[2]))),
+        );
+        manager.set_pane_layout(&id, Some(layout.clone())).unwrap();
+        assert_eq!(manager.list()[0].shield.pane_layout, Some(layout));
+        assert!(!manager.list()[0].pending_restart);
+
+        let invalid = |layout| matches!(manager.set_pane_layout(&id, Some(layout)), Err(Error::InvalidPaneLayout(_)));
+        assert!(invalid(split(SplitDirection::Row, 0.5, leaf(&t[0]), leaf(&t[0]))));
+        assert!(invalid(split(SplitDirection::Row, 0.5, leaf(&t[0]), leaf("gone"))));
+        assert!(invalid(split(SplitDirection::Row, 0.95, leaf(&t[0]), leaf(&t[1]))));
+        assert!(invalid(split(SplitDirection::Row, f64::NAN, leaf(&t[0]), leaf(&t[1]))));
+        let mut deep = PaneNode::Leaf { terminal: t[0].clone() };
+        for _ in 0..9 {
+            deep = split(SplitDirection::Row, 0.5, Box::new(deep), leaf(&t[1]));
+        }
+        assert!(invalid(deep));
+
+        // A close removes the pane; its sibling takes the place of the split.
+        manager.close_terminal(&id, &t[1]).unwrap();
+        let collapsed = split(SplitDirection::Row, 0.4, leaf(&t[0]), leaf(&t[2]));
+        assert_eq!(manager.list()[0].shield.pane_layout, Some(collapsed));
+        manager.close_terminal(&id, &t[0]).unwrap();
+        assert_eq!(manager.list()[0].shield.pane_layout, Some(*leaf(&t[2])));
+        manager.close_terminal(&id, &t[2]).unwrap();
+        assert_eq!(manager.list()[0].shield.pane_layout, None);
+        manager.set_pane_layout(&id, None).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_shells_need_no_start_and_outlive_a_stop_but_not_a_delete() {
+        host_sh();
+        let (manager, runtime, id) = manager();
+        let session = manager.open_session(&id, SessionKind::Host, 24, 80).await.unwrap();
+        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list()[0].shield.terminals[0].kind, SessionKind::Host);
+        let (_, mut rx) = attach(&manager, &session);
+        manager.write(&session, b"echo hi-$((40+2))\n".to_vec()).unwrap();
+        let mut out = String::new();
+        while !out.contains("hi-42") {
+            match next(&mut rx).await {
+                PtyEvent::Output(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                PtyEvent::Exit(code) => panic!("exit {code}: {out}"),
+            }
+        }
+
+        manager.start(&id).await.unwrap();
+        manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        manager.stop(&id).await.unwrap();
+        let sessions = &manager.list()[0].sessions;
+        assert_eq!((sessions.len(), sessions[0].id.as_str()), (1, session.as_str()));
+        assert_eq!(*runtime.argvs.lock().unwrap(), [["/bin/bash", "-l"]], "the host shell is not in the VM");
+
+        manager.delete(&id).await.unwrap();
+        assert!(lock(&manager.state).sessions.is_empty());
+        while !matches!(next(&mut rx).await, PtyEvent::Exit(_)) {}
+    }
+
+    #[tokio::test]
+    async fn a_host_shell_in_a_missing_folder_does_not_open() {
+        let (manager, _, id) = manager();
+        let folder = manager.list()[0].shield.folder.clone();
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert!(matches!(
+            manager.open_session(&id, SessionKind::Host, 24, 80).await,
+            Err(Error::MissingPath(path)) if path == folder.display().to_string()
+        ));
+        assert!(manager.list()[0].shield.terminals.is_empty());
     }
 
     #[test]

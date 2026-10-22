@@ -11,6 +11,7 @@ use crate::host_agents::HostAgents;
 use crate::host_agents::detect::Detection;
 use crate::preferences::{Preferences, Prefs};
 use crate::runtimes::{Progress, RuntimeView, Runtimes};
+use crate::terminal::ghostty;
 
 #[tauri::command]
 pub fn startup_status(bootstrap: State<'_, Bootstrap>) -> Startup {
@@ -25,6 +26,13 @@ pub fn get_preferences(preferences: State<'_, Preferences>) -> Prefs {
 #[tauri::command]
 pub fn set_preferences(preferences: State<'_, Preferences>, prefs: Prefs) -> Result<()> {
     preferences.set(prefs)
+}
+
+/// The settings and colors of the user's Ghostty config.
+#[tauri::command]
+pub async fn import_ghostty_config() -> Result<ghostty::Import> {
+    let home = dirs::home_dir().unwrap_or_default();
+    tokio::task::spawn_blocking(move || ghostty::import(&home)).await.map_err(std::io::Error::other)?
 }
 
 /// Sizes in bytes. `None`: unknown.

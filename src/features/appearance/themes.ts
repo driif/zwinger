@@ -82,10 +82,8 @@ export const BUILT_INS: Theme[] = [
 const CACHE = "zwinger.theme";
 const DARK = "(prefers-color-scheme: dark)";
 
+/** The theme on the window now. */
 let active = BUILT_INS[0];
-
-/** The theme on the window now. A new terminal takes its colors. */
-export const activeTheme = () => active;
 
 /** Sets the base as `data-theme` and the tokens as inline properties of `<html>`, in place of the earlier ones. */
 export function applyTheme(theme: Theme) {
@@ -117,6 +115,8 @@ export const isBuiltIn = (id: string) => BUILT_INS.some((t) => t.id === id);
 /** The themes for the Appearance page. `preview` shows a draft on the window; no draft shows the selected theme. */
 export interface Appearance {
   themes: Theme[];
+  /** The theme on the window: the draft, else the selected theme. */
+  theme: Theme;
   skipped: string[];
   reload: () => Promise<void>;
   preview: (draft?: Theme) => void;
@@ -154,5 +154,5 @@ export function useAppearance(prefs?: Prefs): Appearance {
     }
   }, [draft, selected]);
 
-  return { themes, skipped: list?.skipped ?? [], reload, preview: setDraft };
+  return { themes, theme: draft ?? selected ?? active, skipped: list?.skipped ?? [], reload, preview: setDraft };
 }

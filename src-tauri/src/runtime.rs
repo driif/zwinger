@@ -41,19 +41,21 @@ const SIGTERM: i32 = 15;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SessionKind {
+    /// A login shell in the VM. The UI calls it "VM shell"; the name stays
+    /// `shell`, so saved terminals load.
     Shell,
+    /// The user's login shell on the Mac, unsandboxed, in the shield's folder.
+    Host,
     /// The agent's own TUI, through its wrapper. `resume` continues the
     /// agent's last session.
-    Agent {
-        agent: AgentKind,
-        resume: bool,
-    },
+    Agent { agent: AgentKind, resume: bool },
 }
 
 impl SessionKind {
     pub fn argv(self) -> Vec<String> {
         match self {
             Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
+            Self::Host => vec![crate::terminal::host::login_shell(), "-l".to_owned()],
             Self::Agent { agent, resume } => {
                 let mut argv = vec![format!("{}/{}", launch::BIN_DIR, agent.name())];
                 if resume {
@@ -708,6 +710,9 @@ mod tests {
         assert_eq!(pi.argv(), ["/opt/zwinger/bin/pi", "-c"]);
         assert_eq!(serde_json::to_value(codex).unwrap(), json!({ "type": "agent", "agent": "codex", "resume": true }));
         assert_eq!(serde_json::from_value::<SessionKind>(json!({ "type": "shell" })).unwrap(), SessionKind::Shell);
+        assert_eq!(serde_json::to_value(SessionKind::Host).unwrap(), json!({ "type": "host" }));
+        assert_eq!(serde_json::from_value::<SessionKind>(json!({ "type": "host" })).unwrap(), SessionKind::Host);
+        assert_eq!(SessionKind::Host.argv()[1], "-l");
     }
 
     #[test]

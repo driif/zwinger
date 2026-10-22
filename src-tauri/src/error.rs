@@ -99,6 +99,8 @@ pub enum Error {
     TerminalNotFound,
     #[error("the terminal is already open")]
     TerminalOpen,
+    #[error("invalid pane layout: {0}")]
+    InvalidPaneLayout(String),
     #[error("shield is not running")]
     NotRunning,
     #[error("shield is already started")]
