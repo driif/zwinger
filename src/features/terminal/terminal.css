@@ -10,6 +10,7 @@
 }
 
 .pane-layout {
+  --zw-pane-header: 24px;
   position: relative;
   flex: 1;
   min-height: 0;
@@ -65,4 +66,27 @@
 .pane-divider:hover,
 .pane-divider.dragging {
   background: var(--motiv-color-primary-subtle);
+}
+
+.pane-header {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: var(--motiv-space);
+  padding: 0 var(--motiv-space);
+  border-bottom: 1px solid var(--motiv-color-border);
+  color: var(--motiv-color-text-muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.pane-header.focused {
+  color: var(--motiv-color-text);
+}
+
+.pane-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

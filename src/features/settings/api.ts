@@ -126,6 +126,15 @@ export interface Prefs {
   /** The width of the shield rail, in px. */
   railWidth: number;
   terminal: TerminalPrefs;
+  editors: EditorPrefs;
+}
+
+/** The editors that the launchers offer. */
+export interface EditorPrefs {
+  /** The ids of the editors that are on. `null`: not set, so each detected editor is on. `[]`: all are off. */
+  enabled: string[] | null;
+  /** `null`, or an editor that is off or gone: Zed, else VS Code, else the first editor that is on. */
+  default: string | null;
 }
 
 export type CursorStyle = "block" | "bar" | "underline";

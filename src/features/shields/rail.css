@@ -57,14 +57,6 @@
   border-radius: var(--motiv-radius-md);
 }
 
-.tree-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  z-index: 2;
-  min-width: 12rem;
-}
-
 .tree-item:focus-visible > .tree-row {
   outline: var(--motiv-focus-ring);
 }
@@ -110,8 +102,21 @@
   background: var(--motiv-color-primary-subtle);
 }
 
+.tree-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .tree-shield.current > .tree-row .tree-name {
   font-weight: 600;
+}
+
+.tree-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.75rem;
+  font-weight: 400;
 }
 
 .tree-shield.forbidden-target {

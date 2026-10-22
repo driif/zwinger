@@ -1,6 +1,7 @@
 import { CSSProperties, lazy, ReactNode, Suspense, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { homeDir } from "@tauri-apps/api/path";
 import { Button } from "@driif/motiv";
 import { Plus, RotateCw, Shield, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
@@ -62,7 +63,10 @@ import { AppSettings } from "./features/settings/AppSettings";
 import { CommandBar } from "./shared/CommandBar";
 import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ShieldPage } from "./features/shields/ShieldPage";
-import { agentsOf, ShieldRail } from "./features/shields/ShieldRail";
+import { ShieldRail } from "./features/shields/ShieldRail";
+import { agentsOf, LaunchAction } from "./features/launcher/actions";
+import { detectEditors, Editors, openInEditor, revealShield } from "./features/launcher/api";
+import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
 import { Appearance, useAppearance } from "./features/appearance/themes";
 import { clampRail, RailHandle } from "./features/shields/RailHandle";
@@ -176,6 +180,7 @@ export default function App() {
       <Onboarding
         startup={startup}
         banner={banner}
+        onEditor={(id) => savePrefs({ ...prefs, editors: { ...prefs.editors, default: id } })}
         onDone={async (shieldId) => {
           // Set first: the workspace reads it once, when it mounts.
           setFirstShield(shieldId);
@@ -233,8 +238,12 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
   const [detection, setDetection] = useState<Detection>();
-  /** The main area shows the app settings instead of a shield. */
-  const [showSettings, setShowSettings] = useState(false);
+  /** The tab of the app settings, which the main area shows instead of a shield. */
+  const [settingsTab, setSettingsTab] = useState<string>();
+  const showSettings = settingsTab !== undefined;
+  /** The editors on this Mac. `undefined` until the first detection. */
+  const [editors, setEditors] = useState<Editors>();
+  const [home, setHome] = useState<string>();
   /** Per shield, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
   const [railWidth, setRailWidth] = useState(() => clampRail(prefs.railWidth));
@@ -275,11 +284,21 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => setError(errorMessage(e)));
   };
 
+  const loadEditors = () => detectEditors().then(setEditors, (e) => setError(errorMessage(e)));
+
   useEffect(() => {
     refresh();
     reloadRuntimes();
     detect(false);
+    loadEditors();
+    homeDir().then(setHome, () => {});
   }, []);
+
+  /** The editors that are on and the default come from the prefs, so they are read again. */
+  const savePrefs = async (next: Prefs) => {
+    await onPrefs(next);
+    await loadEditors();
+  };
 
   // An agent login was made in a shield, or it is gone.
   useEffect(() => {
@@ -381,6 +400,8 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     return shown.includes(focusedPanes[target.id]) ? focusedPanes[target.id] : shown[0];
   };
   const focused = shield && focusedOf(shield);
+  /** The pane whose folder ⌘⇧E and the command menu open. */
+  const here = view.kind === "terminal" && !showSettings ? focused : undefined;
   const events = (shield && net[shield.id]) ?? [];
 
   // A deleted app or task has no view.
@@ -417,12 +438,12 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     focusPane(key, target.id);
   }
 
-  /** ⌘W: hides the focused pane. The terminal and its process stay in the tree. */
-  function hidePane() {
-    if (!shield || !focused) return;
-    const layout = remove(shield.paneLayout, focused);
+  /** ⌘W or a pane's close button: hides the pane. The terminal and its process stay in the tree. */
+  function hidePane(key = focused) {
+    if (!shield || !key) return;
+    const layout = remove(shield.paneLayout, key);
     saveLayout(shield.id, layout);
-    focusPane(leaves(layout)[0]);
+    focusPane(key === focused ? leaves(layout)[0] : focused);
   }
 
   function moveFocus(direction: Direction) {
@@ -433,14 +454,14 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   /** Items belong to one shield, so another shield shows its Overview instead. */
   function select(id: string) {
     setRoundFolder(undefined);
-    setShowSettings(false);
+    setSettingsTab(undefined);
     setSelectedId(id);
     if (id === shield?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
   function openView(shieldId: string, next: View) {
     setRoundFolder(undefined);
-    setShowSettings(false);
+    setSettingsTab(undefined);
     setSelectedId(shieldId);
     if (next.kind === "terminal") showPane(next.key, shields.find((s) => s.id === shieldId));
     else setView(next);
@@ -463,11 +484,11 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
 
   /**
    * Opens a terminal, or the first agent of the shield: host agents come first. It shows in the focused pane, or in a new
-   * pane right of it (`row`) or below it (`column`).
+   * pane right of the pane `at` (`row`) or below it (`column`); no `at` splits the focused pane.
    */
-  async function newSession(kind: SessionKind | "agent", target = shield, direction?: "row" | "column") {
+  async function newSession(kind: SessionKind | "agent", target = shield, direction?: "row" | "column", at?: string) {
     if (!target) return;
-    if (direction && tooDeep(target.paneLayout, focusedOf(target)))
+    if (direction && tooDeep(target.paneLayout, at ?? focusedOf(target)))
       throw new Error("This pane cannot split again. Close a pane first.");
     // A stopped shield does not know its mounted agents. Read them after the start. A Mac shell needs no start.
     if (target.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
@@ -486,9 +507,39 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     setSelectedId(target.id);
     if (!terminalId) return;
     if (direction) {
-      saveLayout(target.id, split(fresh.paneLayout, focusedOf(fresh), terminalId, direction));
+      saveLayout(target.id, split(fresh.paneLayout, at ?? focusedOf(fresh), terminalId, direction));
       focusPane(terminalId, target.id);
     } else showPane(terminalId, fresh);
+  }
+
+  /** Opens the shield folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
+  async function openEditor(target: ShieldView, editorId?: string, terminalId?: string) {
+    const askedId = editorId ?? editors?.default ?? null;
+    const opened = await openInEditor(target.id, askedId, terminalId ?? null);
+    const asked = editors?.editors.find((e) => e.id === askedId)?.name ?? "The editor";
+    const notes = [
+      opened.editorFellBack && asked !== opened.editor && `${asked} is not available, so ${opened.editor} opened.`,
+      opened.folderFellBack && `The folder of the terminal is unknown, so ${opened.editor} opened the shield folder ${tildePath(opened.folder, home)}.`,
+    ].filter((note): note is string => !!note);
+    if (notes.length > 0) setAppNotices((all) => [...all, notes.join(" ")]);
+  }
+
+  /** A choice of an editor makes it the default, so the launchers switch to it. */
+  function launch(target: ShieldView, action: LaunchAction, terminalId?: string) {
+    switch (action.type) {
+      case "session":
+        return run(() => newSession(action.kind, target));
+      case "editor":
+        return run(async () => {
+          if (action.editor.id !== editors?.default)
+            await savePrefs({ ...prefs, editors: { ...prefs.editors, default: action.editor.id } });
+          await openEditor(target, action.editor.id, terminalId);
+        });
+      case "copyPath":
+        return run(() => navigator.clipboard.writeText(target.folder));
+      case "reveal":
+        return run(() => revealShield(target.id));
+    }
   }
 
   /** Starts a new process for a dormant or exited terminal, in its place. */
@@ -564,6 +615,8 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     commands: () => commandBar.current?.querySelector("button")?.click(),
     newShield: () => run(newShield),
     newShell: () => run(() => newSession({ type: "host" })),
+    newVmShell: () => run(() => newSession({ type: "shell" })),
+    openEditor: () => shield && run(() => openEditor(shield, undefined, here)),
     newAgent: () => run(() => newSession("agent")),
     close: () => view.kind === "terminal" && hidePane(),
     next: () => cycle(1),
@@ -577,7 +630,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     terminal: () => showPane(focused ?? shieldPanes[shieldPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
-    appSettings: () => setShowSettings(true),
+    appSettings: () => setSettingsTab("agents"),
     splitRight: () => run(() => newSession({ type: "host" }, shield, "row")),
     splitDown: () => run(() => newSession({ type: "host" }, shield, "column")),
     focusLeft: () => moveFocus("left"),
@@ -612,6 +665,12 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
         onNew={actions.newShield}
         onSettings={actions.appSettings}
         dropFolder={dropFolder}
+        editors={editors}
+        home={home}
+        onLaunch={(id, action) => {
+          const target = shields.find((s) => s.id === id);
+          if (target) launch(target, action);
+        }}
         onDropDone={(create) => {
           setDropFolder(undefined);
           if (create && dropFolder) run(() => addShield(dropFolder.folder));
@@ -623,6 +682,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
           shield={shield}
           panes={shieldPanes}
           focused={focused}
+          here={here}
           actions={actions}
           onSelect={select}
           onShowPane={showPane}
@@ -634,6 +694,8 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
           onRestart={restart}
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
+          editors={editors}
+          onLaunch={(action) => shield && launch(shield, action, here)}
           run={run}
         />
       </ShieldRail>
@@ -667,8 +729,12 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
             </Notice>
           )}
         </div>
-        {showSettings ? (
+        {settingsTab !== undefined ? (
           <AppSettings
+            tab={settingsTab}
+            onTab={setSettingsTab}
+            editors={editors}
+            onDetectEditors={loadEditors}
             detection={detection}
             shields={shields}
             runtimes={runtimes}
@@ -679,7 +745,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
               setAdding((current) => ({ ...current, [shieldId]: agent.kind }));
             }}
             prefs={prefs}
-            onPrefs={onPrefs}
+            onPrefs={savePrefs}
             update={update}
             onUpdate={onUpdate}
             appearance={appearance}
@@ -706,7 +772,14 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
             detection={detection}
             adding={adding[shield.id]}
             onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
-            onHostAgents={() => setShowSettings(true)}
+            onHostAgents={() => setSettingsTab("agents")}
+            editors={editors}
+            home={home}
+            onLaunch={(action) => launch(shield, action)}
+            onEditorSettings={() => setSettingsTab("editors")}
+            onSplit={(key, direction) => run(() => newSession({ type: "host" }, shield, direction, key))}
+            onOpenEditor={(key) => run(() => openEditor(shield, undefined, key))}
+            onHide={hidePane}
             runs={runs[shield.id] ?? []}
             onRunsChange={() => reloadRuns(shield.id)}
             onRefresh={refresh}

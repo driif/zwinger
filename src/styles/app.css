@@ -37,7 +37,7 @@ p {
   height: var(--zw-icon);
 }
 
-/* The same for the launcher of motiv's CommandMenu: the command bar and Add agent. */
+/* The same for the launcher of motiv's CommandMenu: the command bar and the agent pickers. */
 .motiv-command-menu__launcher {
   min-height: var(--zw-control-height);
   font-size: inherit;

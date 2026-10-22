@@ -1,11 +1,12 @@
 //! Host shells: the user's login shell on the Mac, in a PTY of this process.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
@@ -91,6 +92,26 @@ impl HostGroup {
             wait_retired(std::slice::from_ref(&group), std::time::Instant::now() + HANGUP_LIMIT);
             group.kill();
         });
+    }
+
+    /// The current folder of the shell, if it is not reaped and macOS tells it.
+    pub(crate) fn cwd(&self) -> Option<PathBuf> {
+        let pid = self.lock();
+        let pid = (*pid)?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes to the buffer. The
+        // held lock keeps the shell unreaped, so the pid is still the shell's.
+        let written =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size) };
+        if written != size {
+            return None;
+        }
+        // SAFETY: the buffer was zeroed and then written in full.
+        let info = unsafe { info.assume_init() };
+        let bytes: Vec<u8> =
+            info.pvi_cdir.vip_path.as_flattened().iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        (!bytes.is_empty()).then(|| PathBuf::from(OsString::from_vec(bytes)))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<libc::pid_t>> {

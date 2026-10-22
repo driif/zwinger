@@ -1,4 +1,4 @@
-import { Button, Card, FloatingField, IconButton } from "@driif/motiv";
+import { Button, Card, IconButton } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -33,7 +33,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
   removeApp,
   reorderApps,
@@ -45,12 +45,16 @@ import { reorderShields } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
-  AgentKind,
   SessionKind,
   ShieldView,
 } from "../../shared/api";
 import type { DroppedFolder, Intent, Pane, Run, View } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
+import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
+import { tildePath, truncateMiddle } from "../../shared/paths";
+import { LaunchAction, launchActions } from "../launcher/actions";
+import { Editors } from "../launcher/api";
+import { launchMenu } from "../launcher/SplitLaunch";
 import "./rail.css";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
@@ -63,24 +67,11 @@ const GROUPS: { group: Group; label: string }[] = [
   { group: "tasks", label: "Tasks" },
 ];
 
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
-
-/**
- * The agents of the shield, host agents first. A running shield has pi and its mounted runtimes. A stopped shield
- * lists the agents that a start can mount; Gemini CLI runs only from this Mac.
- */
-export function agentsOf(shield: ShieldView): AgentKind[] {
-  const host = shield.hostAgents.map((a) => a.kind);
-  const available: AgentKind[] =
-    shield.status.state === "running" ? ["pi", ...shield.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
-  return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
-}
-
 const kindName = (kind: SessionKind) =>
   kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
 
 /** Where a terminal runs: on this Mac, or in the shield's VM. An agent always runs in the VM. */
-function KindIcon({ kind }: { kind: SessionKind }) {
+export function KindIcon({ kind }: { kind: SessionKind }) {
   if (kind.type === "agent") {
     const Icon = AGENT_ICONS[kind.agent];
     return <Icon size={14} aria-label="In the VM" />;
@@ -112,12 +103,6 @@ interface DragData {
 
 const dataOf = (item: Active | Over) => item.data.current as DragData;
 
-/** A row action. `confirm` asks first; `rename` asks for a new name first. */
-type MenuAction = { label: string; icon: ReactNode; disabled?: boolean } & (
-  | { run: () => void; confirm?: string }
-  | { rename: string; onRename: (name: string) => void }
-);
-
 interface Leaf {
   entity: string;
   label: ReactNode;
@@ -126,109 +111,6 @@ interface Leaf {
   icon: ReactNode;
   view: View;
   menu: MenuAction[];
-}
-
-/** The actions of a row. Arrow keys move between them; Escape and a click outside close it. */
-function RowMenu({ label, actions, onClose }: { label: string; actions: MenuAction[]; onClose: (refocus: boolean) => void }) {
-  const card = useRef<HTMLElement>(null);
-  const [step, setStep] = useState<MenuAction>();
-  const [name, setName] = useState("");
-  const close = useRef(onClose);
-  close.current = onClose;
-
-  useEffect(() => {
-    card.current?.querySelector<HTMLElement>("input, button:not(:disabled)")?.focus();
-  }, [step]);
-
-  useEffect(() => {
-    const outside = (event: PointerEvent) => !card.current?.contains(event.target as Node) && close.current(false);
-    document.addEventListener("pointerdown", outside);
-    return () => document.removeEventListener("pointerdown", outside);
-  }, []);
-
-  function onKeyDown(event: KeyboardEvent) {
-    // The tree and dnd-kit do not see the keys of the menu.
-    event.stopPropagation();
-    if (event.key === "Escape") {
-      event.preventDefault();
-      return onClose(true);
-    }
-    if (step || (event.key !== "ArrowDown" && event.key !== "ArrowUp")) return;
-    event.preventDefault();
-    const items = [...(card.current?.querySelectorAll<HTMLElement>("[role=menuitem]:not(:disabled)") ?? [])];
-    const index = items.indexOf(document.activeElement as HTMLElement);
-    items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
-  }
-
-  function choose(action: MenuAction) {
-    if ("rename" in action) {
-      setName(action.rename);
-      return setStep(action);
-    }
-    if (action.confirm) return setStep(action);
-    onClose(true);
-    action.run();
-  }
-
-  function rename(event: FormEvent) {
-    event.preventDefault();
-    if (!step || !("rename" in step) || !name.trim()) return;
-    onClose(true);
-    step.onRename(name.trim());
-  }
-
-  return (
-    <Card ref={card} padding="sm" className="tree-menu" onKeyDown={onKeyDown}>
-      {!step ? (
-        <div role="menu" aria-label={label} className="stack">
-          {actions.map((action) => (
-            <Button
-              key={action.label}
-              role="menuitem"
-              size="sm"
-              variant="ghost"
-              iconLeft={action.icon}
-              disabled={action.disabled}
-              onClick={() => choose(action)}
-            >
-              {action.label}
-            </Button>
-          ))}
-        </div>
-      ) : "rename" in step ? (
-        <form className="stack" onSubmit={rename}>
-          <FloatingField label="Name" value={name} maxLength={200} showValidity={false} onChange={(e) => setName(e.target.value)} />
-          <div className="row end">
-            <Button size="sm" variant="ghost" onClick={() => onClose(true)}>
-              Cancel
-            </Button>
-            <Button size="sm" type="submit" disabled={!name.trim()}>
-              Rename
-            </Button>
-          </div>
-        </form>
-      ) : (
-        <div className="stack" role="alertdialog" aria-label={step.label}>
-          <p>{step.confirm}</p>
-          <div className="row end">
-            <Button size="sm" variant="ghost" onClick={() => onClose(true)}>
-              Cancel
-            </Button>
-            <Button
-              size="sm"
-              variant="danger"
-              onClick={() => {
-                onClose(true);
-                step.run();
-              }}
-            >
-              {step.label}
-            </Button>
-          </div>
-        </div>
-      )}
-    </Card>
-  );
 }
 
 interface RowProps {
@@ -309,6 +191,10 @@ interface Props {
   onSettings: () => void;
   /** A folder dropped from Finder on empty rail space. */
   dropFolder?: DroppedFolder;
+  editors?: Editors;
+  /** The home folder, shown as `~`. */
+  home?: string;
+  onLaunch: (shieldId: string, action: LaunchAction) => void;
   onDropDone: (create: boolean) => void;
   children: ReactNode;
 }
@@ -335,6 +221,9 @@ export function ShieldRail({
   onSettings,
   dropFolder,
   onDropDone,
+  editors,
+  home,
+  onLaunch,
   children,
 }: Props) {
   const tree = useRef<HTMLUListElement>(null);
@@ -569,7 +458,7 @@ export function ShieldRail({
       case "F10":
       case "ContextMenu":
         if (event.key === "F10" && !event.shiftKey) return;
-        if (!id.startsWith("i|")) return;
+        if (id.startsWith("g|")) return;
         event.preventDefault();
         setMenu(id);
     }
@@ -735,6 +624,7 @@ export function ShieldRail({
                     className={`tree-shield ${shield.id === selectedId ? "current" : ""} ${forbidden === shield.id ? "forbidden-target" : ""}`}
                     shieldDrop={shield.id}
                     onOpen={() => onSelect(shield.id)}
+                    onMenu={() => setMenu(shieldRow)}
                     row={
                       <>
                         <IconButton
@@ -752,6 +642,9 @@ export function ShieldRail({
                           title={shield.status.state === "error" ? shield.status.message : shield.folder}
                         >
                           {shield.name}
+                          <span className="tree-path muted" title={shield.folder}>
+                            {truncateMiddle(tildePath(shield.folder, home), 32)}
+                          </span>
                         </span>
                         {blocked[shield.id] > 0 && (
                           <span className="rail-blocked" title="Blocked network events since you last saw them">
@@ -768,9 +661,27 @@ export function ShieldRail({
                             onToggle(shield);
                           }}
                         />
+                        <IconButton
+                          icon={<Ellipsis size={12} />}
+                          label={`Actions for ${shield.name}`}
+                          aria-haspopup="menu"
+                          aria-expanded={menu === shieldRow}
+                          tabIndex={-1}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setMenu(shieldRow);
+                          }}
+                        />
                       </>
                     }
                   >
+                    {menu === shieldRow && (
+                      <ActionMenu
+                        label={`Actions for ${shield.name}`}
+                        actions={launchMenu(launchActions(shield, editors), (action) => onLaunch(shield.id, action))}
+                        onClose={closeMenu}
+                      />
+                    )}
                     {shieldOpen && (
                       <ul role="group">
                         {groups.map(({ group, label, id, container, items, open }) => (
@@ -796,28 +707,12 @@ export function ShieldRail({
                             }
                           >
                             {menu === id && (
-                              <RowMenu
+                              <ActionMenu
                                 label="New terminal"
-                                actions={[
-                                  {
-                                    label: "Mac shell",
-                                    icon: <Laptop size={14} />,
-                                    run: () => onNewSession(shield.id, { type: "host" }),
-                                  },
-                                  {
-                                    label: "VM shell",
-                                    icon: <Box size={14} />,
-                                    run: () => onNewSession(shield.id, { type: "shell" }),
-                                  },
-                                  ...agentsOf(shield).map((agent) => {
-                                    const Icon = AGENT_ICONS[agent];
-                                    return {
-                                      label: AGENT_NAMES[agent],
-                                      icon: <Icon size={14} />,
-                                      run: () => onNewSession(shield.id, { type: "agent", agent, resume: false }),
-                                    };
-                                  }),
-                                ]}
+                                actions={launchMenu(
+                                  launchActions(shield, editors).filter((a) => a.type === "session"),
+                                  (action) => onLaunch(shield.id, action),
+                                )}
                                 onClose={closeMenu}
                               />
                             )}
@@ -861,7 +756,7 @@ export function ShieldRail({
                                         }
                                       >
                                         {menu === rowId && (
-                                          <RowMenu label={`Actions for ${item.name}`} actions={item.menu} onClose={closeMenu} />
+                                          <ActionMenu label={`Actions for ${item.name}`} actions={item.menu} onClose={closeMenu} />
                                         )}
                                       </TreeRow>
                                     );

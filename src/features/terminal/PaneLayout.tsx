@@ -1,9 +1,9 @@
-import { Button } from "@driif/motiv";
-import { Play } from "lucide-react";
+import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
+import { Code, Columns2, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, PointerEvent, useRef, useState } from "react";
 import type { PaneNode } from "../../shared/api";
 import type { Pane } from "../../App";
-import { paneName } from "../shields/ShieldRail";
+import { KindIcon, paneName } from "../shields/ShieldRail";
 import { Path, place, Rect, setRatio } from "./panes";
 import { TerminalView } from "./TerminalView";
 
@@ -20,6 +20,12 @@ interface Props {
   onReopen: (pane: Pane) => void;
   onPaneExit: () => void;
   onPaneError: (error: unknown) => void;
+  /** The name of the default editor. None: no editor is on. */
+  editor?: string;
+  onSplit: (key: string, direction: "row" | "column") => void;
+  onOpenEditor: (key: string) => void;
+  /** Hides the pane. The terminal keeps running. */
+  onHide: (key: string) => void;
 }
 
 const at = (r: Rect): CSSProperties => ({
@@ -29,8 +35,29 @@ const at = (r: Rect): CSSProperties => ({
   height: `${r.height * 100}%`,
 });
 
+/** The part of the pane below its header. */
+const body = (r: Rect): CSSProperties => ({
+  ...at(r),
+  top: `calc(${r.top * 100}% + var(--zw-pane-header))`,
+  height: `calc(${r.height * 100}% - var(--zw-pane-header))`,
+});
+
 /** The panes of the shown shield side by side, with dividers that drag. */
-export function PaneLayout({ layout, panes, focused, visible, onFocus, onLayout, onReopen, onPaneExit, onPaneError }: Props) {
+export function PaneLayout({
+  layout,
+  panes,
+  focused,
+  visible,
+  onFocus,
+  onLayout,
+  onReopen,
+  onPaneExit,
+  onPaneError,
+  editor,
+  onSplit,
+  onOpenEditor,
+  onHide,
+}: Props) {
   const area = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<{ path: Path; ratio: number }>();
   const shown = layout && drag ? setRatio(layout, drag.path, drag.ratio) : layout;
@@ -56,7 +83,7 @@ export function PaneLayout({ layout, panes, focused, visible, onFocus, onLayout,
               sessionId={pane.sessionId}
               visible={visible && rect !== undefined}
               focused={pane.key === focused}
-              style={rect && at(rect)}
+              style={rect && body(rect)}
               onFocus={() => onFocus(pane.key)}
               onExit={onPaneExit}
               onError={onPaneError}
@@ -69,11 +96,39 @@ export function PaneLayout({ layout, panes, focused, visible, onFocus, onLayout,
         return (
           pane &&
           !pane.sessionId && (
-            <div key={terminal} className="pane-dormant" style={at(rect)}>
+            <div key={terminal} className="pane-dormant" style={body(rect)}>
               <p className="muted">{paneName(pane, panes)} is not running.</p>
               <Button variant="outline" iconLeft={<Play size={14} />} onClick={() => onReopen(pane)}>
                 Open
               </Button>
+            </div>
+          )
+        );
+      })}
+      {places.map(({ terminal, rect }) => {
+        const pane = panes.find((p) => p.key === terminal);
+        const name = pane && paneName(pane, panes);
+        return (
+          pane && (
+            <div
+              key={`header-${terminal}`}
+              className={terminal === focused ? "pane-header focused" : "pane-header"}
+              style={{ ...at(rect), height: "var(--zw-pane-header)" }}
+            >
+              <KindIcon kind={pane.kind} />
+              <span className="grow pane-name">{name}</span>
+              <IconButtonGroup label={`Actions for ${name}`}>
+                <IconButton icon={<Columns2 size={12} />} label="Split right with a Mac shell" onClick={() => onSplit(terminal, "row")} />
+                <IconButton icon={<Rows2 size={12} />} label="Split down with a Mac shell" onClick={() => onSplit(terminal, "column")} />
+                {editor && (
+                  <IconButton
+                    icon={<Code size={12} />}
+                    label={`Open the folder of ${name} in ${editor}`}
+                    onClick={() => onOpenEditor(terminal)}
+                  />
+                )}
+                <IconButton icon={<X size={12} />} label="Hide pane" onClick={() => onHide(terminal)} />
+              </IconButtonGroup>
             </div>
           )
         );

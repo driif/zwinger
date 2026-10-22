@@ -1,0 +1,7 @@
+.action-menu {
+  /* No top: the menu opens below the element before it. */
+  position: absolute;
+  right: 0;
+  z-index: 2;
+  min-width: 12rem;
+}

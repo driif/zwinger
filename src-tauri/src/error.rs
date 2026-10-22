@@ -155,6 +155,10 @@ pub enum Error {
     ShieldsRunning(usize),
     #[error("MSB_PATH names a VM runtime that does not work: {0}; fix MSB_PATH or remove it, then open zwinger again")]
     DeveloperRuntime(String),
+    #[error("no editor is on; turn one on in Settings, Editors")]
+    NoEditor,
+    #[error("{0} did not open: {1}")]
+    EditorFailed(String, String),
     #[error("invalid theme: {0}")]
     InvalidTheme(String),
     #[error("update: {0}")]

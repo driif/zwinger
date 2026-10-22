@@ -40,6 +40,99 @@ pub(crate) struct Output {
     pub(crate) attaches: u64,
     /// Wakes the pump when a view acknowledges a frame or goes.
     pub(crate) room: Arc<Notify>,
+    pub(crate) osc7: Osc7,
+}
+
+/// The longest OSC 7 body that the scanner keeps across frames.
+const OSC7_LIMIT: usize = 4 << 10;
+
+const OSC7: &[u8] = b"\x1b]7;";
+
+/// Reads the current folder that a shell reports with OSC 7
+/// (`ESC ] 7 ; file://host/path`, ended by BEL or `ESC \`). A sequence can
+/// span frames.
+#[derive(Default)]
+pub(crate) struct Osc7 {
+    /// The bytes of [`OSC7`] matched so far; at its length, the body follows.
+    matched: usize,
+    body: Vec<u8>,
+    /// The body had an ESC, which starts the `ESC \` end.
+    esc: bool,
+    /// The last reported folder: a guest path for a VM shell.
+    pub(crate) cwd: Option<String>,
+}
+
+impl Osc7 {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i < bytes.len() {
+            if self.matched == 0 {
+                let Some(at) = bytes[i..].iter().position(|&b| b == 0x1b) else { return };
+                i += at + 1;
+                self.matched = 1;
+                continue;
+            }
+            let b = bytes[i];
+            i += 1;
+            if self.matched < OSC7.len() {
+                self.matched = if b == OSC7[self.matched] { self.matched + 1 } else { usize::from(b == 0x1b) };
+            } else if self.esc {
+                self.esc = false;
+                if b == b'\\' {
+                    self.finish();
+                } else {
+                    // The ESC was no end: it may start a new sequence.
+                    self.reset();
+                    self.matched = 1;
+                    i -= 1;
+                }
+            } else {
+                match b {
+                    0x07 => self.finish(),
+                    0x1b => self.esc = true,
+                    _ if self.body.len() >= OSC7_LIMIT => self.reset(),
+                    _ => self.body.push(b),
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.matched = 0;
+        self.esc = false;
+        self.body.clear();
+    }
+
+    /// Keeps the URL-decoded path of a `file://` URL; the host is ignored.
+    fn finish(&mut self) {
+        let path = self.body.strip_prefix(b"file://").and_then(|rest| {
+            let at = rest.iter().position(|&b| b == b'/')?;
+            String::from_utf8(percent_decode(&rest[at..])).ok()
+        });
+        if path.is_some() {
+            self.cwd = path;
+        }
+        self.reset();
+    }
+}
+
+fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push(high << 4 | low);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The view that gets new output.
@@ -57,6 +150,7 @@ impl Output {
     pub(crate) fn push(&mut self, event: PtyEvent) {
         match &event {
             PtyEvent::Output(bytes) => {
+                self.osc7.feed(bytes);
                 self.ring.extend(bytes);
                 let excess = self.ring.len().saturating_sub(RING);
                 self.ring.drain(..excess);
@@ -215,6 +309,7 @@ pub(crate) async fn pump<V>(
 
 #[cfg(test)]
 mod tests {
+    use super::{OSC7_LIMIT, Osc7};
     use crate::shield::testing::*;
 
     #[tokio::test]
@@ -237,6 +332,49 @@ mod tests {
         until(|| runs(&manager) == [(web.clone(), Some(137))]).await;
         assert!(rx.try_recv().is_err());
         manager.detach_session("gone", new);
+    }
+
+    fn cwd(chunks: &[&[u8]]) -> Option<String> {
+        let mut osc7 = Osc7::default();
+        for chunk in chunks {
+            osc7.feed(chunk);
+        }
+        osc7.cwd
+    }
+
+    #[test]
+    fn osc7_reports_the_last_decoded_folder() {
+        assert_eq!(cwd(&[b"ls\r\n\x1b]7;file://vm/workspace/a%20b\x07$ "]).as_deref(), Some("/workspace/a b"));
+        assert_eq!(cwd(&[b"\x1b]7;file://vm/one\x1b\\\x1b]7;file:///two\x07"]).as_deref(), Some("/two"));
+        assert_eq!(cwd(&[b"\x1b]7;file://vm/%C3%A4\x07"]).as_deref(), Some("/\u{e4}"));
+        // Other sequences and bad bodies change nothing.
+        assert_eq!(cwd(&[b"\x1b]0;title\x07\x1b[31m\x1b]7;http://x/y\x07\x1b]7;file://host\x07"]), None);
+        assert_eq!(cwd(&[b"\x1b]7;file://vm/%FF\x07"]), None);
+        assert_eq!(cwd(&[b"\x1b]7;file://vm/a\x1b]7;file://vm/b\x07"]).as_deref(), Some("/b"));
+        assert_eq!(cwd(&[b"\x1b\x1b]7;file://vm/c\x07"]).as_deref(), Some("/c"));
+    }
+
+    #[test]
+    fn osc7_spans_frames() {
+        let whole: &[u8] = b"out\x1b]7;file://vm/workspace/src\x1b\\more";
+        for at in 0..whole.len() {
+            assert_eq!(cwd(&[&whole[..at], &whole[at..]]).as_deref(), Some("/workspace/src"), "split at {at}");
+        }
+        let bytes: Vec<&[u8]> = whole.chunks(1).collect();
+        assert_eq!(cwd(&bytes).as_deref(), Some("/workspace/src"));
+    }
+
+    #[test]
+    fn osc7_drops_a_body_past_its_limit() {
+        let mut long = b"\x1b]7;file://vm/".to_vec();
+        long.extend(vec![b'a'; OSC7_LIMIT]);
+        long.extend(b"\x07");
+        assert_eq!(cwd(&[&long]), None);
+        let mut osc7 = Osc7::default();
+        osc7.feed(&long[..OSC7_LIMIT]);
+        assert!(osc7.body.len() <= OSC7_LIMIT);
+        osc7.feed(b"\x1b]7;file://vm/ok\x07");
+        assert_eq!(osc7.cwd.as_deref(), Some("/ok"));
     }
 
     #[test]

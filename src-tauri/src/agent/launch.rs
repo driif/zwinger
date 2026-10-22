@@ -187,9 +187,35 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
     Some(script)
 }
 
+/// Makes an interactive bash report its folder with OSC 7 at each prompt,
+/// so Open in editor knows the folder of a VM shell. `/bin/sh` reads the
+/// profile too, so the code has a guard and only POSIX syntax. The path is
+/// URL-encoded byte by byte; bash can read a byte as a negative number. A second read adds no second emitter.
+const OSC7_EMITTER: &str = r#"if [ -n "${BASH_VERSION-}" ]; then
+  __zw_osc7() {
+    local LC_ALL=C path= c n i=0
+    while [ "$i" -lt "${#PWD}" ]; do
+      c=${PWD:i:1}
+      case $c in
+        [A-Za-z0-9/._~-]) path=$path$c ;;
+        *) printf -v n '%d' "'$c"; printf -v c '%%%02X' $((n & 255)); path=$path$c ;;
+      esac
+      i=$((i + 1))
+    done
+    printf '\033]7;file://%s%s\007' "${HOSTNAME-}" "$path"
+  }
+  case ";${PROMPT_COMMAND-};" in
+    *";__zw_osc7;"*) ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__zw_osc7" ;;
+  esac
+fi
+"#;
+
 /// The script of [`PROFILE`].
 pub fn profile() -> String {
-    format!("case \":$PATH:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:$PATH ;; esac\nexport PATH\n")
+    format!(
+        "case \":${{PATH-}}:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:${{PATH-}} ;; esac\nexport PATH\n{OSC7_EMITTER}"
+    )
 }
 
 /// The root exec that writes [`PROFILE`] in the guest's root fs.
@@ -421,10 +447,9 @@ mod tests {
 
     #[test]
     fn profile_puts_the_wrappers_first_on_a_login_path() {
-        assert_eq!(
-            profile(),
-            "case \":$PATH:\" in *:/opt/zwinger/bin:*) ;; *) PATH=/opt/zwinger/bin:$PATH ;; esac\nexport PATH\n"
-        );
+        assert!(profile().starts_with(
+            "case \":${PATH-}:\" in *:/opt/zwinger/bin:*) ;; *) PATH=/opt/zwinger/bin:${PATH-} ;; esac\nexport PATH\nif "
+        ));
         // As Debian's /etc/profile does: it resets PATH, then sources profile.d.
         let login = format!("PATH=/usr/bin:/bin\n{}{}echo \"$PATH\"", profile(), profile());
         let out = std::process::Command::new("/bin/sh").arg("-c").arg(login).output().unwrap();
@@ -434,6 +459,43 @@ mod tests {
         assert_eq!(argv[2], "mkdir -p /etc/profile.d && printf '%s' \"$1\" > /etc/profile.d/zwinger.sh");
         assert_eq!(argv[3..], ["sh".to_owned(), profile()]);
         assert!(PATH.starts_with(&format!("{BIN_DIR}:")));
+    }
+
+    #[test]
+    fn profile_makes_bash_report_its_folder_once() {
+        let root = std::env::temp_dir().join(format!("zwinger-osc7-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("a b/\u{e4}%");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "PROMPT_COMMAND=mine\n{}{}cd \"$1\" && HOSTNAME=vm && eval \"$PROMPT_COMMAND\" && echo \"|$PROMPT_COMMAND\"",
+            profile(),
+            profile()
+        );
+        let out = std::process::Command::new("/bin/bash").args(["-c", &script, "bash"]).arg(&dir).output().unwrap();
+        let root = root.to_str().unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("\x1b]7;file://vm{root}/a%20b/%C3%A4%25\x07|mine;__zw_osc7\n")
+        );
+        // A shell that is not bash skips the emitter.
+        let script = format!("emulate sh\n{}echo \"|${{PROMPT_COMMAND:-}}|\"", profile());
+        let out = std::process::Command::new("/bin/zsh").args(["-c", &script]).output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "||\n", "{}", String::from_utf8_lossy(&out.stderr));
+        // `set -u` with no environment: /bin/sh is bash in sh mode on macOS, so only dash tests the guard.
+        let file = std::env::temp_dir().join(format!("zwinger-profile-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(&file, profile()).unwrap();
+        let has_dash = std::process::Command::new("dash").arg("-c").arg(":").status().is_ok_and(|s| s.success());
+        for shell in std::iter::once("/bin/sh").chain(has_dash.then_some("dash")) {
+            let out = std::process::Command::new(shell)
+                .env_clear()
+                .args(["-c", "set -u; . \"$1\"; echo marker", "sh"])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), "marker\n", "{shell}");
+        }
+        std::fs::remove_file(file).unwrap();
     }
 
     /// Runs the trust script with its paths below a temp root. `tools` is a

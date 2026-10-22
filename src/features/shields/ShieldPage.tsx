@@ -1,5 +1,5 @@
-import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, SpringCheckbox } from "@driif/motiv";
-import { Bot, Info, Laptop, Play, Square, TriangleAlert } from "lucide-react";
+import { Button, Card, CardBody, CardHeader, CopyField, ElasticTabs, SpringCheckbox } from "@driif/motiv";
+import { Bot, Code, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -27,6 +27,10 @@ import { SettingsTab } from "../settings/SettingsTab";
 import { TaskDialog } from "../tasks/TaskDialog";
 import { TerminalTab } from "../terminal";
 import { Notice } from "../../shared/Notice";
+import { tildePath } from "../../shared/paths";
+import { LaunchAction, launchActions } from "../launcher/actions";
+import { Editors } from "../launcher/api";
+import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
 
 // React Flow and the run room are large and not on the first screen of every shield.
 const ShieldMap = lazy(() => import("./ShieldMap").then((m) => ({ default: m.ShieldMap })));
@@ -155,6 +159,17 @@ interface Props {
   onLayout: (layout: PaneNode) => void;
   onPaneExit: () => void;
   onPaneError: (error: unknown) => void;
+  /** Splits the pane of a terminal with a Mac shell. */
+  onSplit: (key: string, direction: "row" | "column") => void;
+  /** Opens the terminal's current folder in the default editor. */
+  onOpenEditor: (key: string) => void;
+  /** Hides the pane of a terminal. Its process keeps running. */
+  onHide: (key: string) => void;
+  editors?: Editors;
+  /** The home folder, shown as `~`. */
+  home?: string;
+  onLaunch: (action: LaunchAction) => void;
+  onEditorSettings: () => void;
 }
 
 // Not keyed by shield: the terminal view keeps the panes of every shield attached.
@@ -179,6 +194,10 @@ export function ShieldPage({
   focused,
   run,
   onToggle,
+  editors,
+  home,
+  onLaunch,
+  onEditorSettings,
   ...terminal
 }: Props) {
   const { status } = shield;
@@ -225,6 +244,10 @@ export function ShieldPage({
   const unverified = [...(shield.folderId ? [] : [shield.folder]), ...shield.mounts.filter((m) => !m.id).map((m) => m.host)];
   const app = view.kind === "app" ? shield.apps.find((a) => a.id === view.appId) : undefined;
   const task = view.kind === "task" ? shield.tasks.find((t) => t.id === view.taskId) : undefined;
+  const actions = launchActions(shield, editors);
+  const newTerminals = actions.filter((a) => a.type === "session");
+  const editorActions = actions.filter((a) => a.type === "editor");
+  const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
 
   return (
     <section className="page">
@@ -235,21 +258,34 @@ export function ShieldPage({
             <span className={`dot ${status.state}`} />
             {status.state === "error" ? <span className="danger">{status.message}</span> : status.state}
             {status.state === "running" && shield.loginExpiresAt !== null && <span>· login valid until {time(shield.loginExpiresAt)}</span>}
-            <span className="mono grow" title={shield.folder}>
-              {shield.folder}
-            </span>
           </p>
+          <CopyField className="mono" value={shield.folder} display={tildePath(shield.folder, home)} title={shield.folder} />
         </div>
-        {detection && detection.agents.length > 0 && (
-          <CommandMenu
-            className="model-picker"
-            menuLabel="Add agent"
-            placeholder="Add agent"
-            commands={detection.agents.map((agent) => ({
-              id: agent.kind,
-              label: `${shield.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac`,
-              onSelect: () => onAdding(agent.kind),
-            }))}
+        <SplitLaunch
+          label="New terminal"
+          icon={<Laptop size={14} />}
+          onClick={() => onLaunch(newTerminals[0])}
+          menuLabel="New terminal"
+          menu={[
+            ...launchMenu(newTerminals, onLaunch),
+            // Host agents are set up here, next to the agents that they add.
+            ...(detection?.agents ?? []).map((agent) => ({
+              label: `${shield.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+              icon: <Plus size={14} />,
+              run: () => onAdding(agent.kind),
+            })),
+          ]}
+        />
+        {editors && (
+          <SplitLaunch
+            label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
+            icon={<Code size={14} />}
+            onClick={defaultEditor && (() => onLaunch(defaultEditor))}
+            menuLabel="Editors"
+            menu={[
+              ...launchMenu(editorActions, onLaunch),
+              { label: "Editor settings…", icon: <Settings size={14} />, run: onEditorSettings },
+            ]}
           />
         )}
         <Button
@@ -337,7 +373,7 @@ export function ShieldPage({
                     }
                   >
                     {shield.hostAgents.length === 0 && detection && detection.agents.length > 0
-                      ? "Next: add an agent from this Mac with Add agent, or open the built-in pi agent."
+                      ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
                       : "Next: open an agent, or a shell on this Mac in the shield folder."}
                   </Notice>
                 )}
@@ -461,6 +497,7 @@ export function ShieldPage({
           shield={shield}
           panes={panes}
           focused={focused}
+          editor={defaultEditor?.editor.name}
           visible={view.kind === "terminal"}
           {...terminal}
         />

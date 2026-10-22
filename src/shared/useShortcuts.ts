@@ -15,6 +15,8 @@ export const SHORTCUTS = [
   { key: "k", label: "⌘K", action: "commands" },
   { key: "n", label: "⌘N", action: "newShield" },
   { key: "t", label: "⌘T", action: "newShell" },
+  { key: "t", label: "⌘⇧T", action: "newVmShell", shift: true },
+  { key: "e", label: "⌘⇧E", action: "openEditor", shift: true },
   { key: "p", label: "⌘P", action: "newAgent" },
   { key: "w", label: "⌘W", action: "close" },
   { key: "]", label: "⌘]", action: "next" },

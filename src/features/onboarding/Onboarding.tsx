@@ -1,4 +1,4 @@
-import { Button, Card, CardBody, CardHeader, StepProgress } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, RadioGroup, StepProgress } from "@driif/motiv";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowRight, Bot, CircleCheck, CircleX, Folder, FolderOpen, Globe, Shield, TriangleAlert } from "lucide-react";
@@ -6,6 +6,7 @@ import { ReactNode, useEffect, useState } from "react";
 import { Startup, StartupStep } from "./api";
 import { Detection, hostAgents, putHostAgent } from "../settings/api";
 import { createShield, resolveFolder } from "../shields/api";
+import { detectEditors, Editors } from "../launcher/api";
 import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
 import "./onboarding.css";
@@ -14,6 +15,7 @@ const STEPS = [
   { id: "welcome", label: "Check this Mac" },
   { id: "shield", label: "Create a shield" },
   { id: "agent", label: "Add an agent" },
+  { id: "editor", label: "Your editor" },
   { id: "done", label: "Done" },
 ];
 
@@ -87,21 +89,29 @@ export function StartupScreen({ startup, banner }: { startup: Startup; banner?: 
   );
 }
 
-/** The first run: the checks, a first shield, an agent from this Mac. `onDone` opens the shield, if one was made. */
+/**
+ * The first run: the checks, a first shield, an agent from this Mac, the default editor. `onDone` opens the shield, if
+ * one was made.
+ */
 export function Onboarding({
   startup,
   banner,
+  onEditor,
   onDone,
 }: {
   startup: Startup;
   /** The update banner: a blocked start can still update. */
   banner?: ReactNode;
+  /** Saves the default editor. */
+  onEditor: (id: string) => Promise<void>;
   onDone: (shieldId?: string) => Promise<void>;
 }) {
   const [step, setStep] = useState(0);
   const [shieldId, setShieldId] = useState<string>();
   const [detection, setDetection] = useState<Detection>();
   const [added, setAdded] = useState<AgentKind[]>([]);
+  const [editors, setEditors] = useState<Editors>();
+  const [editor, setEditor] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
@@ -135,6 +145,11 @@ export function Onboarding({
 
   useEffect(() => {
     if (step === 2 && !detection) hostAgents().then(setDetection, (e) => setError(errorMessage(e)));
+    if (step === 3 && !editors)
+      detectEditors().then((found) => {
+        setEditors(found);
+        setEditor(found.default ?? undefined);
+      }, (e) => setError(errorMessage(e)));
   }, [step]);
 
   const add = (kind: AgentKind, profile: boolean, login: boolean) =>
@@ -150,7 +165,7 @@ export function Onboarding({
     <div className="onboarding">
       {banner}
       <h1 className="page-title">Welcome to zwinger</h1>
-      <StepProgress label="First steps" steps={STEPS} current={step} completed={step === 3} />
+      <StepProgress label="First steps" steps={STEPS} current={step} completed={step === 4} />
       {step === 0 && (
         <Card variant="outlined" padding="md">
           <CardHeader title="What a shield is" titleAs="h2" />
@@ -235,6 +250,28 @@ export function Onboarding({
       )}
       {step === 3 && (
         <Card variant="outlined" padding="md">
+          <CardHeader
+            title="Your editor"
+            titleAs="h2"
+            description="Open in editor opens the shield folder, or the current folder of a terminal, in this editor. You can change it later in Settings."
+          />
+          <CardBody className="stack">
+            {!editors && <p className="muted">Looking for editors on this Mac…</p>}
+            {editors?.editors.length === 0 && <p className="muted">No known editor is installed. You can detect editors again later in Settings.</p>}
+            {editor && editors && (
+              <RadioGroup
+                name="default-editor"
+                legend="Default editor"
+                options={editors.editors.map((e) => ({ value: e.id, label: e.name }))}
+                value={editor}
+                onChange={setEditor}
+              />
+            )}
+          </CardBody>
+        </Card>
+      )}
+      {step === 4 && (
+        <Card variant="outlined" padding="md">
           <CardHeader title="Your shield is ready" titleAs="h2" />
           <CardBody className="stack">
             <p>Start the shield, then open an agent with ⌘P or a shell with ⌘T.</p>
@@ -244,7 +281,7 @@ export function Onboarding({
       )}
       {error && <p className="danger">{error}</p>}
       <div className="row end">
-        {(step === 1 || step === 2) && (
+        {step >= 1 && step <= 3 && (
           <Button variant="ghost" disabled={busy} onClick={finish}>
             Skip
           </Button>
@@ -264,6 +301,19 @@ export function Onboarding({
           </Button>
         )}
         {step === 3 && (
+          <Button
+            loading={busy}
+            onClick={() =>
+              act(async () => {
+                if (editor && editor !== editors?.default) await onEditor(editor);
+                setStep(4);
+              })
+            }
+          >
+            Next
+          </Button>
+        )}
+        {step === 4 && (
           <Button loading={busy} onClick={finish}>
             Open the shield
           </Button>

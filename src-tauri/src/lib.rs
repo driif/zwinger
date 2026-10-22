@@ -2,6 +2,7 @@ mod agent;
 mod appearance;
 mod bootstrap;
 mod commands;
+mod editor;
 mod error;
 mod host_agents;
 mod netlog;
@@ -313,6 +314,9 @@ pub fn run() {
             commands::settings::clean_images,
             commands::settings::legacy_storage,
             commands::settings::remove_legacy_runtime,
+            commands::editors::detect_editors,
+            commands::editors::open_in_editor,
+            commands::editors::reveal_shield,
             commands::appearance::list_themes,
             commands::appearance::save_theme,
             commands::appearance::delete_theme,

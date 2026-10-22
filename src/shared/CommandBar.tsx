@@ -10,6 +10,8 @@ import { removeMount, setMountReadonly } from "../features/settings/api";
 import { ShieldView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/shields/ShieldRail";
+import { LaunchAction, launchActions } from "../features/launcher/actions";
+import { Editors } from "../features/launcher/api";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
 interface Props {
@@ -19,6 +21,8 @@ interface Props {
   panes: Pane[];
   /** The focused pane of the shield. */
   focused?: string;
+  /** The focused pane when the terminal view shows; the editor items open its folder. */
+  here?: string;
   actions: Record<ShortcutAction, () => void>;
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
@@ -27,6 +31,8 @@ interface Props {
   onRestart: (id: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
+  editors?: Editors;
+  onLaunch: (action: LaunchAction) => void;
   run: Run;
 }
 
@@ -36,6 +42,7 @@ export function CommandBar({
   shield,
   panes,
   focused,
+  here,
   actions,
   onSelect,
   onShowPane,
@@ -44,6 +51,8 @@ export function CommandBar({
   onRestart,
   onIntent,
   onOpenRound,
+  editors,
+  onLaunch,
   run,
 }: Props) {
   const action = (id: ShortcutAction, label: string): CommandMenuItem => ({
@@ -69,7 +78,23 @@ export function CommandBar({
       });
     if (shield.pendingRestart)
       commands.push({ id: "restart", label: `Restart ${shield.name}`, onSelect: () => onRestart(shield.id) });
-    commands.push(action("newAgent", "New agent"), action("newShell", "New Mac shell"));
+    commands.push(action("newAgent", "New agent"));
+    const herePane = panes.find((p) => p.key === here);
+    for (const launch of launchActions(shield, editors)) {
+      const shortcut =
+        launch.type === "session" && launch.kind.type !== "agent"
+          ? shortcutLabel(launch.kind.type === "host" ? "newShell" : "newVmShell")
+          : launch.type === "editor" && launch.editor.id === editors?.default
+            ? shortcutLabel("openEditor")
+            : undefined;
+      const label =
+        launch.type !== "editor"
+          ? launch.label
+          : herePane
+            ? `Open ${paneName(herePane, panes)}'s folder in ${launch.editor.name}`
+            : `Open ${shield.name} in ${launch.editor.name}`;
+      commands.push({ id: launch.id, label, shortcut, onSelect: () => onLaunch(launch) });
+    }
     panes.forEach((pane) =>
       commands.push({
         id: `pane-${pane.key}`,

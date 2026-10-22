@@ -25,6 +25,8 @@ import { UpdateBanner } from "../updates/UpdateBanner";
 import { AppearancePage } from "../appearance/AppearancePage";
 import { Appearance } from "../appearance/themes";
 import { TerminalSettings } from "../terminal";
+import { Editors } from "../launcher/api";
+import { EditorsSettings } from "./EditorsSettings";
 
 const REPO = "https://github.com/driif/zwinger";
 
@@ -33,6 +35,7 @@ const TABS = [
   { value: "runtimes", label: "Runtimes" },
   { value: "appearance", label: "Appearance" },
   { value: "terminal", label: "Terminal" },
+  { value: "editors", label: "Editors" },
   { value: "updates", label: "Updates" },
   { value: "storage", label: "Storage" },
   { value: "about", label: "About" },
@@ -238,6 +241,11 @@ function About({ version }: { version?: string }) {
 }
 
 interface Props {
+  tab: string;
+  onTab: (tab: string) => void;
+  editors?: Editors;
+  /** Looks for the editors again. */
+  onDetectEditors: () => void;
   detection?: Detection;
   shields: ShieldView[];
   runtimes: Runtimes;
@@ -255,6 +263,10 @@ interface Props {
 
 /** The settings of the app, for all shields. */
 export function AppSettings({
+  tab,
+  onTab,
+  editors,
+  onDetectEditors,
   detection,
   shields,
   runtimes,
@@ -267,7 +279,6 @@ export function AppSettings({
   onUpdate,
   appearance,
 }: Props) {
-  const [tab, setTab] = useState("agents");
   const [version, setVersion] = useState<string>();
 
   useEffect(() => {
@@ -284,7 +295,7 @@ export function AppSettings({
         label="Settings"
         tabs={TABS}
         value={tab}
-        onChange={setTab}
+        onChange={onTab}
         panels={{
           agents: (
             <HostAgentsSettings
@@ -322,6 +333,7 @@ export function AppSettings({
           ),
           appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
           terminal: <TerminalSettings appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
+          editors: <EditorsSettings editors={editors} prefs={prefs} onPrefs={onPrefs} run={run} onDetect={onDetectEditors} />,
           updates: <Updates version={version} prefs={prefs} onPrefs={onPrefs} run={run} update={update} onUpdate={onUpdate} />,
           storage: <Storage />,
           about: <About version={version} />,

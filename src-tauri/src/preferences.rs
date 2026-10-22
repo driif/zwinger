@@ -23,6 +23,19 @@ pub struct Prefs {
     /// The width of the shield rail, in CSS pixels.
     pub rail_width: u32,
     pub terminal: TerminalPrefs,
+    pub editors: EditorPrefs,
+}
+
+/// The editors that the launchers offer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EditorPrefs {
+    /// The ids of the editors that are on. `None`: not set, so each detected
+    /// editor is on. `Some([])`: the user turned all of them off.
+    pub enabled: Option<Vec<String>>,
+    /// `None`, or an editor that is off or gone: Zed, else VS Code, else the
+    /// first editor that is on.
+    pub default: Option<String>,
 }
 
 /// The look and keys of all terminals.
@@ -107,6 +120,7 @@ impl Default for Prefs {
             dark_theme: "zwinger-dark".into(),
             rail_width: 256,
             terminal: TerminalPrefs::default(),
+            editors: EditorPrefs::default(),
         }
     }
 }
@@ -198,6 +212,19 @@ mod tests {
         );
         assert_eq!(prefs.rail_width, 256);
         assert_eq!(prefs.terminal, TerminalPrefs::default());
+        assert_eq!(prefs.editors, EditorPrefs { enabled: None, default: None });
+    }
+
+    #[test]
+    fn unset_editors_differ_from_all_editors_off() {
+        let unset: Prefs = serde_json::from_str(r#"{"editors":{}}"#).unwrap();
+        assert_eq!(unset.editors.enabled, None);
+        let off: Prefs = serde_json::from_str(r#"{"editors":{"enabled":[],"default":"zed"}}"#).unwrap();
+        assert_eq!(off.editors, EditorPrefs { enabled: Some(Vec::new()), default: Some("zed".into()) });
+        let path = path();
+        let prefs = Preferences::load(path.clone());
+        prefs.set(off.clone()).unwrap();
+        assert_eq!(Preferences::load(path).get().editors, off.editors);
     }
 
     #[test]
@@ -262,6 +289,7 @@ mod tests {
                     "optionAsMeta": true,
                     "themeId": null,
                 },
+                "editors": { "enabled": null, "default": null },
             })
         );
     }

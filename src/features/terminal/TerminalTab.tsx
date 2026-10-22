@@ -19,6 +19,11 @@ interface Props {
   onReopen: (pane: Pane) => void;
   onPaneExit: () => void;
   onPaneError: (error: unknown) => void;
+  /** The name of the default editor. */
+  editor?: string;
+  onSplit: (key: string, direction: "row" | "column") => void;
+  onOpenEditor: (key: string) => void;
+  onHide: (key: string) => void;
 }
 
 /** The pane layout of the shown shield. The terminals of every shield stay attached. */

@@ -3,19 +3,21 @@ pub(crate) mod host;
 pub(crate) mod output;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::AgentKind;
+use crate::editor;
 use crate::error::{Error, Result};
 use crate::runtime::{Pty, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
 use crate::shield::apps::AppRun;
 use crate::shield::lifecycle::mounted;
 use crate::shield::manager::{HostRun, Manager, State, Vm, lock};
-use crate::shield::{PaneNode, WORKSPACE};
+use crate::shield::{PaneNode, Shield, WORKSPACE};
 use output::{Output, pump};
 
 /// The backend owns each session, not a view: a view attaches to it and
@@ -275,6 +277,55 @@ impl<R: SandboxRuntime> Manager<R> {
         }
     }
 
+    /// The host folder that Open in editor opens: the shield folder, or the
+    /// current folder of the terminal's live session. A host shell's folder
+    /// comes from macOS; a VM terminal's from its last OSC 7, else its start
+    /// folder, mapped by [`editor::map_guest`]. The flag is false when the
+    /// terminal's folder is unknown and the shield folder is used instead.
+    pub fn editor_folder(&self, shield_id: &str, terminal_id: Option<&str>) -> Result<(PathBuf, bool)> {
+        enum Cwd {
+            Host(host::HostGroup),
+            /// The output, its start folder and the applied config.
+            Guest(Arc<Mutex<Output>>, Option<String>, Box<Shield>),
+        }
+        let (folder, cwd) = {
+            let mut state = lock(&self.state);
+            let folder = state.shield_mut(shield_id)?.folder.clone();
+            let session = terminal_id.and_then(|tid| {
+                state.sessions.iter().find(|s| {
+                    s.shield_id == shield_id && s.terminal_id.as_deref() == Some(tid) && s.exit_code.is_none()
+                })
+            });
+            let cwd = match (session, state.vms.get(shield_id)) {
+                (Some(Session { host_group: Some(group), .. }), _) => Some(Cwd::Host(group.clone())),
+                (Some(session), Some(Vm::Running { applied, .. })) => {
+                    let start = match session.kind {
+                        SessionKind::Agent { .. } => applied.harness.clone(),
+                        SessionKind::Shell | SessionKind::Host => None,
+                    };
+                    Some(Cwd::Guest(session.output.clone(), start, applied.clone()))
+                }
+                _ => None,
+            };
+            (folder, cwd)
+        };
+        if !folder.is_dir() {
+            return Err(Error::MissingPath(folder.display().to_string()));
+        }
+        let found = match cwd {
+            Some(Cwd::Host(group)) => group.cwd().filter(|path| path.is_dir()),
+            Some(Cwd::Guest(output, start, applied)) => {
+                let guest = lock(&output).osc7.cwd.clone().or(start);
+                editor::map_guest(guest.as_deref().unwrap_or(WORKSPACE), &applied)
+            }
+            None => None,
+        };
+        Ok(match found {
+            Some(path) => (path, true),
+            None => (folder, terminal_id.is_none()),
+        })
+    }
+
     pub fn set_pane_layout(&self, shield_id: &str, layout: Option<PaneNode>) -> Result<()> {
         self.edit(shield_id, |s| s.set_pane_layout(layout))
     }
@@ -481,6 +532,49 @@ mod tests {
             Err(Error::MissingPath(path)) if path == folder.display().to_string()
         ));
         assert!(manager.list()[0].shield.terminals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_editor_folder_of_a_host_shell_is_its_current_folder() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let folder = manager.list()[0].shield.folder.clone();
+        std::fs::create_dir(folder.join("sub")).unwrap();
+        assert_eq!(manager.editor_folder(&id, None).unwrap(), (folder.clone(), true));
+        assert_eq!(manager.editor_folder(&id, Some("gone")).unwrap(), (folder.clone(), false));
+
+        let session = manager.open_session(&id, SessionKind::Host, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.clone(), true)).await;
+        manager.write(&session, b"cd sub\n".to_vec()).unwrap();
+        until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.join("sub"), true)).await;
+        assert!(matches!(manager.editor_folder("other", None), Err(Error::ShieldNotFound)));
+        manager.delete(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_editor_folder_of_a_vm_terminal_follows_osc7_below_the_workspace_only() {
+        let (manager, _, id) = manager();
+        let folder = manager.list()[0].shield.folder.clone();
+        std::fs::create_dir(folder.join("sub")).unwrap();
+        manager.start(&id).await.unwrap();
+        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).unwrap(), (folder.clone(), true));
+
+        // The fake VM echoes its input as output.
+        manager.write(&session, b"\x1b]7;file://vm/workspace/sub\x07".to_vec()).unwrap();
+        until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.join("sub"), true)).await;
+        manager.write(&session, b"\x1b]7;file://vm/etc\x07".to_vec()).unwrap();
+        until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.clone(), false)).await;
+
+        // An exited session has no folder.
+        manager.send(&session, PtyInput::Kill).unwrap();
+        until(|| manager.list()[0].sessions[0].exit_code.is_some()).await;
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).unwrap(), (folder.clone(), false));
+
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert!(matches!(manager.editor_folder(&id, None), Err(Error::MissingPath(_))));
     }
 
     #[test]

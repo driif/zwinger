@@ -1,0 +1,9 @@
+.split-launch {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.split-launch > .action-menu {
+  top: 100%;
+}
