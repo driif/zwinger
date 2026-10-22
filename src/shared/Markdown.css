@@ -1,0 +1,43 @@
+.md {
+  display: grid;
+  gap: var(--zw-gap);
+  overflow-wrap: anywhere;
+}
+
+.md ul,
+.md ol,
+.md blockquote {
+  margin: 0;
+}
+
+.md blockquote {
+  padding-left: calc(var(--motiv-space) * 3);
+  border-left: 2px solid var(--motiv-color-border);
+  color: var(--motiv-color-text-muted);
+}
+
+.md code {
+  font-family: var(--zw-font-mono);
+  font-size: 0.75rem;
+}
+
+.md-code {
+  margin: 0;
+  padding: var(--zw-gap) calc(var(--motiv-space) * 3);
+  border-radius: var(--motiv-radius-md);
+  background: var(--motiv-color-surface);
+  overflow-x: auto;
+}
+
+.md-heading {
+  font-weight: 600;
+}
+
+.md-heading.h1,
+.md-heading.h2 {
+  font-size: 1rem;
+}
+
+.md a {
+  color: var(--motiv-color-primary);
+}

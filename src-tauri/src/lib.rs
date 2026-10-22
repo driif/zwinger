@@ -1,4 +1,5 @@
 mod agent;
+mod appearance;
 mod bootstrap;
 mod commands;
 mod error;
@@ -10,12 +11,12 @@ mod proxy;
 mod runtime;
 mod runtimes;
 mod secrets;
-mod sessions;
 mod shield;
 mod store;
 mod task_agents;
 mod task_artifacts;
 mod task_runs;
+mod terminal;
 mod updates;
 
 use std::path::Path;
@@ -30,7 +31,7 @@ use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
 use crate::host_agents::HostAgents;
 use crate::runtime::{Microsandbox, SandboxRuntime};
 use crate::secrets::Vault;
-use crate::sessions::Manager;
+use crate::shield::manager::Manager;
 
 pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
 /// The open files that the app asks for. Each shield's proxy holds guest and
@@ -197,6 +198,7 @@ pub fn run() {
             let minimum = app.config().bundle.macos.minimum_system_version.clone().unwrap_or_default();
             app.manage(Bootstrap::default());
             app.manage(preferences::Preferences::load(data.join("preferences.json")));
+            app.manage(appearance::Themes { dir: data.join("themes") });
             // Off the main thread: the runtime install and the reap take seconds.
             // The shield commands need the manager, so the UI shows the shields
             // only in the Ready phase.
@@ -240,75 +242,78 @@ pub fn run() {
             });
             app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
-            app.manage(commands::Watches::default());
+            app.manage(commands::tasks::Watches::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::list_shields,
-            commands::create_shield,
-            commands::delete_shield,
-            commands::rename_shield,
-            commands::reorder_shields,
-            commands::set_layout,
-            commands::put_app,
-            commands::remove_app,
-            commands::reorder_apps,
-            commands::start_app,
-            commands::stop_app,
-            commands::restart_app,
-            commands::reorder_terminals,
-            commands::attach_session,
-            commands::detach_session,
-            commands::ack_session,
-            commands::resolve_folder,
-            commands::set_harness,
-            commands::list_folders,
-            commands::add_mount,
-            commands::remove_mount,
-            commands::set_mount_readonly,
-            commands::network_catalog,
-            commands::set_network_default,
-            commands::set_offline,
-            commands::put_rule,
-            commands::remove_rule,
-            commands::set_rule_credential,
-            commands::test_network,
-            commands::wildcard_for,
-            commands::list_net_events,
-            commands::start_shield,
-            commands::stop_shield,
-            commands::open_session,
-            commands::reopen_terminal,
-            commands::write_session,
-            commands::resize_session,
-            commands::close_terminal,
-            commands::list_runtimes,
-            commands::install_runtime,
-            commands::cancel_runtime_install,
-            commands::host_agents,
-            commands::detect_host_agents,
-            commands::put_host_agent,
-            commands::remove_host_agent,
-            commands::set_agents_unprompted,
-            commands::put_task,
-            commands::remove_task,
-            commands::start_task_run,
-            commands::control_task_run,
-            commands::list_task_runs,
-            commands::run_diff,
-            commands::is_round_folder,
-            commands::watch_room,
-            commands::unwatch_room,
-            commands::take_app_notices,
-            commands::remove_guest_login,
-            commands::confirm_paths,
-            commands::startup_status,
-            commands::get_preferences,
-            commands::set_preferences,
-            commands::storage,
-            commands::clean_images,
-            commands::legacy_storage,
-            commands::remove_legacy_runtime,
+            commands::shields::list_shields,
+            commands::shields::create_shield,
+            commands::shields::delete_shield,
+            commands::shields::rename_shield,
+            commands::shields::reorder_shields,
+            commands::shields::set_layout,
+            commands::apps::put_app,
+            commands::apps::remove_app,
+            commands::apps::reorder_apps,
+            commands::apps::start_app,
+            commands::apps::stop_app,
+            commands::apps::restart_app,
+            commands::terminal::reorder_terminals,
+            commands::terminal::attach_session,
+            commands::terminal::detach_session,
+            commands::terminal::ack_session,
+            commands::shields::resolve_folder,
+            commands::shields::set_harness,
+            commands::shields::list_folders,
+            commands::shields::add_mount,
+            commands::shields::remove_mount,
+            commands::shields::set_mount_readonly,
+            commands::network::network_catalog,
+            commands::network::set_network_default,
+            commands::network::set_offline,
+            commands::network::put_rule,
+            commands::network::remove_rule,
+            commands::network::set_rule_credential,
+            commands::network::test_network,
+            commands::network::wildcard_for,
+            commands::network::list_net_events,
+            commands::shields::start_shield,
+            commands::shields::stop_shield,
+            commands::terminal::open_session,
+            commands::terminal::reopen_terminal,
+            commands::terminal::write_session,
+            commands::terminal::resize_session,
+            commands::terminal::close_terminal,
+            commands::settings::list_runtimes,
+            commands::settings::install_runtime,
+            commands::settings::cancel_runtime_install,
+            commands::settings::host_agents,
+            commands::settings::detect_host_agents,
+            commands::shields::put_host_agent,
+            commands::shields::remove_host_agent,
+            commands::shields::set_agents_unprompted,
+            commands::tasks::put_task,
+            commands::tasks::remove_task,
+            commands::tasks::start_task_run,
+            commands::tasks::control_task_run,
+            commands::tasks::list_task_runs,
+            commands::tasks::run_diff,
+            commands::tasks::is_round_folder,
+            commands::tasks::watch_room,
+            commands::tasks::unwatch_room,
+            commands::shields::take_app_notices,
+            commands::shields::remove_guest_login,
+            commands::shields::confirm_paths,
+            commands::settings::startup_status,
+            commands::settings::get_preferences,
+            commands::settings::set_preferences,
+            commands::settings::storage,
+            commands::settings::clean_images,
+            commands::settings::legacy_storage,
+            commands::settings::remove_legacy_runtime,
+            commands::appearance::list_themes,
+            commands::appearance::save_theme,
+            commands::appearance::delete_theme,
             updates::check_update,
             updates::install_update,
         ])
@@ -389,10 +394,10 @@ mod tests {
         let source = include_str!("lib.rs");
         let handler = &source[source.find("generate_handler![").unwrap()..];
         let handler = &handler[..handler.find("])").unwrap()];
-        assert!(handler.contains("commands::open_session,"));
-        assert!(handler.contains("commands::set_agents_unprompted,"));
+        assert!(handler.contains("commands::terminal::open_session,"));
+        assert!(handler.contains("commands::shields::set_agents_unprompted,"));
         for gone in ["open_agent", "agent_call", "close_agent", "list_chats", "delete_chat", "rename_chat"] {
-            assert!(!handler.contains(&format!("commands::{gone},")), "{gone}");
+            assert!(!handler.contains(&format!("::{gone},")), "{gone}");
         }
     }
 }

@@ -1,0 +1,219 @@
+/* React Flow takes its colours from the tokens, so the map follows the theme. */
+.map {
+  flex: 1;
+  min-height: 20rem;
+  border: 1px solid var(--motiv-color-border);
+  border-radius: var(--motiv-radius-lg);
+  overflow: hidden;
+}
+
+.map .react-flow {
+  --xy-background-color: var(--zw-map-bg);
+  --xy-background-pattern-color: var(--zw-map-grid);
+  --xy-edge-stroke: var(--zw-map-edge);
+  --xy-edge-stroke-width: 1.5;
+  --xy-node-background-color: transparent;
+  --xy-node-border: none;
+  --xy-node-color: var(--motiv-color-text);
+  --xy-node-boxshadow-hover: none;
+  --xy-node-boxshadow-selected: none;
+  --xy-node-group-background-color: transparent;
+  --xy-handle-background-color: transparent;
+  --xy-handle-border-color: transparent;
+  --xy-attribution-background-color: transparent;
+  font-family: var(--zw-font-mono);
+  font-size: 12px;
+}
+
+.map .react-flow__attribution a {
+  color: var(--motiv-color-text-muted);
+}
+
+.map .react-flow__node:focus-visible {
+  outline: var(--motiv-focus-ring);
+  border-radius: var(--motiv-radius-md);
+}
+
+.map .react-flow__edge.blocked path {
+  stroke: var(--zw-map-blocked);
+  stroke-dasharray: 4 4;
+}
+
+.map-node {
+  position: relative;
+  height: 28px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: calc(var(--motiv-space) * 1.5);
+  padding: 0 var(--zw-gap);
+  border: 1px solid var(--motiv-color-border);
+  border-radius: var(--motiv-radius-md);
+  background: var(--motiv-color-surface);
+  color: var(--motiv-color-text);
+  white-space: nowrap;
+}
+
+.map-node > svg {
+  flex-shrink: 0;
+  color: var(--motiv-color-text-muted);
+}
+
+.map-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.react-flow__node:hover .map-node {
+  background: var(--motiv-color-surface-hover);
+}
+
+.map-node.muted {
+  background: transparent;
+  border-style: dashed;
+}
+
+.map-node.harness {
+  border-color: var(--zw-map-boundary);
+}
+
+.map-node.harness > svg {
+  color: var(--zw-map-boundary);
+}
+
+.map-node.warn {
+  border-color: var(--motiv-color-warning);
+  color: var(--motiv-color-warning);
+}
+
+.map-node.warn > svg {
+  color: var(--motiv-color-warning);
+}
+
+.map-node.blocked > svg {
+  color: var(--zw-map-blocked);
+}
+
+.map-node.blocked .map-label {
+  text-decoration: line-through;
+  color: var(--motiv-color-text-muted);
+}
+
+.map-node.denied {
+  border: 1px dashed var(--zw-map-blocked);
+}
+
+.map-node.denied > svg {
+  color: var(--zw-map-blocked);
+}
+
+.map-activity {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--motiv-radius-full);
+  background: var(--zw-status-running);
+}
+
+.map-badge {
+  padding: 0 calc(var(--motiv-space) * 1.5);
+  border-radius: var(--motiv-radius-full);
+  background: var(--zw-map-badge);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.map-badge.rw {
+  background: var(--zw-map-badge-rw);
+}
+
+.map-badge.key {
+  background: var(--zw-map-badge-key);
+}
+
+.map-boundary {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border: 2px solid var(--zw-map-boundary);
+  border-radius: var(--motiv-radius-lg);
+  background: var(--zw-map-boundary-bg);
+}
+
+.map-boundary.stopped,
+.map-boundary.starting,
+.map-boundary.stopping {
+  border: 2px dashed var(--motiv-color-border);
+}
+
+.map-boundary.error {
+  border-color: var(--zw-status-error);
+}
+
+.map-boundary-header {
+  display: flex;
+  align-items: center;
+  gap: var(--zw-gap);
+  padding: calc(var(--motiv-space) * 3) var(--zw-page-pad);
+}
+
+.map-boundary-header > svg {
+  color: var(--zw-map-boundary);
+}
+
+.map-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--motiv-font-title);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.map-state,
+.map-caption {
+  color: var(--motiv-color-text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+/* The point where the egress edges leave the microVM. */
+.map .map-gateway {
+  top: 70px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid var(--zw-map-boundary);
+  border-radius: var(--motiv-radius-full);
+  background: var(--motiv-color-surface);
+  color: var(--motiv-color-text-muted);
+}
+
+.map-gateway > svg {
+  pointer-events: none;
+}
+
+.map-legend {
+  display: grid;
+  gap: var(--motiv-space);
+  padding: var(--zw-gap);
+  border-radius: var(--motiv-radius-md);
+  background: var(--motiv-color-surface);
+  color: var(--motiv-color-text-muted);
+  font-size: 11px;
+}
+
+.map-legend .map-badge {
+  color: var(--motiv-color-text);
+}
+
+.map-swatch {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+}

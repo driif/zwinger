@@ -4,7 +4,7 @@ use tauri_plugin_updater::UpdaterExt as _;
 
 use crate::error::{Error, Result};
 use crate::runtime::Microsandbox;
-use crate::sessions::Manager;
+use crate::shield::manager::Manager;
 
 #[derive(Serialize)]
 pub struct UpdateInfo {

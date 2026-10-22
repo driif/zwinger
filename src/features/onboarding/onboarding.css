@@ -1,0 +1,14 @@
+/* The first-run steps and the startup screen fill the window. */
+.onboarding {
+  margin: auto;
+  width: min(40rem, 100%);
+  box-sizing: border-box;
+  padding: calc(var(--motiv-space) * 6) var(--zw-page-pad);
+  display: grid;
+  gap: var(--zw-page-pad);
+}
+
+.onboarding-picture {
+  justify-content: center;
+  padding: calc(var(--motiv-space) * 3) 0;
+}

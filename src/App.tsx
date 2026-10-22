@@ -1,62 +1,67 @@
-import { lazy, ReactNode, Suspense, useEffect, useRef, useState } from "react";
+import { CSSProperties, lazy, ReactNode, Suspense, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Button, Card } from "@driif/motiv";
+import { Button } from "@driif/motiv";
 import { Plus, RotateCw, Shield, TriangleAlert } from "lucide-react";
+import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
+import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
 import {
-  AGENT_NAMES,
-  AgentKind,
-  checkUpdate,
-  closeTerminal,
-  createShield,
   Detection,
   detectHostAgents,
   getPreferences,
   hostAgents,
   InstallProgress,
   installRuntime,
-  INVALID_ORDER,
+  listRuntimes,
+  Prefs,
+  RuntimeName,
+  RuntimeView,
+  setPreferences,
+} from "./features/settings/api";
+import {
+  createShield,
+  listShields,
+  onGuestLogin,
+  resolveFolder,
+  startShield,
+  stopShield,
+  takeAppNotices,
+} from "./features/shields/api";
+import {
   isLive,
   isRoundFolder,
-  listNetEvents,
-  listRuntimes,
-  listShields,
   listTaskRuns,
-  NetEvent,
-  Prefs,
-  onGuestLogin,
-  onNetEvent,
-  onStartup,
+  RunSummary,
+} from "./features/tasks/api";
+import {
+  closeTerminal,
   openSession,
   reopenTerminal,
   reorderTerminals,
-  resolveFolder,
-  RuntimeName,
-  RuntimeView,
-  RunSummary,
+} from "./features/terminal/api";
+import { checkUpdate, UpdateInfo } from "./features/updates/api";
+import {
+  AGENT_NAMES,
+  AgentKind,
+  INVALID_ORDER,
   SessionKind,
-  setPreferences,
   ShieldView,
-  Startup,
-  startShield,
-  startupStatus,
-  stopShield,
-  takeAppNotices,
-  UpdateInfo,
-} from "./api";
-import { AppSettings } from "./AppSettings";
-import { CommandBar } from "./CommandBar";
-import { Onboarding, StartupScreen } from "./Onboarding";
-import { ShieldPage } from "./ShieldPage";
-import { agentsOf, ShieldRail } from "./ShieldRail";
-import { fittedSize } from "./TerminalPane";
-import { UpdateBanner } from "./UpdateBanner";
-import { ShortcutAction, useShortcuts } from "./useShortcuts";
-import "./App.css";
-import { errorCode, errorMessage, isBackendError } from "./errorMessage";
-import { LOST_TITLE, ReloadScreen, useBackendLost } from "./Recover";
+} from "./shared/api";
+import { AppSettings } from "./features/settings/AppSettings";
+import { CommandBar } from "./shared/CommandBar";
+import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
+import { ShieldPage } from "./features/shields/ShieldPage";
+import { agentsOf, ShieldRail } from "./features/shields/ShieldRail";
+import { fittedSize } from "./features/terminal/TerminalPane";
+import { UpdateBanner } from "./features/updates/UpdateBanner";
+import { Appearance, useAppearance } from "./features/appearance/themes";
+import { clampRail, RailHandle } from "./features/shields/RailHandle";
+import { Notice } from "./shared/Notice";
+import { ShortcutAction, useShortcuts } from "./shared/useShortcuts";
+import { errorCode, errorMessage, isBackendError } from "./shared/errorMessage";
+import { LOST_TITLE, ReloadScreen, useBackendLost } from "./shared/Recover";
 
-const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
+const TaskRoom = lazy(() => import("./features/tasks/TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
 /** The same size as the ring in the backend. */
 const NET_RING = 2000;
@@ -123,6 +128,7 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateInfo>();
   const [updateLater, setUpdateLater] = useState(false);
   const lost = useBackendLost();
+  const appearance = useAppearance(prefs);
   /** The start needs both of its first calls, so one failure that is not a backend error shows Reload. */
   const [startLost, setStartLost] = useState(false);
 
@@ -176,6 +182,7 @@ export default function App() {
       banner={banner}
       update={update}
       onUpdate={setUpdate}
+      appearance={appearance}
     />
   );
 }
@@ -189,9 +196,10 @@ interface WorkspaceProps {
   banner: ReactNode;
   update?: UpdateInfo;
   onUpdate: (update?: UpdateInfo) => void;
+  appearance: Appearance;
 }
 
-function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: WorkspaceProps) {
+function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
   const [shields, setShields] = useState<ShieldView[]>([]);
   const [selectedId, setSelectedId] = useState(firstShield);
   const [view, setView] = useState<View>({ kind: "overview" });
@@ -218,6 +226,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
   const [showSettings, setShowSettings] = useState(false);
   /** Per shield, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
+  const [railWidth, setRailWidth] = useState(() => clampRail(prefs.railWidth));
 
   // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the list it read.
   const refresh = () => {
@@ -512,7 +521,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
   useShortcuts(actions);
 
   return (
-    <div className="app">
+    <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
       <ShieldRail
         shields={shields}
         selectedId={shield?.id}
@@ -561,17 +570,36 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
           run={run}
         />
       </ShieldRail>
+      <RailHandle
+        width={railWidth}
+        onResize={setRailWidth}
+        onDone={(width) => onPrefs({ ...prefs, railWidth: width }).catch((e) => setError(errorMessage(e)))}
+      />
       <main className="main">
-        {appNotices.map((notice) => (
-          <Card key={notice} variant="outlined" padding="sm" className="banner row">
-            <TriangleAlert size={16} className="warn" />
-            <span className="grow">{notice}</span>
-            <Button size="sm" variant="outline" onClick={() => setAppNotices((all) => all.filter((n) => n !== notice))}>
-              Dismiss
-            </Button>
-          </Card>
-        ))}
-        {banner}
+        <div className="notices">
+          {appNotices.map((notice) => (
+            <Notice
+              key={notice}
+              icon={<TriangleAlert size={14} className="warn" />}
+              onDismiss={() => setAppNotices((all) => all.filter((n) => n !== notice))}
+            >
+              {notice}
+            </Notice>
+          ))}
+          {banner}
+          {!showSettings && !roundFolder && shield?.pendingRestart && (
+            <Notice
+              icon={<RotateCw size={14} className="warn" />}
+              actions={
+                <Button size="sm" variant="outline" onClick={() => restart(shield.id)}>
+                  Restart
+                </Button>
+              }
+            >
+              The running shield uses an older config. Restart it to apply the changes.
+            </Notice>
+          )}
+        </div>
         {showSettings ? (
           <AppSettings
             detection={detection}
@@ -587,6 +615,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
             onPrefs={onPrefs}
             update={update}
             onUpdate={onUpdate}
+            appearance={appearance}
           />
         ) : roundFolder ? (
           <section className="page">
@@ -597,43 +626,32 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
             </div>
           </section>
         ) : shield ? (
-          <>
-            {shield.pendingRestart && (
-              <Card variant="outlined" padding="sm" className="banner row">
-                <RotateCw size={16} className="warn" />
-                <span className="grow">The running shield uses an older config. Restart it to apply the changes.</span>
-                <Button size="sm" variant="outline" onClick={() => restart(shield.id)}>
-                  Restart
-                </Button>
-              </Card>
-            )}
-            <ShieldPage
-              shield={shield}
-              events={events}
-              view={view}
-              onView={setView}
-              intent={intent}
-              onIntentDone={() => setIntent(undefined)}
-              onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [shield.id]: seq }))}
-              onDropFolder={dropMount}
-              runtimes={runtimes}
-              detection={detection}
-              adding={adding[shield.id]}
-              onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
-              onHostAgents={() => setShowSettings(true)}
-              runs={runs[shield.id] ?? []}
-              onRunsChange={() => reloadRuns(shield.id)}
-              onRefresh={refresh}
-              panes={panes}
-              activePanes={activePanes}
-              run={run}
-              onToggle={() => toggle(shield)}
-              onNewSession={(kind) => run(() => newSession(kind))}
-              onReopen={(pane) => run(() => reopen(pane))}
-              onPaneExit={refresh}
-              onPaneError={(e) => setError(errorMessage(e))}
-            />
-          </>
+          <ShieldPage
+            shield={shield}
+            events={events}
+            view={view}
+            onView={setView}
+            intent={intent}
+            onIntentDone={() => setIntent(undefined)}
+            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [shield.id]: seq }))}
+            onDropFolder={dropMount}
+            runtimes={runtimes}
+            detection={detection}
+            adding={adding[shield.id]}
+            onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
+            onHostAgents={() => setShowSettings(true)}
+            runs={runs[shield.id] ?? []}
+            onRunsChange={() => reloadRuns(shield.id)}
+            onRefresh={refresh}
+            panes={panes}
+            activePanes={activePanes}
+            run={run}
+            onToggle={() => toggle(shield)}
+            onNewSession={(kind) => run(() => newSession(kind))}
+            onReopen={(pane) => run(() => reopen(pane))}
+            onPaneExit={refresh}
+            onPaneError={(e) => setError(errorMessage(e))}
+          />
         ) : (
           <div className="empty">
             <Shield size={40} className="muted" />

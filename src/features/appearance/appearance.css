@@ -1,0 +1,29 @@
+.theme-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: calc(var(--motiv-space) * 3);
+}
+
+/* A small picture of the theme: its background with chips of its main colors. */
+.theme-swatch {
+  display: flex;
+  gap: var(--motiv-space);
+  padding: var(--zw-gap);
+  border: 1px solid var(--motiv-color-border);
+  border-radius: var(--motiv-radius-md);
+}
+
+.theme-swatch > span {
+  flex: 1;
+  height: 1.25rem;
+  border-radius: var(--motiv-radius-sm);
+}
+
+.theme-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: calc(var(--motiv-space) * 3);
+}

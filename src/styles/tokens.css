@@ -1,0 +1,26 @@
+/* App tokens. Each one comes from a motiv token, so a theme changes them all. */
+:root {
+  --zw-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --zw-gap: calc(var(--motiv-space) * 2);
+  --zw-page-pad: calc(var(--motiv-space) * 4);
+  --zw-rail-width: 16rem;
+  --zw-rail-row: 1.75rem;
+  --zw-icon-button: 1.5rem;
+  --zw-icon: 14px;
+  --zw-control-height: 2rem;
+
+  --zw-status-idle: var(--motiv-color-border);
+  --zw-status-running: var(--motiv-color-success);
+  --zw-status-busy: var(--motiv-color-warning);
+  --zw-status-error: var(--motiv-color-danger);
+
+  --zw-map-bg: var(--motiv-color-bg);
+  --zw-map-grid: var(--motiv-color-border);
+  --zw-map-edge: var(--motiv-color-border);
+  --zw-map-blocked: var(--motiv-color-danger);
+  --zw-map-boundary: var(--motiv-color-primary);
+  --zw-map-boundary-bg: var(--motiv-color-primary-subtle);
+  --zw-map-badge: var(--motiv-color-primary-subtle);
+  --zw-map-badge-rw: color-mix(in oklch, var(--motiv-color-warning) 20%, transparent);
+  --zw-map-badge-key: color-mix(in oklch, var(--motiv-color-success) 20%, transparent);
+}

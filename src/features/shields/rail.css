@@ -1,0 +1,137 @@
+.rail {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--zw-gap);
+  padding: calc(var(--motiv-space) * 3);
+  border-right: 1px solid var(--motiv-color-border);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* The drag handle on the right edge of the rail. */
+.rail-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--zw-rail-width) - 3px);
+  z-index: 3;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.rail-handle:hover,
+.rail-handle.dragging {
+  background: var(--motiv-color-primary-subtle);
+}
+
+.rail-blocked {
+  padding: 0 calc(var(--motiv-space) * 1.5);
+  border-radius: var(--motiv-radius-full);
+  background: var(--motiv-color-danger);
+  color: var(--motiv-color-surface);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.tree,
+.tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rail-tree {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--zw-gap);
+}
+
+.tree-item {
+  position: relative;
+  min-width: 0;
+  outline: none;
+  border-radius: var(--motiv-radius-md);
+}
+
+.tree-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 2;
+  min-width: 12rem;
+}
+
+.tree-item:focus-visible > .tree-row {
+  outline: var(--motiv-focus-ring);
+}
+
+.tree-item.dragging {
+  position: relative;
+  z-index: 1;
+  opacity: 0.8;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--motiv-space) * 1.5);
+  min-width: 0;
+  min-height: var(--zw-rail-row);
+  padding-right: var(--motiv-space);
+  border-radius: var(--motiv-radius-md);
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.tree-row > svg {
+  flex-shrink: 0;
+}
+
+.tree-row:hover {
+  background: var(--motiv-color-surface-hover);
+}
+
+.tree-row.level-2 {
+  padding-left: calc(var(--motiv-space) * 5);
+  color: var(--motiv-color-text-muted);
+  font-size: 0.75rem;
+}
+
+.tree-row.level-3 {
+  padding-left: calc(var(--motiv-space) * 9);
+}
+
+.tree-item[aria-selected="true"] > .tree-row {
+  background: var(--motiv-color-primary-subtle);
+}
+
+.tree-shield.current > .tree-row .tree-name {
+  font-weight: 600;
+}
+
+.tree-shield.forbidden-target {
+  outline: 1px dashed var(--motiv-color-danger);
+}
+
+.rail.forbidden,
+.rail.forbidden * {
+  cursor: not-allowed;
+}
+
+.tree-chevron {
+  transition: rotate var(--motiv-duration) var(--motiv-ease);
+}
+
+.tree-chevron.open {
+  rotate: 90deg;
+}
+
+.tree-state {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+}

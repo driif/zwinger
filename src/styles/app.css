@@ -1,0 +1,289 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* The startup, first-run and recover screens center in the window. */
+#root {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+body {
+  background: var(--motiv-color-bg);
+  color: var(--motiv-color-text);
+  font-family: var(--motiv-font-body);
+  font-size: var(--motiv-font-size);
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+/* motiv's IconButton has one large size. The app uses it compact. */
+.motiv-icon-button {
+  width: var(--zw-icon-button);
+  height: var(--zw-icon-button);
+  border-radius: var(--motiv-radius-sm);
+}
+
+.motiv-icon-button__icon {
+  width: var(--zw-icon);
+  height: var(--zw-icon);
+}
+
+/* The same for the launcher of motiv's CommandMenu: the command bar and Add agent. */
+.motiv-command-menu__launcher {
+  min-height: var(--zw-control-height);
+  font-size: inherit;
+}
+
+.app {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--zw-rail-width) minmax(0, 1fr);
+  height: 100%;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--motiv-space);
+}
+
+.dot {
+  flex-shrink: 0;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--motiv-radius-full);
+  background: var(--zw-status-idle);
+}
+
+.dot.running {
+  background: var(--zw-status-running);
+}
+
+.dot.starting,
+.dot.stopping {
+  background: var(--zw-status-busy);
+  animation: pulse 1s ease-in-out infinite alternate;
+}
+
+.dot.error {
+  background: var(--zw-status-error);
+}
+
+@keyframes pulse {
+  to {
+    opacity: 0.3;
+  }
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--zw-gap);
+}
+
+.row.end {
+  justify-content: flex-end;
+}
+
+.stack {
+  display: grid;
+  gap: calc(var(--motiv-space) * 3);
+}
+
+.grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--zw-font-mono);
+}
+
+.muted {
+  color: var(--motiv-color-text-muted);
+}
+
+.warn {
+  color: var(--motiv-color-warning);
+}
+
+.danger {
+  color: var(--motiv-color-danger);
+}
+
+.ok {
+  color: var(--motiv-color-success);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* One-line notices, stacked above the page. */
+.notices {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--motiv-space);
+}
+
+.main > .notices {
+  padding: calc(var(--motiv-space) * 3) var(--zw-page-pad) 0;
+}
+
+.notices:empty {
+  display: none;
+}
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: var(--zw-gap);
+}
+
+.notice > svg {
+  flex-shrink: 0;
+}
+
+.notice-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notice-actions {
+  flex-shrink: 0;
+}
+
+.empty {
+  margin: auto;
+  max-width: 28rem;
+  display: grid;
+  justify-items: center;
+  gap: calc(var(--motiv-space) * 3);
+  text-align: center;
+}
+
+.status {
+  padding: var(--zw-gap) var(--zw-page-pad);
+  border-top: 1px solid var(--motiv-color-border);
+}
+
+.page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--zw-page-pad) var(--zw-page-pad) 0;
+  gap: calc(var(--motiv-space) * 3);
+}
+
+.page-title {
+  font-family: var(--motiv-font-title);
+  font-size: 1.125rem;
+}
+
+/* Layout only: the tab panels fill the page and scroll on their own. */
+.tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--motiv-space) * 3);
+}
+
+.tabs[hidden] {
+  display: none;
+}
+
+.tabs .motiv-elastic-tabs__panels {
+  flex: 1;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.tabs .motiv-elastic-tabs__panel {
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: var(--zw-page-pad);
+}
+
+.overview,
+.tab-body {
+  display: grid;
+  gap: var(--zw-page-pad);
+}
+
+/* The map takes the height that the other overview parts leave. */
+.overview {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+.facts {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: calc(var(--motiv-space) * 8);
+}
+
+.facts dt {
+  color: var(--motiv-color-text-muted);
+  font-size: 0.75rem;
+}
+
+.facts dd {
+  margin: 0;
+}
+
+/* The views below the page header. Hidden ones stay mounted. */
+.view {
+  flex: 1;
+  min-height: 0;
+  padding-bottom: var(--zw-page-pad);
+}
+
+.view[hidden] {
+  display: none;
+}
+
+.task-view {
+  overflow-y: auto;
+}
+
+.command-bar {
+  max-width: none;
+}
+
+.model-picker {
+  max-width: 18rem;
+}
