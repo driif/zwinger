@@ -1,5 +1,5 @@
 import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, LiquidSwitch, SpringCheckbox } from "@driif/motiv";
-import { Play, RotateCw, Square, TriangleAlert } from "lucide-react";
+import { Bot, Play, RotateCw, Square, SquareTerminal, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import {
   AGENT_NAMES,
@@ -311,6 +311,21 @@ export function ShieldPage({
           panels={{
             overview: (
               <div className="overview">
+                {shield.terminals.length === 0 && (
+                  <Card variant="outlined" padding="sm" className="row">
+                    <span className="grow">
+                      {shield.hostAgents.length === 0 && detection && detection.agents.length > 0
+                        ? "Next: add an agent from this Mac with Add agent, or open the built-in pi agent."
+                        : "Next: open an agent or a shell."}
+                    </span>
+                    <Button size="sm" variant="outline" iconLeft={<SquareTerminal size={14} />} onClick={() => terminal.onNewSession({ type: "shell" })}>
+                      New shell
+                    </Button>
+                    <Button size="sm" iconLeft={<Bot size={14} />} onClick={() => terminal.onNewSession("agent")}>
+                      New agent
+                    </Button>
+                  </Card>
+                )}
                 <Suspense>
                   <ShieldMap
                     key={shield.id}
@@ -421,6 +436,7 @@ export function ShieldPage({
               onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
               onRunsChange={onRunsChange}
               onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
+              onStartShield={onToggle}
             />
           </Suspense>
         </div>

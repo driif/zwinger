@@ -3,6 +3,7 @@ import { Pencil, Plus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { App, putApp, removeApp, ShieldView } from "./api";
 import type { Intent, Run } from "./App";
+import { errorMessage } from "./errorMessage";
 
 type Draft = Omit<App, "id"> & { id?: string; error?: string };
 
@@ -33,7 +34,7 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
     run(() =>
       putApp(id, app).then(
         () => setDraft(undefined),
-        (e) => setDraft({ ...draft, error: String(e) }),
+        (e) => setDraft({ ...draft, error: errorMessage(e) }),
       ),
     );
   }
@@ -98,7 +99,14 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
             </div>
           </form>
         )}
-        {shield.apps.length === 0 && !draft && <p className="muted">No apps.</p>}
+        {shield.apps.length === 0 && !draft && (
+          <div className="row">
+            <p className="muted grow">No apps. Save a command that you run often, such as a dev server, to start it with one click.</p>
+            <Button size="sm" variant="outline" iconLeft={<Plus size={14} />} onClick={() => setDraft(blank())}>
+              Add app
+            </Button>
+          </div>
+        )}
         <ul className="list">
           {shield.apps.map((app) => (
             <li key={app.id} className="row">

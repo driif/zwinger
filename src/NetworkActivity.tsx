@@ -1,7 +1,7 @@
 import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
-import { Ban, Check, KeyRound, Lock, LucideIcon } from "lucide-react";
+import { Ban, Check, KeyRound, Lock, LucideIcon, Play } from "lucide-react";
 import { useEffect, useState } from "react";
-import { allowHost, isBlocked, NetEvent, ShieldView, wildcardFor } from "./api";
+import { allowHost, isBlocked, NetEvent, ShieldView, startShield, wildcardFor } from "./api";
 import type { Run } from "./App";
 import { reachable } from "./SecretsSection";
 
@@ -74,7 +74,19 @@ export function NetworkActivity({ shield, events, run }: Props) {
           value={[filter]}
           onChange={(selected) => setFilter(selected.find((f) => f !== filter) ?? "all")}
         />
-        {shown.length === 0 && <p className="muted">No network activity yet.</p>}
+        {shown.length === 0 &&
+          (events.length > 0 ? (
+            <p className="muted">No {filter} activity.</p>
+          ) : shield.status.state === "running" ? (
+            <p className="muted">No network activity yet. The hosts show here when the agent reaches out.</p>
+          ) : (
+            <div className="row">
+              <p className="muted grow">No network activity. Start the shield to see the hosts that the agent reaches.</p>
+              <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={() => run(() => startShield(id))}>
+                Start
+              </Button>
+            </div>
+          ))}
         <ul className="list">
           {shown.map((event) => {
             const [Icon, label, tone] = describe(event);

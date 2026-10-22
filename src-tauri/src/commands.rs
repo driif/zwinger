@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
 use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{AppHandle, Manager as _, State};
 use tokio::task::AbortHandle;
 
 use crate::agent::AgentKind;
+use crate::bootstrap::{self, Bootstrap, Legacy, Startup};
 use crate::error::Result;
 use crate::host_agents::HostAgents;
 use crate::host_agents::detect::Detection;
 use crate::netlog::NetEvent;
+use crate::preferences::{Preferences, Prefs};
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::runtimes::{Progress, RuntimeView, Runtimes};
 use crate::secrets::{Secret, SecretValue};
@@ -232,6 +235,86 @@ pub fn resize_session(shields: Shields<'_>, id: String, rows: u16, cols: u16) ->
 #[tauri::command]
 pub fn close_terminal(shields: Shields<'_>, shield_id: String, terminal_id: String) -> Result<()> {
     shields.close_terminal(&shield_id, &terminal_id)
+}
+
+#[tauri::command]
+pub fn startup_status(bootstrap: State<'_, Bootstrap>) -> Startup {
+    bootstrap.get()
+}
+
+#[tauri::command]
+pub fn get_preferences(preferences: State<'_, Preferences>) -> Prefs {
+    preferences.get()
+}
+
+#[tauri::command]
+pub fn set_preferences(preferences: State<'_, Preferences>, prefs: Prefs) -> Result<()> {
+    preferences.set(prefs)
+}
+
+/// Sizes in bytes. `None`: unknown.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageView {
+    app_data: PathBuf,
+    images: Option<u64>,
+    runtimes: Option<u64>,
+}
+
+/// Does not follow links. `None` if a part cannot be read.
+fn dir_size(path: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    std::fs::read_dir(path).ok()?.map(|entry| dir_size(&entry.ok()?.path())).sum()
+}
+
+#[tauri::command]
+pub async fn storage(app: AppHandle) -> Result<StorageView> {
+    let app_data = app.path().app_data_dir().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let images = microsandbox::Storage::usage().await?.images.logical_bytes;
+    let dir = app_data.join("runtimes");
+    let runtimes = tokio::task::spawn_blocking(move || dir_size(&dir)).await.ok().flatten();
+    Ok(StorageView { app_data, images, runtimes })
+}
+
+/// Removes the cached images that no shield uses. Resolves to the freed bytes, if known.
+#[tauri::command]
+pub async fn clean_images() -> Result<Option<u64>> {
+    Ok(microsandbox::Image::prune().await?.bytes_reclaimed)
+}
+
+/// A microsandbox home of an earlier zwinger build. `size` in bytes, `None`: unknown.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyView {
+    legacy: Legacy,
+    path: PathBuf,
+    size: Option<u64>,
+}
+
+fn legacy_homes(app: &AppHandle) -> Result<Vec<(Legacy, PathBuf)>> {
+    let data = app.path().app_data_dir().map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(bootstrap::legacy_homes(&data, &dirs::home_dir().unwrap_or_default()))
+}
+
+#[tauri::command]
+pub async fn legacy_storage(app: AppHandle) -> Result<Vec<LegacyView>> {
+    let homes = legacy_homes(&app)?;
+    let views = tokio::task::spawn_blocking(move || {
+        homes.into_iter().map(|(legacy, path)| LegacyView { legacy, size: dir_size(&path), path }).collect()
+    });
+    Ok(views.await.unwrap_or_default())
+}
+
+/// Removes zwinger's VMs and image from a legacy home. Deletes the home only if zwinger owns it.
+#[tauri::command]
+pub async fn remove_legacy_runtime(app: AppHandle, legacy: Legacy) -> Result<()> {
+    match legacy_homes(&app)?.into_iter().find(|(l, _)| *l == legacy) {
+        Some((legacy, path)) => bootstrap::remove_legacy(legacy, &path, crate::REAP_LIMIT).await,
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]

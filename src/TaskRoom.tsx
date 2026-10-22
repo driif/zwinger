@@ -18,6 +18,7 @@ import {
 } from "./api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
+import { errorMessage } from "./errorMessage";
 
 /** An in-app task, or a duo round folder on the host that the room only reads. */
 type Props =
@@ -32,6 +33,7 @@ type Props =
       onRun: (run: string) => void;
       onRunsChange: () => void;
       onEdit: () => void;
+      onStartShield: () => void;
     };
 
 /** The live room of a round: stages, messages, positions, disagreements and verdicts. */
@@ -79,7 +81,7 @@ export function TaskRoom(props: Props) {
         if (closed) unwatchRoom(t);
         else token = t;
       },
-      (e) => setError(String(e)),
+      (e) => setError(errorMessage(e)),
     );
     return () => {
       closed = true;
@@ -103,7 +105,7 @@ export function TaskRoom(props: Props) {
     setError(undefined);
     work().then(
       () => inApp?.onRunsChange(),
-      (e) => setError(String(e)),
+      (e) => setError(errorMessage(e)),
     );
   };
   const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.shield.id, inApp.task.id, run, c));
@@ -239,6 +241,13 @@ export function TaskRoom(props: Props) {
             <span className="mono">{inApp.task.workdir}</span>.{" "}
             {shieldRunning ? "Start a run to see them plan." : "Start the shield, then start a run."}
           </p>
+          {!shieldRunning && (
+            <div className="row end">
+              <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={inApp.onStartShield}>
+                Start shield
+              </Button>
+            </div>
+          )}
         </Card>
       )}
       {room && (

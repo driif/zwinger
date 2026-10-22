@@ -5,6 +5,7 @@ import { addDomain, NetEvent, NetworkMode, removeDomain, setNetworkMode, ShieldV
 import type { Intent, Run } from "./App";
 import { NetworkActivity } from "./NetworkActivity";
 import { SecretsSection } from "./SecretsSection";
+import { errorMessage } from "./errorMessage";
 
 const PROVIDERS = ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"];
 const PRESETS = [...PROVIDERS, "registry.npmjs.org"];
@@ -87,7 +88,7 @@ export function NetworkTab({ shield, events, run, intent, onIntentDone, active, 
     run(() =>
       addDomain(id, domain).then(
         () => setDomain(""),
-        (e) => setProblem(String(e)),
+        (e) => setProblem(errorMessage(e)),
       ),
     );
   }

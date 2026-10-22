@@ -141,11 +141,18 @@ export function TerminalPane({ sessionId, active, onExit, onError }: Props) {
     let token: number | undefined;
     /** The frames written before the attach resolved to its token. */
     let unacked = 0;
-    const send = (data: string) => writeSession(sessionId, data).catch(() => {});
+    // Input that does not arrive is reported once, not at each key.
+    let reported = false;
+    const fail = (e: unknown) => {
+      if (reported || disposed) return;
+      reported = true;
+      onError(e);
+    };
+    const send = (data: string) => writeSession(sessionId, data).catch(fail);
     const ack = () => {
       if (disposed) return;
       if (token === undefined) unacked++;
-      else ackSession(sessionId, token).catch(() => {});
+      else ackSession(sessionId, token).catch(fail);
     };
     loadGhostty()
       .then(async ({ FitAddon, Terminal }) => {
@@ -185,7 +192,7 @@ export function TerminalPane({ sessionId, active, onExit, onError }: Props) {
         };
         token = await attachSession(sessionId, onFrame);
         if (disposed) return detachSession(sessionId, token).catch(() => {});
-        for (; unacked > 0; unacked--) ackSession(sessionId, token).catch(() => {});
+        for (; unacked > 0; unacked--) ackSession(sessionId, token).catch(fail);
         // After the replay, so the TUI draws itself again at this size. An exited session takes no input.
         fit.fit();
         await resizeSession(sessionId, t.rows, t.cols).catch(() => {});

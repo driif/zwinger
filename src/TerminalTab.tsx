@@ -27,6 +27,7 @@ export function TerminalTab({ shield, panes, activePane, visible, onNewSession, 
         <div className="empty">
           <p className="muted">
             No terminal. A shell starts in /workspace. An agent starts in {shield.harness ?? "/workspace"}.
+            {shield.status.state !== "running" && " The shield starts first."}
           </p>
           <div className="row">
             <Button variant="outline" iconLeft={<SquareTerminal size={14} />} onClick={() => onNewSession({ type: "shell" })}>

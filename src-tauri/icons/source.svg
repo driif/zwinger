@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#24485c"/>
+      <stop offset="1" stop-color="#10222e"/>
+    </linearGradient>
+    <clipPath id="shield">
+      <path d="M512 196 L776 288 V492 C776 660 664 774 512 836 C360 774 248 660 248 492 V288 Z"/>
+    </clipPath>
+  </defs>
+  <rect x="96" y="96" width="832" height="832" rx="188" fill="url(#bg)"/>
+  <path d="M512 196 L776 288 V492 C776 660 664 774 512 836 C360 774 248 660 248 492 V288 Z" fill="#f2b84b"/>
+  <g clip-path="url(#shield)" fill="#10222e">
+    <path d="M370 424 L412 370 L454 424 V860 H370 Z"/>
+    <path d="M470 404 L512 350 L554 404 V860 H470 Z"/>
+    <path d="M570 424 L612 370 L654 424 V860 H570 Z"/>
+    <rect x="320" y="548" width="384" height="48"/>
+  </g>
+</svg>

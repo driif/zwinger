@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, ReactNode, Suspense, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Button, Card } from "@driif/motiv";
@@ -6,10 +6,12 @@ import { Plus, RotateCw, Shield, TriangleAlert } from "lucide-react";
 import {
   AGENT_NAMES,
   AgentKind,
+  checkUpdate,
   closeTerminal,
   createShield,
   Detection,
   detectHostAgents,
+  getPreferences,
   hostAgents,
   InstallProgress,
   installRuntime,
@@ -22,9 +24,11 @@ import {
   listShields,
   listTaskRuns,
   NetEvent,
+  Prefs,
   onGuestLogin,
   onNetEvent,
   onRenewDue,
+  onStartup,
   openSession,
   reopenTerminal,
   reorderTerminals,
@@ -33,18 +37,26 @@ import {
   RuntimeView,
   RunSummary,
   SessionKind,
+  setPreferences,
   ShieldView,
+  Startup,
   startShield,
+  startupStatus,
   stopShield,
   takeAppNotices,
+  UpdateInfo,
 } from "./api";
+import { AppSettings } from "./AppSettings";
 import { CommandBar } from "./CommandBar";
-import { HostAgentsSettings } from "./HostAgentsSettings";
+import { Onboarding, StartupScreen } from "./Onboarding";
 import { ShieldPage } from "./ShieldPage";
 import { agentsOf, ShieldRail } from "./ShieldRail";
 import { fittedSize } from "./TerminalPane";
+import { UpdateBanner } from "./UpdateBanner";
 import { ShortcutAction, useShortcuts } from "./useShortcuts";
 import "./App.css";
+import { errorCode, errorMessage, isBackendError } from "./errorMessage";
+import { LOST_TITLE, ReloadScreen, useBackendLost } from "./Recover";
 
 const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
@@ -101,9 +113,89 @@ export interface Runtimes {
   onInstall: (name: RuntimeName, version?: string, confirm?: boolean) => void;
 }
 
+/** The order of the start phases. A late reply must not take the phase back. */
+const PHASE_ORDER: Record<Startup["phase"], number> = { checking: 0, installing: 1, ready: 2, blocked: 2 };
+
+/** Shows the first-run steps once, then the shields when the runtime is ready. */
 export default function App() {
+  const [startup, setStartup] = useState<Startup>();
+  const [prefs, setPrefs] = useState<Prefs>();
+  const [firstShield, setFirstShield] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [update, setUpdate] = useState<UpdateInfo>();
+  const [updateLater, setUpdateLater] = useState(false);
+  const lost = useBackendLost();
+  /** The start needs both of its first calls, so one failure that is not a backend error shows Reload. */
+  const [startLost, setStartLost] = useState(false);
+
+  const advance = (next: Startup) =>
+    setStartup((current) => (current && PHASE_ORDER[current.phase] > PHASE_ORDER[next.phase] ? current : next));
+
+  const fail = (e: unknown) => (isBackendError(e) ? setError(e.message) : setStartLost(true));
+
+  // The read starts after the listener, so no phase change falls between the two.
+  useEffect(() => {
+    const stop = onStartup(advance);
+    stop.then(startupStatus).then(advance, fail);
+    // Here, not in the workspace, so a blocked start can still update. Quiet: offline, the check
+    // fails with no message. Check now in Settings shows the error.
+    getPreferences().then((loaded) => {
+      setPrefs(loaded);
+      if (loaded.autoUpdate) checkUpdate().then((found) => setUpdate(found ?? undefined), () => {});
+    }, fail);
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  const savePrefs = async (next: Prefs) => {
+    await setPreferences(next);
+    setPrefs(next);
+  };
+
+  if (lost || startLost) return <ReloadScreen title={LOST_TITLE} />;
+  if (error) return <p className="empty danger">{error}</p>;
+  if (!startup || !prefs) return null;
+  const banner = update && !updateLater && <UpdateBanner update={update} onLater={() => setUpdateLater(true)} />;
+  if (!prefs.onboarded)
+    return (
+      <Onboarding
+        startup={startup}
+        banner={banner}
+        onDone={async (shieldId) => {
+          // Set first: the workspace reads it once, when it mounts.
+          setFirstShield(shieldId);
+          await savePrefs({ ...prefs, onboarded: true });
+        }}
+      />
+    );
+  if (startup.phase !== "ready") return <StartupScreen startup={startup} banner={banner} />;
+  return (
+    <Workspace
+      firstShield={firstShield}
+      prefs={prefs}
+      onPrefs={savePrefs}
+      banner={banner}
+      update={update}
+      onUpdate={setUpdate}
+    />
+  );
+}
+
+interface WorkspaceProps {
+  /** The shield that the first-run steps made. */
+  firstShield?: string;
+  prefs: Prefs;
+  onPrefs: (prefs: Prefs) => Promise<void>;
+  /** The update banner of the app. */
+  banner: ReactNode;
+  update?: UpdateInfo;
+  onUpdate: (update?: UpdateInfo) => void;
+}
+
+function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: WorkspaceProps) {
   const [shields, setShields] = useState<ShieldView[]>([]);
-  const [selectedId, setSelectedId] = useState<string>();
+  const [selectedId, setSelectedId] = useState(firstShield);
   const [view, setView] = useState<View>({ kind: "overview" });
   const [activePanes, setActivePanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
@@ -124,8 +216,8 @@ export default function App() {
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
   const [detection, setDetection] = useState<Detection>();
-  /** The main area shows the agents on this Mac instead of a shield. */
-  const [showHostAgents, setShowHostAgents] = useState(false);
+  /** The main area shows the app settings instead of a shield. */
+  const [showSettings, setShowSettings] = useState(false);
   /** Per shield, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
 
@@ -138,7 +230,7 @@ export default function App() {
         return next;
       },
       (e) => {
-        if (request === refreshes.current) setError(String(e));
+        if (request === refreshes.current) setError(errorMessage(e));
       },
     );
   };
@@ -146,19 +238,19 @@ export default function App() {
   const run: Run = (action) => {
     setError(undefined);
     const done = action().then(refresh, (e) => {
-      setError(String(e));
+      setError(errorMessage(e));
       return refresh();
     });
     refresh();
     return done;
   };
 
-  const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => setError(String(e)));
+  const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => setError(errorMessage(e)));
 
   // Detection runs at app start and on request, never in a loop.
   const detect = (fresh: boolean) => {
     setDetection(undefined);
-    (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => setError(String(e)));
+    (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => setError(errorMessage(e)));
   };
 
   useEffect(() => {
@@ -184,7 +276,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    takeAppNotices().then(setAppNotices, (e) => setError(String(e)));
+    takeAppNotices().then(setAppNotices, (e) => setError(errorMessage(e)));
   }, []);
 
   const runtimes: Runtimes = {
@@ -291,14 +383,14 @@ export default function App() {
   /** Items belong to one shield, so another shield shows its Overview instead. */
   function select(id: string) {
     setRoundFolder(undefined);
-    setShowHostAgents(false);
+    setShowSettings(false);
     setSelectedId(id);
     if (id === shield?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
   function openView(shieldId: string, next: View) {
     setRoundFolder(undefined);
-    setShowHostAgents(false);
+    setShowSettings(false);
     setSelectedId(shieldId);
     if (next.kind === "terminal") showPane(next.key, shieldId);
     else setView(next);
@@ -361,7 +453,7 @@ export default function App() {
       }
       if (!element?.closest("[data-drop=rail]") || element.closest("[role=treeitem]")) return;
       setError(undefined);
-      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder }), (e) => setError(String(e)));
+      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder }), (e) => setError(errorMessage(e)));
     });
     return () => {
       stop.then((unlisten) => unlisten());
@@ -393,7 +485,7 @@ export default function App() {
   /** Saves the order of the shield's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
   const moveTerminals = (shieldId: string, ids: string[]) =>
     reorderTerminals(shieldId, ids).then(refresh, (e) => {
-      if (String(e) !== INVALID_ORDER) setError(String(e));
+      if (errorCode(e) !== INVALID_ORDER) setError(errorMessage(e));
       return refresh();
     });
 
@@ -425,6 +517,7 @@ export default function App() {
     terminal: () => showPane(activePane || shieldPanes[shieldPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
+    appSettings: () => setShowSettings(true),
   };
   useShortcuts(actions);
 
@@ -451,7 +544,7 @@ export default function App() {
         onReopen={(pane) => run(() => reopen(pane))}
         onMoveTerminals={moveTerminals}
         onNew={actions.newShield}
-        onHostAgents={() => setShowHostAgents(true)}
+        onSettings={actions.appSettings}
         dropFolder={dropFolder}
         onDropDone={(create) => {
           setDropFolder(undefined);
@@ -475,7 +568,6 @@ export default function App() {
           onRestart={restart}
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
-          onHostAgents={() => setShowHostAgents(true)}
           run={run}
         />
       </ShieldRail>
@@ -489,8 +581,9 @@ export default function App() {
             </Button>
           </Card>
         ))}
-        {showHostAgents ? (
-          <HostAgentsSettings
+        {banner}
+        {showSettings ? (
+          <AppSettings
             detection={detection}
             shields={shields}
             runtimes={runtimes}
@@ -500,6 +593,10 @@ export default function App() {
               select(shieldId);
               setAdding((current) => ({ ...current, [shieldId]: agent.kind }));
             }}
+            prefs={prefs}
+            onPrefs={onPrefs}
+            update={update}
+            onUpdate={onUpdate}
           />
         ) : roundFolder ? (
           <section className="page">
@@ -534,7 +631,7 @@ export default function App() {
               adding={adding[shield.id]}
               onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
               onRestart={() => restart(shield.id)}
-              onHostAgents={() => setShowHostAgents(true)}
+              onHostAgents={() => setShowSettings(true)}
               runs={runs[shield.id] ?? []}
               onRunsChange={() => reloadRuns(shield.id)}
               onRefresh={refresh}
@@ -545,7 +642,7 @@ export default function App() {
               onNewSession={(kind) => run(() => newSession(kind))}
               onReopen={(pane) => run(() => reopen(pane))}
               onPaneExit={refresh}
-              onPaneError={(e) => setError(String(e))}
+              onPaneError={(e) => setError(errorMessage(e))}
             />
           </>
         ) : (

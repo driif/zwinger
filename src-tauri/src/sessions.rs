@@ -1200,7 +1200,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
                 }
                 Err(e) => {
-                    state.vms.insert(id.to_owned(), Vm::Failed(e.to_string()));
+                    state.vms.insert(id.to_owned(), Vm::Failed(e.message()));
                     return Err(e);
                 }
             }
@@ -1555,6 +1555,12 @@ impl<R: SandboxRuntime> Manager<R> {
             if stops.is_empty() { Poll::Ready(()) } else { Poll::Pending }
         });
         let _ = tokio::time::timeout(limit, all).await;
+    }
+
+    /// The shields with a VM that starts, runs or stops. A failed stop
+    /// leaves the shield running.
+    pub fn live(&self) -> usize {
+        lock(&self.state).vms.values().filter(|vm| !matches!(vm, Vm::Failed(_))).count()
     }
 
     /// The app notices, such as the VMs that the app start removed. Each
@@ -2519,6 +2525,22 @@ mod tests {
         assert!(manager.list().iter().all(|v| v.status == Status::Stopped));
         let log = runtime.log.lock().unwrap();
         assert!(log.contains(&format!("stop {a}")) && log.contains(&format!("stop {b}")));
+    }
+
+    #[tokio::test]
+    async fn the_update_restarts_only_when_no_shield_is_live() {
+        let (manager, runtime, id) = manager();
+        assert!(crate::updates::restart_guard(manager.live()).is_ok());
+        manager.start(&id).await.unwrap();
+        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::ShieldsRunning(1))));
+
+        *runtime.fail_stop.lock().unwrap() = true;
+        manager.stop_all(Duration::from_secs(2)).await;
+        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::ShieldsRunning(1))));
+
+        *runtime.fail_stop.lock().unwrap() = false;
+        manager.stop_all(Duration::from_secs(2)).await;
+        assert!(crate::updates::restart_guard(manager.live()).is_ok());
     }
 
     #[tokio::test]

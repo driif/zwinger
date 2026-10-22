@@ -39,93 +39,93 @@ interface Props {
   onUse: (shieldId: string, agent: HostAgent) => void;
 }
 
-/** The agents on this Mac, for all shields. */
+/** The agents on this Mac, for all shields. A tab of the app settings. */
 export function HostAgentsSettings({ detection, shields, runtimes, run, onRefresh, onUse }: Props) {
   /** The agent whose unpinned download waits for a confirm. */
   const [confirming, setConfirming] = useState<RuntimeName>();
 
   return (
-    <section className="page">
-      <header className="page-header row">
-        <div className="grow">
-          <h1 className="page-title">Agents on this Mac</h1>
-          <p className="muted">
-            Shields can use these agents instead of their own copies, with your profile (read-only) and your subscription
-            login. The agent never sees the login: the shield's proxy adds it to requests to the provider only.
-          </p>
-        </div>
+    <div className="tab-body">
+      <div className="row">
+        <p className="muted grow">
+          Shields can use these agents instead of their own copies, with your profile (read-only) and your subscription
+          login. The agent never sees the login: the shield's proxy adds it to requests to the provider only.
+        </p>
         <Button variant="outline" iconLeft={<RefreshCw size={14} />} loading={!detection} onClick={onRefresh}>
           Refresh detection
         </Button>
-      </header>
-      <div className="tab-body">
-        {detection?.agents.length === 0 && <p className="muted">No supported agent is installed on this Mac.</p>}
-        {detection?.agents.map((agent) => {
-          const native = agent.kind === "claude" || agent.kind === "codex";
-          const runtime = native ? runtimes.list.find((r) => r.name === agent.kind) : undefined;
-          return (
-            <Card key={agent.kind} variant="outlined" padding="md">
-              <CardHeader title={`${AGENT_NAMES[agent.kind]} ${agent.version}`} titleAs="h2" description={agent.path} />
-              <CardBody className="stack">
-                <span>{source(agent)}</span>
-                <span className={agent.login.state === "expired" ? "warn" : undefined}>{login(agent)}</span>
-                <span className="muted">
-                  {agent.profile
-                    ? `Profile: the skills, instructions and settings in ${CONFIG_DIRS[agent.kind]}, copied read-only. Logins, history and sessions stay on this Mac.`
-                    : `No profile: ${CONFIG_DIRS[agent.kind]} does not exist.`}
-                </span>
-                {confirming === agent.kind && (
-                  <span className="warn row">
-                    <TriangleAlert size={14} />
-                    zwinger has no pinned hash for {AGENT_NAMES[agent.kind]} {agent.version}. The download is checked only
-                    against the integrity that the npm registry gives.
-                  </span>
-                )}
-                <div className="row end">
-                  {native && agent.source === "pinned" && runtime && runtimes.installs[runtime.name] && (
-                    <InstallControl runtime={runtime} runtimes={runtimes} />
-                  )}
-                  {native && agent.source === "pinned" && runtime && !runtimes.installs[runtime.name] && (
-                    <>
-                      {confirming === agent.kind && (
-                        <Button variant="ghost" onClick={() => setConfirming(undefined)}>
-                          Cancel
-                        </Button>
-                      )}
-                      <Button
-                        variant="outline"
-                        iconLeft={<Download size={14} />}
-                        onClick={() => {
-                          if (!agent.pinned && confirming !== agent.kind) return setConfirming(runtime.name);
-                          setConfirming(undefined);
-                          runtimes.onInstall(runtime.name, agent.version, !agent.pinned);
-                        }}
-                      >
-                        {confirming === agent.kind ? "Download anyway" : `Download Linux build ${agent.version}`}
-                      </Button>
-                    </>
-                  )}
-                  <CommandMenu
-                    className="model-picker"
-                    menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a shield`}
-                    placeholder="Use in shields"
-                    commands={shields.map((shield) => ({
-                      id: shield.id,
-                      label: shield.hostAgents.some((a) => a.kind === agent.kind) ? `${shield.name} (in use)` : shield.name,
-                      onSelect: () => run(async () => onUse(shield.id, agent)),
-                    }))}
-                  />
-                </div>
-              </CardBody>
-            </Card>
-          );
-        })}
-        {detection?.antigravity && (
-          <Card variant="outlined" padding="md">
-            <CardHeader title="Antigravity" titleAs="h2" description="Not supported yet." />
-          </Card>
-        )}
       </div>
-    </section>
+      {detection?.agents.length === 0 && (
+        <p className="muted">
+          No supported agent is installed on this Mac. Install Claude Code or Codex on this Mac, then refresh. Shields can
+          also use their own copies: see Runtimes.
+        </p>
+      )}
+      {detection?.agents.map((agent) => {
+        const native = agent.kind === "claude" || agent.kind === "codex";
+        const runtime = native ? runtimes.list.find((r) => r.name === agent.kind) : undefined;
+        return (
+          <Card key={agent.kind} variant="outlined" padding="md">
+            <CardHeader title={`${AGENT_NAMES[agent.kind]} ${agent.version}`} titleAs="h2" description={agent.path} />
+            <CardBody className="stack">
+              <span>{source(agent)}</span>
+              <span className={agent.login.state === "expired" ? "warn" : undefined}>{login(agent)}</span>
+              <span className="muted">
+                {agent.profile
+                  ? `Profile: the skills, instructions and settings in ${CONFIG_DIRS[agent.kind]}, copied read-only. Logins, history and sessions stay on this Mac.`
+                  : `No profile: ${CONFIG_DIRS[agent.kind]} does not exist.`}
+              </span>
+              {confirming === agent.kind && (
+                <span className="warn row">
+                  <TriangleAlert size={14} />
+                  zwinger has no pinned hash for {AGENT_NAMES[agent.kind]} {agent.version}. The download is checked only
+                  against the integrity that the npm registry gives.
+                </span>
+              )}
+              <div className="row end">
+                {native && agent.source === "pinned" && runtime && runtimes.installs[runtime.name] && (
+                  <InstallControl runtime={runtime} runtimes={runtimes} />
+                )}
+                {native && agent.source === "pinned" && runtime && !runtimes.installs[runtime.name] && (
+                  <>
+                    {confirming === agent.kind && (
+                      <Button variant="ghost" onClick={() => setConfirming(undefined)}>
+                        Cancel
+                      </Button>
+                    )}
+                    <Button
+                      variant="outline"
+                      iconLeft={<Download size={14} />}
+                      onClick={() => {
+                        if (!agent.pinned && confirming !== agent.kind) return setConfirming(runtime.name);
+                        setConfirming(undefined);
+                        runtimes.onInstall(runtime.name, agent.version, !agent.pinned);
+                      }}
+                    >
+                      {confirming === agent.kind ? "Download anyway" : `Download Linux build ${agent.version}`}
+                    </Button>
+                  </>
+                )}
+                <CommandMenu
+                  className="model-picker"
+                  menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a shield`}
+                  placeholder="Use in shields"
+                  commands={shields.map((shield) => ({
+                    id: shield.id,
+                    label: shield.hostAgents.some((a) => a.kind === agent.kind) ? `${shield.name} (in use)` : shield.name,
+                    onSelect: () => run(async () => onUse(shield.id, agent)),
+                  }))}
+                />
+              </div>
+            </CardBody>
+          </Card>
+        );
+      })}
+      {detection?.antigravity && (
+        <Card variant="outlined" padding="md">
+          <CardHeader title="Antigravity" titleAs="h2" description="Not supported yet." />
+        </Card>
+      )}
+    </div>
   );
 }

@@ -1,6 +1,7 @@
 import { Button, Card, CardBody, CardFooter, CardHeader, FloatingField, SegmentedControl, Textarea } from "@driif/motiv";
 import { FormEvent, useState } from "react";
 import { AGENT_NAMES, AgentKind, putTask, ShieldView, TaskAgent } from "./api";
+import { errorMessage } from "./errorMessage";
 
 const KINDS: AgentKind[] = ["claude", "codex", "pi"];
 /** Gemini CLI runs only from this Mac. */
@@ -53,7 +54,7 @@ export function TaskDialog({ shield, taskId, onDone }: Props) {
       });
       await onDone(id);
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     } finally {
       setSaving(false);
     }

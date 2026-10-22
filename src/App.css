@@ -13,6 +13,13 @@ body,
   margin: 0;
 }
 
+/* The startup, first-run and recover screens center in the window. */
+#root {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
 body {
   background: var(--motiv-color-bg);
   color: var(--motiv-color-text);
@@ -701,4 +708,19 @@ p {
 
 .room-diff {
   max-height: 32rem;
+}
+
+/* The first-run steps and the startup screen fill the window. */
+.onboarding {
+  margin: auto;
+  width: min(40rem, 100%);
+  box-sizing: border-box;
+  padding: calc(var(--motiv-space) * 6) calc(var(--motiv-space) * 4);
+  display: grid;
+  gap: calc(var(--motiv-space) * 4);
+}
+
+.onboarding-picture {
+  justify-content: center;
+  padding: calc(var(--motiv-space) * 3) 0;
 }

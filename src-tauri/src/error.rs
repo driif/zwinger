@@ -1,3 +1,4 @@
+use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -144,6 +145,12 @@ pub enum Error {
     IntegrityMismatch(String),
     #[error("invalid package of {0}: {1}")]
     BadPackage(String, String),
+    #[error("{0} shields still run; stop them to restart for the update")]
+    ShieldsRunning(usize),
+    #[error("MSB_PATH names a VM runtime that does not work: {0}; fix MSB_PATH or remove it, then open zwinger again")]
+    DeveloperRuntime(String),
+    #[error("update: {0}")]
+    Update(String),
     #[error("download: {0}")]
     Download(#[from] reqwest::Error),
     #[error(transparent)]
@@ -154,8 +161,106 @@ pub enum Error {
     Sandbox(#[from] microsandbox::MicrosandboxError),
 }
 
+impl Error {
+    /// The variant name, for the UI to tell errors apart.
+    pub fn code(&self) -> String {
+        // The derived Debug output starts with the variant name.
+        let debug = format!("{self:?}");
+        debug.split(['(', ' ', '{']).next().unwrap_or_default().to_owned()
+    }
+
+    /// The text that the user reads. The wrapped errors of other crates get
+    /// a plain explanation; the rest are already written for the user.
+    pub fn message(&self) -> String {
+        match self {
+            Error::Download(_) => "The download failed. Check the internet connection, then try again.".into(),
+            Error::Io(e) => format!("A file operation on this Mac failed: {e}."),
+            Error::Json(e) => format!("zwinger could not read its saved data: {e}."),
+            Error::Sandbox(e) => sandbox_message(e),
+            Error::ShieldsRunning(1) => "A shield still runs. Stop it, then restart to update.".into(),
+            other => sentence(&other.to_string()),
+        }
+    }
+}
+
+fn sandbox_message(error: &microsandbox::MicrosandboxError) -> String {
+    use microsandbox::MicrosandboxError as E;
+    match error {
+        E::RuntimeNotInstalled(_) | E::RuntimeIncomplete(_) | E::LibkrunfwNotFound(_) => {
+            "The VM runtime is missing or damaged. Download zwinger again and replace the app to reinstall it.".into()
+        }
+        E::Http(_) => "The download failed. Check the internet connection, then try again.".into(),
+        E::Image(e) => {
+            format!("zwinger could not get the shield image. Check the internet connection, then try again ({e}).")
+        }
+        E::BootStart { .. } => format!("The shield VM did not start: {error}."),
+        E::Database(_) => "The VM database is not available. Quit zwinger and open it again.".into(),
+        E::ExecTimeout(_) => "The command in the shield did not answer in time.".into(),
+        _ => format!("The VM runtime failed: {error}."),
+    }
+}
+
+/// Starts with a capital letter and ends with a full stop. The app name stays lowercase.
+fn sentence(text: &str) -> String {
+    let mut out = match text.chars().next() {
+        Some(first) if !text.starts_with("zwinger") => first.to_uppercase().chain(text.chars().skip(1)).collect(),
+        _ => text.to_owned(),
+    };
+    if !out.ends_with(['.', '?', '!']) {
+        out.push('.');
+    }
+    out
+}
+
+/// `{code, message}`: the one place where an error becomes text for the user.
 impl Serialize for Error {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("code", &self.code())?;
+        map.serialize_entry("message", &self.message())?;
+        map.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn serializes_a_code_and_a_sentence() {
+        assert_eq!(
+            serde_json::to_value(Error::InvalidOrder).unwrap(),
+            json!({ "code": "InvalidOrder", "message": "The order must name each item once." })
+        );
+        assert_eq!(
+            serde_json::to_value(Error::MissingPath("/x".into())).unwrap(),
+            json!({ "code": "MissingPath", "message": "Path does not exist: /x." })
+        );
+        assert_eq!(Error::ShieldNotFound.message(), "Shield not found.");
+        assert_eq!(Error::RunState("paused").code(), "RunState");
+    }
+
+    #[test]
+    fn keeps_the_app_name_and_the_full_stop() {
+        assert_eq!(sentence("zwinger stopped."), "zwinger stopped.");
+        assert_eq!(sentence("done?"), "Done?");
+        assert_eq!(Error::ShieldsRunning(1).message(), "A shield still runs. Stop it, then restart to update.");
+        assert_eq!(Error::ShieldsRunning(2).message(), "2 shields still run; stop them to restart for the update.");
+    }
+
+    #[test]
+    fn explains_the_errors_of_other_crates() {
+        let io = Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+        assert_eq!(io.code(), "Io");
+        assert_eq!(io.message(), "A file operation on this Mac failed: denied.");
+        let missing = Error::Sandbox(microsandbox::MicrosandboxError::RuntimeNotInstalled("x".into()));
+        assert_eq!(missing.code(), "Sandbox");
+        assert!(missing.message().starts_with("The VM runtime is missing or damaged."));
+        assert!(!missing.message().contains("open it again"));
+        let other = Error::Sandbox(microsandbox::MicrosandboxError::Custom("boom".into()));
+        assert_eq!(other.message(), "The VM runtime failed: boom.");
+        let json = Error::Json(serde_json::from_str::<u8>("x").unwrap_err());
+        assert!(json.message().starts_with("zwinger could not read its saved data: "));
     }
 }

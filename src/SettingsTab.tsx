@@ -25,6 +25,7 @@ import {
 import type { Intent, Run, Runtimes } from "./App";
 import { InstallControl } from "./roomParts";
 import { AppsSection } from "./AppsSection";
+import { errorMessage } from "./errorMessage";
 
 const WORKSPACE = "/workspace";
 
@@ -72,7 +73,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
 
   function rename(event: FormEvent) {
     event.preventDefault();
-    run(() => renameShield(id, name).catch((e) => setNameError(String(e))));
+    run(() => renameShield(id, name).catch((e) => setNameError(errorMessage(e))));
   }
 
   function draftMount(host: string, dropped?: string) {
@@ -114,7 +115,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
     run(() =>
       addMount(id, draft.host, draft.guest, draft.readonly).then(
         () => setDraft(undefined),
-        (e) => setDraft({ ...draft, error: String(e) }),
+        (e) => setDraft({ ...draft, error: errorMessage(e) }),
       ),
     );
   }

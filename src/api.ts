@@ -1,5 +1,24 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { Channel, invoke, InvokeArgs } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { isBackendError } from "./errorMessage";
+
+/** The window event of a lost backend. The backend also emits it on a panic. */
+export const BACKEND_LOST = "backend-lost";
+
+let lostCalls = 0;
+
+/** Every command goes through here. Three rejections in a row that are not `{ code, message }` mean that the backend is gone. */
+async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
+  try {
+    const result = await invoke<T>(command, args);
+    lostCalls = 0;
+    return result;
+  } catch (e) {
+    lostCalls = isBackendError(e) ? 0 : lostCalls + 1;
+    if (lostCalls === 3) window.dispatchEvent(new Event(BACKEND_LOST));
+    throw e;
+  }
+}
 
 /** A login shell in /workspace, or an agent's own TUI in the harness. `resume` continues the agent's last session. */
 export type SessionKind = { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
@@ -158,82 +177,82 @@ export interface ShieldView {
 /** Output bytes, or the exit. Tauri can send small raw bodies as a number array. */
 export type SessionFrame = ArrayBuffer | number[] | { exit: number };
 
-/** The message of the backend's `InvalidOrder` error. */
-export const INVALID_ORDER = "the order must name each item once";
+/** The code of the backend's `InvalidOrder` error. */
+export const INVALID_ORDER = "InvalidOrder";
 
-export const listShields = () => invoke<ShieldView[]>("list_shields");
+export const listShields = () => call<ShieldView[]>("list_shields");
 
-export const createShield = (folder: string) => invoke<string>("create_shield", { folder });
+export const createShield = (folder: string) => call<string>("create_shield", { folder });
 
-export const deleteShield = (id: string) => invoke<void>("delete_shield", { id });
+export const deleteShield = (id: string) => call<void>("delete_shield", { id });
 
 /** `ids` must name each shield once. */
-export const reorderShields = (ids: string[]) => invoke<void>("reorder_shields", { ids });
+export const reorderShields = (ids: string[]) => call<void>("reorder_shields", { ids });
 
 /** `null` restores the auto layout. */
-export const setLayout = (id: string, layout: Record<string, Pos> | null) => invoke<void>("set_layout", { id, layout });
+export const setLayout = (id: string, layout: Record<string, Pos> | null) => call<void>("set_layout", { id, layout });
 
 /** No `id` adds a new app. Resolves to the app id. */
-export const putApp = (id: string, app: Omit<App, "id"> & { id?: string }) => invoke<string>("put_app", { id, app });
+export const putApp = (id: string, app: Omit<App, "id"> & { id?: string }) => call<string>("put_app", { id, app });
 
 /** Also stops the app. */
-export const removeApp = (id: string, appId: string) => invoke<void>("remove_app", { id, appId });
+export const removeApp = (id: string, appId: string) => call<void>("remove_app", { id, appId });
 
-export const reorderApps = (id: string, appIds: string[]) => invoke<void>("reorder_apps", { id, appIds });
+export const reorderApps = (id: string, appIds: string[]) => call<void>("reorder_apps", { id, appIds });
 
 /** Resolves to the session id of the run. */
-export const startApp = (id: string, appId: string) => invoke<string>("start_app", { id, appId });
+export const startApp = (id: string, appId: string) => call<string>("start_app", { id, appId });
 
-export const stopApp = (id: string, appId: string) => invoke<void>("stop_app", { id, appId });
+export const stopApp = (id: string, appId: string) => call<void>("stop_app", { id, appId });
 
-export const restartApp = (id: string, appId: string) => invoke<string>("restart_app", { id, appId });
+export const restartApp = (id: string, appId: string) => call<string>("restart_app", { id, appId });
 
 export const reorderTerminals = (id: string, terminalIds: string[]) =>
-  invoke<void>("reorder_terminals", { id, terminalIds });
+  call<void>("reorder_terminals", { id, terminalIds });
 
 /**
  * Sends the kept output of the session, and its exit if it has exited, then new output. A later attach takes over.
  * Resolves to the token for `detachSession` and `ackSession`.
  */
 export function attachSession(sessionId: string, onFrame: (frame: SessionFrame) => void) {
-  return invoke<number>("attach_session", { sessionId, onEvent: new Channel<SessionFrame>(onFrame) });
+  return call<number>("attach_session", { sessionId, onEvent: new Channel<SessionFrame>(onFrame) });
 }
 
 /** Stops the output to the attach of `token`. A later attach keeps its output. */
-export const detachSession = (sessionId: string, token: number) => invoke<void>("detach_session", { sessionId, token });
+export const detachSession = (sessionId: string, token: number) => call<void>("detach_session", { sessionId, token });
 
 /** The attach of `token` has written one more output frame. The session holds its process while frames wait. */
-export const ackSession = (sessionId: string, token: number) => invoke<void>("ack_session", { sessionId, token });
+export const ackSession = (sessionId: string, token: number) => call<void>("ack_session", { sessionId, token });
 
 /** The canonical folder of a host path: a link resolves to its target. */
-export const resolveFolder = (path: string) => invoke<string>("resolve_folder", { path });
+export const resolveFolder = (path: string) => call<string>("resolve_folder", { path });
 
-export const renameShield = (id: string, name: string) => invoke<void>("rename_shield", { id, name });
+export const renameShield = (id: string, name: string) => call<void>("rename_shield", { id, name });
 
-export const setHarness = (id: string, harness: string | null) => invoke<void>("set_harness", { id, harness });
+export const setHarness = (id: string, harness: string | null) => call<void>("set_harness", { id, harness });
 
-export const listFolders = (id: string) => invoke<string[]>("list_folders", { id });
+export const listFolders = (id: string) => call<string[]>("list_folders", { id });
 
 export const addMount = (id: string, host: string, guest: string, readonly: boolean) =>
-  invoke<void>("add_mount", { id, host, guest, readonly });
+  call<void>("add_mount", { id, host, guest, readonly });
 
 export const removeMount = (id: string, guest: string) =>
-  invoke<void>("remove_mount", { id, guest });
+  call<void>("remove_mount", { id, guest });
 
 export const setMountReadonly = (id: string, guest: string, readonly: boolean) =>
-  invoke<void>("set_mount_readonly", { id, guest, readonly });
+  call<void>("set_mount_readonly", { id, guest, readonly });
 
-export const setNetworkMode = (id: string, mode: NetworkMode) => invoke<void>("set_network_mode", { id, mode });
+export const setNetworkMode = (id: string, mode: NetworkMode) => call<void>("set_network_mode", { id, mode });
 
-export const addDomain = (id: string, domain: string) => invoke<void>("add_domain", { id, domain });
+export const addDomain = (id: string, domain: string) => call<void>("add_domain", { id, domain });
 
-export const removeDomain = (id: string, domain: string) => invoke<void>("remove_domain", { id, domain });
+export const removeDomain = (id: string, domain: string) => call<void>("remove_domain", { id, domain });
 
 /** Allows the host in one edit. A shield in Deny mode changes to List mode. */
-export const allowHost = (shieldId: string, host: string) => invoke<void>("allow_host", { shieldId, host });
+export const allowHost = (shieldId: string, host: string) => call<void>("allow_host", { shieldId, host });
 
 /** The wildcard of the host's registrable domain, as `*.bbc.co.uk` for `news.bbc.co.uk`. `null` if there is none. */
-export const wildcardFor = (host: string) => invoke<string | null>("wildcard_for", { host });
+export const wildcardFor = (host: string) => call<string | null>("wildcard_for", { host });
 
 export type NetKind = "dns_allowed" | "dns_denied" | "tls" | "tls_denied";
 
@@ -249,41 +268,41 @@ export interface NetEvent {
 export const isBlocked = (event: NetEvent) => event.kind === "dns_denied" || event.kind === "tls_denied";
 
 /** The events that the backend keeps for the shield, oldest first. */
-export const listNetEvents = (shieldId: string) => invoke<NetEvent[]>("list_net_events", { shieldId });
+export const listNetEvents = (shieldId: string) => call<NetEvent[]>("list_net_events", { shieldId });
 
 /** Resolves to the function that stops the listener. */
 export const onNetEvent = (handler: (shieldId: string, event: NetEvent) => void) =>
   listen<{ shieldId: string; event: NetEvent }>("net-event", ({ payload }) => handler(payload.shieldId, payload.event));
 
-export const listSecrets = (id: string) => invoke<SecretView[]>("list_secrets", { id });
+export const listSecrets = (id: string) => call<SecretView[]>("list_secrets", { id });
 
 /** `value` null keeps the current value of an existing secret. */
 export const putSecret = (id: string, secret: Secret, value: string | null) =>
-  invoke<void>("put_secret", { id, secret, value });
+  call<void>("put_secret", { id, secret, value });
 
-export const removeSecret = (id: string, name: string) => invoke<void>("remove_secret", { id, name });
+export const removeSecret = (id: string, name: string) => call<void>("remove_secret", { id, name });
 
-export const startShield = (id: string) => invoke<void>("start_shield", { id });
+export const startShield = (id: string) => call<void>("start_shield", { id });
 
-export const stopShield = (id: string) => invoke<void>("stop_shield", { id });
+export const stopShield = (id: string) => call<void>("stop_shield", { id });
 
 /** Adds a terminal to the end of the shield's list and opens it. Resolves to the session id. */
 export const openSession = (shieldId: string, kind: SessionKind, rows: number, cols: number) =>
-  invoke<string>("open_session", { shieldId, kind, rows, cols });
+  call<string>("open_session", { shieldId, kind, rows, cols });
 
 /** Opens a dormant or exited terminal again, under the same id. Resolves to the session id. */
 export const reopenTerminal = (shieldId: string, terminalId: string, rows: number, cols: number) =>
-  invoke<string>("reopen_terminal", { shieldId, terminalId, rows, cols });
+  call<string>("reopen_terminal", { shieldId, terminalId, rows, cols });
 
 export const writeSession = (id: string, data: string) =>
-  invoke<void>("write_session", { id, data });
+  call<void>("write_session", { id, data });
 
 export const resizeSession = (id: string, rows: number, cols: number) =>
-  invoke<void>("resize_session", { id, rows, cols });
+  call<void>("resize_session", { id, rows, cols });
 
 /** Removes the terminal and ends its process. */
 export const closeTerminal = (shieldId: string, terminalId: string) =>
-  invoke<void>("close_terminal", { shieldId, terminalId });
+  call<void>("close_terminal", { shieldId, terminalId });
 
 export type AgentKind = "pi" | "claude" | "codex" | "gemini";
 
@@ -303,7 +322,7 @@ export interface RuntimeView {
 
 export type InstallProgress = { stage: "download"; received: number; total: number | null } | { stage: "extract" };
 
-export const listRuntimes = () => invoke<RuntimeView[]>("list_runtimes");
+export const listRuntimes = () => call<RuntimeView[]>("list_runtimes");
 
 /**
  * Downloads `version`, else the pinned version, and checks its integrity. Resolves when it is installed.
@@ -315,7 +334,7 @@ export function installRuntime(
   version: string | null = null,
   confirm = false,
 ) {
-  return invoke<void>("install_runtime", { name, version, confirm, onProgress: new Channel<InstallProgress>(onProgress) });
+  return call<void>("install_runtime", { name, version, confirm, onProgress: new Channel<InstallProgress>(onProgress) });
 }
 
 /** Where a shield's copy of a host agent comes from. */
@@ -348,51 +367,51 @@ export interface Detection {
 }
 
 /** The last detection, else a new one. */
-export const hostAgents = () => invoke<Detection>("host_agents");
+export const hostAgents = () => call<Detection>("host_agents");
 
-export const detectHostAgents = () => invoke<Detection>("detect_host_agents");
+export const detectHostAgents = () => call<Detection>("detect_host_agents");
 
 /** `allowHosts` also adds the login's provider host to the allow list. Applies on the next start. */
 export const putHostAgent = (id: string, agent: HostAgentUse, allowHosts: boolean) =>
-  invoke<void>("put_host_agent", { id, agent, allowHosts });
+  call<void>("put_host_agent", { id, agent, allowHosts });
 
 /** Also removes its host login. */
-export const removeHostAgent = (id: string, agent: AgentKind) => invoke<void>("remove_host_agent", { id, agent });
+export const removeHostAgent = (id: string, agent: AgentKind) => call<void>("remove_host_agent", { id, agent });
 
 /** Needs no restart: the running shield gets new agent commands at once. */
-export const setAgentsUnprompted = (id: string, on: boolean) => invoke<void>("set_agents_unprompted", { id, on });
+export const setAgentsUnprompted = (id: string, on: boolean) => call<void>("set_agents_unprompted", { id, on });
 
-export const setAutoRenew = (id: string, on: boolean) => invoke<void>("set_auto_renew", { id, on });
+export const setAutoRenew = (id: string, on: boolean) => call<void>("set_auto_renew", { id, on });
 
 /** Resolves to the function that stops the listener. */
 export const onRenewDue = (handler: (shieldId: string) => void) =>
   listen<string>("renew-due", ({ payload }) => handler(payload));
 
 /** The user confirms the folders that are not verified since the update. */
-export const confirmPaths = (id: string) => invoke<void>("confirm_paths", { id });
+export const confirmPaths = (id: string) => call<void>("confirm_paths", { id });
 
 /** Deletes the agent's login that was made in the guest. */
-export const removeGuestLogin = (id: string, agent: AgentKind) => invoke<void>("remove_guest_login", { id, agent });
+export const removeGuestLogin = (id: string, agent: AgentKind) => call<void>("remove_guest_login", { id, agent });
 
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (shieldId: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));
 
 /** Each notice comes once, such as the VMs that the app start removed. */
-export const takeAppNotices = () => invoke<string[]>("take_app_notices");
+export const takeAppNotices = () => call<string[]>("take_app_notices");
 
 /** Stops the download. The install then fails with a cancel error. */
-export const cancelRuntimeInstall = (name: RuntimeName) => invoke<void>("cancel_runtime_install", { name });
+export const cancelRuntimeInstall = (name: RuntimeName) => call<void>("cancel_runtime_install", { name });
 
 /** No `id` adds a new task. Resolves to the task id. */
 export const putTask = (id: string, task: Omit<Task, "id" | "slug"> & { id?: string }) =>
-  invoke<string>("put_task", { id, task });
+  call<string>("put_task", { id, task });
 
 /** Also removes its runs. */
-export const removeTask = (id: string, taskId: string) => invoke<void>("remove_task", { id, taskId });
+export const removeTask = (id: string, taskId: string) => call<void>("remove_task", { id, taskId });
 
 /** Resolves to the run name. */
-export const startTaskRun = (shieldId: string, taskId: string) => invoke<string>("start_task_run", { shieldId, taskId });
+export const startTaskRun = (shieldId: string, taskId: string) => call<string>("start_task_run", { shieldId, taskId });
 
 export type RunControl =
   | { type: "message" | "answer"; text: string }
@@ -400,7 +419,7 @@ export type RunControl =
   | { type: "pickImplementer"; agent: string };
 
 export const controlTaskRun = (shieldId: string, taskId: string, run: string, control: RunControl) =>
-  invoke<void>("control_task_run", { shieldId, taskId, run, control });
+  call<void>("control_task_run", { shieldId, taskId, run, control });
 
 export type RunState = "running" | "paused" | "waiting" | "done" | "failed" | "cancelled";
 
@@ -417,14 +436,14 @@ export interface RunSummary {
 }
 
 /** The runs of the shield's tasks, oldest first per task. */
-export const listTaskRuns = (shieldId: string) => invoke<RunSummary[]>("list_task_runs", { shieldId });
+export const listTaskRuns = (shieldId: string) => call<RunSummary[]>("list_task_runs", { shieldId });
 
 /** The change of a run: the commits since its start, the status, then the diff from its start. */
 export const runDiff = (shieldId: string, taskId: string, run: string) =>
-  invoke<string>("run_diff", { shieldId, taskId, run });
+  call<string>("run_diff", { shieldId, taskId, run });
 
 /** True if the folder looks like a duo round, so a drop opens its room. */
-export const isRoundFolder = (path: string) => invoke<boolean>("is_round_folder", { path });
+export const isRoundFolder = (path: string) => call<boolean>("is_round_folder", { path });
 
 /** The state of an in-app run of this app session. */
 export interface RunStatus {
@@ -509,6 +528,85 @@ export type RoomEvent =
 
 /** Sends the room now and on each change. Resolves to the token for `unwatchRoom`. */
 export const watchRoom = (source: RoomSource, onEvent: (event: RoomEvent) => void) =>
-  invoke<number>("watch_room", { source, onEvent: new Channel<RoomEvent>(onEvent) });
+  call<number>("watch_room", { source, onEvent: new Channel<RoomEvent>(onEvent) });
 
-export const unwatchRoom = (token: number) => invoke<void>("unwatch_room", { token });
+export const unwatchRoom = (token: number) => call<void>("unwatch_room", { token });
+
+export type CheckLevel = "pass" | "warn" | "fail";
+
+/** A system check of the app start, with what to do if it does not pass. */
+export interface Check {
+  name: string;
+  level: CheckLevel;
+  message: string;
+}
+
+/** The steps of the runtime start, in order. */
+export type StartupStep = "resolve" | "reapLegacy" | "install" | "reap" | "ready";
+
+/** The shield commands work only in the `ready` phase. `blocked`: a check failed. */
+export interface Startup {
+  phase: "checking" | "installing" | "ready" | "blocked";
+  checks: Check[];
+  step: StartupStep | null;
+  /** When `step` started, in milliseconds since the Unix epoch. */
+  startedAt: number;
+}
+
+export const startupStatus = () => call<Startup>("startup_status");
+
+/** Resolves to the function that stops the listener. */
+export const onStartup = (handler: (startup: Startup) => void) =>
+  listen<Startup>("startup", ({ payload }) => handler(payload));
+
+export interface Prefs {
+  /** The user finished or skipped the first-run steps. */
+  onboarded: boolean;
+  /** Look for an update at each start. */
+  autoUpdate: boolean;
+}
+
+export const getPreferences = () => call<Prefs>("get_preferences");
+
+export const setPreferences = (prefs: Prefs) => call<void>("set_preferences", { prefs });
+
+/** Sizes in bytes. `null`: unknown. */
+export interface StorageView {
+  appData: string;
+  images: number | null;
+  runtimes: number | null;
+}
+
+export const storage = () => call<StorageView>("storage");
+
+/** A microsandbox home of an earlier zwinger build. `appData`: only zwinger used it. `shared`: `~/.microsandbox`. */
+export type Legacy = "appData" | "shared";
+
+/** `size` in bytes, `null`: unknown. */
+export interface LegacyView {
+  legacy: Legacy;
+  path: string;
+  size: number | null;
+}
+
+export const legacyStorage = () => call<LegacyView[]>("legacy_storage");
+
+/** Removes zwinger's VMs and image. Deletes the `appData` home; keeps the `shared` home and its other data. */
+export const removeLegacyRuntime = (legacy: Legacy) => call<void>("remove_legacy_runtime", { legacy });
+
+/** Removes the cached images that no shield uses. Resolves to the freed bytes, if known. */
+export const cleanImages = () => call<number | null>("clean_images");
+
+export interface UpdateInfo {
+  version: string;
+  notes: string | null;
+}
+
+/** `null`: this is the newest version. */
+export const checkUpdate = () => call<UpdateInfo | null>("check_update");
+
+/**
+ * Installs the update and restarts. Fails with `ShieldsRunning` while a shield is live, unless `stopShields`.
+ * With `stopShields` it stops them first; if one does not stop, the update applies at the next start.
+ */
+export const installUpdate = (stopShields: boolean) => call<void>("install_update", { stopShields });

@@ -17,7 +17,6 @@ import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, v
 import { CSS } from "@dnd-kit/utilities";
 import {
   AppWindow,
-  Bot,
   ChevronRight,
   Ellipsis,
   History,
@@ -26,6 +25,7 @@ import {
   Play,
   Plus,
   RotateCw,
+  Settings,
   Square,
   SquareTerminal,
   Trash2,
@@ -294,8 +294,8 @@ interface Props {
   /** Saves the order of all terminals of the shield. */
   onMoveTerminals: (shieldId: string, ids: string[]) => void;
   onNew: () => void;
-  /** Opens the agents on this Mac. */
-  onHostAgents: () => void;
+  /** Opens the app settings. */
+  onSettings: () => void;
   /** A folder dropped from Finder on empty rail space. */
   dropFolder?: DroppedFolder;
   onDropDone: (create: boolean) => void;
@@ -321,7 +321,7 @@ export function ShieldRail({
   onReopen,
   onMoveTerminals,
   onNew,
-  onHostAgents,
+  onSettings,
   dropFolder,
   onDropDone,
   children,
@@ -862,8 +862,8 @@ export function ShieldRail({
         <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
           New shield
         </Button>
-        <Button variant="ghost" size="sm" iconLeft={<Bot size={14} />} onClick={onHostAgents}>
-          Agents on this Mac
+        <Button variant="ghost" size="sm" iconLeft={<Settings size={14} />} onClick={onSettings}>
+          Settings <kbd className="muted">⌘,</kbd>
         </Button>
       </div>
     </aside>

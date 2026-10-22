@@ -13,6 +13,7 @@ export const SHORTCUTS = [
   { key: "3", label: "⌘3", action: "terminal" },
   { key: "4", label: "⌘4", action: "network" },
   { key: "5", label: "⌘5", action: "settings" },
+  { key: ",", label: "⌘,", action: "appSettings" },
 ] as const;
 
 export type ShortcutAction = (typeof SHORTCUTS)[number]["action"];

@@ -28,7 +28,6 @@ interface Props {
   onRestart: (id: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
-  onHostAgents: () => void;
   run: Run;
 }
 
@@ -46,7 +45,6 @@ export function CommandBar({
   onRestart,
   onIntent,
   onOpenRound,
-  onHostAgents,
   run,
 }: Props) {
   const action = (id: ShortcutAction, label: string): CommandMenuItem => ({
@@ -131,7 +129,7 @@ export function CommandBar({
   commands.push(
     action("newShield", "New shield"),
     { id: "open-round", label: "Open round folder…", onSelect: onOpenRound },
-    { id: "host-agents", label: "Agents on this Mac", onSelect: onHostAgents },
+    action("appSettings", "Settings: agents on this Mac, updates, storage"),
   );
   for (const other of shields)
     if (other.id !== shield?.id)

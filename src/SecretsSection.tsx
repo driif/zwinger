@@ -15,6 +15,7 @@ import {
 } from "./api";
 import type { Run } from "./App";
 import { echoHost } from "./echoHost";
+import { errorMessage } from "./errorMessage";
 
 const PRESETS = [
   { label: "Anthropic", name: "ANTHROPIC_API_KEY", hosts: ["api.anthropic.com"], fields: ["x-api-key", "authorization"] },
@@ -97,7 +98,7 @@ export function SecretsSection({ shield, run }: Props) {
           setDraft(undefined);
           reload();
         },
-        (e) => setDraft({ ...draft, value: "", error: String(e) }),
+        (e) => setDraft({ ...draft, value: "", error: errorMessage(e) }),
       ),
     );
   }

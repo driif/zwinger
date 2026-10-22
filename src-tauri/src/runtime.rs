@@ -19,7 +19,7 @@ use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
-const IMAGE: &str = "node:22-slim";
+pub(crate) const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
 /// The queue size of the output of a PTY. A full queue holds the reader, so
@@ -220,6 +220,49 @@ pub fn shield_id(vm_name: &str) -> Option<&str> {
     vm_name.strip_prefix(NAME_PREFIX)
 }
 
+/// Stops and removes the zwinger VMs of the default backend. Resolves to their names.
+pub async fn reap_zwinger() -> Result<Vec<String>> {
+    // Sandboxes from round 01 have no label, so the name prefix also counts.
+    let mut found = BTreeMap::new();
+    for labelled in [true, false] {
+        let mut cursor = None;
+        loop {
+            let page = Sandbox::list_with(|mut list| {
+                list = list.limit(MAX_SANDBOX_LIST_LIMIT);
+                if labelled {
+                    list = list.label(LABEL.0, LABEL.1);
+                }
+                match cursor.take() {
+                    Some(c) => list.cursor(c),
+                    None => list,
+                }
+            })
+            .await?;
+            for handle in page.sandboxes {
+                if labelled || handle.name().starts_with(NAME_PREFIX) {
+                    found.insert(handle.name().to_owned(), handle);
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    // One stuck sandbox must not keep the others alive.
+    let (mut reaped, mut failed) = (Vec::new(), None);
+    for (name, handle) in found {
+        match handle.destroy().await {
+            Ok(()) => reaped.push(name),
+            Err(e) => failed = Some(e),
+        }
+    }
+    match failed {
+        Some(e) => Err(e.into()),
+        None => Ok(reaped),
+    }
+}
+
 /// `pi` is the host copy of the pi bundle, from [`crate::agent::pi::install_pi`].
 #[derive(Clone)]
 pub struct Microsandbox {
@@ -290,45 +333,7 @@ impl SandboxRuntime for Microsandbox {
     }
 
     async fn reap(&self) -> Result<Vec<String>> {
-        // Sandboxes from round 01 have no label, so the name prefix also counts.
-        let mut found = BTreeMap::new();
-        for labelled in [true, false] {
-            let mut cursor = None;
-            loop {
-                let page = Sandbox::list_with(|mut list| {
-                    list = list.limit(MAX_SANDBOX_LIST_LIMIT);
-                    if labelled {
-                        list = list.label(LABEL.0, LABEL.1);
-                    }
-                    match cursor.take() {
-                        Some(c) => list.cursor(c),
-                        None => list,
-                    }
-                })
-                .await?;
-                for handle in page.sandboxes {
-                    if labelled || handle.name().starts_with(NAME_PREFIX) {
-                        found.insert(handle.name().to_owned(), handle);
-                    }
-                }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-        }
-        // One stuck sandbox must not keep the others alive.
-        let (mut reaped, mut failed) = (Vec::new(), None);
-        for (name, handle) in found {
-            match handle.destroy().await {
-                Ok(()) => reaped.push(name),
-                Err(e) => failed = Some(e),
-            }
-        }
-        match failed {
-            Some(e) => Err(e.into()),
-            None => Ok(reaped),
-        }
+        reap_zwinger().await
     }
 
     /// Tails `runtime.log` itself: `follow_logs` returns a `futures` Stream,

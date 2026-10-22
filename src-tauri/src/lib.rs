@@ -1,8 +1,10 @@
 mod agent;
+mod bootstrap;
 mod commands;
 mod error;
 mod host_agents;
 mod netlog;
+mod preferences;
 mod runtime;
 mod runtimes;
 mod secrets;
@@ -12,6 +14,7 @@ mod store;
 mod task_agents;
 mod task_artifacts;
 mod task_runs;
+mod updates;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,13 +24,14 @@ use std::time::Duration;
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 
+use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
 use crate::host_agents::HostAgents;
 use crate::runtime::{Microsandbox, SandboxRuntime};
 use crate::secrets::Vault;
 use crate::sessions::Manager;
 
-const REAP_LIMIT: Duration = Duration::from_secs(10);
-const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
+pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
 
 /// Has no Close Window item, so ⌘W reaches the webview and closes a session.
 fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
@@ -70,6 +74,18 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )
 }
 
+/// A panic shows the recover screen. A panic in the emit itself does not loop.
+fn report_panics(app: AppHandle) {
+    let default = std::panic::take_hook();
+    let reported = AtomicBool::new(false);
+    std::panic::set_hook(Box::new(move |info| {
+        if !reported.swap(true, Ordering::SeqCst) {
+            let _ = app.emit("backend-lost", ());
+        }
+        default(info);
+    }));
+}
+
 /// Removes the VMs of an earlier run, loads the shields and makes the
 /// manager. The manager starts with no VMs, so every shield shows as
 /// stopped; a notice names the removed VMs.
@@ -109,13 +125,45 @@ fn boot<R: SandboxRuntime>(
     Ok(manager)
 }
 
+/// Sends the manager's events to the UI.
+fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
+    // One app-wide event, so the rail and the map update while the
+    // Network tab is closed.
+    let handle = app.clone();
+    manager.set_net_sink(Box::new(move |shield_id, event| {
+        let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
+    }));
+    // A host login is due: the UI shows the notice or 'Restart to
+    // renew', and the manager restarts the shield if the Mac has a
+    // newer login and the user turned that on. The renewal ends with
+    // the VM.
+    let handle = app.clone();
+    manager.set_renew_sink(Box::new(move |shield_id| {
+        let _ = handle.emit("renew-due", shield_id);
+        let (handle, shield_id) = (handle.clone(), shield_id.to_owned());
+        tauri::async_runtime::spawn(async move {
+            let manager = handle.state::<Manager<Microsandbox>>();
+            if let Err(e) = manager.renew(&shield_id).await {
+                eprintln!("renewal of {shield_id} failed: {e}");
+            }
+            let _ = handle.emit("renew-due", shield_id);
+        });
+    }));
+    let handle = app.clone();
+    manager.set_guest_sink(Box::new(move |shield_id| {
+        let _ = handle.emit("guest-login", shield_id);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
         .setup(|app| {
+            report_panics(app.handle().clone());
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
             // Canonical, like the host paths of the shields it is compared with.
@@ -135,34 +183,50 @@ pub fn run() {
                 move || host.detect()
             });
             let vault = Arc::new(secrets::Ordered::new(Arc::new(secrets::Keychain)));
-            let manager = boot(runtime, vault, &data, host.clone())?;
-            // One app-wide event, so the rail and the map update while the
-            // Network tab is closed.
+            let minimum = app.config().bundle.macos.minimum_system_version.clone().unwrap_or_default();
+            app.manage(Bootstrap::default());
+            app.manage(preferences::Preferences::load(data.join("preferences.json")));
+            // Off the main thread: the runtime install and the reap take seconds.
+            // The shield commands need the manager, so the UI shows the shields
+            // only in the Ready phase.
             let handle = app.handle().clone();
-            manager.set_net_sink(Box::new(move |shield_id, event| {
-                let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
-            }));
-            // A host login is due: the UI shows the notice or 'Restart to
-            // renew', and the manager restarts the shield if the Mac has a
-            // newer login and the user turned that on. The renewal ends with
-            // the VM.
-            let handle = app.handle().clone();
-            manager.set_renew_sink(Box::new(move |shield_id| {
-                let _ = handle.emit("renew-due", shield_id);
-                let (handle, shield_id) = (handle.clone(), shield_id.to_owned());
-                tauri::async_runtime::spawn(async move {
-                    let manager = handle.state::<Manager<Microsandbox>>();
-                    if let Err(e) = manager.renew(&shield_id).await {
-                        eprintln!("renewal of {shield_id} failed: {e}");
+            let host_agents = host.clone();
+            std::thread::spawn(move || {
+                let startup = handle.state::<Bootstrap>();
+                let home = match bootstrap::runtime_home() {
+                    Ok(home) => home,
+                    Err(e) => {
+                        let message = error::Error::Io(e).message();
+                        return startup.set(
+                            &handle,
+                            Phase::Blocked,
+                            vec![Check::new("VM folder", Level::Fail, message)],
+                            None,
+                        );
                     }
-                    let _ = handle.emit("renew-due", shield_id);
+                };
+                let mut checks = bootstrap::system_checks(&data, &home, &minimum);
+                if checks.iter().any(|c| c.level == Level::Fail) {
+                    return startup.set(&handle, Phase::Blocked, checks, None);
+                }
+                let step = |step| startup.set(&handle, Phase::Installing, checks.clone(), Some(step));
+                let legacy = bootstrap::legacy_homes(&data, &dirs::home_dir().unwrap_or_default());
+                let manager = bootstrap::prepare_runtime(&home, &legacy, &runtime, REAP_LIMIT, step).and_then(|()| {
+                    step(Step::Reap);
+                    boot(runtime, vault, &data, host_agents)
                 });
-            }));
-            let handle = app.handle().clone();
-            manager.set_guest_sink(Box::new(move |shield_id| {
-                let _ = handle.emit("guest-login", shield_id);
-            }));
-            app.manage(manager);
+                match manager {
+                    Ok(manager) => {
+                        connect(&handle, &manager);
+                        handle.manage(manager);
+                        startup.set(&handle, Phase::Ready, checks, Some(Step::Ready));
+                    }
+                    Err(e) => {
+                        checks.push(Check::new("VM runtime", Level::Fail, e.message()));
+                        startup.set(&handle, Phase::Blocked, checks, None);
+                    }
+                }
+            });
             app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
             app.manage(commands::Watches::default());
@@ -228,6 +292,15 @@ pub fn run() {
             commands::take_app_notices,
             commands::remove_guest_login,
             commands::confirm_paths,
+            commands::startup_status,
+            commands::get_preferences,
+            commands::set_preferences,
+            commands::storage,
+            commands::clean_images,
+            commands::legacy_storage,
+            commands::remove_legacy_runtime,
+            updates::check_update,
+            updates::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -240,14 +313,18 @@ pub fn run() {
             api.prevent_exit();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                app.state::<Manager<Microsandbox>>().stop_all(STOP_ALL_LIMIT).await;
+                if let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
+                    manager.stop_all(STOP_ALL_LIMIT).await;
+                }
                 app.exit(0);
             });
         }
         // ⌘Q on macOS ends the loop without ExitRequested. Stop the VMs here,
         // before the process exits.
         RunEvent::Exit => {
-            tauri::async_runtime::block_on(app.state::<Manager<Microsandbox>>().stop_all(STOP_ALL_LIMIT));
+            if let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
+                tauri::async_runtime::block_on(manager.stop_all(STOP_ALL_LIMIT));
+            }
         }
         _ => {}
     });
