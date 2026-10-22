@@ -1,7 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package, UserCog } from "lucide-react";
-import { AGENT_NAMES, AgentKind, isBlocked, NetEvent, ShieldView } from "./api";
-import { coveredBy, reachable } from "./SecretsSection";
+import { AGENT_NAMES, AgentKind, NetEvent, Service, ShieldView } from "./api";
+import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "./network";
 
 const HOST_X = 16;
 const HOST_W = 230;
@@ -51,15 +51,14 @@ const under = (path: string, base: string) => path === base || path.startsWith(`
  * columns; a position in `shield.layout` replaces it. Child positions are
  * relative to the boundary.
  */
-export function mapLayout(shield: ShieldView, folders: string[], events: NetEvent[], now: number) {
+export function mapLayout(shield: ShieldView, folders: string[], events: NetEvent[], catalog: Service[], now: number) {
   const { harness, network } = shield;
   const nodes: MapNode[] = [];
   const edges: Edge[] = [];
   const at = (id: string, x: number, y: number) => shield.layout[id] ?? { x, y };
 
   const recent = (event: NetEvent, ms: number) => now - event.at < ms;
-  const active = (domain: string) =>
-    events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS) && coveredBy(domain, [e.host]));
+  const active = (reason: string) => events.some((e) => e.allowed && e.reason === reason && recent(e, ACTIVE_MS));
 
   const inner = (id: string, x: number, y: number, width: number, data: ItemData) =>
     nodes.push({
@@ -226,63 +225,67 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
     data: { name: shield.name, state: shield.status.state },
   });
 
-  const secretHosts = [...new Set(shield.secrets.flatMap((s) => s.hosts))];
-  const secretNames = (host: string) =>
-    shield.secrets
-      .filter((s) => s.hosts.includes(host))
-      .map((s) => s.name)
-      .join(", ");
-
   let ny = TOP;
   const host = (id: string, data: ItemData, blocked?: boolean) => {
     outer(id, NET_X, ny, NET_W, { ...data, jump: "network" });
     edge("boundary", id, blocked);
     ny += ROW;
   };
-  if (network.mode === "public") {
-    host("host:*", {
+  // The default is the edge style of "everything else".
+  const closed = network.offline || network.default === "block";
+  host(
+    "default",
+    {
       icon: Globe,
-      label: "Public internet",
-      title: "Public internet",
-      tone: "warn",
+      label: network.offline ? "Offline: all blocked" : `Everything else: ${closed ? "blocked" : "allowed"}`,
+      title: network.offline
+        ? "Offline: the proxy blocks every request and keeps the rules"
+        : `A host that no rule names is ${closed ? "blocked" : "allowed"}`,
+      tone: network.offline ? "blocked" : closed ? "muted" : "warn",
       badges: [],
-      active: events.some((e) => !isBlocked(e) && recent(e, ACTIVE_MS)),
-    });
-  } else if (network.mode === "deny" || network.domains.length === 0) {
-    const label = network.mode === "deny" ? "Deny all" : "No hosts allowed";
-    outer("host:none", NET_X, ny, NET_W, { icon: Globe, label, title: label, tone: "muted", badges: [], jump: "network" });
-    ny += ROW;
-  } else {
-    for (const domain of network.domains)
-      host(`host:${domain}`, {
-        icon: Globe,
-        label: domain,
-        title: domain,
-        badges: coveredBy(domain, secretHosts) ? ["key"] : [],
-        active: active(domain),
-      });
+      active: active("default"),
+    },
+    closed,
+  );
+  const loginsOf = (domains: string[]) =>
+    shield.logins.filter((l) => l.hosts.some((h) => domains.some((d) => covers(d, h))));
+  for (const rule of network.rules) {
+    const service = serviceOf(rule.target, catalog);
+    const label = ruleLabel(rule, catalog);
+    const domains = ruleDomains(rule, catalog);
+    const keys = [...(rule.credentials ?? []).map((c) => c.name), ...loginsOf(domains).map((l) => l.name)];
+    const blocked = rule.action === "block" || network.offline;
+    host(
+      `rule:${rule.id}`,
+      {
+        icon: rule.action === "block" ? Ban : serviceIcon(service),
+        label,
+        title: `${rule.action === "allow" ? "Allowed" : "Blocked"}: ${domains.join(", ")}${keys.length ? `; gets ${keys.join(", ")}` : ""}`,
+        tone: rule.action === "block" ? "denied" : undefined,
+        badges: keys.length ? ["key"] : [],
+        active: active(`rule:${label}`),
+      },
+      blocked,
+    );
   }
-  // In List mode the allow-list nodes carry the key badges. In Public mode the
-  // secret hosts are shown on their own, as nothing else names them.
-  for (const secretHost of secretHosts) {
-    const ok = reachable(network, secretHost);
-    if (ok && network.mode === "list") continue;
-    const id = `secret:${secretHost}`;
-    const data: ItemData = {
-      icon: KeyRound,
-      label: secretHost,
-      title: ok
-        ? `${secretHost} gets ${secretNames(secretHost)}`
-        : `${secretHost} gets ${secretNames(secretHost)}, but it is not on the allow list`,
-      tone: ok ? undefined : "warn",
-      badges: ["key"],
-      active: ok && active(secretHost),
-      jump: "network",
-    };
-    outer(id, NET_X, ny, NET_W, data);
-    if (ok) edge("boundary", id);
-    ny += ROW;
-  }
+  // A host login that no rule names is shown on its own, as nothing else names it.
+  const named = network.rules.flatMap((r) => ruleDomains(r, catalog));
+  for (const login of shield.logins)
+    for (const loginHost of login.hosts.filter((h) => !named.some((d) => covers(d, h)))) {
+      const ok = decide(network, loginHost, catalog).allowed;
+      const agent = AGENT_NAMES[login.origin.agent];
+      host(
+        `login-host:${loginHost}`,
+        {
+          icon: KeyRound,
+          label: loginHost,
+          title: ok ? `${loginHost} gets the ${agent} login` : `${loginHost} gets the ${agent} login, but it is blocked`,
+          tone: ok ? undefined : "warn",
+          badges: ["key"],
+        },
+        !ok,
+      );
+    }
   ny += GAP;
   host(
     "group:blocked",
@@ -298,7 +301,7 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
   const blockedHosts = [
     ...new Set(
       events
-        .filter((e) => isBlocked(e) && recent(e, BLOCKED_MS))
+        .filter((e) => !e.allowed && recent(e, BLOCKED_MS))
         .reverse()
         .map((e) => e.host),
     ),
@@ -312,7 +315,7 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
         title: `${denied} was blocked in the last minute`,
         tone: "denied",
         badges: [],
-        active: events.some((e) => isBlocked(e) && recent(e, ACTIVE_MS) && e.host === denied),
+        active: events.some((e) => !e.allowed && recent(e, ACTIVE_MS) && e.host === denied),
       },
       true,
     );
@@ -323,5 +326,6 @@ export function mapLayout(shield: ShieldView, folders: string[], events: NetEven
   ] as const)
     nodes.push({ id, type: "caption", position: { x, y: 28 }, draggable: false, selectable: false, focusable: false, data: { label } });
 
-  return { nodes, edges, hasSecrets: secretHosts.length > 0 };
+  const hasSecrets = shield.logins.length > 0 || network.rules.some((r) => (r.credentials ?? []).length > 0);
+  return { nodes, edges, hasSecrets };
 }

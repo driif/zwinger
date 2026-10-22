@@ -18,6 +18,7 @@ import "@xyflow/react/dist/style.css";
 import { Maximize, Minus, Network, Plus, Shield } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { isRoundFolder, NetEvent, Pos, setLayout, ShieldView } from "./api";
+import { useCatalog } from "./network";
 import type { Run } from "./App";
 import { BoundaryData, ItemData, Jump, MapNode, mapLayout } from "./mapLayout";
 
@@ -113,6 +114,7 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   const container = useRef<HTMLDivElement>(null);
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
+  const catalog = useCatalog();
   // The layout that the last save sent, until the shield list has it.
   const [saved, setSaved] = useState<{ base: Record<string, Pos>; layout: Record<string, Pos> }>();
   const layout = saved?.base === shield.layout ? saved.layout : shield.layout;
@@ -130,8 +132,8 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   }, [latest]);
 
   const map = useMemo(
-    () => mapLayout({ ...shield, layout }, folders ?? [], events, now),
-    [shield, layout, folders, events, now],
+    () => mapLayout({ ...shield, layout }, folders ?? [], events, catalog, now),
+    [shield, layout, folders, events, catalog, now],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 
@@ -234,10 +236,10 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
         {map.hasSecrets && (
           <Panel position="bottom-right" className="map-legend">
             <p className="row">
-              <span className="map-badge key">key</span> gets a secret
-              <span className="map-node warn map-swatch" /> secret host that the network policy blocks
+              <span className="map-badge key">key</span> gets a credential
+              <span className="map-node warn map-swatch" /> login host that the rules block
             </p>
-            <p>Agent sees $MSB_…, the shield injects the real value.</p>
+            <p>The agent sees $MSB_…, the proxy adds the real value.</p>
           </Panel>
         )}
       </ReactFlow>

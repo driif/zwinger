@@ -4,7 +4,9 @@ mod commands;
 mod error;
 mod host_agents;
 mod netlog;
+mod network;
 mod preferences;
+mod proxy;
 mod runtime;
 mod runtimes;
 mod secrets;
@@ -31,6 +33,9 @@ use crate::secrets::Vault;
 use crate::sessions::Manager;
 
 pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
+/// The open files that the app asks for. Each shield's proxy holds guest and
+/// upstream connections; the default soft limit of macOS is 256.
+const OPEN_FILES: libc::rlim_t = 8192;
 pub(crate) const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
 
 /// Has no Close Window item, so ⌘W reaches the webview and closes a session.
@@ -125,6 +130,25 @@ fn boot<R: SandboxRuntime>(
     Ok(manager)
 }
 
+/// Raises the soft limit of open files to [`OPEN_FILES`], or to the hard
+/// limit if it is lower. Returns the soft limit after the change.
+fn raise_open_files() -> std::io::Result<libc::rlim_t> {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes the struct that it gets.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let wanted = OPEN_FILES.min(limit.rlim_max);
+    if limit.rlim_cur < wanted {
+        limit.rlim_cur = wanted;
+        // SAFETY: setrlimit reads the struct that it gets.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(limit.rlim_cur)
+}
+
 /// Sends the manager's events to the UI.
 fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     // One app-wide event, so the rail and the map update while the
@@ -132,22 +156,6 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     let handle = app.clone();
     manager.set_net_sink(Box::new(move |shield_id, event| {
         let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
-    }));
-    // A host login is due: the UI shows the notice or 'Restart to
-    // renew', and the manager restarts the shield if the Mac has a
-    // newer login and the user turned that on. The renewal ends with
-    // the VM.
-    let handle = app.clone();
-    manager.set_renew_sink(Box::new(move |shield_id| {
-        let _ = handle.emit("renew-due", shield_id);
-        let (handle, shield_id) = (handle.clone(), shield_id.to_owned());
-        tauri::async_runtime::spawn(async move {
-            let manager = handle.state::<Manager<Microsandbox>>();
-            if let Err(e) = manager.renew(&shield_id).await {
-                eprintln!("renewal of {shield_id} failed: {e}");
-            }
-            let _ = handle.emit("renew-due", shield_id);
-        });
     }));
     let handle = app.clone();
     manager.set_guest_sink(Box::new(move |shield_id| {
@@ -164,6 +172,9 @@ pub fn run() {
         .menu(menu)
         .setup(|app| {
             report_panics(app.handle().clone());
+            if let Err(e) = raise_open_files() {
+                eprintln!("the open file limit could not be raised: {e}");
+            }
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
             // Canonical, like the host paths of the shields it is compared with.
@@ -255,15 +266,15 @@ pub fn run() {
             commands::add_mount,
             commands::remove_mount,
             commands::set_mount_readonly,
-            commands::set_network_mode,
-            commands::add_domain,
-            commands::remove_domain,
-            commands::allow_host,
+            commands::network_catalog,
+            commands::set_network_default,
+            commands::set_offline,
+            commands::put_rule,
+            commands::remove_rule,
+            commands::set_rule_credential,
+            commands::test_network,
             commands::wildcard_for,
             commands::list_net_events,
-            commands::put_secret,
-            commands::remove_secret,
-            commands::list_secrets,
             commands::start_shield,
             commands::stop_shield,
             commands::open_session,
@@ -279,7 +290,6 @@ pub fn run() {
             commands::put_host_agent,
             commands::remove_host_agent,
             commands::set_agents_unprompted,
-            commands::set_auto_renew,
             commands::put_task,
             commands::remove_task,
             commands::start_task_run,
@@ -363,6 +373,15 @@ mod tests {
             ["zwinger stopped the VMs that the last run left running: proj, zwinger-gone."]
         );
         assert!(manager.take_app_notices().is_empty());
+    }
+
+    #[test]
+    fn the_open_file_limit_is_raised() {
+        let soft = raise_open_files().unwrap();
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        assert_eq!(limit.rlim_cur, soft);
+        assert!(soft >= OPEN_FILES.min(limit.rlim_max));
     }
 
     #[test]

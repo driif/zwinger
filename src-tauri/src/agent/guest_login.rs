@@ -12,7 +12,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use serde_json::Value;
 
 use super::AgentKind;
-use crate::host_agents::{self, KINDS};
+use crate::host_agents::{self, KINDS, login};
 
 /// A login file over this size is not read.
 const FILE_LIMIT: u64 = 1 << 20;
@@ -59,7 +59,10 @@ fn is_login(kind: AgentKind, doc: &Value) -> bool {
         AgentKind::Claude => is_token(&doc["claudeAiOauth"]["accessToken"]),
         AgentKind::Codex => is_token(&doc["tokens"]["access_token"]) || is_token(&doc["OPENAI_API_KEY"]),
         AgentKind::Pi => doc.as_object().is_some_and(|providers| providers.values().any(|p| is_token(&p["access"]))),
-        AgentKind::Gemini => is_token(&doc["access_token"]) || is_token(&doc["refresh_token"]),
+        AgentKind::Gemini => {
+            is_token(&doc["access_token"])
+                || (is_token(&doc["refresh_token"]) && doc["refresh_token"] != login::INERT_REFRESH)
+        }
     }
 }
 

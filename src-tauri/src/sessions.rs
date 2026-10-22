@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore, watch};
@@ -13,15 +13,18 @@ use tokio::time::Instant;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
 use crate::error::{Error, Result};
-use crate::host_agents::login::{self, Step};
+use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
-use crate::netlog::{self, Dedupe, NetEvent};
-use crate::runtime::{
-    Bind, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind, sandbox_policy, secret_entries,
-};
+use crate::netlog::{self, Dedupe};
+use crate::network::{self, Action, Credential, DefaultAction, Inject, NetworkPolicy, RuleDraft, Target};
+use crate::proxy::ca::{self, Ca};
+use crate::proxy::inject::Login;
+use crate::proxy::log::Entry;
+use crate::proxy::{self, Live, Proxy};
+use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
-use crate::secrets::{self, Origin, Places, Secret, SecretValue, Vault};
-use crate::shield::{self, AppDraft, HostAgentUse, NetworkMode, NetworkPolicy, Pos, Shield, TaskDraft, WORKSPACE};
+use crate::secrets::{self, SecretValue, Vault};
+use crate::shield::{self, AppDraft, HostAgentUse, Pos, Shield, TaskDraft, WORKSPACE};
 use crate::store::Store;
 use crate::task_agents::Exec;
 use crate::task_artifacts::{self, Mirror, RoundWriter};
@@ -32,8 +35,8 @@ const NODE_LIMIT: Duration = Duration::from_secs(15);
 const NODE_OUT: usize = 1 << 10;
 /// How long a stopped app has to exit before its restart fails.
 const CLOSE_LIMIT: Duration = Duration::from_secs(5);
-/// The network events kept per shield.
-const NET_RING: usize = 500;
+/// The network log entries kept per shield.
+const NET_RING: usize = 2000;
 /// The output bytes kept per session, for a view that attaches later.
 const RING: usize = 1 << 20;
 /// A frame takes the queued output up to this many bytes, or for at most
@@ -59,18 +62,17 @@ const PROBE_LIMIT: Duration = Duration::from_secs(15);
 const TUI_PROBE: Duration = Duration::from_secs(4);
 /// The bytes of a probe's stderr that a notice shows.
 const PROBE_ERR: usize = 512;
-/// The first and the longest wait before a due host login is checked again.
-const RENEW_RETRY: Duration = Duration::from_secs(60);
-const RENEW_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
+/// How long the network test may run in the guest.
+const NET_TEST_LIMIT: Duration = Duration::from_secs(25);
+/// The bytes of the network test output that are read.
+const NET_TEST_OUT: usize = 8 << 10;
 /// The shields that `stop_all` stops at once.
 const STOP_PARALLEL: usize = 4;
 /// How often a running shield looks for agent logins that were made in the guest.
 const GUEST_LOGIN_POLL: Duration = Duration::from_secs(10);
 
-/// Gets each new network event with its shield id.
-pub type NetSink = Box<dyn Fn(&str, &NetEvent) + Send + Sync>;
-/// Gets the id of a shield whose host login is due for renewal.
-pub type RenewSink = Box<dyn Fn(&str) + Send + Sync>;
+/// Gets each new network log entry with its shield id.
+pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
 /// Gets the id of a shield whose guest logins changed.
 pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -83,6 +85,8 @@ pub struct Manager<R: SandboxRuntime> {
     /// wrappers of each shield.
     data: PathBuf,
     vault: Arc<dyn Vault>,
+    /// The zwinger CA, loaded at the first start.
+    ca: tokio::sync::OnceCell<Arc<Ca>>,
     /// Serializes the secret edits, so that a rollback cannot undo a later edit.
     /// The state lock is not held during vault calls.
     secret_edit: Mutex<()>,
@@ -98,7 +102,6 @@ pub struct Manager<R: SandboxRuntime> {
     /// The stage limits of new task runs.
     run_config: task_runs::Config,
     host: Arc<HostAgents>,
-    renew_sink: Arc<OnceLock<RenewSink>>,
     guest_sink: Arc<OnceLock<GuestSink>>,
     app_notices: Mutex<Vec<String>>,
 }
@@ -107,12 +110,12 @@ struct State<V> {
     shields: Vec<Shield>,
     vms: HashMap<String, Vm<V>>,
     sessions: Vec<Session>,
-    /// Per shield, counts the secret value changes. The config does not hold
-    /// the values, so a running VM compares this count instead.
-    secrets_rev: HashMap<String, u64>,
-    /// Per shield, the last network events. They stay after a stop, so the
-    /// user can still allow a blocked host.
-    net: HashMap<String, VecDeque<NetEvent>>,
+    /// Per shield that starts or runs, the policy and the credential values
+    /// of its proxy. An edit changes them at once.
+    live: HashMap<String, Arc<Live>>,
+    /// Per shield, the last network log entries. They stay after a stop, so
+    /// the user can still allow a blocked host.
+    net: HashMap<String, VecDeque<Entry>>,
     /// Per shield and app, counts the app stops. A start that saw an older
     /// count was stopped while its process opened.
     app_stops: HashMap<(String, String), u64>,
@@ -121,15 +124,14 @@ struct State<V> {
 enum Vm<V> {
     Starting,
     /// `applied` is the config the VM booted with; it differs from the stored
-    /// config after an edit, until the next start. `applied_rev` is the
-    /// `secrets_rev` that the start read before it read the values.
-    /// `net` follows the VM's network events. It is `None` if the runtime
-    /// log could not be opened. `runtimes` are the agent runtimes that the
-    /// start mounted.
+    /// config after an edit, until the next start. `proxy` is the shield's
+    /// proxy; a drop stops it. `net` follows the VM's network events. It is
+    /// `None` if the runtime log could not be opened. `runtimes` are the
+    /// agent runtimes that the start mounted.
     Running {
         vm: Arc<V>,
         applied: Box<Shield>,
-        applied_rev: u64,
+        proxy: Arc<Proxy>,
         net: Option<AbortHandle>,
         runtimes: Vec<&'static str>,
         host: Box<HostRun>,
@@ -146,15 +148,8 @@ struct HostRun {
     pi_host: bool,
     /// The guest path of Gemini CLI's entry point, if it runs in the VM.
     gemini: Option<String>,
-    /// The expiry of each host login at the start, in ms since the epoch.
-    /// A login with no expiry is not here: it is not renewed.
-    logins: Vec<(AgentKind, i64)>,
-    /// The earliest expiry of the host logins, in ms since the epoch.
-    login_expires: Option<i64>,
-    /// The renewal of each login in `logins`. A stop aborts them.
-    renew: Vec<AbortHandle>,
-    /// The Mac has a newer host login: a restart uses it.
-    renew_due: bool,
+    /// The URL of the shield's proxy.
+    proxy: Option<String>,
     /// What the user should know, such as a fallback.
     notices: Vec<String>,
     /// The host agents that do not run in the VM, with the reason.
@@ -167,7 +162,7 @@ struct HostRun {
 
 impl HostRun {
     fn found(&self) -> launch::Found<'_> {
-        launch::Found { pi_host: self.pi_host, gemini: self.gemini.as_deref() }
+        launch::Found { pi_host: self.pi_host, gemini: self.gemini.as_deref(), proxy: self.proxy.as_deref() }
     }
 }
 
@@ -387,28 +382,34 @@ pub struct ShieldView {
     /// The agent runtimes that the running VM has mounted. A host Gemini CLI
     /// that loads counts as one.
     pub runtimes: Vec<&'static str>,
-    /// The earliest expiry of the host logins of the running VM, in ms.
+    /// The earliest expiry of the host logins that the proxy of the running
+    /// VM has now, in ms. The proxy reads a newer login when it is due.
     pub login_expires_at: Option<i64>,
-    /// A host login is due for renewal: a restart reads the new token.
-    pub renew_due: bool,
     /// What the start of the running VM did differently for the host
     /// agents, such as a fallback.
     pub host_notices: Vec<String>,
     /// The agents of the running VM with a login that was made in the
     /// guest: the agent can read its real token.
     pub guest_logins: Vec<AgentKind>,
+    /// The hosts that the shield's agents need, with the proxy's decision.
+    pub agent_needs: Vec<network::AgentNeed>,
 }
 
-/// A secret as the UI sees it. It has no value, only if the vault has one.
-#[derive(Debug, Serialize)]
+/// One stage of the network test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SecretView {
-    pub name: String,
-    pub hosts: Vec<String>,
-    pub places: Places,
-    pub placeholder: String,
-    pub set: bool,
-    pub origin: Origin,
+pub struct NetStage {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// The network test: the shield reaches its proxy, then the host through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetTest {
+    pub proxy: NetStage,
+    /// `None` if the first stage failed.
+    pub target: Option<NetStage>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -446,13 +447,11 @@ fn prune_vault(vault: &dyn Vault, shields: &[Shield]) {
         Err(e) => return eprintln!("secret prune: cannot list the vault: {e}"),
     };
     // A host login has no value in the vault, so its account is not kept.
-    let configured: HashSet<String> = shields
+    let mut configured: HashSet<String> = shields
         .iter()
-        .flat_map(|shield| {
-            let user = shield.secrets.iter().filter(|s| s.origin.is_user());
-            user.map(|s| secrets::account(&shield.id, &s.name))
-        })
+        .flat_map(|shield| shield.network.credentials().into_iter().map(|c| secrets::account(&shield.id, &c.name)))
         .collect();
+    configured.insert(secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1));
     for account in accounts.iter().filter(|a| !configured.contains(*a)) {
         let Some((shield_id, name)) = account.split_once('/') else {
             continue;
@@ -468,30 +467,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<V> State<V> {
-    /// An agent session or an app runs in the shield. The task runs are in
-    /// the run registry.
-    fn is_busy(&self, id: &str) -> bool {
-        self.sessions.iter().any(|s| {
-            s.shield_id == id
-                && s.exit_code.is_none()
-                && (s.app.is_some() || matches!(s.kind, SessionKind::Agent { .. }))
-        })
-    }
-
-    fn secrets_rev(&self, id: &str) -> u64 {
-        self.secrets_rev.get(id).copied().unwrap_or(0)
-    }
-
-    fn bump_secrets_rev(&mut self, id: &str) {
-        *self.secrets_rev.entry(id.to_owned()).or_default() += 1;
-    }
-
     fn shield_mut(&mut self, id: &str) -> Result<&mut Shield> {
         self.shields.iter_mut().find(|s| s.id == id).ok_or(Error::ShieldNotFound)
     }
 
-    /// Numbers the event and adds it to the shield's ring.
-    fn push_net(&mut self, id: &str, mut event: NetEvent) -> NetEvent {
+    /// Numbers the entry and adds it to the shield's ring.
+    fn push_net(&mut self, id: &str, mut event: Entry) -> Entry {
         let ring = self.net.entry(id.to_owned()).or_default();
         event.seq = ring.back().map_or(1, |last| last.seq + 1);
         if ring.len() == NET_RING {
@@ -520,13 +501,14 @@ impl<R: SandboxRuntime> Manager<R> {
             store,
             data,
             vault,
+            ca: tokio::sync::OnceCell::new(),
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
             state: Arc::new(Mutex::new(State {
                 shields,
                 vms: HashMap::new(),
                 sessions: Vec::new(),
-                secrets_rev: HashMap::new(),
+                live: HashMap::new(),
                 net: HashMap::new(),
                 app_stops: HashMap::new(),
             })),
@@ -535,7 +517,6 @@ impl<R: SandboxRuntime> Manager<R> {
             run_start: Mutex::new(()),
             run_config: task_runs::Config::default(),
             host,
-            renew_sink: Arc::new(OnceLock::new()),
             guest_sink: Arc::new(OnceLock::new()),
             app_notices: Mutex::default(),
         })
@@ -547,16 +528,11 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Only the first sink counts.
-    pub fn set_renew_sink(&self, sink: RenewSink) {
-        let _ = self.renew_sink.set(sink);
-    }
-
-    /// Only the first sink counts.
     pub fn set_guest_sink(&self, sink: GuestSink) {
         let _ = self.guest_sink.set(sink);
     }
 
-    pub fn list_net_events(&self, id: &str) -> Result<Vec<NetEvent>> {
+    pub fn list_net_events(&self, id: &str) -> Result<Vec<Entry>> {
         let mut state = lock(&self.state);
         state.shield_mut(id)?;
         Ok(state.net.get(id).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
@@ -571,9 +547,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 let (status, pending_restart) = match state.vms.get(&shield.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting) => (Status::Starting, false),
-                    // A new name, layout, app list or terminal list is used
-                    // at once, so it needs no restart.
-                    Some(Vm::Running { applied, applied_rev, .. }) => (
+                    // A new name, layout, app list, terminal list or network
+                    // rule is used at once, so it needs no restart. A new
+                    // credential name needs its placeholder in the guest env.
+                    Some(Vm::Running { applied, .. }) => (
                         Status::Running,
                         Shield {
                             name: shield.name.clone(),
@@ -581,28 +558,24 @@ impl<R: SandboxRuntime> Manager<R> {
                             apps: shield.apps.clone(),
                             tasks: shield.tasks.clone(),
                             terminals: shield.terminals.clone(),
-                            auto_renew: shield.auto_renew,
                             agents_unprompted: shield.agents_unprompted,
+                            network: shield.network.clone(),
                             ..(**applied).clone()
                         } != *shield
-                            || *applied_rev != state.secrets_rev(&shield.id),
+                            || placeholders(&applied.network) != placeholders(&shield.network),
                     ),
                     Some(Vm::Stopping) => (Status::Stopping, false),
                     Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
                 };
                 let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
-                let (runtimes, login_expires_at, renew_due, host_notices, guest_logins) =
-                    match state.vms.get(&shield.id) {
-                        Some(Vm::Running { runtimes, host, .. }) => (
-                            runtimes.clone(),
-                            host.login_expires,
-                            host.renew_due,
-                            host.notices.clone(),
-                            host.guest_logins.clone(),
-                        ),
-                        _ => (Vec::new(), None, false, Vec::new(), Vec::new()),
-                    };
+                let (runtimes, login_expires_at, host_notices, guest_logins) = match state.vms.get(&shield.id) {
+                    Some(Vm::Running { runtimes, host, proxy, .. }) => {
+                        (runtimes.clone(), proxy.login_expires(), host.notices.clone(), host.guest_logins.clone())
+                    }
+                    _ => (Vec::new(), None, Vec::new(), Vec::new()),
+                };
                 ShieldView {
+                    agent_needs: network::agent_needs(shield),
                     shield: shield.clone(),
                     status,
                     pending_restart,
@@ -627,7 +600,6 @@ impl<R: SandboxRuntime> Manager<R> {
                         .collect(),
                     runtimes,
                     login_expires_at,
-                    renew_due,
                     host_notices,
                     guest_logins,
                 }
@@ -750,98 +722,189 @@ impl<R: SandboxRuntime> Manager<R> {
         shield::list_folders(&folder)
     }
 
-    pub fn set_network_mode(&self, id: &str, mode: NetworkMode) -> Result<()> {
+    /// Applies `edit` to the network policy and saves it. A running proxy
+    /// uses the new policy from its next request.
+    fn edit_network<T>(&self, id: &str, edit: impl FnOnce(&mut NetworkPolicy) -> Result<T>) -> Result<T> {
+        let mut out = None;
         self.edit(id, |s| {
-            s.network.mode = mode;
+            out = Some(edit(&mut s.network)?);
             Ok(())
-        })
+        })?;
+        self.publish(id, None);
+        Ok(out.expect("the edit ran"))
     }
 
-    /// The domain must also be valid for the sandbox, so that a later start
-    /// in List mode cannot fail on it.
-    pub fn add_domain(&self, id: &str, domain: &str) -> Result<()> {
-        self.edit(id, |s| {
-            s.network.add_domain(domain)?;
-            sandbox_policy(&NetworkPolicy { mode: NetworkMode::List, domains: s.network.domains.clone() }, &[])?;
-            Ok(())
-        })
-    }
-
-    /// Allows a blocked host in one edit. A shield in Deny mode changes to
-    /// List mode, else the host would stay blocked.
-    pub fn allow_host(&self, id: &str, host: &str) -> Result<()> {
-        self.edit(id, |s| {
-            if s.network.mode == NetworkMode::Deny {
-                s.network.mode = NetworkMode::List;
-            }
-            s.network.add_domain(host)?;
-            sandbox_policy(&NetworkPolicy { mode: NetworkMode::List, domains: s.network.domains.clone() }, &[])?;
-            Ok(())
-        })
-    }
-
-    pub fn remove_domain(&self, id: &str, domain: &str) -> Result<()> {
-        self.edit(id, |s| {
-            s.network.remove_domain(domain);
-            Ok(())
-        })
-    }
-
-    /// Adds or replaces the secret. A new secret needs a value; `None` keeps
-    /// the current value. The vault is written before the config, and a failed
-    /// config save restores the vault.
-    pub fn put_secret(&self, id: &str, secret: Secret, value: Option<SecretValue>) -> Result<()> {
-        if !secret.origin.is_user() {
-            return Err(Error::HostLoginSecret(secret.name));
+    /// Sends the stored policy to the shield's proxy, if it has one, in one
+    /// step with the new `value` of a credential.
+    fn publish(&self, id: &str, value: Option<(&str, SecretValue)>) {
+        let state = lock(&self.state);
+        if let Some(live) = state.live.get(id)
+            && let Some(shield) = state.shields.iter().find(|s| s.id == id)
+        {
+            live.edit(|policy, values| {
+                *policy = shield.network.clone();
+                if let Some((name, value)) = value {
+                    values.insert(name.to_owned(), value);
+                }
+            });
         }
-        let secret = secret.normalize()?;
-        if value.as_ref().is_some_and(|v| v.expose().is_empty()) {
-            return Err(Error::SecretValueRequired(secret.name));
-        }
+    }
+
+    pub fn set_network_default(&self, id: &str, default: DefaultAction) -> Result<()> {
+        self.edit_network(id, |n| {
+            n.default = default;
+            Ok(())
+        })
+    }
+
+    pub fn set_offline(&self, id: &str, offline: bool) -> Result<()> {
+        self.edit_network(id, |n| {
+            n.offline = offline;
+            Ok(())
+        })
+    }
+
+    /// Adds or changes a rule. Returns its id.
+    pub fn put_rule(&self, id: &str, draft: RuleDraft) -> Result<String> {
+        self.edit_network(id, |n| n.put_rule(draft))
+    }
+
+    /// Saves the config first, then deletes the values that no other rule
+    /// uses, so that a failure leaves a value with no credential.
+    pub fn remove_rule(&self, id: &str, rule_id: &str) -> Result<()> {
         let _edit = lock(&self.secret_edit);
-        self.settle(id, &secret.name)?;
+        let removed = self.edit_network(id, |n| n.remove_rule(rule_id))?;
+        self.drop_unused(id, removed.credentials.iter().map(|c| c.name.as_str()))
+    }
+
+    /// Deletes the values of `names` that no credential of the shield uses.
+    fn drop_unused<'a>(&self, id: &str, names: impl Iterator<Item = &'a str>) -> Result<()> {
+        let (used, live) = {
+            let mut state = lock(&self.state);
+            let used: Vec<String> =
+                state.shield_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
+            (used, state.live.get(id).cloned())
+        };
+        let mut result = Ok(());
+        for name in names.filter(|n| !used.iter().any(|u| u == n)) {
+            if let Some(live) = &live {
+                live.set_value(name, None);
+            }
+            match self.vault.delete(id, name) {
+                Ok(()) => {
+                    lock(&self.unsettled).remove(&secrets::account(id, name));
+                }
+                Err(e) => result = Err(e),
+            }
+        }
+        result
+    }
+
+    /// Adds, changes or (with `inject` `None`) removes the credential `name`
+    /// of the rule. A new name needs a value; `None` keeps the current value.
+    /// The vault is written before the config, and a failed config save
+    /// restores the vault. A running proxy uses the value from its next request.
+    pub fn set_rule_credential(
+        &self,
+        id: &str,
+        rule_id: &str,
+        name: &str,
+        inject: Option<Inject>,
+        value: Option<SecretValue>,
+    ) -> Result<()> {
+        let Some(inject) = inject else {
+            let _edit = lock(&self.secret_edit);
+            if self.vault.is_pending(id, name) {
+                return Err(Error::SecretPending(name.to_owned()));
+            }
+            self.edit_network(id, |n| {
+                let rule = n.rule_mut(rule_id)?;
+                let before = rule.credentials.len();
+                rule.credentials.retain(|c| c.name != name);
+                if rule.credentials.len() == before {
+                    return Err(Error::SecretNotFound(name.to_owned()));
+                }
+                Ok(())
+            })?;
+            return self.drop_unused(id, std::iter::once(name));
+        };
+        let credential = Credential { name: name.to_owned(), inject }.normalize()?;
+        let name = credential.name.clone();
+        if value.as_ref().is_some_and(|v| v.expose().is_empty()) {
+            return Err(Error::SecretValueRequired(name));
+        }
+        let put = |n: &mut NetworkPolicy| -> Result<()> {
+            let rule = n.rule_mut(rule_id)?;
+            match rule.credentials.iter_mut().find(|c| c.name == credential.name) {
+                Some(current) => *current = credential.clone(),
+                None => rule.credentials.push(credential.clone()),
+            }
+            Ok(())
+        };
+        let _edit = lock(&self.secret_edit);
+        self.settle(id, &name)?;
         let is_new = {
             let state = lock(&self.state);
             let mut shield = state.shields.iter().find(|s| s.id == id).ok_or(Error::ShieldNotFound)?.clone();
-            if shield.secrets.iter().any(|s| s.name == secret.name && !s.origin.is_user()) {
-                return Err(Error::HostLoginSecret(secret.name));
-            }
-            let is_new = shield.put_secret(secret.clone());
+            let is_new = !shield.network.credentials().iter().any(|c| c.name == name);
+            put(&mut shield.network)?;
             shield.check()?;
             is_new
         };
         let Some(value) = value else {
             if is_new {
-                return Err(Error::SecretValueRequired(secret.name));
+                return Err(Error::SecretValueRequired(name));
             }
-            return self.edit(id, |s| {
-                s.put_secret(secret);
-                Ok(())
-            });
+            return self.edit_network(id, put);
         };
 
-        let prior = self.vault.get(id, &secret.name)?;
-        // After each write: a start that reads the count first and then the
-        // vault either reads the new value, or later sees a changed count.
-        let written = self.vault.set(id, &secret.name, &value);
-        lock(&self.state).bump_secrets_rev(id);
-        if let Err(e) = written {
+        let prior = self.vault.get(id, &name)?;
+        if let Err(e) = self.vault.set(id, &name, &value) {
             // The late write still runs; the restore runs after it.
             if matches!(e, Error::KeychainTimeout) {
-                self.restore_value(id, &secret.name, prior.as_ref());
+                self.restore_value(id, &name, prior.as_ref());
             }
             return Err(e);
         }
-        let name = secret.name.clone();
-        let saved = self.edit(id, |s| {
-            s.put_secret(secret);
-            Ok(())
-        });
-        if let Err(e) = saved {
+        if let Err(e) = self.edit(id, |s| put(&mut s.network)) {
             self.restore_value(id, &name, prior.as_ref());
             return Err(e);
         }
+        // A request must not see the new rule with the old value.
+        self.publish(id, Some((&name, value)));
         Ok(())
+    }
+
+    /// Tests the network from inside the running shield: first a TCP connect
+    /// to the proxy, then a request to `host` through it.
+    pub async fn test_network(&self, id: &str, host: &str) -> Result<NetTest> {
+        let host = shield::domain(host)?;
+        if host.starts_with("*.") {
+            return Err(Error::InvalidDomain(host, "test one host, not a wildcard".into()));
+        }
+        let vm = match lock(&self.state).vms.get(id) {
+            Some(Vm::Running { vm, .. }) => vm.clone(),
+            _ => return Err(Error::NotRunning),
+        };
+        let argv = ["node", "-e", NET_TEST, host.as_str()].map(str::to_owned);
+        let mut pipe = self.runtime.open_pipe(&vm, &argv, WORKSPACE).await?;
+        let mut out = Vec::new();
+        let read = async {
+            while let Some(event) = pipe.events.recv().await {
+                match event {
+                    PipeEvent::Stdout(bytes) => {
+                        let room = NET_TEST_OUT.saturating_sub(out.len());
+                        out.extend(bytes.into_iter().take(room));
+                    }
+                    PipeEvent::Stderr(_) => {}
+                    PipeEvent::Exit(_) => break,
+                }
+            }
+        };
+        if tokio::time::timeout(NET_TEST_LIMIT, read).await.is_err() {
+            let _ = pipe.input.try_send(PipeInput::Kill);
+        }
+        Ok(net_test(&String::from_utf8_lossy(&out)))
     }
 
     /// Puts the prior value back after a failed edit. The old hosts must
@@ -861,7 +924,6 @@ impl<R: SandboxRuntime> Manager<R> {
         if restored.is_err() {
             lock(&self.unsettled).insert(secrets::account(id, name), prior.cloned());
         }
-        lock(&self.state).bump_secrets_rev(id);
     }
 
     /// Fails while a write of the account still runs, or while the vault may
@@ -888,14 +950,13 @@ impl<R: SandboxRuntime> Manager<R> {
             return Err(Error::SecretPending(name.to_owned()));
         }
         lock(&self.unsettled).remove(&account);
-        lock(&self.state).bump_secrets_rev(id);
         Ok(())
     }
 
     /// Adds the host agent to the shield, or changes it: its runtime, and
     /// its profile and host login if `used` asks for them. A login adds the
-    /// agent's host-login secret; `allow_hosts` also adds its provider host to
-    /// the allow list, which the user confirmed. Applies on the next start.
+    /// agent's host-login secret; `allow_hosts` also adds an Allow rule for
+    /// its provider host, which the user confirmed. Applies on the next start.
     pub async fn put_host_agent(&self, id: &str, used: HostAgentUse, allow_hosts: bool) -> Result<()> {
         let kind = used.kind;
         let host = self.host.clone();
@@ -912,25 +973,25 @@ impl<R: SandboxRuntime> Manager<R> {
                 Some(login::secret(kind, &token.host))
             }
         };
-        let login = login.map(Secret::normalize).transpose()?;
+        let login = login.map(crate::secrets::Secret::normalize).transpose()?;
         let _edit = lock(&self.secret_edit);
         self.edit(id, |s| {
-            if let Some(secret) = &login {
-                if s.secrets.iter().any(|x| x.name == secret.name && x.origin.is_user()) {
-                    return Err(Error::DuplicateSecret(secret.name.clone()));
-                }
-                if allow_hosts {
-                    if s.network.mode == NetworkMode::Deny {
-                        s.network.mode = NetworkMode::List;
-                    }
-                    for host in &secret.hosts {
-                        s.network.add_domain(host)?;
+            if let Some(secret) = &login
+                && allow_hosts
+            {
+                for host in &secret.hosts {
+                    if !s.network.rules.iter().any(|r| r.action == Action::Allow && r.matches(host)) {
+                        let target = Target::Host { host: host.to_string() };
+                        s.network.put_rule(RuleDraft { id: None, target, action: Action::Allow })?;
                     }
                 }
             }
             s.put_host_agent(used, login);
             Ok(())
-        })
+        })?;
+        drop(_edit);
+        self.publish(id, None);
+        Ok(())
     }
 
     /// Also removes its host-login secret. Applies on the next start.
@@ -957,50 +1018,6 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Needs no restart.
-    pub fn set_auto_renew(&self, id: &str, on: bool) -> Result<()> {
-        self.edit(id, |s| {
-            s.auto_renew = on;
-            Ok(())
-        })
-    }
-
-    /// Saves the config first, so that a failure leaves a value with no
-    /// secret, not a secret with no value.
-    pub fn remove_secret(&self, id: &str, name: &str) -> Result<()> {
-        let _edit = lock(&self.secret_edit);
-        if self.vault.is_pending(id, name) {
-            return Err(Error::SecretPending(name.to_owned()));
-        }
-        // A removed secret needs no settled value: the delete below removes it.
-        self.edit(id, |s| {
-            if s.secrets.iter().any(|x| x.name == name && !x.origin.is_user()) {
-                return Err(Error::HostLoginSecret(name.to_owned()));
-            }
-            s.remove_secret(name)
-        })?;
-        lock(&self.state).bump_secrets_rev(id);
-        self.vault.delete(id, name)?;
-        lock(&self.unsettled).remove(&secrets::account(id, name));
-        Ok(())
-    }
-
-    pub fn list_secrets(&self, id: &str) -> Result<Vec<SecretView>> {
-        let secrets = lock(&self.state).shield_mut(id)?.secrets.clone();
-        let accounts: HashSet<String> = self.vault.accounts()?.into_iter().collect();
-        Ok(secrets
-            .into_iter()
-            .map(|secret| SecretView {
-                set: !secret.origin.is_user() || accounts.contains(&secrets::account(id, &secret.name)),
-                placeholder: secret.placeholder(),
-                name: secret.name,
-                hosts: secret.hosts,
-                places: secret.places,
-                origin: secret.origin,
-            })
-            .collect())
-    }
-
     /// Saves the config first, then deletes the secret values, the agent
     /// state, the wrappers and the old chats. The first error is returned after all deletes ran.
     pub async fn delete(&self, id: &str) -> Result<()> {
@@ -1009,9 +1026,10 @@ impl<R: SandboxRuntime> Manager<R> {
             e => Err(e),
         })?;
         let _edit = lock(&self.secret_edit);
-        let secrets = {
+        let names = {
             let mut state = lock(&self.state);
-            let secrets = state.shield_mut(id)?.secrets.clone();
+            let names: Vec<String> =
+                state.shield_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
             // A start can claim the shield between the stop above and this lock.
             match state.vms.get(id) {
                 Some(Vm::Starting) => return Err(Error::Starting),
@@ -1023,13 +1041,13 @@ impl<R: SandboxRuntime> Manager<R> {
             self.store.save(&shields)?;
             state.shields = shields;
             state.vms.remove(id);
-            state.secrets_rev.remove(id);
+            state.live.remove(id);
             state.net.remove(id);
-            secrets
+            names
         };
         let mut result = Ok(());
-        for secret in &secrets {
-            if let Err(e) = self.vault.delete(id, &secret.name)
+        for name in &names {
+            if let Err(e) = self.vault.delete(id, name)
                 && result.is_ok()
             {
                 result = Err(e);
@@ -1054,35 +1072,52 @@ impl<R: SandboxRuntime> Manager<R> {
         result
     }
 
-    /// The config snapshot and the vault reads hold `secret_edit`, so a start
-    /// never pairs a new value with old hosts. The lock is released before the
-    /// host logins are read (the Keychain can wait for the macOS prompt) and
-    /// before the runtime start.
+    /// The config snapshot, the vault reads and the registration of the
+    /// proxy's live values hold `secret_edit`, so a credential edit during
+    /// the start reaches the proxy. The lock is released before the host
+    /// logins are read (the Keychain can wait for the macOS prompt) and
+    /// before the runtime start. The proxy starts before the VM: if it
+    /// cannot start, the shield does not start.
     pub async fn start(&self, id: &str) -> Result<()> {
-        let (shield, applied_rev, values) = {
+        let (shield, live) = {
             let _edit = lock(&self.secret_edit);
-            let (shield, applied_rev) = self.claim_start(id)?;
+            let shield = self.claim_start(id)?;
             match self.vault_values(&shield) {
-                Ok(values) => (shield, applied_rev, values),
+                Ok(values) => {
+                    let live = Live::new(shield.network.clone(), values);
+                    lock(&self.state).live.insert(id.to_owned(), live.clone());
+                    (shield, live)
+                }
                 Err(e) => {
                     lock(&self.state).vms.remove(id);
                     return Err(e);
                 }
             }
         };
+        let fail = |e: Error| {
+            let mut state = lock(&self.state);
+            state.vms.remove(id);
+            state.live.remove(id);
+            Err(e)
+        };
         let prepared = {
             let (host, data, shield) = (self.host.clone(), self.data.clone(), shield.clone());
-            blocking(move || prepare(&host, &data, &shield, values)).await
+            blocking(move || prepare(&host, &data, &shield)).await
         };
-        let (entries, prepared) =
-            match prepared.and_then(|mut p| Ok((secret_entries(&shield.secrets, std::mem::take(&mut p.values))?, p))) {
-                Ok(ready) => ready,
-                Err(e) => {
-                    lock(&self.state).vms.remove(id);
-                    return Err(e);
-                }
-            };
-        let Prepared { binds, wanted, mut run, .. } = prepared;
+        let Prepared { mut binds, wanted, mut run, tokens } = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => return fail(e),
+        };
+        let proxy = match self.start_proxy(id, &shield, live, tokens).await {
+            Ok(proxy) => Arc::new(proxy),
+            Err(e) => return fail(e),
+        };
+        binds.push(Bind { guest: launch::CA_DIR.to_owned(), host: Ca::dir(&self.data) });
+        run.proxy = Some(proxy.url());
+        let mut env = launch::net_env(&proxy.url());
+        let names = shield.logins.iter().map(|l| l.name.clone());
+        env.extend(names.chain(placeholders(&shield.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
+        let net = GuestNet { port: proxy.port, env };
         let installed = runtimes::installed(&self.data, &wanted);
         for kind in [AgentKind::Claude, AgentKind::Codex] {
             let Some(version) = wanted.get(kind.name()) else {
@@ -1102,7 +1137,7 @@ impl<R: SandboxRuntime> Manager<R> {
         // The paths again right before and after the boot, which binds them: a
         // folder that was swapped meanwhile is refused.
         let result = match shield.verify_paths() {
-            Ok(()) => match self.runtime.start(&shield, entries, &self.state_dir(id), &installed, &binds).await {
+            Ok(()) => match self.runtime.start(&shield, &net, &self.state_dir(id), &installed, &binds).await {
                 Ok(vm) => {
                     let checked = match shield.verify_paths() {
                         Ok(()) => self.check_node(&vm).await,
@@ -1124,7 +1159,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
         if let Ok(vm) = &result {
             if run.pi_host
-                && let Err(e) = self.probe_tui(vm).await
+                && let Err(e) = self.probe_tui(vm, run.proxy.as_deref()).await
             {
                 run.pi_host = false;
                 run.notices.push(format!(
@@ -1151,12 +1186,9 @@ impl<R: SandboxRuntime> Manager<R> {
                     launch::BIN_DIR
                 ));
             }
-            // Only secrets turn on the interception, and with it the CA.
-            if !shield.secrets.is_empty()
-                && let Err(e) = self.probe(vm, &launch::trust_argv()).await
-            {
+            if let Err(e) = self.probe(vm, &launch::trust_argv()).await {
                 run.notices.push(format!(
-                    "Only Node trusts the secret proxy of this shield, so curl, git and Python fail TLS to the secret hosts: {e}."
+                    "Only Node trusts the network proxy of this shield, so curl, git and Python fail TLS: {e}."
                 ));
             }
         }
@@ -1182,25 +1214,17 @@ impl<R: SandboxRuntime> Manager<R> {
                         run.notices.push(format!("The agent commands could not be written: {e}"));
                     }
                     let vm = Arc::new(vm);
-                    run.renew =
-                        run.logins.iter().map(|&(kind, started)| self.watch_renewal(id, &vm, kind, started)).collect();
                     run.guest_watch = Some(self.watch_guest_logins(id, &vm));
                     state.vms.insert(
                         id.to_owned(),
-                        Vm::Running {
-                            vm,
-                            applied: Box::new(shield),
-                            applied_rev,
-                            net,
-                            runtimes: names,
-                            host: Box::new(run),
-                        },
+                        Vm::Running { vm, applied: Box::new(shield), proxy, net, runtimes: names, host: Box::new(run) },
                     );
                     let apps = state.shield_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
                     apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
                 }
                 Err(e) => {
                     state.vms.insert(id.to_owned(), Vm::Failed(e.message()));
+                    state.live.remove(id);
                     return Err(e);
                 }
             }
@@ -1215,77 +1239,44 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Renews one host login while the VM runs. When the login is due, it
-    /// reads the login on the Mac again and follows [`login::renew_step`]:
-    /// a newer login marks the VM and calls the renew sink, which restarts
-    /// the shield if that may happen; no newer login shows the notice to
-    /// open the agent on the Mac. It checks again on a backoff. It ends
-    /// with the VM: a stop aborts it, and a new VM ends it.
-    fn watch_renewal(&self, id: &str, vm: &Arc<R::Vm>, kind: AgentKind, started: i64) -> AbortHandle {
-        let (state, runs, host, sink) =
-            (self.state.clone(), self.runs.clone(), self.host.clone(), self.renew_sink.clone());
-        let (id, vm) = (id.to_owned(), vm.clone());
-        tokio::spawn(async move {
-            let mut retry = RENEW_RETRY;
-            loop {
-                let now = host.now_ms();
-                // The Keychain read can wait for the macOS prompt.
-                let current = if now < started - login::RENEW_BEFORE_MS {
-                    None
-                } else {
-                    let host = host.clone();
-                    tokio::task::spawn_blocking(move || host.token(kind)).await.ok().and_then(|t| t.ok()?.expires)
-                };
-                let (step, changed) = {
-                    let mut state = lock(&state);
-                    let auto = state.shields.iter().any(|s| s.id == id && s.auto_renew);
-                    let busy = state.is_busy(&id) || runs.has_live(&id);
-                    let Some(Vm::Running { vm: running, host: run, .. }) = state.vms.get_mut(&id) else {
-                        return;
-                    };
-                    if !Arc::ptr_eq(running, &vm) {
-                        return;
-                    }
-                    let step = login::renew_step(started, current, now, busy, auto);
-                    let label = kind.label();
-                    let notice = format!(
-                        "The {label} login expires soon and this Mac has no newer one. Open {label} on this Mac once to refresh it."
-                    );
-                    let changed = match step {
-                        Step::Wait(_) => false,
-                        Step::ExpiresSoon => {
-                            let new = !run.notices.contains(&notice);
-                            if new {
-                                run.notices.push(notice);
-                            }
-                            new
-                        }
-                        // The Mac has a newer login now: the notice is stale.
-                        Step::Restart | Step::Notify | Step::Retry => {
-                            let count = run.notices.len();
-                            run.notices.retain(|n| *n != notice);
-                            let removed = run.notices.len() != count;
-                            let due = std::mem::replace(&mut run.renew_due, true);
-                            step == Step::Restart || removed || !due
-                        }
-                    };
-                    (step, changed)
-                };
-                if changed && let Some(sink) = sink.get() {
-                    sink(&id);
+    /// The zwinger CA, loaded once. The Keychain read runs off the async workers.
+    async fn ca(&self) -> Result<Arc<Ca>> {
+        let ca = self
+            .ca
+            .get_or_try_init(|| {
+                let (vault, dir) = (self.vault.clone(), Ca::dir(&self.data));
+                blocking(move || Ok(Arc::new(Ca::load(vault.as_ref(), &dir)?)))
+            })
+            .await?;
+        Ok(ca.clone())
+    }
+
+    /// Starts the shield's proxy. Its log entries go to the shield's ring and the sink.
+    async fn start_proxy(&self, id: &str, shield: &Shield, live: Arc<Live>, tokens: Vec<HostToken>) -> Result<Proxy> {
+        let ca = self.ca().await?;
+        let logins = shield
+            .logins
+            .iter()
+            .zip(tokens)
+            .map(|(secret, token)| {
+                Arc::new(Login::new(secret.name.clone(), secret.hosts.clone(), token, self.host.clone()))
+            })
+            .collect();
+        let (state, sink, id) = (self.state.clone(), self.net_sink.clone(), id.to_owned());
+        let config = proxy::Config {
+            ca,
+            live,
+            logins,
+            refresh: login::denied_hosts(&shield.logins),
+            sink: Arc::new(move |entry| {
+                let entry = lock(&state).push_net(&id, entry);
+                if let Some(sink) = sink.get() {
+                    sink(&id, &entry);
                 }
-                let wait = match step {
-                    Step::Wait(wait) => wait,
-                    _ => {
-                        let wait = retry;
-                        retry = (retry * 2).min(RENEW_RETRY_MAX);
-                        wait
-                    }
-                };
-                tokio::time::sleep(wait).await;
-            }
-        })
-        .abort_handle()
+            }),
+            resolver: Arc::new(proxy::dial::System),
+        };
+        Proxy::start(config).await.map_err(|e| Error::Proxy(e.to_string()))
     }
 
     /// Looks for guest logins every `GUEST_LOGIN_POLL` while the VM runs, and
@@ -1330,25 +1321,8 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// The Mac has a newer host login for the shield: restarts the shield if
-    /// the user turned that on and no agent turn, app or task run works in
-    /// it. A new host token applies only to a new VM.
-    pub async fn renew(&self, id: &str) -> Result<()> {
-        {
-            let state = lock(&self.state);
-            let shield = state.shields.iter().find(|s| s.id == id).ok_or(Error::ShieldNotFound)?;
-            if !matches!(state.vms.get(id), Some(Vm::Running { host, .. }) if host.renew_due) {
-                return Ok(());
-            }
-            if !shield.auto_renew || state.is_busy(id) || self.runs.has_live(id) {
-                return Ok(());
-            }
-        }
-        self.stop(id).await?;
-        self.start(id).await
-    }
-
-    /// Turns the runtime log lines into the shield's events.
+    /// Turns the runtime log lines into the shield's log: the direct
+    /// connections that the VM blocked, because a tool ignores the proxy.
     fn follow_net(&self, id: &str, mut lines: Receiver<String>) -> AbortHandle {
         let state = self.state.clone();
         let sink = self.net_sink.clone();
@@ -1359,10 +1333,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 let Some(event) = netlog::parse(&line) else {
                     continue;
                 };
-                if !dedupe.keep(&event) {
+                let Some(entry) = Entry::direct(&event).filter(|_| dedupe.keep(&event)) else {
                     continue;
-                }
-                let event = lock(&state).push_net(&id, event);
+                };
+                let event = lock(&state).push_net(&id, entry);
                 if let Some(sink) = sink.get() {
                     sink(&id, &event);
                 }
@@ -1372,7 +1346,7 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Checks the shield, marks it as starting and returns its config.
-    fn claim_start(&self, id: &str) -> Result<(Shield, u64)> {
+    fn claim_start(&self, id: &str) -> Result<Shield> {
         let mut state = lock(&self.state);
         let shield = state.shield_mut(id)?.clone();
         match state.vms.get(id) {
@@ -1382,10 +1356,11 @@ impl<R: SandboxRuntime> Manager<R> {
             None | Some(Vm::Failed(_)) => {}
         }
         shield.verify_paths()?;
+        shield.network.check()?;
         shield.check_app_data(&self.data)?;
         shield.check_overlap_with(state.shields.iter().filter(|s| s.id != id))?;
         state.vms.insert(id.to_owned(), Vm::Starting);
-        Ok((shield, state.secrets_rev(id)))
+        Ok(shield)
     }
 
     /// pi needs a newer Node than some `node:22-slim` images have.
@@ -1411,24 +1386,18 @@ impl<R: SandboxRuntime> Manager<R> {
         pi::check_node(&String::from_utf8_lossy(&out))
     }
 
-    /// The vault value of each user secret. A host login has `None`: its
-    /// value comes from the Mac. A value with a write that still runs fails
-    /// the start: the vault may not match the config yet.
-    fn vault_values(&self, shield: &Shield) -> Result<Vec<Option<SecretValue>>> {
-        for secret in shield.secrets.iter().filter(|s| s.origin.is_user()) {
-            self.settle(&shield.id, &secret.name)?;
+    /// The vault value of each credential. A value with a write that still
+    /// runs fails the start: the vault may not match the config yet.
+    fn vault_values(&self, shield: &Shield) -> Result<HashMap<String, SecretValue>> {
+        let mut values = HashMap::new();
+        for credential in shield.network.credentials() {
+            self.settle(&shield.id, &credential.name)?;
+            match self.vault.get(&shield.id, &credential.name)? {
+                Some(value) => values.insert(credential.name.clone(), value),
+                None => return Err(Error::SecretMissing(credential.name.clone())),
+            };
         }
-        shield
-            .secrets
-            .iter()
-            .map(|secret| match secret.origin {
-                Origin::HostLogin { .. } => Ok(None),
-                Origin::User => match self.vault.get(&shield.id, &secret.name)? {
-                    Some(value) => Ok(Some(value)),
-                    None => Err(Error::SecretMissing(secret.name.clone())),
-                },
-            })
-            .collect()
+        Ok(values)
     }
 
     /// Checks that `argv` runs in the VM and ends with code 0. The error is
@@ -1459,9 +1428,9 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Checks that the host pi starts its TUI in a terminal: it loads a
     /// native module that `--version` does not. A TUI that still runs after
     /// `TUI_PROBE` has loaded, and is killed. The error is the end of its output.
-    async fn probe_tui(&self, vm: &R::Vm) -> std::result::Result<(), String> {
-        let mut argv =
-            launch::command(AgentKind::Pi, launch::Found { pi_host: true, gemini: None }).expect("pi has a program");
+    async fn probe_tui(&self, vm: &R::Vm, proxy: Option<&str>) -> std::result::Result<(), String> {
+        let found = launch::Found { pi_host: true, gemini: None, proxy };
+        let mut argv = launch::command(AgentKind::Pi, found).expect("pi has a program");
         argv.push("--no-session".to_owned());
         let (rows, cols) = APP_SIZE;
         let mut pty = self.runtime.open_pty(vm, &argv, WORKSPACE, rows, cols).await.map_err(|e| e.to_string())?;
@@ -1490,7 +1459,7 @@ impl<R: SandboxRuntime> Manager<R> {
     pub async fn stop(&self, id: &str) -> Result<()> {
         // First, so each run settles its manifest before its processes die with the VM.
         self.runs.cancel_shield(id, "the shield stopped", RUN_STOP_LIMIT).await;
-        let (vm, applied, applied_rev, net, runtimes, host) = {
+        let (vm, applied, proxy, net, runtimes, host) = {
             let mut state = lock(&self.state);
             state.shield_mut(id)?;
             match state.vms.get(id) {
@@ -1499,7 +1468,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 Some(Vm::Stopping) => return Err(Error::Stopping),
                 Some(Vm::Failed(_)) | None => return Err(Error::NotRunning),
             }
-            let Some(Vm::Running { vm, applied, applied_rev, net, runtimes, host }) =
+            let Some(Vm::Running { vm, applied, proxy, net, runtimes, host }) =
                 state.vms.insert(id.to_owned(), Vm::Stopping)
             else {
                 unreachable!("checked above");
@@ -1510,22 +1479,24 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
                 s.shield_id != id
             });
-            (vm, applied, applied_rev, net, runtimes, host)
+            (vm, applied, proxy, net, runtimes, host)
         };
 
         let result = self.runtime.stop(&vm).await;
 
         let mut state = lock(&self.state);
         match result {
+            // The proxy stops with the last reference to it.
             Ok(()) => {
                 state.vms.remove(id);
-                for task in net.iter().chain(&host.renew).chain(&host.guest_watch) {
+                state.live.remove(id);
+                for task in net.iter().chain(&host.guest_watch) {
                     task.abort();
                 }
             }
-            // The follower stays with the VM that still runs.
+            // The follower and the proxy stay with the VM that still runs.
             Err(_) => {
-                state.vms.insert(id.to_owned(), Vm::Running { vm, applied, applied_rev, net, runtimes, host });
+                state.vms.insert(id.to_owned(), Vm::Running { vm, applied, proxy, net, runtimes, host });
             }
         }
         result
@@ -1897,7 +1868,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// must be writable before the run starts.
     pub fn start_task_run(&self, id: &str, task_id: &str) -> Result<String> {
         let _start = lock(&self.run_start);
-        let (task, vm, applied, pi_host, gemini, unmounted) = {
+        let (task, vm, applied, pi_host, gemini, proxy, unmounted) = {
             let mut state = lock(&self.state);
             let task = state.shield_mut(id)?.task(task_id)?.clone();
             match state.vms.get(id) {
@@ -1907,7 +1878,8 @@ impl<R: SandboxRuntime> Manager<R> {
                         .iter()
                         .find(|a| a.kind != AgentKind::Pi && !runtimes.contains(&a.kind.name()))
                         .map(|a| self.unmounted(a.kind, host));
-                    (task, vm.clone(), applied.clone(), host.pi_host, host.gemini.clone(), unmounted)
+                    let (pi_host, gemini, proxy) = (host.pi_host, host.gemini.clone(), host.proxy.clone());
+                    (task, vm.clone(), applied.clone(), pi_host, gemini, proxy, unmounted)
                 }
                 _ => return Err(Error::NotRunning),
             }
@@ -1942,6 +1914,7 @@ impl<R: SandboxRuntime> Manager<R> {
             artifacts: Some(guest_artifacts(harness, &task.slug, &run)),
             pi_host,
             gemini,
+            proxy,
         };
         self.runs.start(task_runs::Spec {
             shield_id: id.to_owned(),
@@ -2029,6 +2002,7 @@ impl<R: SandboxRuntime> Manager<R> {
             // The diff runs git only.
             pi_host: false,
             gemini: None,
+            proxy: None,
         };
         let (_, mut cancel) = tokio::sync::watch::channel(false);
         Ok(exec
@@ -2073,8 +2047,8 @@ fn run_names(dir: &std::path::Path) -> Vec<String> {
 
 /// What a start needs for the shield's host agents.
 struct Prepared {
-    /// The value of each secret, in the order of the config.
-    values: Vec<SecretValue>,
+    /// The token of each host login, in the order of the config.
+    tokens: Vec<HostToken>,
     binds: Vec<Bind>,
     /// The host version of each native runtime that a host agent uses.
     wanted: HashMap<&'static str, String>,
@@ -2083,10 +2057,10 @@ struct Prepared {
 
 /// Copies the profiles and links them into the agents' state, reads the
 /// host logins and writes the guest logins, and picks the host packages and
-/// runtime versions. `vault` has the value of each user secret. It reads the
-/// Keychain and copies files, so it runs on a blocking thread. The state dir
-/// is guest-writable: each write there follows no link.
-fn prepare(host: &HostAgents, data: &Path, shield: &Shield, vault: Vec<Option<SecretValue>>) -> Result<Prepared> {
+/// runtime versions. It reads the Keychain and copies files, so it runs on a
+/// blocking thread. The state dir is guest-writable: each write there
+/// follows no link.
+fn prepare(host: &HostAgents, data: &Path, shield: &Shield) -> Result<Prepared> {
     let state = data.join("shields").join(&shield.id);
     std::fs::create_dir_all(&state)?;
     // Empty: the start writes the wrappers of the agents that run in the VM.
@@ -2161,10 +2135,9 @@ fn prepare(host: &HostAgents, data: &Path, shield: &Shield, vault: Vec<Option<Se
 
     // After the links, so no link of the profile replaces a login file.
     let now = host.now_ms();
-    let mut values = Vec::new();
-    for (secret, value) in shield.secrets.iter().zip(vault) {
-        let Origin::HostLogin { agent } = secret.origin else {
-            values.extend(value);
+    let mut tokens = Vec::new();
+    for secret in &shield.logins {
+        let crate::secrets::Origin::HostLogin { agent } = secret.origin else {
             continue;
         };
         let token = host.token(agent)?;
@@ -2178,26 +2151,76 @@ fn prepare(host: &HostAgents, data: &Path, shield: &Shield, vault: Vec<Option<Se
             let dir = host_agents::open_parts(&state, file.dir)?;
             host_agents::write_at(&dir, file.name, &file.body)?;
         }
-        match token.expires {
-            Some(expires) => run.logins.push((agent, expires)),
-            None => run.notices.push(format!(
-                "The {} login of this Mac has no expiry that zwinger can read, so the shield does not renew it. \
+        if token.expires.is_none() {
+            run.notices.push(format!(
+                "The {} login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. \
                  Restart the shield when the agent reports a login error.",
                 agent.label()
-            )),
+            ));
         }
-        values.push(token.access);
+        tokens.push(token);
     }
-    run.login_expires = run.logins.iter().map(|&(_, expires)| expires).min();
     // After the host logins: a placeholder that replaced a guest login is not one.
     run.guest_logins = guest_login::found(&state);
-    if login::denied_hosts(&shield.secrets).contains(&login::GITHUB_API) {
+    if login::denied_hosts(&shield.logins).contains(&login::GITHUB_API) {
         run.notices.push(format!(
             "The GitHub API ({}) is blocked in this shield: pi's Copilot login is refreshed there.",
             login::GITHUB_API
         ));
     }
-    Ok(Prepared { values, binds, wanted, run })
+    Ok(Prepared { tokens, binds, wanted, run })
+}
+
+/// The network test in the guest. It prints one JSON line per stage.
+/// The target stage passes only on an answer of the host: a response of the
+/// proxy itself has [`proxy::BLOCKED_HEADER`] or [`proxy::ERROR_HEADER`].
+const NET_TEST: &str = r#"const net = require("net");
+const host = process.argv[1];
+const say = (stage, ok, detail) => console.log(JSON.stringify({ stage, ok, detail }));
+let proxy;
+try { proxy = new URL(process.env.HTTPS_PROXY); } catch { say("proxy", false, "the shield has no proxy setting"); process.exit(0); }
+const socket = net.connect(Number(proxy.port), proxy.hostname);
+socket.setTimeout(5000);
+socket.on("timeout", () => { say("proxy", false, "no answer from " + proxy.host); socket.destroy(); });
+socket.on("error", (e) => say("proxy", false, e.message));
+socket.on("connect", async () => {
+  socket.end();
+  say("proxy", true, "reached " + proxy.host);
+  try {
+    const res = await fetch("https://" + host + "/", { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(15000) });
+    const blocked = res.headers.get("x-zwinger-blocked");
+    const error = res.headers.get("x-zwinger-error");
+    say("target", !blocked && !error, blocked ? "blocked: " + blocked : error ? "failed: " + error : "HTTP " + res.status);
+  } catch (e) {
+    say("target", false, String((e.cause && e.cause.message) || e.message));
+  }
+});
+"#;
+
+/// Reads the lines of [`NET_TEST`].
+fn net_test(out: &str) -> NetTest {
+    #[derive(Deserialize)]
+    struct Line {
+        stage: String,
+        #[serde(flatten)]
+        result: NetStage,
+    }
+    let lines: Vec<Line> = out.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let stage = |name: &str| lines.iter().find(|l| l.stage == name).map(|l| l.result.clone());
+    let proxy = stage("proxy").unwrap_or(NetStage { ok: false, detail: "the test did not answer in time".into() });
+    let target = if proxy.ok {
+        Some(stage("target").unwrap_or(NetStage { ok: false, detail: "the host did not answer in time".into() }))
+    } else {
+        None
+    };
+    NetTest { proxy, target }
+}
+
+/// The names of the credentials, which the guest gets as placeholder variables.
+fn placeholders(policy: &NetworkPolicy) -> Vec<String> {
+    let mut names: Vec<String> = policy.credentials().into_iter().map(|c| c.name.clone()).collect();
+    names.sort();
+    names
 }
 
 fn bin_dir(data: &Path, id: &str) -> PathBuf {
@@ -2233,7 +2256,6 @@ mod tests {
     use crate::runtime::PTY_QUEUE;
     use crate::runtime::fake::{FakeRuntime, PtyGate};
     use crate::secrets::fake::MemoryVault;
-    use crate::secrets::tests::secret;
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-sessions-{}", uuid::Uuid::new_v4()));
@@ -2288,10 +2310,39 @@ mod tests {
         (token, rx)
     }
 
+    fn host_rule(host: &str, action: Action) -> RuleDraft {
+        RuleDraft { id: None, target: Target::Host { host: host.into() }, action }
+    }
+
+    /// An Allow rule for `host`. Returns its id.
+    fn allow<R: SandboxRuntime>(manager: &Manager<R>, id: &str, host: &str) -> String {
+        manager.put_rule(id, host_rule(host, Action::Allow)).unwrap()
+    }
+
+    fn bearer() -> Option<Inject> {
+        Some(Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() })
+    }
+
+    /// Sets the credential `name` on an Allow rule for `host`.
+    fn credential<R: SandboxRuntime>(
+        manager: &Manager<R>,
+        id: &str,
+        host: &str,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<()> {
+        let rule = allow(manager, id, host);
+        manager.set_rule_credential(id, &rule, name, bearer(), value.map(SecretValue::new))
+    }
+
+    fn live(manager: &Manager<FakeRuntime>, id: &str) -> Arc<Live> {
+        lock(&manager.state).live.get(id).cloned().expect("the shield has a proxy")
+    }
+
     #[tokio::test]
     async fn delete_refuses_a_shield_that_is_starting() {
         let (manager, _runtime, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("TOKEN", &["api.example.com"]), Some(SecretValue::new("v"))).unwrap();
+        credential(&manager, &id, "api.example.com", "TOKEN", Some("v")).unwrap();
         lock(&manager.state).vms.insert(id.clone(), Vm::Starting);
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().len(), 1);
@@ -2387,6 +2438,17 @@ mod tests {
         names
     }
 
+    #[test]
+    fn the_network_test_knows_the_responses_of_the_proxy() {
+        for header in [proxy::BLOCKED_HEADER, proxy::ERROR_HEADER] {
+            assert!(NET_TEST.contains(&format!("res.headers.get(\"{header}\")")), "{header}");
+        }
+        let out = r#"{"stage":"proxy","ok":true,"detail":"reached p"}
+{"stage":"target","ok":false,"detail":"failed: cannot connect to a.io in time"}"#;
+        let target = net_test(out).target.unwrap();
+        assert_eq!((target.ok, target.detail.as_str()), (false, "failed: cannot connect to a.io in time"));
+    }
+
     #[tokio::test]
     async fn agent_sessions_run_the_wrappers_of_the_mounted_agents() {
         let (manager, runtime, id) = manager();
@@ -2395,11 +2457,21 @@ mod tests {
         assert_eq!(*runtime.profiles.lock().unwrap(), [launch::profile_argv()]);
         assert_eq!(
             *runtime.binds.lock().unwrap(),
-            [Bind { guest: "/opt/zwinger/bin".into(), host: manager.bin_dir(&id) }]
+            [
+                Bind { guest: "/opt/zwinger/bin".into(), host: manager.bin_dir(&id) },
+                Bind { guest: launch::CA_DIR.into(), host: Ca::dir(&manager.data) },
+            ]
         );
         assert_eq!(wrappers(&manager, &id), ["pi"]);
         let pi = std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap();
-        assert_eq!(Some(pi), launch::wrapper(AgentKind::Pi, launch::Found::default(), true));
+        // The wrapper sets the proxy env itself, so a cleared env keeps it.
+        assert!(pi.contains(" HTTPS_PROXY='http://zw:") && pi.contains(" NODE_USE_ENV_PROXY=1 "), "{pi}");
+        let after_env = |w: &str| {
+            let env = |l: &&str| l.starts_with("export ") || l.starts_with("case \" $NODE_OPTIONS");
+            w.lines().skip(2).filter(|l| !env(l)).map(str::to_owned).collect::<Vec<_>>()
+        };
+        let bare = launch::wrapper(AgentKind::Pi, launch::Found::default(), true).unwrap();
+        assert_eq!(after_env(&pi), after_env(&bare));
 
         manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/pi"]);
@@ -2448,21 +2520,6 @@ mod tests {
         manager.stop(&id).await.unwrap();
         manager.delete(&id).await.unwrap();
         assert!(!manager.bin_dir(&id).exists());
-    }
-
-    #[tokio::test]
-    async fn a_live_agent_session_keeps_the_shield_busy() {
-        let (manager, _, id) = manager();
-        manager.start(&id).await.unwrap();
-        manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
-        assert!(!lock(&manager.state).is_busy(&id));
-
-        let session = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
-        let (_, mut rx) = attach(&manager, &session);
-        assert!(lock(&manager.state).is_busy(&id));
-        manager.send(&session, PtyInput::Kill).unwrap();
-        while next(&mut rx).await != PtyEvent::Exit(137) {}
-        assert!(!lock(&manager.state).is_busy(&id));
     }
 
     #[tokio::test]
@@ -2588,7 +2645,7 @@ mod tests {
             .expect("the follow task still runs");
     }
 
-    fn hosts(events: &[NetEvent]) -> Vec<(u64, &str)> {
+    fn hosts(events: &[Entry]) -> Vec<(u64, &str)> {
         events.iter().map(|e| (e.seq, e.host.as_str())).collect()
     }
 
@@ -2615,6 +2672,7 @@ mod tests {
             sent.push(event);
         }
         assert_eq!(hosts(&sent), [(1, "google.com"), (2, "example.com")]);
+        assert!(sent.iter().all(|e| e.reason == crate::proxy::log::DIRECT && !e.allowed));
         assert_eq!(manager.list_net_events(&id).unwrap(), sent);
 
         // The ring stays after a stop; a restart continues the numbers.
@@ -2653,63 +2711,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_host_leaves_deny_mode() {
-        let (manager, _, id) = manager();
-        assert_eq!(manager.list()[0].shield.network.mode, NetworkMode::Deny);
-        manager.allow_host(&id, "google.com").unwrap();
-        let network = &manager.list()[0].shield.network;
-        assert_eq!(network.mode, NetworkMode::List);
-        assert_eq!(network.domains, ["google.com"]);
-
-        manager.set_network_mode(&id, NetworkMode::Public).unwrap();
-        manager.allow_host(&id, "*.example.com").unwrap();
-        let network = &manager.list()[0].shield.network;
-        assert_eq!(network.mode, NetworkMode::Public);
-        assert_eq!(network.domains, ["google.com", "*.example.com"]);
-
-        assert!(matches!(manager.allow_host(&id, "not a host"), Err(Error::InvalidDomain(..))));
-        assert!(matches!(manager.allow_host("missing", "google.com"), Err(Error::ShieldNotFound)));
-    }
-
-    #[tokio::test]
-    async fn edit_while_running_sets_pending_restart() {
-        let (manager, _, id) = manager();
+    async fn network_edits_reach_the_running_proxy_with_no_restart() {
+        let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
+        let net = runtime.net.lock().unwrap().clone().unwrap();
+        let env: BTreeMap<_, _> = net.env.iter().cloned().collect();
+        assert!(env["HTTPS_PROXY"].ends_with(&format!("@host.microsandbox.internal:{}", net.port)));
+        assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
+
+        let rule = allow(&manager, &id, "Registry.npmjs.org");
+        manager.set_network_default(&id, DefaultAction::Allow).unwrap();
+        manager.set_offline(&id, true).unwrap();
+        let policy = live(&manager, &id).snapshot().policy;
+        assert_eq!(
+            (policy.default, policy.offline, policy.rules[0].id.as_str()),
+            (DefaultAction::Allow, true, rule.as_str())
+        );
+        assert_eq!(policy.rules[0].target, Target::Host { host: "registry.npmjs.org".into() });
         assert!(!manager.list()[0].pending_restart);
 
-        manager.add_domain(&id, " Registry.npmjs.org ").unwrap();
-        let view = &manager.list()[0];
-        assert!(view.pending_restart);
-        assert_eq!(view.shield.network.domains, ["registry.npmjs.org"]);
-
-        manager.stop(&id).await.unwrap();
-        manager.start(&id).await.unwrap();
-        assert!(!manager.list()[0].pending_restart);
-    }
-
-    #[tokio::test]
-    async fn mode_change_with_same_domains_sets_pending_restart() {
-        let (manager, _, id) = manager();
-        manager.set_network_mode(&id, NetworkMode::List).unwrap();
-        manager.add_domain(&id, "registry.npmjs.org").unwrap();
-        manager.start(&id).await.unwrap();
-        manager.set_network_mode(&id, NetworkMode::Deny).unwrap();
+        // A new credential name needs its placeholder variable in the guest.
+        manager.set_rule_credential(&id, &rule, "NPM_TOKEN", bearer(), Some(SecretValue::new("t"))).unwrap();
         assert!(manager.list()[0].pending_restart);
-        manager.set_network_mode(&id, NetworkMode::List).unwrap();
+        assert_eq!(live(&manager, &id).snapshot().values["NPM_TOKEN"], SecretValue::new("t"));
+        manager.stop(&id).await.unwrap();
+        assert!(lock(&manager.state).live.is_empty());
+        manager.start(&id).await.unwrap();
         assert!(!manager.list()[0].pending_restart);
+        let net = runtime.net.lock().unwrap().clone().unwrap();
+        assert!(net.env.contains(&("NPM_TOKEN".to_owned(), "$MSB_NPM_TOKEN$".to_owned())));
+        assert!(!net.env.iter().any(|(_, v)| v == "t"));
     }
 
     #[test]
-    fn domain_edits_dedupe_and_validate() {
+    fn rule_edits_dedupe_and_validate() {
         let (manager, _, id) = manager();
-        manager.add_domain(&id, "registry.npmjs.org").unwrap();
-        manager.add_domain(&id, "Registry.NPMjs.org").unwrap();
-        manager.add_domain(&id, "*.anthropic.com").unwrap();
-        assert!(matches!(manager.add_domain(&id, "https://example.com"), Err(Error::InvalidDomain(..))));
-        assert!(matches!(manager.add_domain("nope", "a.io"), Err(Error::ShieldNotFound)));
-        manager.remove_domain(&id, "registry.npmjs.org").unwrap();
-        manager.remove_domain(&id, "registry.npmjs.org").unwrap();
-        assert_eq!(manager.list()[0].shield.network.domains, ["*.anthropic.com"]);
+        let first = allow(&manager, &id, "registry.npmjs.org");
+        assert_eq!(manager.put_rule(&id, host_rule("Registry.NPMjs.org", Action::Block)).unwrap(), first);
+        allow(&manager, &id, "*.anthropic.com");
+        assert!(matches!(
+            manager.put_rule(&id, host_rule("https://example.com", Action::Allow)),
+            Err(Error::InvalidDomain(..))
+        ));
+        assert!(matches!(manager.put_rule("nope", host_rule("a.io", Action::Allow)), Err(Error::ShieldNotFound)));
+        manager.remove_rule(&id, &first).unwrap();
+        assert!(matches!(manager.remove_rule(&id, &first), Err(Error::RuleNotFound)));
+        let rules = manager.list()[0].shield.network.rules.clone();
+        assert_eq!(rules.iter().map(|r| r.label()).collect::<Vec<_>>(), ["*.anthropic.com"]);
     }
 
     #[test]
@@ -3296,93 +3344,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_secret_stores_the_value_outside_the_config() {
+    async fn credential_values_stay_out_of_the_config() {
         let (manager, runtime, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret(" OPENAI_API_KEY ", &["API.openai.com"]), value("sk-hidden")).unwrap();
+        credential(&manager, &id, "api.openai.com", " OPENAI_API_KEY ", Some("sk-hidden")).unwrap();
         assert_eq!(stored(&vault, &id, "OPENAI_API_KEY").as_deref(), Some("sk-hidden"));
-
-        let views = manager.list_secrets(&id).unwrap();
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].hosts, ["api.openai.com"]);
-        assert_eq!(views[0].placeholder, "$MSB_OPENAI_API_KEY$");
-        assert!(views[0].set);
+        let rules = manager.list()[0].shield.network.rules.clone();
+        assert_eq!(rules[0].credentials[0].name, "OPENAI_API_KEY");
 
         let config = std::fs::read_to_string(manager.store.path()).unwrap();
         let shields = serde_json::to_string(&manager.list()).unwrap();
-        let secrets = serde_json::to_string(&views).unwrap();
-        for text in [config, shields, secrets] {
+        for text in [config, shields] {
             assert!(text.contains("OPENAI_API_KEY") && !text.contains("sk-hidden"), "{text}");
         }
 
         manager.start(&id).await.unwrap();
-        assert_eq!(
-            *runtime.secrets.lock().unwrap(),
-            [("OPENAI_API_KEY".to_owned(), vec![microsandbox::HostPattern::Exact("api.openai.com".into())])]
-        );
+        let net = runtime.net.lock().unwrap().clone().unwrap();
+        assert!(net.env.contains(&("OPENAI_API_KEY".to_owned(), "$MSB_OPENAI_API_KEY$".to_owned())));
+        assert!(!format!("{net:?}").contains("sk-hidden"));
+        assert_eq!(live(&manager, &id).snapshot().values["OPENAI_API_KEY"], SecretValue::new("sk-hidden"));
     }
 
     #[test]
-    fn put_secret_needs_a_value_only_when_new() {
+    fn a_credential_needs_a_value_only_when_new() {
         let (manager, _, id, vault) = manager_with_vault();
-        assert!(matches!(manager.put_secret(&id, secret("KEY", &["a.io"]), None), Err(Error::SecretValueRequired(_))));
-        assert!(matches!(
-            manager.put_secret(&id, secret("KEY", &["a.io"]), value("")),
-            Err(Error::SecretValueRequired(_))
-        ));
-        assert!(manager.list_secrets(&id).unwrap().is_empty());
+        let rule = allow(&manager, &id, "a.io");
+        let set = |name: &str, inject: Option<Inject>, value: Option<SecretValue>| {
+            manager.set_rule_credential(&id, &rule, name, inject, value)
+        };
+        assert!(matches!(set("KEY", bearer(), None), Err(Error::SecretValueRequired(_))));
+        assert!(matches!(set("KEY", bearer(), value("")), Err(Error::SecretValueRequired(_))));
+        assert!(manager.list()[0].shield.network.rules[0].credentials.is_empty());
 
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v1")).unwrap();
-        manager.put_secret(&id, secret("KEY", &["b.io"]), None).unwrap();
-        assert_eq!(manager.list_secrets(&id).unwrap()[0].hosts, ["b.io"]);
+        set("KEY", bearer(), value("v1")).unwrap();
+        let replace = Inject::Replace {
+            places: secrets::Places { header_fields: vec!["x-api-key".into()], query: false, body: false },
+        };
+        set("KEY", Some(replace.clone()), None).unwrap();
+        assert_eq!(manager.list()[0].shield.network.rules[0].credentials[0].inject, replace);
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
 
+        assert!(matches!(set("PATH", bearer(), value("x")), Err(Error::InvalidSecret(..))));
         assert!(matches!(
-            manager.put_secret(&id, secret("PATH", &["a.io"]), value("x")),
+            manager.set_rule_credential("nope", &rule, "KEY", bearer(), value("x")),
+            Err(Error::ShieldNotFound)
+        ));
+        let wildcard = manager.put_rule(&id, host_rule("*.b.io", Action::Allow)).unwrap();
+        assert!(matches!(
+            manager.set_rule_credential(&id, &wildcard, "OTHER", bearer(), value("x")),
             Err(Error::InvalidSecret(..))
         ));
-        assert!(matches!(manager.put_secret("nope", secret("KEY", &["a.io"]), value("x")), Err(Error::ShieldNotFound)));
         assert_eq!(vault.values.lock().unwrap().len(), 1);
+        // A rule with a credential cannot become a wildcard; it can become a Block rule.
+        let moved =
+            RuleDraft { id: Some(rule.clone()), target: Target::Host { host: "*.a.io".into() }, action: Action::Allow };
+        assert!(matches!(manager.put_rule(&id, moved), Err(Error::InvalidSecret(..))));
+        manager
+            .put_rule(
+                &id,
+                RuleDraft { id: Some(rule), target: Target::Host { host: "a.io".into() }, action: Action::Block },
+            )
+            .unwrap();
+        assert_eq!(manager.list()[0].shield.network.rules[0].credentials.len(), 1);
     }
 
     #[test]
     fn failed_save_restores_the_vault() {
         let (manager, _, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("OLD", &["a.io"]), value("old")).unwrap();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "OLD", bearer(), value("old")).unwrap();
         break_store(&manager);
 
-        assert!(manager.put_secret(&id, secret("OLD", &["a.io"]), value("new")).is_err());
+        assert!(manager.set_rule_credential(&id, &rule, "OLD", bearer(), value("new")).is_err());
         assert_eq!(stored(&vault, &id, "OLD").as_deref(), Some("old"));
 
-        let error = manager.put_secret(&id, secret("NEW", &["a.io"]), value("fresh")).unwrap_err();
+        let error = manager.set_rule_credential(&id, &rule, "NEW", bearer(), value("fresh")).unwrap_err();
         assert!(!error.to_string().contains("fresh"));
         assert_eq!(stored(&vault, &id, "NEW"), None);
-        let names: Vec<_> = manager.list_secrets(&id).unwrap().into_iter().map(|s| s.name).collect();
+        let names: Vec<_> = manager.list()[0].shield.network.credentials().iter().map(|c| c.name.clone()).collect();
         assert_eq!(names, ["OLD"]);
     }
 
     #[test]
-    fn remove_secret_saves_the_config_first() {
+    fn a_removed_credential_saves_the_config_first_and_keeps_a_shared_value() {
         let (manager, _, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
-        assert!(matches!(manager.remove_secret(&id, "OTHER"), Err(Error::SecretNotFound(_))));
+        let a = allow(&manager, &id, "a.io");
+        let b = allow(&manager, &id, "b.io");
+        manager.set_rule_credential(&id, &a, "KEY", bearer(), value("v")).unwrap();
+        // The same name on a second rule shares the value.
+        manager.set_rule_credential(&id, &b, "KEY", bearer(), None).unwrap();
+        assert!(matches!(manager.set_rule_credential(&id, &a, "OTHER", None, None), Err(Error::SecretNotFound(_))));
+
+        manager.set_rule_credential(&id, &a, "KEY", None, None).unwrap();
+        assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v"));
 
         break_store(&manager);
-        assert!(manager.remove_secret(&id, "KEY").is_err());
+        assert!(manager.remove_rule(&id, &b).is_err());
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v"));
-        assert_eq!(manager.list_secrets(&id).unwrap().len(), 1);
+        assert_eq!(manager.list()[0].shield.network.credentials().len(), 1);
 
         let path = manager.store.path().to_owned();
         std::fs::remove_dir_all(&path).unwrap();
-        manager.remove_secret(&id, "KEY").unwrap();
+        manager.remove_rule(&id, &b).unwrap();
         assert_eq!(stored(&vault, &id, "KEY"), None);
-        assert!(manager.list_secrets(&id).unwrap().is_empty());
+        assert!(manager.list()[0].shield.network.credentials().is_empty());
     }
 
     #[tokio::test]
     async fn delete_removes_the_values() {
         let (manager, _, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("A", &["a.io"]), value("1")).unwrap();
-        manager.put_secret(&id, secret("B", &["a.io"]), value("2")).unwrap();
+        credential(&manager, &id, "a.io", "A", Some("1")).unwrap();
+        credential(&manager, &id, "b.io", "B", Some("2")).unwrap();
         manager.delete(&id).await.unwrap();
         assert!(vault.values.lock().unwrap().is_empty());
         assert!(manager.list().is_empty());
@@ -3391,22 +3462,22 @@ mod tests {
     #[tokio::test]
     async fn start_refuses_a_missing_value() {
         let (manager, runtime, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
+        credential(&manager, &id, "a.io", "KEY", Some("v")).unwrap();
         vault.delete(&id, "KEY").unwrap();
-        assert!(!manager.list_secrets(&id).unwrap()[0].set);
 
         assert!(matches!(manager.start(&id).await, Err(Error::SecretMissing(n)) if n == "KEY"));
         assert_eq!(manager.list()[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
+        assert!(lock(&manager.state).live.is_empty());
     }
 
-    /// `shields.json` can be edited by hand. A host that the builder does not
-    /// accept must give an error, not a panic.
+    /// `shields.json` can be edited by hand. A rule that the checks do not
+    /// accept must refuse the start.
     #[tokio::test]
     async fn start_refuses_an_invalid_stored_host() {
         let (manager, runtime, id) = manager();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
-        lock(&manager.state).shields[0].secrets[0].hosts = vec!["*".into()];
+        allow(&manager, &id, "a.io");
+        lock(&manager.state).shields[0].network.rules[0].target = Target::Host { host: "*".into() };
 
         assert!(matches!(manager.start(&id).await, Err(Error::InvalidDomain(..))));
         assert_eq!(manager.list()[0].status, Status::Stopped);
@@ -3414,33 +3485,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secret_changes_while_running_set_pending_restart() {
+    async fn value_changes_while_running_reach_the_proxy_at_once() {
         let (manager, _, id) = manager();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v1")).unwrap();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
         manager.start(&id).await.unwrap();
+
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
         assert!(!manager.list()[0].pending_restart);
+        assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
 
-        // The config is the same; only the value changes.
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v2")).unwrap();
-        assert!(manager.list()[0].pending_restart);
-
-        manager.stop(&id).await.unwrap();
-        manager.start(&id).await.unwrap();
-        assert!(!manager.list()[0].pending_restart);
-
-        manager.put_secret(&id, secret("KEY", &["b.io"]), None).unwrap();
-        assert!(manager.list()[0].pending_restart);
-        manager.put_secret(&id, secret("KEY", &["a.io"]), None).unwrap();
-        assert!(!manager.list()[0].pending_restart);
-
-        manager.remove_secret(&id, "KEY").unwrap();
+        // The guest still has the placeholder variable of a removed name.
+        manager.set_rule_credential(&id, &rule, "KEY", None, None).unwrap();
+        assert!(!live(&manager, &id).snapshot().values.contains_key("KEY"));
         assert!(manager.list()[0].pending_restart);
     }
 
     #[tokio::test]
-    async fn value_change_during_start_sets_pending_restart() {
+    async fn a_value_change_during_start_reaches_the_proxy() {
         let (manager, runtime, id) = manager();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v1")).unwrap();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
         let gate = Arc::new(PtyGate::default());
         *runtime.start_gate.lock().unwrap() = Some(gate.clone());
 
@@ -3451,43 +3516,34 @@ mod tests {
         });
         gate.entered.notified().await;
         assert_eq!(manager.list()[0].status, Status::Starting);
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v2")).unwrap();
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
         gate.release.notify_one();
 
         starting.await.unwrap().unwrap();
         let view = &manager.list()[0];
         assert_eq!(view.status, Status::Running);
-        assert!(view.pending_restart);
+        assert!(!view.pending_restart);
+        assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
     }
 
     #[test]
-    fn list_secrets_reads_accounts_not_values() {
-        let (manager, _, id, vault) = manager_with_vault();
-        manager.put_secret(&id, secret("A", &["a.io"]), value("1")).unwrap();
-        manager.put_secret(&id, secret("B", &["a.io"]), value("2")).unwrap();
-        vault.values.lock().unwrap().remove(&secrets::account(&id, "B"));
-
-        let gets = vault.gets.load(std::sync::atomic::Ordering::SeqCst);
-        let set: Vec<_> = manager.list_secrets(&id).unwrap().into_iter().map(|s| (s.name, s.set)).collect();
-        assert_eq!(set, [("A".to_owned(), true), ("B".to_owned(), false)]);
-        assert_eq!(vault.gets.load(std::sync::atomic::Ordering::SeqCst), gets);
-    }
-
-    #[test]
-    fn load_prunes_values_with_no_secret() {
+    fn load_prunes_values_with_no_credential_and_keeps_the_ca_key() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("shields.json"));
         let vault = vault();
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("keep")).unwrap();
+        credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.set("deleted-shield", "KEY", &SecretValue::new("y")).unwrap();
+        vault.set(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1, &SecretValue::new("ca")).unwrap();
 
         Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let mut accounts = vault.accounts().unwrap();
         accounts.sort();
-        assert_eq!(accounts, [secrets::account(&id, "KEY")]);
+        let mut kept = [secrets::account(&id, "KEY"), secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1)];
+        kept.sort();
+        assert_eq!(accounts, kept);
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("keep"));
     }
 
@@ -3498,11 +3554,12 @@ mod tests {
         let vault = vault();
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        assert!(matches!(manager.remove_secret(&id, "KEY"), Err(Error::Keychain(_))));
+        assert!(matches!(manager.set_rule_credential(&id, &rule, "KEY", None, None), Err(Error::Keychain(_))));
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(stored(&vault, &id, "GONE").as_deref(), Some("x"));
@@ -3537,10 +3594,9 @@ mod tests {
         }
     }
 
-    /// A start during a host and value edit waits for the edit, so it never
-    /// pairs the new value with the old hosts.
+    /// A start during a value edit waits for the edit, so its proxy gets the new value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_during_a_secret_edit_uses_the_new_hosts() {
+    async fn start_during_a_credential_edit_uses_the_new_value() {
         let dir = temp_dir();
         let vault = Arc::new(GatedVault::default());
         let runtime = FakeRuntime::default();
@@ -3549,14 +3605,15 @@ mod tests {
                 .unwrap(),
         );
         let id = manager.create(dir.to_str().unwrap()).unwrap();
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v1")).unwrap();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
 
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         *vault.gate.lock().unwrap() = Some((entered_tx, release_rx));
         let putting = std::thread::spawn({
             let (manager, id) = (manager.clone(), id.clone());
-            move || manager.put_secret(&id, secret("KEY", &["b.io"]), value("v2"))
+            move || manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2"))
         });
         entered.recv().unwrap();
 
@@ -3570,10 +3627,7 @@ mod tests {
         putting.join().unwrap().unwrap();
         starting.await.unwrap().unwrap();
 
-        assert_eq!(
-            *runtime.secrets.lock().unwrap(),
-            [("KEY".to_owned(), vec![microsandbox::HostPattern::Exact("b.io".into())])]
-        );
+        assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
         let view = &manager.list()[0];
         assert_eq!(view.status, Status::Running);
         assert!(!view.pending_restart);
@@ -3628,34 +3682,28 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), true).await.unwrap();
 
         let shield = manager.list().remove(0).shield;
-        assert_eq!(shield.network.mode, NetworkMode::List);
-        assert_eq!(shield.network.domains, ["api.anthropic.com"]);
-        let listed = manager.list_secrets(&id).unwrap();
-        assert_eq!((listed[0].name.as_str(), listed[0].set), ("CLAUDE_CODE_OAUTH_TOKEN", true));
-        assert_eq!(listed[0].origin, Origin::HostLogin { agent: AgentKind::Claude });
-        // The user cannot edit or remove it, and the vault never holds it.
-        let mut edit = secret("CLAUDE_CODE_OAUTH_TOKEN", &["api.anthropic.com"]);
+        let rules: Vec<_> = shield.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
+        assert_eq!(rules, [(Target::Host { host: "api.anthropic.com".into() }, Action::Allow)]);
+        assert_eq!(shield.logins[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(shield.logins[0].origin, crate::secrets::Origin::HostLogin { agent: AgentKind::Claude });
+        // A credential cannot take its name, and the vault never holds it.
+        let rule = shield.network.rules[0].id.clone();
         assert!(matches!(
-            manager.put_secret(&id, edit.clone(), Some(SecretValue::new("x"))),
-            Err(Error::HostLoginSecret(_))
+            manager.set_rule_credential(&id, &rule, "CLAUDE_CODE_OAUTH_TOKEN", bearer(), value("x")),
+            Err(Error::DuplicateSecret(_))
         ));
-        edit.origin = Origin::HostLogin { agent: AgentKind::Claude };
-        assert!(matches!(manager.put_secret(&id, edit, None), Err(Error::HostLoginSecret(_))));
-        assert!(matches!(manager.remove_secret(&id, "CLAUDE_CODE_OAUTH_TOKEN"), Err(Error::HostLoginSecret(_))));
 
         manager.start(&id).await.unwrap();
-        assert!(vault.values.lock().unwrap().is_empty());
-        assert_eq!(
-            *runtime.secrets.lock().unwrap(),
-            [(
-                "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
-                vec![microsandbox::HostPattern::Exact("api.anthropic.com".into())]
-            )]
-        );
+        let accounts: Vec<String> = vault.values.lock().unwrap().keys().cloned().collect();
+        assert_eq!(accounts, [secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1)], "only the CA key");
+        let net = runtime.net.lock().unwrap().clone().unwrap();
+        assert!(net.env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "$MSB_CLAUDE_CODE_OAUTH_TOKEN$".to_owned())));
+        assert!(!format!("{net:?}").contains("sk-ant-oat-real"));
         let snapshot = manager.profile_dir(&id).join("claude");
+        let ca = Bind { guest: launch::CA_DIR.into(), host: Ca::dir(&manager.data) };
         assert_eq!(
             runtime.binds.lock().unwrap()[1..],
-            [Bind { guest: "/opt/zwinger/profile/claude".into(), host: snapshot.clone() }]
+            [Bind { guest: "/opt/zwinger/profile/claude".into(), host: snapshot.clone() }, ca]
         );
         assert!(snapshot.join("skills/review/SKILL.md").is_file());
         assert!(!snapshot.join(".credentials.json").exists());
@@ -3663,7 +3711,7 @@ mod tests {
         assert_eq!(std::fs::read_link(skills).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
 
         let view = manager.list().remove(0);
-        assert_eq!((view.login_expires_at, view.renew_due), (Some(NOW + 3_600_000), false));
+        assert_eq!(view.login_expires_at, Some(NOW + 3_600_000));
         // Neither the host version nor the pinned Claude Code is downloaded.
         assert!(
             view.host_notices.iter().any(|n| n.contains("Claude Code 2.1.310 is not downloaded")),
@@ -3676,7 +3724,7 @@ mod tests {
         manager.stop(&id).await.unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         manager.start(&id).await.unwrap();
-        assert_eq!(runtime.binds.lock().unwrap().len(), 1, "only the bin dir");
+        assert_eq!(runtime.binds.lock().unwrap().len(), 2, "only the bin dir and the CA");
         assert!(!manager.state_dir(&id).join("claude/.claude/skills").exists());
         assert!(!snapshot.exists());
         manager.stop(&id).await.unwrap();
@@ -3706,13 +3754,14 @@ mod tests {
             auth.contains("$MSB_CODEX_HOST_LOGIN$") && auth.contains(login::INERT_REFRESH) && auth.contains("id.real")
         );
         assert!(!auth.contains("at-real") && !auth.contains("rt-real"));
-        assert_eq!(runtime.secrets.lock().unwrap()[0].1, [microsandbox::HostPattern::Exact("chatgpt.com".into())]);
+        assert_eq!(manager.list()[0].shield.logins[0].hosts, ["chatgpt.com"]);
+        assert!(!format!("{:?}", runtime.net.lock().unwrap()).contains("at-real"));
         // The access token here is no JWT, so its expiry is unknown.
         let notices = manager.list().remove(0).host_notices;
         assert_eq!(
             notices,
             [
-                "The Codex login of this Mac has no expiry that zwinger can read, so the shield does not renew it. Restart the shield when the agent reports a login error.",
+                "The Codex login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. Restart the shield when the agent reports a login error.",
                 "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings, then restart the shield.",
             ]
         );
@@ -3747,181 +3796,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pi_copilot_login_blocks_the_github_api_and_gemini_has_no_host_login() {
+    async fn pi_copilot_login_blocks_the_github_api_and_gemini_gets_a_placeholder_login() {
         let logins = FakeLogins::default();
         let pi = serde_json::json!({ "github-copilot": {
             "type": "oauth", "access": "tid=1;proxy-ep=proxy.business.githubcopilot.com;", "refresh": "r", "expires": NOW + 3_600_000,
         } });
         logins.docs.lock().unwrap().insert(AgentKind::Pi, pi.to_string());
-        let gemini = serde_json::json!({ "access_token": "ya29", "expiry_date": NOW + 3_600_000 });
+        let gemini = serde_json::json!({ "access_token": "ya29.real", "refresh_token": "1//real", "expiry_date": NOW + 3_600_000, "scope": "openid" });
         logins.docs.lock().unwrap().insert(AgentKind::Gemini, gemini.to_string());
-        let (manager, runtime, id, _) = host_manager(logins, NOW);
+        let (manager, _, id, _) = host_manager(logins, NOW);
 
-        let err = manager.put_host_agent(&id, uses(AgentKind::Gemini, false, true), true).await.unwrap_err();
-        assert!(err.to_string().contains("not supported yet"), "{err}");
-        manager.add_domain(&id, "api.github.com").unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Gemini, false, true), true).await.unwrap();
+        // A GitHub token on the GitHub API conflicts with pi's Copilot login.
+        credential(&manager, &id, "api.github.com", "GITHUB_TOKEN", Some("ghp")).unwrap();
         assert!(matches!(
             manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await,
             Err(Error::RefreshHostConflict(..))
         ));
-        manager.remove_domain(&id, "api.github.com").unwrap();
+        let github = manager.list()[0].shield.network.rules[1].id.clone();
+        manager.remove_rule(&id, &github).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await.unwrap();
-        assert_eq!(manager.list()[0].shield.network.domains, ["api.business.githubcopilot.com"]);
+        let shield = manager.list().remove(0).shield;
+        let hosts: Vec<_> = shield.network.rules.iter().map(|r| r.label()).collect();
+        assert_eq!(hosts, ["cloudcode-pa.googleapis.com", "api.business.githubcopilot.com"]);
 
         manager.start(&id).await.unwrap();
-        assert_eq!(
-            runtime.secrets.lock().unwrap()[0].1,
-            [microsandbox::HostPattern::Exact("api.business.githubcopilot.com".into())]
-        );
-        let notices = manager.list().remove(0).host_notices;
-        assert!(notices.iter().any(|n| n.contains("GitHub API (api.github.com) is blocked")), "{notices:?}");
-    }
-
-    /// A shield with Claude Code's host login, its fake login source and
-    /// clock, and the ids that the renew sink got.
-    struct Renewal {
-        manager: Manager<FakeRuntime>,
-        runtime: FakeRuntime,
-        id: String,
-        logins: Arc<FakeLogins>,
-        clock: Arc<FakeClock>,
-        due: mpsc::UnboundedReceiver<String>,
-    }
-
-    async fn renewal(doc: String) -> Renewal {
-        let (dir, home) = (temp_dir(), temp_dir());
-        let runtime = FakeRuntime::default();
-        let logins = Arc::new(FakeLogins::default());
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, doc);
-        let clock = Arc::new(FakeClock(NOW.into()));
-        let host = Arc::new(HostAgents::new(Arc::new(mac(&home)), logins.clone(), clock.clone(), temp_dir()));
-        let manager =
-            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
-        let (tx, due) = mpsc::unbounded_channel();
-        manager.set_renew_sink(Box::new(move |id| {
-            let _ = tx.send(id.to_owned());
-        }));
-        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
-        Renewal { manager, runtime, id, logins, clock, due }
-    }
-
-    impl Renewal {
-        /// Moves the fake clock and the paused timers forward.
-        async fn pass(&self, minutes: i64) {
-            self.clock.0.fetch_add(minutes * 60_000, std::sync::atomic::Ordering::SeqCst);
-            tokio::time::advance(Duration::from_secs(minutes as u64 * 60)).await;
-        }
-
-        /// The next id from the renew sink. The renewal reads the login on a
-        /// blocking thread, so this waits in real time. A short sleep, not a
-        /// yield: the paused timers fire only when the runtime parks.
-        async fn next_due(&mut self) -> String {
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(id) = self.due.try_recv() {
-                    return id;
-                }
-                assert!(std::time::Instant::now() < deadline, "no renewal");
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-
-        fn starts(&self) -> usize {
-            self.runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count()
-        }
-    }
-
-    #[tokio::test]
-    async fn the_renewal_waits_for_a_newer_login_on_the_mac() {
-        let mut r = renewal(claude_doc("t", NOW + 20 * 60_000)).await;
-        r.manager.set_auto_renew(&r.id, true).unwrap();
-        r.manager.start(&r.id).await.unwrap();
-        tokio::time::pause();
-
-        // Not due yet.
-        r.pass(9).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(r.due.try_recv().is_err());
-        // Due, but the Mac has the same login: a restart would not renew it.
-        r.pass(2).await;
-        assert_eq!(r.next_due().await, r.id);
-        let view = r.manager.list().remove(0);
-        assert!(!view.renew_due);
+        let creds = std::fs::read_to_string(manager.state_dir(&id).join("gemini/.gemini/oauth_creds.json")).unwrap();
         assert!(
-            view.host_notices.iter().any(|n| n.contains("Open Claude Code on this Mac once")),
+            creds.contains("$MSB_GEMINI_HOST_LOGIN$") && !creds.contains("ya29.real") && !creds.contains("1//real")
+        );
+        let view = manager.list().remove(0);
+        assert!(view.guest_logins.is_empty(), "the placeholder login is not a guest login");
+        assert!(
+            view.host_notices.iter().any(|n| n.contains("GitHub API (api.github.com) is blocked")),
             "{:?}",
             view.host_notices
         );
-        r.manager.renew(&r.id).await.unwrap();
-        assert_eq!(r.starts(), 1);
-
-        // The user opened Claude Code on the Mac: a newer login. An app works,
-        // so the restart waits.
-        r.logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t2", NOW + 3 * 3_600_000));
-        let app = app(&r.manager, &r.id, "pnpm dev", false);
-        r.manager.start_app(&r.id, &app).await.unwrap();
-        r.pass(1).await;
-        assert_eq!(r.next_due().await, r.id);
-        assert!(r.manager.list()[0].renew_due);
-        r.manager.renew(&r.id).await.unwrap();
-        assert_eq!(r.starts(), 1);
-
-        // Idle: the next check restarts with the new login.
-        r.manager.stop_app(&r.id, &app).unwrap();
-        until(|| r.manager.list()[0].app_runs.iter().all(|a| a.exit_code.is_some())).await;
-        r.pass(2).await;
-        assert_eq!(r.next_due().await, r.id);
-        r.manager.renew(&r.id).await.unwrap();
-        assert_eq!(r.starts(), 2);
-        let view = r.manager.list().remove(0);
-        assert_eq!((view.login_expires_at, view.renew_due), (Some(NOW + 3 * 3_600_000), false));
-        assert!(view.host_notices.iter().all(|n| !n.contains("expires soon")), "{:?}", view.host_notices);
     }
 
     #[tokio::test]
-    async fn without_auto_restart_a_newer_login_shows_restart_to_renew() {
-        let mut r = renewal(claude_doc("t", NOW + 5 * 60_000)).await;
-        r.manager.start(&r.id).await.unwrap();
-        tokio::time::pause();
-        // Due at the start, with the same login: the notice, no restart.
-        assert_eq!(r.next_due().await, r.id);
-        assert!(!r.manager.list()[0].renew_due);
-        assert!(r.manager.list()[0].host_notices.iter().any(|n| n.contains("expires soon")));
-        r.logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t2", NOW + 3_600_000));
-        r.pass(1).await;
-        assert_eq!(r.next_due().await, r.id);
-        let view = r.manager.list().remove(0);
-        assert!(view.renew_due);
-        assert!(view.host_notices.iter().all(|n| !n.contains("expires soon")), "{:?}", view.host_notices);
-        r.manager.renew(&r.id).await.unwrap();
-        assert_eq!(r.starts(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_login_with_no_expiry_is_not_renewed() {
+    async fn a_login_with_no_expiry_is_not_read_again() {
+        let logins = FakeLogins::default();
         let doc = serde_json::json!({ "claudeAiOauth": { "accessToken": "t" } }).to_string();
-        let r = renewal(doc).await;
-        r.manager.start(&r.id).await.unwrap();
-        let view = r.manager.list().remove(0);
+        logins.docs.lock().unwrap().insert(AgentKind::Claude, doc);
+        let (manager, _, id, _) = host_manager(logins, NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        manager.start(&id).await.unwrap();
+        let view = manager.list().remove(0);
         assert_eq!(view.login_expires_at, None);
-        assert!(view.host_notices.iter().any(|n| n.contains("does not renew it")), "{:?}", view.host_notices);
-        assert!(
-            matches!(lock(&r.manager.state).vms.get(&r.id), Some(Vm::Running { host, .. }) if host.renew.is_empty())
-        );
-    }
-
-    #[tokio::test]
-    async fn a_renewal_ends_with_the_vm() {
-        let r = renewal(claude_doc("t", NOW + 3_600_000)).await;
-        r.manager.start(&r.id).await.unwrap();
-        let renewal = match lock(&r.manager.state).vms.get(&r.id) {
-            Some(Vm::Running { host, .. }) => host.renew[0].clone(),
-            _ => unreachable!(),
-        };
-        r.manager.stop(&r.id).await.unwrap();
-        until(|| renewal.is_finished()).await;
-        assert!(!r.manager.list()[0].renew_due);
+        assert!(view.host_notices.iter().any(|n| n.contains("does not read it again")), "{:?}", view.host_notices);
     }
 
     #[tokio::test]
@@ -3931,13 +3854,16 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
         manager.start(&id).await.unwrap();
         let binds: Vec<String> = runtime.binds.lock().unwrap().iter().map(|b| b.guest.clone()).collect();
-        assert_eq!(binds, ["/opt/zwinger/bin", "/opt/zwinger/host/pi", "/opt/zwinger/host/gemini"]);
+        assert_eq!(binds, ["/opt/zwinger/bin", "/opt/zwinger/host/pi", "/opt/zwinger/host/gemini", "/opt/zwinger/ca"]);
         assert!(manager.list()[0].runtimes.contains(&"gemini"));
         // The TUI probe: a terminal, with no session file.
+        let probe = runtime.argvs.lock().unwrap()[0].clone();
+        assert_eq!(probe[0], "env");
+        assert!(probe.iter().any(|a| a.starts_with("HTTPS_PROXY=http://zw:")), "{probe:?}");
+        assert!(probe.contains(&"NODE_USE_ENV_PROXY=1".to_owned()), "{probe:?}");
         assert_eq!(
-            runtime.argvs.lock().unwrap()[0],
+            probe[probe.len() - 4..],
             [
-                "env",
                 "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent",
                 "node",
                 "/opt/zwinger/host/pi/dist/cli.js",
@@ -3974,13 +3900,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shield_with_secrets_trusts_the_proxy_ca_or_says_why_not() {
+    async fn each_shield_trusts_the_zwinger_ca_or_says_why_not() {
         let (manager, runtime, id) = manager();
-        manager.start(&id).await.unwrap();
-        manager.stop(&id).await.unwrap();
-        assert_eq!(*runtime.trusts.lock().unwrap(), 0, "no secrets, no interception");
-
-        manager.put_secret(&id, secret("KEY", &["a.io"]), value("v")).unwrap();
         manager.start(&id).await.unwrap();
         assert_eq!(*runtime.trusts.lock().unwrap(), 1);
         assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("Only Node")));
@@ -3993,6 +3914,12 @@ mod tests {
             notices.iter().any(|n| n.contains("Only Node trusts") && n.contains("no system CA bundle")),
             "{notices:?}"
         );
+    }
+
+    /// The hosts of the rules with a credential.
+    fn holders(manager: &Manager<FakeRuntime>) -> Vec<String> {
+        let rules = manager.list().remove(0).shield.network.rules;
+        rules.iter().filter(|r| !r.credentials.is_empty()).map(|r| r.label()).collect()
     }
 
     #[tokio::test]
@@ -4009,21 +3936,22 @@ mod tests {
         )
         .unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
-        manager.put_secret(&id, secret("KEY", &["old.io"]), value("v1")).unwrap();
+        credential(&manager, &id, "old.io", "KEY", Some("v1")).unwrap();
+        let new = allow(&manager, &id, "new.io");
 
-        // New hosts and a new value: the set passes its deadline.
+        // A new host and a new value: the set passes its deadline.
         slow.hold();
         assert!(matches!(
-            manager.put_secret(&id, secret("KEY", &["new.io"]), value("v2")),
+            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")),
             Err(Error::KeychainTimeout)
         ));
         assert!(matches!(manager.start(&id).await, Err(Error::SecretPending(n)) if n == "KEY"));
         assert_eq!(manager.list()[0].status, Status::Stopped);
         assert!(matches!(
-            manager.put_secret(&id, secret("KEY", &["new.io"]), value("v3")),
+            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")),
             Err(Error::SecretPending(_))
         ));
-        assert!(matches!(manager.remove_secret(&id, "KEY"), Err(Error::SecretPending(_))));
+        assert!(matches!(manager.set_rule_credential(&id, &new, "KEY", None, None), Err(Error::SecretPending(_))));
 
         // The late set runs, then the restore: the old hosts keep the old value.
         slow.release();
@@ -4032,7 +3960,7 @@ mod tests {
         let writes: Vec<_> =
             slow.writes.lock().unwrap().iter().map(|(a, v)| (a == &account, v.clone().unwrap())).collect();
         assert_eq!(writes, [(true, "v1".to_owned()), (true, "v2".to_owned()), (true, "v1".to_owned())]);
-        assert_eq!(manager.list()[0].shield.secrets[0].hosts, ["old.io"]);
+        assert_eq!(holders(&manager), ["old.io"]);
         manager.start(&id).await.unwrap();
     }
 
@@ -4050,13 +3978,14 @@ mod tests {
         )
         .unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
-        manager.put_secret(&id, secret("KEY", &["old.io"]), value("v1")).unwrap();
+        credential(&manager, &id, "old.io", "KEY", Some("v1")).unwrap();
+        let new = allow(&manager, &id, "new.io");
 
         // The late set of v2 runs; the restore and its fallback delete fail.
         slow.hold();
         *slow.fail_after.lock().unwrap() = Some(2);
         assert!(matches!(
-            manager.put_secret(&id, secret("KEY", &["new.io"]), value("v2")),
+            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")),
             Err(Error::KeychainTimeout)
         ));
         slow.release();
@@ -4065,7 +3994,7 @@ mod tests {
 
         assert!(matches!(manager.start(&id).await, Err(Error::SecretPending(n)) if n == "KEY"));
         assert!(matches!(
-            manager.put_secret(&id, secret("KEY", &["new.io"]), value("v3")),
+            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")),
             Err(Error::SecretPending(_))
         ));
 
@@ -4073,7 +4002,7 @@ mod tests {
         *slow.fail_after.lock().unwrap() = None;
         manager.start(&id).await.unwrap();
         assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "v1");
-        assert_eq!(manager.list()[0].shield.secrets[0].hosts, ["old.io"]);
+        assert_eq!(holders(&manager), ["old.io"]);
     }
 
     #[tokio::test]
@@ -4159,18 +4088,27 @@ mod tests {
         assert_eq!(manager.list()[0].guest_logins, [AgentKind::Codex]);
     }
 
-    /// Runs `script` with `sh -c` in the VM. Returns the exit code and the output.
+    /// Runs `script` with `sh -c` in the VM. Returns the exit code and the
+    /// stdout; after a failure also the stderr.
     async fn sh<R: SandboxRuntime>(manager: &Manager<R>, vm: &R::Vm, script: &str) -> (i32, String) {
         let argv = ["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
         let mut pipe = manager.runtime.open_pipe(vm, &argv, WORKSPACE).await.unwrap();
-        let mut out = Vec::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut code = -1;
         while let Some(event) = pipe.events.recv().await {
             match event {
-                PipeEvent::Stdout(bytes) | PipeEvent::Stderr(bytes) => out.extend(bytes),
-                PipeEvent::Exit(code) => return (code, String::from_utf8_lossy(&out).trim().to_owned()),
+                PipeEvent::Stdout(bytes) => out.extend(bytes),
+                PipeEvent::Stderr(bytes) => err.extend(bytes),
+                PipeEvent::Exit(exit) => {
+                    code = exit;
+                    break;
+                }
             }
         }
-        (-1, String::from_utf8_lossy(&out).into_owned())
+        if code != 0 {
+            out.extend(err);
+        }
+        (code, String::from_utf8_lossy(&out).trim().to_owned())
     }
 
     /// Boots a real shield. Needs microsandbox and network:
@@ -4186,13 +4124,11 @@ mod tests {
         let manager = Manager::new(Microsandbox { pi }, store, vault(), data.clone(), host()).unwrap();
         let id = manager.create(folder.to_str().unwrap()).unwrap();
         manager.add_mount(&id, readonly.to_str().unwrap(), "/mnt/ro", true).unwrap();
-        manager.set_network_mode(&id, NetworkMode::List).unwrap();
-        // A secret host and a host with no secret.
-        manager.add_domain(&id, "api.github.com").unwrap();
-        manager.add_domain(&id, "example.com").unwrap();
-        // The image has no curl and no CA bundle: the test installs them.
-        manager.add_domain(&id, "deb.debian.org").unwrap();
-        manager.put_secret(&id, secret("ZWINGER_LIVE", &["api.github.com"]), value("live-value")).unwrap();
+        // A credential host, a host with no credential, and the Debian mirror:
+        // the image has no curl, so the test installs it.
+        credential(&manager, &id, "api.github.com", "ZWINGER_LIVE", Some("live-value")).unwrap();
+        allow(&manager, &id, "example.com");
+        allow(&manager, &id, "deb.debian.org");
         manager.start(&id).await.unwrap();
         let vm = match lock(&manager.state).vms.get(&id) {
             Some(Vm::Running { vm, .. }) => vm.clone(),
@@ -4204,15 +4140,15 @@ mod tests {
         assert_eq!(run("test ! -e /Users").await.0, 0, "/Users is visible");
         assert_ne!(run("echo x > /mnt/ro/f").await.0, 0, "a read-only mount took a write");
         assert!(!readonly.join("f").exists());
-        assert_ne!(run("getent hosts unlisted.example.org").await.0, 0, "an unlisted name resolved");
+        assert_ne!(run("getent hosts example.com").await.0, 0, "a name resolved in the guest");
         let connect = "node -e \"const s = require('net').connect(443, '1.1.1.1'); \
             s.on('connect', () => process.exit(0)); s.on('error', () => process.exit(1)); \
             setTimeout(() => process.exit(1), 5000)\"";
-        assert_ne!(run(connect).await.0, 0, "egress to an unlisted address passed");
+        assert_ne!(run(connect).await.0, 0, "direct egress passed");
         assert_eq!(run("printenv ZWINGER_LIVE").await, (0, "$MSB_ZWINGER_LIVE$".to_owned()));
         assert_eq!(run("bash -lc 'command -v pi'").await, (0, "/opt/zwinger/bin/pi".to_owned()));
 
-        // Node trusts the proxy CA through NODE_EXTRA_CA_CERTS.
+        // Node goes through the proxy and trusts the zwinger CA.
         for url in ["https://api.github.com/zen", "https://example.com/"] {
             let script = format!(
                 "node -e \"fetch('{url}').then(() => process.exit(0), (e) => {{ console.error(e.cause ?? e); process.exit(1); }})\""
@@ -4220,19 +4156,29 @@ mod tests {
             let (code, out) = sh(&manager, &vm, &script).await;
             assert_eq!(code, 0, "{url}: {out}");
         }
+        // The start made a bundle with the proxy CA, although the image has none.
+        let trusted = format!("grep -qF \"$(sed -n 2p {})\" {}", launch::CA_CERT, launch::CA_BUNDLE);
+        assert_eq!(sh(&manager, &vm, &trusted).await.0, 0, "the bundle has no proxy CA");
+        // curl only, without ca-certificates: it must work with that bundle.
         let install = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive \
-            apt-get install -qq -y --no-install-recommends curl ca-certificates >/dev/null";
+            apt-get install -qq -y --no-install-recommends curl >/dev/null";
         let (code, out) = run(install).await;
         assert_eq!(code, 0, "install curl: {out}");
-        // The trust command of the next start, on the combined bundle.
-        let (code, out) = sh(&manager, &vm, &launch::trust_argv()[2]).await;
-        assert_eq!(code, 0, "trust: {out}");
-        let trusted = format!("grep -qF \"$(sed -n 2p {})\" {}", launch::GUEST_TLS_CA_PATH, launch::CA_BUNDLE);
-        assert_eq!(sh(&manager, &vm, &trusted).await.0, 0, "the bundle has no proxy CA");
-        for url in ["https://api.github.com/zen", "https://example.com/"] {
-            let (code, out) = sh(&manager, &vm, &format!("curl -fsS -o /dev/null {url}")).await;
-            assert_eq!(code, 0, "curl {url}: {out}");
-        }
+        let (code, out) = run("curl -fsS -o /dev/null https://example.com/").await;
+        assert_eq!(code, 0, "curl https://example.com/: {out}");
+        // The proxy sends the fake credential, so GitHub answers 401 itself.
+        let (code, out) = run("curl -sS -o /dev/null -w '%{http_code}' https://api.github.com/zen").await;
+        assert_eq!((code, out.as_str()), (0, "401"), "curl https://api.github.com/zen");
+        let events = manager.list_net_events(&id).unwrap();
+        assert!(events.iter().any(|e| e.host == "api.github.com" && e.credentials == ["ZWINGER_LIVE"]), "{events:?}");
+        // The default blocks the rest, with the zwinger reason.
+        let (_, out) = run("curl -sS https://www.iana.org/ 2>&1").await;
+        assert!(out.contains("403"), "{out}");
+        assert!(
+            manager.list_net_events(&id).unwrap().iter().any(|e| e.host == "www.iana.org" && e.reason == "default")
+        );
+        let test = manager.test_network(&id, "example.com").await.unwrap();
+        assert!(test.proxy.ok && test.target.is_some_and(|t| t.ok));
         manager.stop(&id).await.unwrap();
     }
 }

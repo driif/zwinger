@@ -75,6 +75,12 @@ pub enum Error {
     SecretValueRequired(String),
     #[error("secret {0} not found")]
     SecretNotFound(String),
+    #[error("rule not found")]
+    RuleNotFound,
+    #[error("invalid rule: {0}")]
+    InvalidRule(String),
+    #[error("the network proxy of the shield does not start, so the shield does not start: {0}")]
+    Proxy(String),
     #[error("secret {0} has no value in the Keychain; set it again")]
     SecretMissing(String),
     #[error("Keychain: {0}")]
@@ -135,8 +141,6 @@ pub enum Error {
     HostLoginMissing(String),
     #[error("the {0} login on this Mac has expired; open {0} on the Mac once to renew it, then start the shield again")]
     HostLoginExpired(String),
-    #[error("secret {0} is the host login of an agent; change it in the agent's settings")]
-    HostLoginSecret(String),
     #[error(
         "{0} is blocked in this shield: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off"
     )]

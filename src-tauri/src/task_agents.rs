@@ -109,12 +109,11 @@ impl std::fmt::Display for Failure {
 /// that the CLI has: Claude Code loses its edit tools and pi gets read tools
 /// only. Gemini CLI without `--yolo` refuses the tools that need an approval.
 /// Codex's own sandbox does not work in the VM, so for Codex read-only
-/// is the instruction in the prompt and the check after the stage. `pi_host`
-/// runs the host pi that the shield mounts. `gemini` is the guest path of
-/// Gemini CLI's entry point, if the shield mounts it.
-pub fn argv(agent: &TaskAgent, access: Access, pi_host: bool, gemini: Option<&str>) -> Result<Vec<String>, Failure> {
+/// is the instruction in the prompt and the check after the stage. `found`
+/// picks the program and sets the proxy env.
+pub fn argv(agent: &TaskAgent, access: Access, found: launch::Found) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
-    let Some(mut argv) = launch::command(agent.kind, launch::Found { pi_host, gemini }) else {
+    let Some(mut argv) = launch::command(agent.kind, found) else {
         return Err(Failure::Start("Gemini CLI is not mounted in the shield".to_owned()));
     };
     match agent.kind {
@@ -306,6 +305,8 @@ pub struct Exec<R: SandboxRuntime> {
     pub pi_host: bool,
     /// The guest path of Gemini CLI's entry point, if the shield mounts it.
     pub gemini: Option<String>,
+    /// The URL of the shield's proxy.
+    pub proxy: Option<String>,
 }
 
 /// The final text of a call and the error that the CLI reported.
@@ -323,6 +324,10 @@ enum Mapper {
 }
 
 impl<R: SandboxRuntime> Exec<R> {
+    fn found(&self) -> launch::Found<'_> {
+        launch::Found { pi_host: self.pi_host, gemini: self.gemini.as_deref(), proxy: self.proxy.as_deref() }
+    }
+
     /// Runs `argv` with `input` on stdin until it exits, is killed by a limit,
     /// or `cancel` becomes true. Each stdout chunk goes to `on_stdout`.
     async fn drive(
@@ -432,15 +437,8 @@ impl<R: SandboxRuntime> Exec<R> {
                 }
             }
         };
-        let (code, stderr) = self
-            .drive(
-                &argv(agent, access, self.pi_host, self.gemini.as_deref())?,
-                prompt.as_bytes(),
-                limits,
-                cancel,
-                on_stdout,
-            )
-            .await?;
+        let (code, stderr) =
+            self.drive(&argv(agent, access, self.found())?, prompt.as_bytes(), limits, cancel, on_stdout).await?;
         if let Some(error) = result.error {
             return Err(Failure::Agent(error));
         }
@@ -704,38 +702,49 @@ mod tests {
 
     const GEMINI: Option<&str> = Some("/opt/zwinger/host/gemini/bundle/gemini.js");
 
+    fn found(pi_host: bool, gemini: Option<&str>) -> launch::Found<'_> {
+        launch::Found { pi_host, gemini, proxy: None }
+    }
+
     #[test]
     fn read_only_stages_pass_the_read_only_flags() {
-        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, false, GEMINI).unwrap();
+        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, found(false, GEMINI)).unwrap();
         assert!(claude.windows(2).any(|w| w == ["--disallowedTools", "Edit,Write,NotebookEdit"]));
         assert!(claude.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(
-            !argv(&agent(AgentKind::Claude, None), Access::Write, false, GEMINI)
+            !argv(&agent(AgentKind::Claude, None), Access::Write, found(false, GEMINI))
                 .unwrap()
                 .contains(&"--disallowedTools".to_owned())
         );
 
-        let pi = argv(&agent(AgentKind::Pi, None), Access::Read, false, GEMINI).unwrap();
+        let pi = argv(&agent(AgentKind::Pi, None), Access::Read, found(false, GEMINI)).unwrap();
         assert!(pi.windows(2).any(|w| w == ["--tools", PI_READ_TOOLS]));
         assert_eq!(pi.last().map(String::as_str), Some("-p"));
         assert!(
-            !argv(&agent(AgentKind::Pi, None), Access::Write, false, GEMINI).unwrap().contains(&"--tools".to_owned())
+            !argv(&agent(AgentKind::Pi, None), Access::Write, found(false, GEMINI))
+                .unwrap()
+                .contains(&"--tools".to_owned())
         );
 
-        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, false, GEMINI).unwrap();
-        assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, false, GEMINI).unwrap());
+        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, found(false, GEMINI)).unwrap();
+        assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, found(false, GEMINI)).unwrap());
         assert!(codex.windows(2).any(|w| w == ["-m", "gpt-5"]));
         assert_eq!(codex.last().map(String::as_str), Some("-"));
 
-        let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, false, GEMINI).unwrap();
+        let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, found(false, GEMINI)).unwrap();
         assert!(!gemini.contains(&"--yolo".to_owned()));
         assert!(
-            argv(&agent(AgentKind::Gemini, None), Access::Write, false, GEMINI).unwrap().contains(&"--yolo".to_owned())
+            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, GEMINI))
+                .unwrap()
+                .contains(&"--yolo".to_owned())
         );
         assert_eq!(gemini[3], "/opt/zwinger/host/gemini/bundle/gemini.js");
-        assert!(matches!(argv(&agent(AgentKind::Gemini, None), Access::Write, false, None), Err(Failure::Start(_))));
+        assert!(matches!(
+            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, None)),
+            Err(Failure::Start(_))
+        ));
 
-        let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, true, GEMINI).unwrap();
+        let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, found(true, GEMINI)).unwrap();
         assert_eq!(host_pi[2..4], ["node", "/opt/zwinger/host/pi/dist/cli.js"]);
         assert_eq!(pi[..4], ["env", "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/pi/cli.js"]);
     }

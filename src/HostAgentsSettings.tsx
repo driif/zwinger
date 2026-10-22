@@ -1,7 +1,7 @@
 import { Button, Card, CardBody, CardHeader, CommandMenu } from "@driif/motiv";
 import { Download, RefreshCw, TriangleAlert } from "lucide-react";
 import { useState } from "react";
-import { AGENT_NAMES, Detection, GEMINI_NO_LOGIN, HostAgent, RuntimeName, ShieldView } from "./api";
+import { AGENT_NAMES, Detection, HostAgent, RuntimeName, ShieldView } from "./api";
 import type { Run, Runtimes } from "./App";
 import { InstallControl } from "./roomParts";
 
@@ -21,7 +21,6 @@ function source(agent: HostAgent) {
 }
 
 function login(agent: HostAgent) {
-  if (agent.kind === "gemini") return GEMINI_NO_LOGIN;
   if (agent.login.state === "expired") return `The login has expired. Open ${AGENT_NAMES[agent.kind]} on this Mac once to renew it.`;
   if (agent.login.state === "none") return "No subscription login on this Mac.";
   if (agent.kind === "claude")

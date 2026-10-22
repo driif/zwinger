@@ -1,11 +1,11 @@
 import { CommandMenu, CommandMenuItem } from "@driif/motiv";
 import { Ref } from "react";
 import {
-  NetworkMode,
-  removeDomain,
   removeMount,
+  removeRule,
   setMountReadonly,
-  setNetworkMode,
+  setNetworkDefault,
+  setOffline,
   ShieldView,
   startApp,
   stopApp,
@@ -86,7 +86,7 @@ export function CommandBar({
       action("terminal", "Terminal"),
       action("network", "Network"),
       action("settings", "Settings"),
-      intent("allowList", "Edit allow list…"),
+      intent("addRule", "Add a network rule…"),
       intent("rename", "Rename shield…"),
       intent("mount", "Add mount…"),
       intent("harness", "Set harness…"),
@@ -107,16 +107,23 @@ export function CommandBar({
     commands.push({ id: "new-task", label: "New task…", onSelect: () => onView({ kind: "taskEdit" }) });
     for (const task of shield.tasks)
       commands.push({ id: `task-${task.id}`, label: `Show task ${task.title}`, onSelect: () => onView({ kind: "task", taskId: task.id }) });
-    const modes: [NetworkMode, string][] = [
-      ["deny", "Network: deny all"],
-      ["list", "Network: allow list only"],
-      ["public", "Network: public internet"],
-    ];
-    for (const [mode, label] of modes)
-      if (network.mode !== mode)
-        commands.push({ id: `mode-${mode}`, label, onSelect: () => run(() => setNetworkMode(id, mode)) });
-    for (const domain of network.domains)
-      commands.push({ id: `domain-${domain}`, label: `Remove host ${domain}`, onSelect: () => run(() => removeDomain(id, domain)) });
+    const other = network.default === "allow" ? "block" : "allow";
+    commands.push(
+      {
+        id: "network-default",
+        label: `Network: ${other} everything else`,
+        onSelect: () => run(() => setNetworkDefault(id, other)),
+      },
+      {
+        id: "network-offline",
+        label: network.offline ? "Network: go online" : "Network: go offline",
+        onSelect: () => run(() => setOffline(id, !network.offline)),
+      },
+    );
+    for (const rule of network.rules) {
+      const label = rule.target.kind === "host" ? rule.target.host : rule.target.id;
+      commands.push({ id: `rule-${rule.id}`, label: `Remove network rule ${label}`, onSelect: () => run(() => removeRule(id, rule.id)) });
+    }
     for (const mount of shield.mounts) {
       commands.push({
         id: `access-${mount.guest}`,

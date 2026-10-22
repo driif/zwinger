@@ -1,7 +1,6 @@
 //! Gemini CLI: one `gemini --output-format stream-json` per task call. It runs from the host install, which the shield
 //! mounts read-only: Gemini CLI has no pinned runtime. It authenticates
-//! with a `GEMINI_API_KEY` secret only: its subscription login is not
-//! supported yet (ADR 0002, issue #16).
+//! with the host login (ADR 0002) or a `GEMINI_API_KEY` credential.
 
 use serde_json::{Value, json};
 

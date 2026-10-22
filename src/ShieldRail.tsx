@@ -737,9 +737,6 @@ export function ShieldRail({
                         >
                           {shield.name}
                         </span>
-                        {shield.renewDue && (
-                          <RotateCw size={12} className="warn" aria-label="The host login is due: restart to renew" />
-                        )}
                         {blocked[shield.id] > 0 && (
                           <span className="rail-blocked" title="Blocked network events since you last saw them">
                             {blocked[shield.id]}

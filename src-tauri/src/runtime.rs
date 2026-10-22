@@ -3,7 +3,7 @@ use std::future::Future;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SecretBuilder};
+use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT};
 use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
@@ -11,11 +11,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
 use crate::error::{Error, Result};
-use crate::host_agents::login;
 use crate::netlog;
 use crate::runtimes::Installed;
-use crate::secrets::{Secret, SecretValue};
-use crate::shield::{self, NetworkMode, Shield, WORKSPACE};
+use crate::shield::{Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -71,10 +69,13 @@ impl SessionKind {
 /// of [`launch::PROFILE`] puts the wrappers back.
 pub const PTY_ENV: [(&str, &str); 3] = [("PATH", launch::PATH), ("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
 
-/// The CA bundle vars of OpenSSL, Python requests, curl and git. They point
-/// at the system bundle, which [`launch::trust_argv`] extends with the
-/// interception CA.
-const CA_ENV: [&str; 4] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"];
+/// What the guest needs to use the shield's proxy: the host port that the
+/// VM may reach, and the env of every process (see [`launch::net_env`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestNet {
+    pub port: u16,
+    pub env: Vec<(String, String)>,
+}
 
 /// A host folder that a start mounts read-only, such as a host agent's
 /// package or profile snapshot.
@@ -130,13 +131,14 @@ pub struct Pipe {
 pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
-    /// `secrets` comes from [`secret_entries`]. `state` is the host dir of the
-    /// shield's agent state. Each runtime in `runtimes` is mounted read-only
-    /// at `/opt/zwinger/<name>`, and each of `binds` read-only at its guest path.
+    /// The VM reaches only `net.port` on the host. `state` is the host dir
+    /// of the shield's agent state. Each runtime in `runtimes` is mounted
+    /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
+    /// its guest path.
     fn start(
         &self,
         shield: &Shield,
-        secrets: Vec<SecretBuilder>,
+        net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
@@ -160,56 +162,16 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
 }
 
-/// Builds the tenant policy. The MultiTenant profile adds a host-owned public-only
-/// floor on top. Host, LAN, loopback, link-local and metadata are denied first in
-/// every mode. The Host deny skips TCP/UDP port 53: the DNS interceptor evaluates
-/// queries against Host rules, so a full Host deny would refuse every query.
-/// `denied` are the refresh hosts of the shield's host logins: they are denied
-/// next, before any allow, so also Public mode and the allow list cannot reach them.
-pub fn sandbox_policy(policy: &shield::NetworkPolicy, denied: &[&str]) -> Result<microsandbox::NetworkPolicy> {
-    let (suffixes, domains): (Vec<&str>, Vec<&str>) =
-        policy.domains.iter().map(String::as_str).partition(|d| d.starts_with("*."));
-    let builder = microsandbox::NetworkPolicy::builder()
+/// The outer wall of the shield (ADR 0003): all egress is denied but TCP to
+/// the proxy's port on the host, with no DNS. Ingress is denied. The VM runs
+/// with the SingleTenant profile: the public-only floor of MultiTenant
+/// denies the host, so the guest could not reach the proxy.
+pub fn sandbox_policy(port: u16) -> Result<microsandbox::NetworkPolicy> {
+    microsandbox::NetworkPolicy::builder()
         .default_deny()
-        .egress(|e| e.tcp().udp().port_range(0, 52).port_range(54, u16::MAX).deny_host())
-        .egress(|e| e.icmpv4().icmpv6().deny_host())
-        .egress(|e| e.deny_private().deny_loopback().deny_link_local().deny_meta());
-    let builder = if denied.is_empty() { builder } else { builder.egress(|e| e.deny_domains(denied.iter().copied())) };
-    let builder = match policy.mode {
-        NetworkMode::Deny => builder,
-        NetworkMode::List => {
-            builder.egress(|e| e.allow_domains(domains).allow_domain_suffixes(suffixes.into_iter().map(|s| &s[2..])))
-        }
-        NetworkMode::Public => {
-            builder.rule(|r| r.egress().udp().tcp().port(53).allow_host()).egress(|e| e.allow_public())
-        }
-    };
-    builder.build().map_err(|e| Error::InvalidDomain(policy.domains.join(", "), e.to_string()))
-}
-
-/// Pairs each secret with its value. The guest gets the placeholder in the
-/// variable; the proxy replaces it with the value only in the selected places
-/// of requests to the secret's hosts, and only after the TLS identity check.
-/// Checks each secret again, because `SecretBuilder::allow` panics on an
-/// invalid host and the stored config can be edited by hand.
-pub fn secret_entries(secrets: &[Secret], values: Vec<SecretValue>) -> Result<Vec<SecretBuilder>> {
-    secrets
-        .iter()
-        .zip(values)
-        .map(|(secret, value)| {
-            let secret = secret.clone().normalize()?;
-            let builder =
-                SecretBuilder::new().env(&secret.name).placeholder(secret.placeholder()).value(value.expose());
-            // An empty field list means all header fields to microsandbox.
-            let builder = if secret.places.header_fields.is_empty() {
-                builder.substitute_in_headers(false)
-            } else {
-                builder.substitute_in_header_fields(&secret.places.header_fields)
-            };
-            let builder = builder.substitute_in_query(secret.places.query).substitute_in_body(secret.places.body);
-            Ok(secret.hosts.iter().fold(builder, |b, host| b.allow(host)))
-        })
-        .collect()
+        .rule(|r| r.egress().tcp().port(port).allow_host())
+        .build()
+        .map_err(|e| Error::Proxy(e.to_string()))
 }
 
 const LABEL: (&str, &str) = ("app", "zwinger");
@@ -275,16 +237,16 @@ impl SandboxRuntime for Microsandbox {
     async fn start(
         &self,
         shield: &Shield,
-        secrets: Vec<SecretBuilder>,
+        net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<Sandbox> {
-        let policy = sandbox_policy(&shield.network, &login::denied_hosts(&shield.secrets))?;
+        let policy = sandbox_policy(net.port)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", shield.id))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
-            .deployment_profile(DeploymentProfile::MultiTenant)
+            .deployment_profile(DeploymentProfile::SingleTenant)
             .ephemeral(true)
             .replace()
             // The network events are debug lines of the runtime log.
@@ -308,17 +270,9 @@ impl SandboxRuntime for Microsandbox {
         for bind in binds {
             builder = builder.volume(&bind.guest, |m| m.bind(&bind.host).readonly());
         }
-        // Secrets turn on TLS interception. Node does not read the system
-        // trust store, so it gets the interception CA explicitly. The builder
-        // env reaches every exec; a login shell resets only `PATH`.
-        if !secrets.is_empty() {
-            builder = builder.env("NODE_EXTRA_CA_CERTS", launch::GUEST_TLS_CA_PATH);
-            for name in CA_ENV {
-                builder = builder.env(name, launch::CA_BUNDLE);
-            }
-        }
-        for secret in secrets {
-            builder = builder.secret_entry(secret.build());
+        // The builder env reaches every exec; a login shell resets only `PATH`.
+        for (name, value) in &net.env {
+            builder = builder.env(name, value);
         }
         Ok(builder.create().await?)
     }
@@ -474,14 +428,9 @@ pub mod fake {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use microsandbox::HostPattern;
-
     use super::*;
 
     use tokio::sync::Notify;
-
-    /// The name and the hosts of a secret.
-    pub type StartedSecret = (String, Vec<HostPattern>);
 
     /// Echoes input back as output. `Kill` ends the process with code 137.
     #[derive(Default, Clone)]
@@ -494,8 +443,8 @@ pub mod fake {
         pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// Holds the exit of a killed PTY process.
         pub kill_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
-        /// The names and hosts of the secrets of the last start, never the values.
-        pub secrets: Arc<Mutex<Vec<StartedSecret>>>,
+        /// The guest network of the last start.
+        pub net: Arc<Mutex<Option<GuestNet>>>,
         /// The runtime names of the last start.
         pub runtimes: Arc<Mutex<Vec<String>>>,
         /// The read-only binds of the last start.
@@ -557,7 +506,7 @@ pub mod fake {
         async fn start(
             &self,
             shield: &Shield,
-            secrets: Vec<SecretBuilder>,
+            net: &GuestNet,
             _: &Path,
             runtimes: &[Installed],
             binds: &[Bind],
@@ -570,12 +519,7 @@ pub mod fake {
                 gate.release.notified().await;
             }
             self.log.lock().unwrap().push(format!("start {}", shield.id));
-            let mut started = self.secrets.lock().unwrap();
-            started.clear();
-            for secret in secrets {
-                let entry = secret.build();
-                started.push((entry.env_var, entry.allowed_hosts));
-            }
+            *self.net.lock().unwrap() = Some(net.clone());
             Ok(FakeVm { shield_id: shield.id.clone() })
         }
 
@@ -723,175 +667,32 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
-    use microsandbox::{HostPattern, NetworkAction};
-    use serde_json::{Value, json};
+    use microsandbox::NetworkAction;
+    use serde_json::json;
 
     use super::*;
-    use crate::secrets::{Origin, Places};
-
-    fn policy(mode: NetworkMode, domains: &[&str]) -> microsandbox::NetworkPolicy {
-        denying(mode, domains, &[])
-    }
-
-    fn denying(mode: NetworkMode, domains: &[&str], denied: &[&str]) -> microsandbox::NetworkPolicy {
-        sandbox_policy(
-            &shield::NetworkPolicy { mode, domains: domains.iter().map(|d| (*d).to_owned()).collect() },
-            denied,
-        )
-        .unwrap()
-    }
-
-    fn rules(policy: &microsandbox::NetworkPolicy) -> Value {
-        serde_json::to_value(&policy.rules).unwrap()
-    }
-
-    /// The DNS interceptor's decision for a UDP/53 query.
-    fn dns(policy: &microsandbox::NetworkPolicy, name: &str) -> NetworkAction {
-        policy.evaluate_dns_query(&name.parse().unwrap(), serde_json::from_value(json!("udp")).unwrap(), 53)
-    }
-
-    fn deny(destination: Value, protocols: Value, ports: Value) -> Value {
-        json!({
-            "direction": "egress",
-            "destination": destination,
-            "protocols": protocols,
-            "ports": ports,
-            "action": "deny",
-        })
-    }
-
-    fn allow(destination: Value) -> Value {
-        json!({
-            "direction": "egress",
-            "destination": destination,
-            "protocols": [],
-            "ports": [],
-            "action": "allow",
-        })
-    }
-
-    fn floor() -> Vec<Value> {
-        let host = json!({ "group": "host" });
-        let mut rules = vec![
-            deny(
-                host.clone(),
-                json!(["tcp", "udp"]),
-                json!([{ "start": 0, "end": 52 }, { "start": 54, "end": 65535 }]),
-            ),
-            deny(host, json!(["icmpv4", "icmpv6"]), json!([])),
-        ];
-        for group in ["private", "loopback", "link_local", "metadata"] {
-            rules.push(deny(json!({ "group": group }), json!([]), json!([])));
-        }
-        rules
-    }
 
     #[test]
-    fn every_mode_denies_by_default_and_starts_with_the_floor() {
-        for policy in [
-            policy(NetworkMode::Deny, &["registry.npmjs.org"]),
-            policy(NetworkMode::List, &[]),
-            policy(NetworkMode::List, &["registry.npmjs.org"]),
-            policy(NetworkMode::Public, &[]),
-        ] {
-            assert_eq!(policy.default_egress, NetworkAction::Deny);
-            assert_eq!(policy.default_ingress, NetworkAction::Deny);
-            assert_eq!(rules(&policy).as_array().unwrap()[..6], floor()[..]);
-        }
-    }
-
-    #[test]
-    fn allow_list_maps_domains_and_wildcards_without_open_dns() {
-        let policy = policy(NetworkMode::List, &["registry.npmjs.org", "*.anthropic.com"]);
-        let mut expected = floor();
-        expected.push(allow(json!({ "domain": "registry.npmjs.org" })));
-        expected.push(allow(json!({ "domain_suffix": "anthropic.com" })));
-        assert_eq!(rules(&policy), Value::Array(expected));
-    }
-
-    #[test]
-    fn allow_list_resolves_only_listed_names() {
-        let policy = policy(NetworkMode::List, &["registry.npmjs.org", "*.anthropic.com"]);
-        assert_eq!(dns(&policy, "registry.npmjs.org"), NetworkAction::Allow);
-        assert_eq!(dns(&policy, "api.anthropic.com"), NetworkAction::Allow);
-        assert_eq!(dns(&policy, "anthropic.com"), NetworkAction::Allow);
-        assert_eq!(dns(&policy, "example.com"), NetworkAction::Deny);
-        assert_eq!(dns(&policy, "npmjs.org"), NetworkAction::Deny);
-        assert_eq!(dns(&policy, "host.microsandbox.internal"), NetworkAction::Deny);
-    }
-
-    #[test]
-    fn empty_allow_list_resolves_nothing() {
-        assert_eq!(dns(&policy(NetworkMode::List, &[]), "registry.npmjs.org"), NetworkAction::Deny);
-    }
-
-    #[test]
-    fn deny_allows_no_domains() {
-        let policy = policy(NetworkMode::Deny, &["registry.npmjs.org", "*.anthropic.com"]);
-        assert_eq!(rules(&policy), Value::Array(floor()));
-        assert_eq!(dns(&policy, "registry.npmjs.org"), NetworkAction::Deny);
-        assert_eq!(dns(&policy, "api.anthropic.com"), NetworkAction::Deny);
-    }
-
-    #[test]
-    fn public_opens_dns_and_public_only() {
-        let policy = policy(NetworkMode::Public, &["registry.npmjs.org"]);
-        let mut expected = floor();
-        expected.push(json!({
-            "direction": "egress",
-            "destination": { "group": "host" },
-            "protocols": ["udp", "tcp"],
-            "ports": [{ "start": 53, "end": 53 }],
-            "action": "allow",
-        }));
-        expected.push(allow(json!({ "group": "public" })));
-        assert_eq!(rules(&policy), Value::Array(expected));
-        assert_eq!(rules(&policy)[6], serde_json::to_value(microsandbox::NetworkRule::allow_dns()).unwrap());
-        assert_eq!(dns(&policy, "example.com"), NetworkAction::Allow);
-    }
-
-    #[test]
-    fn secret_entries_map_places_and_hosts() {
-        let secrets = [
-            Secret {
-                name: "OPENAI_API_KEY".into(),
-                hosts: vec!["api.openai.com".into(), "openai.com".into()],
-                places: Places {
-                    header_fields: vec!["Authorization".into(), "x-api-key".into()],
-                    query: false,
-                    body: false,
-                },
-                origin: Origin::User,
-            },
-            Secret {
-                name: "MAPS_KEY".into(),
-                hosts: vec!["maps.example.com".into()],
-                places: Places { header_fields: vec![], query: true, body: true },
-                origin: Origin::User,
-            },
-        ];
-        let values = vec![SecretValue::new("sk-1"), SecretValue::new("mk-2")];
-        let entries: Vec<_> = secret_entries(&secrets, values).unwrap().into_iter().map(SecretBuilder::build).collect();
-
-        assert_eq!(entries[0].env_var, "OPENAI_API_KEY");
-        assert_eq!(*entries[0].value, "sk-1");
-        assert_eq!(entries[0].placeholder, "$MSB_OPENAI_API_KEY$");
+    fn the_vm_reaches_only_the_proxy_port() {
+        let policy = sandbox_policy(41234).unwrap();
+        assert_eq!(policy.default_egress, NetworkAction::Deny);
+        assert_eq!(policy.default_ingress, NetworkAction::Deny);
         assert_eq!(
-            entries[0].allowed_hosts,
-            [HostPattern::Exact("api.openai.com".into()), HostPattern::Exact("openai.com".into())]
+            serde_json::to_value(&policy.rules).unwrap(),
+            json!([{
+                "direction": "egress",
+                "destination": { "group": "host" },
+                "protocols": ["tcp"],
+                "ports": [{ "start": 41234, "end": 41234 }],
+                "action": "allow",
+            }])
         );
-        let s = &entries[0].substitution;
-        assert!(s.headers && !s.query && !s.body);
-        assert_eq!(s.header_fields, ["authorization", "x-api-key"]);
-
-        assert_eq!(*entries[1].value, "mk-2");
-        let s = &entries[1].substitution;
-        assert!(!s.headers && s.header_fields.is_empty() && s.query && s.body);
-
-        for entry in &entries {
-            assert!(entry.require_tls_identity);
-            assert!(entry.passthrough_hosts.is_empty());
-        }
+        // No name resolves: the guest finds the proxy in /etc/hosts.
+        let dns = |name: &str| {
+            policy.evaluate_dns_query(&name.parse().unwrap(), serde_json::from_value(json!("udp")).unwrap(), 53)
+        };
+        assert_eq!(dns("example.com"), NetworkAction::Deny);
+        assert_eq!(dns("host.microsandbox.internal"), NetworkAction::Deny);
     }
 
     #[test]
@@ -957,31 +758,5 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the grandchild is still running");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    }
-
-    #[test]
-    fn refresh_hosts_are_denied_in_every_mode() {
-        let refresh = ["console.anthropic.com", "platform.claude.com"];
-        for mode in [NetworkMode::Deny, NetworkMode::List, NetworkMode::Public] {
-            // Also when the allow list names them, or a wildcard covers them.
-            let policy = denying(mode, &["console.anthropic.com", "*.claude.com", "api.anthropic.com"], &refresh);
-            let rules = rules(&policy);
-            assert_eq!(rules.as_array().unwrap()[..6], floor()[..]);
-            for (i, host) in refresh.iter().enumerate() {
-                assert_eq!(rules[6 + i], deny(json!({ "domain": host }), json!([]), json!([])), "{mode:?}");
-                assert_eq!(dns(&policy, host), NetworkAction::Deny, "{mode:?} {host}");
-            }
-            let api = if mode == NetworkMode::Deny { NetworkAction::Deny } else { NetworkAction::Allow };
-            assert_eq!(dns(&policy, "api.anthropic.com"), api, "{mode:?}");
-        }
-    }
-
-    #[test]
-    fn invalid_domain_is_rejected() {
-        let result = sandbox_policy(
-            &shield::NetworkPolicy { mode: NetworkMode::List, domains: vec!["not a domain".into()] },
-            &[],
-        );
-        assert!(matches!(result, Err(Error::InvalidDomain(..))));
     }
 }

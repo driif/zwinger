@@ -1,22 +1,60 @@
-import { Button, Card, CardBody, CardHeader, FilterChips, FloatingField, SegmentedControl } from "@driif/motiv";
-import { Ban, Plus, TriangleAlert, X } from "lucide-react";
+import {
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  FloatingField,
+  LiquidSwitch,
+  SegmentedControl,
+} from "@driif/motiv";
+import {
+  Ban,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  KeyRound,
+  Plus,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { addDomain, NetEvent, NetworkMode, removeDomain, setNetworkMode, ShieldView } from "./api";
+import {
+  Action,
+  AGENT_NAMES,
+  DefaultAction,
+  NetEvent,
+  NetStage,
+  NetTest,
+  putRule,
+  removeRule,
+  Rule,
+  setNetworkDefault,
+  setOffline,
+  ShieldView,
+  Target,
+  testNetwork,
+} from "./api";
 import type { Intent, Run } from "./App";
 import { NetworkActivity } from "./NetworkActivity";
-import { SecretsSection } from "./SecretsSection";
+import { RuleCredentials } from "./RuleCredentials";
 import { errorMessage } from "./errorMessage";
+import {
+  covers,
+  credentialHosts,
+  ruleDomains,
+  ruleLabel,
+  serviceIcon,
+  serviceOf,
+  useCatalog,
+} from "./network";
 
-const PROVIDERS = ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"];
-const PRESETS = [...PROVIDERS, "registry.npmjs.org"];
-
-/** The groups that `sandbox_policy` in the backend denies in every mode. */
+/** The groups that the proxy blocks after it resolves the host on this Mac. */
 const ALWAYS_BLOCKED = [
-  { label: "This computer", hint: "the host, except DNS" },
-  { label: "Local network", hint: "private ranges" },
-  { label: "Loopback", hint: "127.0.0.0/8, ::1" },
-  { label: "Link-local", hint: "169.254.0.0/16, fe80::/10" },
-  { label: "Cloud metadata", hint: "169.254.169.254" },
+  { label: "This computer", hint: "127.0.0.0/8, ::1" },
+  { label: "Local network", hint: "10/8, 172.16/12, 192.168/16, fc00::/7" },
+  { label: "Shared and link-local", hint: "100.64/10, 169.254/16, fe80::/10" },
+  { label: "Cloud metadata", hint: "169.254.169.254, fd00:ec2::254" },
+  { label: "Token refresh of the host logins", hint: "the Mac renews them" },
 ];
 
 const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
@@ -44,28 +82,44 @@ interface Props {
   onSeen: (seq: number) => void;
 }
 
-export function NetworkTab({ shield, events, run, intent, onIntentDone, active, onSeen }: Props) {
+export function NetworkTab({
+  shield,
+  events,
+  run,
+  intent,
+  onIntentDone,
+  active,
+  onSeen,
+}: Props) {
   const { id, network } = shield;
-  const [domain, setDomain] = useState("");
+  const catalog = useCatalog();
+  const [adding, setAdding] = useState<"service" | "host">();
+  const [host, setHost] = useState("");
   const [problem, setProblem] = useState<string>();
-  const domainField = useRef<HTMLInputElement>(null);
-  const focusDomain = useRef(false);
-  const presetPending = useRef(false);
+  const [expanded, setExpanded] = useState<string>();
+  const [credentialsOf, setCredentialsOf] = useState<string>();
+  const [testHost, setTestHost] = useState("example.com");
+  const [test, setTest] = useState<NetTest | "running">();
+  const hostField = useRef<HTMLInputElement>(null);
   const activity = useRef<HTMLDivElement>(null);
   const [activityVisible, setActivityVisible] = useState(false);
   const latestSeq = events[events.length - 1]?.seq ?? 0;
-  const presets = network.domains.filter((d) => PRESETS.includes(d));
-  const piReady = PROVIDERS.some((d) => network.domains.includes(d));
+  const running = shield.status.state === "running";
 
   useEffect(() => {
-    if (intent?.kind !== "allowList") return;
+    if (intent?.kind !== "addRule") return;
     onIntentDone();
-    focusDomain.current = true;
-    if (network.mode !== "list") run(() => setNetworkMode(id, "list"));
+    setAdding("host");
   }, [intent]);
 
   useEffect(() => {
-    const observer = new IntersectionObserver(([entry]) => setActivityVisible(entry.isIntersecting));
+    if (adding === "host") hostField.current?.focus();
+  }, [adding]);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(([entry]) =>
+      setActivityVisible(entry.isIntersecting),
+    );
     observer.observe(activity.current!);
     return () => observer.disconnect();
   }, []);
@@ -74,115 +128,367 @@ export function NetworkTab({ shield, events, run, intent, onIntentDone, active, 
     if (active && activityVisible) onSeen(latestSeq);
   }, [active, activityVisible, latestSeq]);
 
-  // The domain field exists only in List mode, so the focus waits for it.
-  useEffect(() => {
-    if (!focusDomain.current || network.mode !== "list") return;
-    focusDomain.current = false;
-    domainField.current?.focus();
-  });
+  const add = (target: Target, action: Action) =>
+    run(() => putRule(id, { target, action }));
 
-  function submitDomain(event: FormEvent) {
-    event.preventDefault();
-    const error = domainError(domain);
+  function submitHost(action: Action) {
+    const error = domainError(host);
     if (error) return setProblem(error);
     run(() =>
-      addDomain(id, domain).then(
-        () => setDomain(""),
+      putRule(id, { target: { kind: "host", host }, action }).then(
+        () => {
+          setHost("");
+          setAdding(undefined);
+        },
         (e) => setProblem(errorMessage(e)),
       ),
     );
   }
 
-  /**
-   * The chips report the whole selection. Only the chip that changed is sent.
-   * Clicks during a pending change are dropped: the chips would compare against
-   * a selection that is not refreshed yet.
-   */
-  function setPresets(selected: string[]) {
-    if (presetPending.current) return;
-    const added = selected.find((d) => !presets.includes(d));
-    const removed = presets.find((d) => !selected.includes(d));
-    const change = added ? () => addDomain(id, added) : removed ? () => removeDomain(id, removed) : undefined;
-    if (!change) return;
-    presetPending.current = true;
-    run(change).finally(() => {
-      presetPending.current = false;
-    });
+  function runTest(event: FormEvent) {
+    event.preventDefault();
+    setTest("running");
+    testNetwork(id, testHost.trim()).then(setTest, (e) =>
+      setTest({ proxy: { ok: false, detail: errorMessage(e) }, target: null }),
+    );
   }
+
+  const stage = (label: string, { ok, detail }: NetStage) => (
+    <li className={`row ${ok ? "ok" : "danger"}`}>
+      {ok ? <Check size={14} /> : <X size={14} />}
+      <span>{label}</span>
+      <span className="grow muted">{detail}</span>
+    </li>
+  );
+
+  const loginsOf = (rule: Rule) =>
+    shield.logins.filter((l) =>
+      l.hosts.some((h) => ruleDomains(rule, catalog).some((d) => covers(d, h))),
+    );
+  const blockedNeeds = shield.agentNeeds.filter((need) => !need.allowed);
+  const unused = catalog.filter(
+    (s) =>
+      !network.rules.some(
+        (r) => r.target.kind === "service" && r.target.id === s.id,
+      ),
+  );
 
   return (
     <div className="tab-body">
+      <Card variant="subtle" padding="md">
+        <CardHeader
+          title="How the rules work"
+          titleAs="h2"
+          description="The agent can reach a host only if the rules allow it. The proxy checks in this order:"
+        />
+        <CardBody>
+          <ol className="stack">
+            <li>Always blocked: your Mac, your network, cloud metadata.</li>
+            <li>Blocked services and hosts. Block always beats Allow.</li>
+            <li>
+              Allowed services and hosts. Their credentials are added here.
+            </li>
+            <li>Everything else: the default.</li>
+          </ol>
+          <p className="muted">
+            Changes apply to the next request, with no restart.
+          </p>
+        </CardBody>
+      </Card>
+
       <Card variant="outlined" padding="md">
-        <CardHeader title="Egress" titleAs="h2" description="Which hosts the agent can reach from inside the shield." />
+        <CardHeader title="Internet access" titleAs="h2" />
         <CardBody className="stack">
           <SegmentedControl
-            label="Network mode"
+            label="Everything else"
             options={[
-              { value: "deny", label: "Deny all" },
-              { value: "list", label: "Allow list" },
-              { value: "public", label: "Public internet" },
+              { value: "block", label: "Block everything else" },
+              { value: "allow", label: "Allow everything else" },
             ]}
-            value={network.mode}
-            onChange={(mode) => run(() => setNetworkMode(id, mode as NetworkMode))}
+            value={network.default}
+            onChange={(value) =>
+              run(() => setNetworkDefault(id, value as DefaultAction))
+            }
           />
-          {network.mode === "deny" && <p className="muted">The agent cannot reach any host. The allow list is kept.</p>}
-          {network.mode === "public" && (
+          {network.default === "block" ? (
+            <p className="muted">A host that no rule allows is blocked.</p>
+          ) : (
             <p className="warn row">
-              <TriangleAlert size={14} />
-              The agent can reach every public host. Only the groups below stay blocked.
+              <TriangleAlert size={14} />A host that no rule blocks is allowed.
+              Only the always-blocked groups stay closed.
             </p>
           )}
-          {network.mode === "list" && (
-            <>
-              {network.domains.length === 0 && <p className="muted">No hosts yet. All egress is denied.</p>}
-              <ul className="list">
-                {network.domains.map((d) => (
-                  <li key={d} className="row">
-                    <span className="grow mono">{d}</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      aria-label={`Remove ${d}`}
-                      iconLeft={<X size={14} />}
-                      onClick={() => run(() => removeDomain(id, d))}
-                    />
-                  </li>
-                ))}
-              </ul>
-              <form className="row" onSubmit={submitDomain}>
-                <FloatingField
-                  ref={domainField}
-                  label="Domain or *.domain"
-                  className="grow mono"
-                  value={domain}
-                  hint={problem}
-                  aria-invalid={problem !== undefined}
-                  showValidity={false}
-                  onChange={(e) => {
-                    setDomain(e.target.value);
-                    setProblem(undefined);
-                  }}
-                />
-                <Button type="submit" variant="outline" aria-label="Add domain" iconLeft={<Plus size={14} />} />
-              </form>
-              <FilterChips
-                label="Quick add"
-                showSummary={false}
-                options={PRESETS.map((d) => ({ value: d, label: d }))}
-                value={presets}
-                onChange={setPresets}
-              />
-              {!piReady && <p className="muted">pi needs the API host of your LLM provider.</p>}
-            </>
+          <LiquidSwitch
+            label="Offline: block all requests now and keep the rules"
+            checked={network.offline}
+            onChange={(on) => run(() => setOffline(id, on))}
+          />
+          <form className="row" onSubmit={runTest}>
+            <FloatingField
+              label="Host to test"
+              className="grow mono"
+              value={testHost}
+              onChange={(e) => setTestHost(e.target.value)}
+            />
+            <Button
+              type="submit"
+              variant="outline"
+              disabled={
+                !running || test === "running" || testHost.trim() === ""
+              }
+              title={running ? undefined : "Start the shield to test"}
+            >
+              {test === "running" ? "Testing…" : "Test"}
+            </Button>
+          </form>
+          {test && test !== "running" && (
+            <ul className="list">
+              {stage("Proxy", test.proxy)}
+              {test.target && stage("Host", test.target)}
+            </ul>
           )}
         </CardBody>
       </Card>
+
+      <Card variant="outlined" padding="md">
+        <CardHeader
+          title="Services and hosts"
+          titleAs="h2"
+          description="The exceptions to the default."
+        />
+        <CardBody className="stack">
+          {blockedNeeds.map((need) => {
+            const name =
+              catalog.find((s) => s.id === need.service)?.name ?? need.service;
+            return (
+              <div key={`${need.agent}:${need.host}`} className="row">
+                <span className="warn row grow">
+                  <TriangleAlert size={14} />
+                  {AGENT_NAMES[need.agent]} uses {name} (
+                  <span className="mono">{need.host}</span>), which is blocked.
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    add({ kind: "service", id: need.service }, "allow")
+                  }
+                >
+                  Allow {name}
+                </Button>
+              </div>
+            );
+          })}
+          {network.rules.length === 0 && (
+            <p className="muted">No rules. Every host gets the default.</p>
+          )}
+          <ul className="list">
+            {network.rules.map((rule) => {
+              const service = serviceOf(rule.target, catalog);
+              const Icon = serviceIcon(service);
+              const domains = ruleDomains(rule, catalog);
+              const credentials = rule.credentials ?? [];
+              // On a Block rule the credentials are inactive: the proxy never adds them.
+              const inactive =
+                rule.action === "block" && credentials.length > 0;
+              const takesCredentials =
+                credentialHosts(rule, catalog).length > 0 &&
+                (rule.action === "allow" || inactive);
+              const logins = loginsOf(rule);
+              const other: Action = rule.action === "allow" ? "block" : "allow";
+              return (
+                <li key={rule.id} className="stack">
+                  <div className="row">
+                    <Icon size={14} />
+                    <span
+                      className={service ? "grow" : "grow mono"}
+                      title={domains.join(", ")}
+                    >
+                      {ruleLabel(rule, catalog)}
+                    </span>
+                    <span className={rule.action === "allow" ? "ok" : "danger"}>
+                      {rule.action === "allow" ? "Allowed" : "Blocked"}
+                    </span>
+                    {service && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        iconLeft={
+                          expanded === rule.id ? (
+                            <ChevronDown size={14} />
+                          ) : (
+                            <ChevronRight size={14} />
+                          )
+                        }
+                        onClick={() =>
+                          setExpanded(
+                            expanded === rule.id ? undefined : rule.id,
+                          )
+                        }
+                      >
+                        {domains.length} domains
+                      </Button>
+                    )}
+                    {logins.map((l) => (
+                      <span key={l.name} className="muted row">
+                        <KeyRound size={14} />
+                        Your Mac login: {AGENT_NAMES[l.origin.agent]}
+                      </span>
+                    ))}
+                    {takesCredentials && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        iconLeft={<KeyRound size={14} />}
+                        onClick={() =>
+                          setCredentialsOf(
+                            credentialsOf === rule.id ? undefined : rule.id,
+                          )
+                        }
+                      >
+                        {credentials.length > 0
+                          ? credentials.map((c) => c.name).join(", ")
+                          : "Add token…"}
+                        {inactive && " (inactive)"}
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        run(() =>
+                          putRule(id, {
+                            id: rule.id,
+                            target: rule.target,
+                            action: other,
+                          }),
+                        )
+                      }
+                    >
+                      {other === "allow" ? "Allow" : "Block"}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-label={`Remove ${ruleLabel(rule, catalog)}`}
+                      iconLeft={<X size={14} />}
+                      onClick={() => run(() => removeRule(id, rule.id))}
+                    />
+                  </div>
+                  {expanded === rule.id && (
+                    <p className="muted mono">{domains.join(", ")}</p>
+                  )}
+                  {credentialsOf === rule.id && takesCredentials && (
+                    <RuleCredentials
+                      shield={shield}
+                      rule={rule}
+                      catalog={catalog}
+                      run={run}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+
+          {adding === "service" && (
+            <ul className="list">
+              {unused.map((service) => {
+                const Icon = serviceIcon(service);
+                return (
+                  <li key={service.id} className="row">
+                    <Icon size={14} />
+                    <span className="grow" title={service.domains.join(", ")}>
+                      {service.name}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        add({ kind: "service", id: service.id }, "allow")
+                      }
+                    >
+                      Allow
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        add({ kind: "service", id: service.id }, "block")
+                      }
+                    >
+                      Block
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {adding === "host" && (
+            <form
+              className="row"
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitHost("allow");
+              }}
+            >
+              <FloatingField
+                ref={hostField}
+                label="Host or *.domain"
+                className="grow mono"
+                value={host}
+                hint={problem}
+                aria-invalid={problem !== undefined}
+                showValidity={false}
+                onChange={(e) => {
+                  setHost(e.target.value);
+                  setProblem(undefined);
+                }}
+              />
+              <Button type="submit" variant="outline">
+                Allow
+              </Button>
+              <Button variant="ghost" onClick={() => submitHost("block")}>
+                Block
+              </Button>
+            </form>
+          )}
+          <div className="row">
+            <Button
+              variant={adding === "service" ? "secondary" : "outline"}
+              iconLeft={<Plus size={14} />}
+              onClick={() =>
+                setAdding(adding === "service" ? undefined : "service")
+              }
+            >
+              Add service
+            </Button>
+            <Button
+              variant={adding === "host" ? "secondary" : "outline"}
+              iconLeft={<Plus size={14} />}
+              onClick={() => setAdding(adding === "host" ? undefined : "host")}
+            >
+              Add host
+            </Button>
+          </div>
+        </CardBody>
+      </Card>
+
       <div ref={activity}>
-        <NetworkActivity shield={shield} events={events} run={run} />
+        <NetworkActivity
+          shield={shield}
+          events={events}
+          catalog={catalog}
+          run={run}
+        />
       </div>
-      <SecretsSection shield={shield} run={run} />
+
       <Card variant="subtle" padding="md">
-        <CardHeader title="Always blocked" titleAs="h2" description="Every mode blocks these groups. You cannot change this." />
+        <CardHeader
+          title="Always blocked"
+          titleAs="h2"
+          description="No rule and no default opens these. You cannot change this."
+        />
         <CardBody>
           <ul className="list">
             {ALWAYS_BLOCKED.map((group) => (

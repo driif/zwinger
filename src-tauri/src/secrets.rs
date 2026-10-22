@@ -36,6 +36,12 @@ const RESERVED: &[&str] = &[
     "NODE_EXTRA_CA_CERTS",
     "NODE_VERSION",
     "YARN_VERSION",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "NODE_USE_ENV_PROXY",
+    "NODE_OPTIONS",
 ];
 
 /// The config of a secret. The value is in the vault, never here.
@@ -102,72 +108,90 @@ impl From<StoredPlaces> for Places {
 }
 
 /// An HTTP field name (RFC 9110 token).
-fn is_token(field: &str) -> bool {
+pub fn is_token(field: &str) -> bool {
     !field.is_empty() && field.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// The trimmed name of a secret or credential: a variable name that the
+/// shield does not set.
+pub fn check_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    let invalid = |reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
+    let mut chars = name.chars();
+    let valid_name = chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !valid_name {
+        return Err(invalid("use A-Z, 0-9 and _, and do not start with a digit"));
+    }
+    if RESERVED.contains(&name) || name.starts_with("MSB_") {
+        return Err(invalid("the shield sets this variable"));
+    }
+    Ok(name.to_owned())
+}
+
+/// Lowercases and dedupes the header fields, and needs one place.
+pub fn normalize_places(name: &str, mut places: Places) -> Result<Places> {
+    let invalid = |reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
+    let mut fields: Vec<String> = Vec::new();
+    for field in &places.header_fields {
+        let field = field.trim().to_ascii_lowercase();
+        if !is_token(&field) {
+            return Err(invalid(&format!("{field:?} is not a valid header field name")));
+        }
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+    places.header_fields = fields;
+    if places.header_fields.is_empty() && !places.query && !places.body {
+        return Err(invalid("select at least one place"));
+    }
+    Ok(places)
+}
+
+/// The text that the guest sees in the variable instead of the value. The
+/// closing `$` keeps one placeholder from being a prefix of another, such
+/// as `KEY` of `KEY_2`.
+pub fn placeholder(name: &str) -> String {
+    format!("$MSB_{name}$")
 }
 
 impl Secret {
     /// Trims the name and normalizes the hosts, then checks the rules.
     pub fn normalize(mut self) -> Result<Self> {
-        let invalid = |name: &str, reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
-        self.name = self.name.trim().to_owned();
+        self.name = check_name(&self.name)?;
         let name = &self.name;
-        let mut chars = name.chars();
-        let valid_name = chars.next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
-            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        if !valid_name {
-            return Err(invalid(name, "use A-Z, 0-9 and _, and do not start with a digit"));
-        }
-        if RESERVED.contains(&name.as_str()) || name.starts_with("MSB_") {
-            return Err(invalid(name, "the shield sets this variable"));
-        }
+        let invalid = |reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
         let mut hosts: Vec<String> = Vec::new();
         for host in &self.hosts {
             let host = shield::domain(host)?;
             if host.starts_with("*.") {
-                return Err(invalid(name, "use exact hosts, not wildcards"));
+                return Err(invalid("use exact hosts, not wildcards"));
             }
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
         }
         if hosts.is_empty() {
-            return Err(invalid(name, "add at least one host"));
+            return Err(invalid("add at least one host"));
         }
         // The refresh hosts never get a host token, so the agent cannot renew
         // the login or swap it for a new one.
         if let Origin::HostLogin { .. } = self.origin {
             if let Some(host) = hosts.iter().find(|h| login::is_refresh_host(h)) {
-                return Err(invalid(name, &format!("a host login may not reach the refresh host {host}")));
+                return Err(invalid(&format!("a host login may not reach the refresh host {host}")));
             }
             if self.places.query || self.places.body {
-                return Err(invalid(name, "a host login goes into header fields only"));
+                return Err(invalid("a host login goes into header fields only"));
             }
         }
         self.hosts = hosts;
-        let mut fields: Vec<String> = Vec::new();
-        for field in &self.places.header_fields {
-            let field = field.trim().to_ascii_lowercase();
-            if !is_token(&field) {
-                return Err(invalid(name, &format!("{field:?} is not a valid header field name")));
-            }
-            if !fields.contains(&field) {
-                fields.push(field);
-            }
-        }
-        self.places.header_fields = fields;
-        let Places { header_fields, query, body } = &self.places;
-        if header_fields.is_empty() && !query && !body {
-            return Err(invalid(name, "select at least one place"));
-        }
+        self.places = normalize_places(&self.name, self.places)?;
         Ok(self)
     }
 
-    /// The text that the guest sees in the variable instead of the value. The
-    /// closing `$` keeps one placeholder from being a prefix of another, such
-    /// as `KEY` of `KEY_2`.
     pub fn placeholder(&self) -> String {
-        format!("$MSB_{}$", self.name)
+        placeholder(&self.name)
     }
 }
 

@@ -1,12 +1,11 @@
-import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, LiquidSwitch, SpringCheckbox } from "@driif/motiv";
-import { Bot, Play, RotateCw, Square, SquareTerminal, TriangleAlert } from "lucide-react";
+import { Button, Card, CardBody, CardHeader, CommandMenu, ElasticTabs, SpringCheckbox } from "@driif/motiv";
+import { Bot, Play, Square, SquareTerminal, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import {
   AGENT_NAMES,
   AgentKind,
   confirmPaths,
   Detection,
-  GEMINI_NO_LOGIN,
   listFolders,
   NetEvent,
   putHostAgent,
@@ -14,11 +13,10 @@ import {
   removeHostAgent,
   RunSummary,
   SessionKind,
-  setAutoRenew,
   ShieldView,
 } from "./api";
 import { time } from "./HostAgentsSettings";
-import { reachable } from "./SecretsSection";
+import { decide, useCatalog } from "./network";
 import type { Intent, Pane, Run, Runtimes, TabView, View } from "./App";
 import { AppView } from "./AppView";
 import { NetworkTab } from "./NetworkTab";
@@ -30,10 +28,11 @@ import { TerminalTab } from "./TerminalTab";
 const ShieldMap = lazy(() => import("./ShieldMap").then((m) => ({ default: m.ShieldMap })));
 const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
-/** The provider host of each host login. pi's depends on its login. Gemini CLI has none. */
+/** The provider host of each host login. pi's depends on its login. */
 const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
   claude: "api.anthropic.com",
   codex: "chatgpt.com",
+  gemini: "cloudcode-pa.googleapis.com",
 };
 
 /** The step that adds a host agent to the shield, or changes or removes it. */
@@ -46,11 +45,12 @@ function AddAgent({ shield, detection, kind, run, onDone }: {
 }) {
   const agent = detection.agents.find((a) => a.kind === kind);
   const current = shield.hostAgents.find((a) => a.kind === kind);
-  const canLogin = kind !== "gemini" && agent?.login.state === "found";
+  const catalog = useCatalog();
+  const canLogin = agent?.login.state === "found";
   const [profile, setProfile] = useState(current?.profile ?? agent?.profile === true);
   const [login, setLogin] = useState(current?.login ?? canLogin);
   const host = LOGIN_HOSTS[kind];
-  const blocked = host === undefined || !reachable(shield.network, host);
+  const blocked = host === undefined || !decide(shield.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
   if (!agent) return null;
   const name = AGENT_NAMES[kind];
@@ -73,11 +73,9 @@ function AddAgent({ shield, detection, kind, run, onDone }: {
         />
         <SpringCheckbox
           label={
-            kind === "gemini"
-              ? GEMINI_NO_LOGIN
-              : canLogin
-                ? "Subscription login: the proxy adds it to requests to the provider. The agent sees a placeholder only."
-                : `Subscription login: ${agent.login.state === "expired" ? "expired; open the agent on this Mac once" : "none on this Mac"}`
+            canLogin
+              ? "Subscription login: the proxy adds it to requests to the provider. The agent sees a placeholder only."
+              : `Subscription login: ${agent.login.state === "expired" ? "expired; open the agent on this Mac once" : "none on this Mac"}`
           }
           checked={login}
           disabled={!canLogin && !current?.login}
@@ -133,7 +131,6 @@ interface Props {
   /** The host agent that the Add agent step shows. */
   adding?: AgentKind;
   onAdding: (kind?: AgentKind) => void;
-  onRestart: () => void;
   /** Opens the Host agents settings. */
   onHostAgents: () => void;
   /** The runs of the shield's tasks. */
@@ -167,7 +164,6 @@ export function ShieldPage({
   detection,
   adding,
   onAdding,
-  onRestart,
   onHostAgents,
   runs,
   onRunsChange,
@@ -269,15 +265,6 @@ export function ShieldPage({
           </Button>
         </Card>
       )}
-      {shield.renewDue && (
-        <Card variant="outlined" padding="sm" className="banner row">
-          <RotateCw size={16} className="warn" />
-          <span className="grow">The host login expires soon, and this Mac has a newer one. Restart the shield to use it.</span>
-          <Button size="sm" variant="outline" onClick={onRestart}>
-            Restart to renew
-          </Button>
-        </Card>
-      )}
       {status.state === "running" &&
         shield.hostNotices.map((notice) => (
           <Card key={notice} variant="outlined" padding="sm" className="banner row">
@@ -346,11 +333,9 @@ export function ShieldPage({
                   <div>
                     <dt>Network</dt>
                     <dd>
-                      {shield.network.mode === "public"
-                        ? "Public internet"
-                        : shield.network.mode === "deny" || shield.network.domains.length === 0
-                          ? "No egress"
-                          : `${shield.network.domains.length} allowed hosts`}
+                      {shield.network.offline
+                        ? "Offline"
+                        : `${shield.network.default === "allow" ? "Allow" : "Block"} everything else, ${shield.network.rules.length} rules`}
                     </dd>
                   </div>
                   <div>
@@ -368,18 +353,6 @@ export function ShieldPage({
                         {shield.hostAgents
                           .map((a) => [AGENT_NAMES[a.kind], a.profile && "profile", a.login && "login"].filter(Boolean).join(" + "))
                           .join(", ")}
-                      </dd>
-                    </div>
-                  )}
-                  {shield.hostAgents.some((a) => a.login) && (
-                    <div>
-                      <dt>Login renewal</dt>
-                      <dd>
-                        <LiquidSwitch
-                          label="Restart by itself when idle"
-                          checked={shield.autoRenew}
-                          onChange={(on) => run(() => setAutoRenew(shield.id, on))}
-                        />
                       </dd>
                     </div>
                   )}

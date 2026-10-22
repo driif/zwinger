@@ -260,11 +260,6 @@ impl Registry {
         lock(&self.runs).iter().any(|r| r.shield_id == shield_id && r.task_id == task_id && r.status().state.is_live())
     }
 
-    /// A run of the shield is not done.
-    pub fn has_live(&self, shield_id: &str) -> bool {
-        lock(&self.runs).iter().any(|r| r.shield_id == shield_id && r.status().state.is_live())
-    }
-
     pub fn start<R: SandboxRuntime>(&self, spec: Spec<R>) -> Arc<RunHandle> {
         let names = spec.task.agents.clone().map(|a| a.kind.name().to_owned());
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -1651,6 +1646,7 @@ mod tests {
                 artifacts: Some("/workspace/.zwinger/tasks/fix/01".into()),
                 pi_host: false,
                 gemini: None,
+                proxy: None,
             },
             writer: RoundWriter::create(dir.clone(), Some(mirror)).unwrap(),
             config: Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } },

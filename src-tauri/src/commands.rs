@@ -13,13 +13,14 @@ use crate::bootstrap::{self, Bootstrap, Legacy, Startup};
 use crate::error::Result;
 use crate::host_agents::HostAgents;
 use crate::host_agents::detect::Detection;
-use crate::netlog::NetEvent;
+use crate::network::{self, DefaultAction, Inject, RuleDraft, Service};
 use crate::preferences::{Preferences, Prefs};
+use crate::proxy::log::Entry;
 use crate::runtime::{Microsandbox, PtyEvent, SessionKind};
 use crate::runtimes::{Progress, RuntimeView, Runtimes};
-use crate::secrets::{Secret, SecretValue};
-use crate::sessions::{Manager, RunSummary, SecretView, ShieldView};
-use crate::shield::{self, AppDraft, HostAgentUse, NetworkMode, Pos, TaskDraft};
+use crate::secrets::SecretValue;
+use crate::sessions::{Manager, NetTest, RunSummary, ShieldView};
+use crate::shield::{self, AppDraft, HostAgentUse, Pos, TaskDraft};
 use crate::task_artifacts::{self, Room};
 use crate::task_runs::{Control, LiveRecord, Status};
 
@@ -144,18 +145,23 @@ pub fn set_mount_readonly(shields: Shields<'_>, id: String, guest: String, reado
 }
 
 #[tauri::command]
-pub fn set_network_mode(shields: Shields<'_>, id: String, mode: NetworkMode) -> Result<()> {
-    shields.set_network_mode(&id, mode)
+pub fn network_catalog() -> &'static [Service] {
+    network::CATALOG
 }
 
 #[tauri::command]
-pub fn add_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
-    shields.add_domain(&id, &domain)
+pub fn set_network_default(shields: Shields<'_>, id: String, default: DefaultAction) -> Result<()> {
+    shields.set_network_default(&id, default)
 }
 
 #[tauri::command]
-pub fn allow_host(shields: Shields<'_>, shield_id: String, host: String) -> Result<()> {
-    shields.allow_host(&shield_id, &host)
+pub fn set_offline(shields: Shields<'_>, id: String, offline: bool) -> Result<()> {
+    shields.set_offline(&id, offline)
+}
+
+#[tauri::command]
+pub fn put_rule(shields: Shields<'_>, id: String, rule: RuleDraft) -> Result<String> {
+    shields.put_rule(&id, rule)
 }
 
 #[tauri::command]
@@ -164,30 +170,33 @@ pub fn wildcard_for(host: String) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn list_net_events(shields: Shields<'_>, shield_id: String) -> Result<Vec<NetEvent>> {
+pub fn list_net_events(shields: Shields<'_>, shield_id: String) -> Result<Vec<Entry>> {
     shields.list_net_events(&shield_id)
 }
 
+// The credential commands are async, so the Keychain calls do not block the main thread.
+
 #[tauri::command]
-pub fn remove_domain(shields: Shields<'_>, id: String, domain: String) -> Result<()> {
-    shields.remove_domain(&id, &domain)
+pub async fn remove_rule(shields: Shields<'_>, id: String, rule_id: String) -> Result<()> {
+    shields.remove_rule(&id, &rule_id)
 }
 
-// The secret commands are async, so the Keychain calls do not block the main thread.
-
+/// `inject` `None` removes the credential. `value` `None` keeps the stored value.
 #[tauri::command]
-pub async fn put_secret(shields: Shields<'_>, id: String, secret: Secret, value: Option<SecretValue>) -> Result<()> {
-    shields.put_secret(&id, secret, value)
+pub async fn set_rule_credential(
+    shields: Shields<'_>,
+    id: String,
+    rule_id: String,
+    name: String,
+    inject: Option<Inject>,
+    value: Option<SecretValue>,
+) -> Result<()> {
+    shields.set_rule_credential(&id, &rule_id, &name, inject, value)
 }
 
 #[tauri::command]
-pub async fn remove_secret(shields: Shields<'_>, id: String, name: String) -> Result<()> {
-    shields.remove_secret(&id, &name)
-}
-
-#[tauri::command]
-pub async fn list_secrets(shields: Shields<'_>, id: String) -> Result<Vec<SecretView>> {
-    shields.list_secrets(&id)
+pub async fn test_network(shields: Shields<'_>, id: String, host: String) -> Result<NetTest> {
+    shields.test_network(&id, &host).await
 }
 
 #[tauri::command]
@@ -390,11 +399,6 @@ pub fn take_app_notices(shields: Shields<'_>) -> Vec<String> {
 #[tauri::command]
 pub fn set_agents_unprompted(shields: Shields<'_>, id: String, on: bool) -> Result<()> {
     shields.set_agents_unprompted(&id, on)
-}
-
-#[tauri::command]
-pub fn set_auto_renew(shields: Shields<'_>, id: String, on: bool) -> Result<()> {
-    shields.set_auto_renew(&id, on)
 }
 
 #[tauri::command]

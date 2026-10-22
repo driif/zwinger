@@ -16,7 +16,6 @@ import {
   InstallProgress,
   installRuntime,
   INVALID_ORDER,
-  isBlocked,
   isLive,
   isRoundFolder,
   listNetEvents,
@@ -27,7 +26,6 @@ import {
   Prefs,
   onGuestLogin,
   onNetEvent,
-  onRenewDue,
   onStartup,
   openSession,
   reopenTerminal,
@@ -61,7 +59,7 @@ import { LOST_TITLE, ReloadScreen, useBackendLost } from "./Recover";
 const TaskRoom = lazy(() => import("./TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
 /** The same size as the ring in the backend. */
-const NET_RING = 500;
+const NET_RING = 2000;
 
 export type TabView = "overview" | "network" | "settings";
 
@@ -88,7 +86,7 @@ export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
 
 /** A ⌘K action that a tab completes, such as focusing a field. `at` makes a repeated action new. */
 export interface Intent {
-  kind: "rename" | "mount" | "harness" | "delete" | "allowList" | "app";
+  kind: "rename" | "mount" | "harness" | "delete" | "addRule" | "app";
   at: number;
   /** For `mount`: the canonical folder that was dropped on the map. */
   host?: string;
@@ -259,14 +257,6 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
     detect(false);
   }, []);
 
-  // A host login is due, or the shield restarted to renew it.
-  useEffect(() => {
-    const stop = onRenewDue(() => refresh());
-    return () => {
-      stop.then((unlisten) => unlisten());
-    };
-  }, []);
-
   // An agent login was made in a shield, or it is gone.
   useEffect(() => {
     const stop = onGuestLogin(() => refresh());
@@ -371,7 +361,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
   }, [view, shield]);
 
   const blocked = Object.fromEntries(
-    shields.map(({ id }) => [id, (net[id] ?? []).filter((e) => isBlocked(e) && e.seq > (lastSeen[id] ?? 0)).length]),
+    shields.map(({ id }) => [id, (net[id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[id] ?? 0)).length]),
   );
 
   function showPane(key: string | undefined, shieldId = shield?.id) {
@@ -493,7 +483,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
     run(() => (shield.status.state === "running" ? stopShield(shield.id) : startShield(shield.id)));
 
   function startIntent(kind: Intent["kind"], appId?: string) {
-    setView({ kind: kind === "allowList" ? "network" : "settings" });
+    setView({ kind: kind === "addRule" ? "network" : "settings" });
     setIntent({ kind, appId, at: Date.now() });
   }
 
@@ -630,7 +620,6 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate }: Wo
               detection={detection}
               adding={adding[shield.id]}
               onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
-              onRestart={() => restart(shield.id)}
               onHostAgents={() => setShowSettings(true)}
               runs={runs[shield.id] ?? []}
               onRunsChange={() => reloadRuns(shield.id)}

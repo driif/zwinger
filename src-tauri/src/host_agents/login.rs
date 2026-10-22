@@ -3,15 +3,14 @@
 //! or the host login files. The guest gets a login with placeholders only:
 //! the proxy puts the real access token into the `authorization` header of
 //! requests to the provider's exact hosts. The refresh token in the guest is
-//! an inert literal that no secret replaces, and the refresh hosts are denied
-//! in every network mode, so the agent cannot renew or leak the login.
-//! Gemini CLI's login is not supported yet: Gemini CLI checks its cached
-//! token at `oauth2.googleapis.com`, which the proxy cannot answer
-//! (issue #16). Gemini CLI uses a `GEMINI_API_KEY` secret instead.
+//! an inert literal that no secret replaces, and the proxy blocks the refresh
+//! hosts always, so the agent cannot renew or leak the login. The proxy reads
+//! the login on the Mac again when it is due, so a new host token applies
+//! with no restart. Gemini CLI checks its cached token at the tokeninfo
+//! endpoint of `oauth2.googleapis.com`: the proxy answers that one request.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{Map, Value};
@@ -28,11 +27,9 @@ const FILE_LIMIT: u64 = 1 << 20;
 pub const INERT_REFRESH: &str = "zwinger-host-login-no-refresh";
 /// The expiry in the guest (2100-01-01), so the agent does not try a refresh.
 pub const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
-/// The renewal starts this long before the token expires.
-pub const RENEW_BEFORE_MS: i64 = 10 * 60 * 1000;
-/// Why Gemini CLI has no host login.
-pub const GEMINI_UNSUPPORTED: &str =
-    "subscription login is not supported yet (needs the app proxy, #16); add a GEMINI_API_KEY secret instead";
+/// Where Gemini CLI checks its cached token. The proxy answers it.
+pub const TOKENINFO_HOST: &str = "oauth2.googleapis.com";
+pub const TOKENINFO_PATH: &str = "/tokeninfo";
 
 /// An API host of a login and the hosts where its token is refreshed.
 struct Provider {
@@ -247,8 +244,17 @@ pub struct HostToken {
     /// The start of the real token that comes before the placeholder in the
     /// guest: the non-secret claims up to the `proxy-ep` field of a Copilot
     /// token that is not individual. pi reads its API host there. `access`
-    /// is the rest, with the signature, so the proxy sends the full token.
+    /// is the rest, with the signature.
     prefix: String,
+    /// The OAuth scopes of a Google login, for the tokeninfo answer.
+    pub scope: Option<String>,
+}
+
+impl HostToken {
+    /// The whole access token, as the provider gets it.
+    pub fn full_access(&self) -> SecretValue {
+        SecretValue::new(format!("{}{}", self.prefix, self.access.expose()))
+    }
 }
 
 /// Shows no token: `doc` has the real refresh token.
@@ -262,6 +268,7 @@ impl fmt::Debug for HostToken {
             .field("doc", &"<redacted>")
             .field("pi", &self.pi)
             .field("prefix", &self.prefix)
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -315,10 +322,11 @@ pub fn parse(kind: AgentKind, text: &str) -> Result<HostToken> {
             }
             (token, entry["expires"].as_i64(), host, Some(provider.pi))
         }
-        AgentKind::Gemini => return Err(bad(kind, GEMINI_UNSUPPORTED)),
+        AgentKind::Gemini => (access(&doc["access_token"]), doc["expiry_date"].as_i64(), GOOGLE.host.to_owned(), None),
     };
     let access = access.ok_or_else(|| bad(kind, "the login has no access token"))?;
-    Ok(HostToken { kind, access, expires, host, doc, pi, prefix })
+    let scope = doc["scope"].as_str().map(str::to_owned);
+    Ok(HostToken { kind, access, expires, host, doc, pi, prefix, scope })
 }
 
 /// The host login of the agent, checked for its expiry.
@@ -353,13 +361,13 @@ pub fn state(source: &dyn LoginSource, kind: AgentKind, now: i64) -> LoginState 
 }
 
 /// The provider's API host of the agent's login. `None` for pi, whose host
-/// depends on its login, and for Gemini CLI, which has no host login: the
-/// token read then gives the host or the error.
+/// depends on its login: the token read then gives the host.
 pub fn api_host(kind: AgentKind) -> Option<&'static str> {
     match kind {
         AgentKind::Claude => Some(ANTHROPIC.host),
         AgentKind::Codex => Some(CHATGPT.host),
-        AgentKind::Pi | AgentKind::Gemini => None,
+        AgentKind::Gemini => Some(GOOGLE.host),
+        AgentKind::Pi => None,
     }
 }
 
@@ -399,8 +407,14 @@ fn keep(from: &Value, names: &[&str]) -> Map<String, Value> {
 /// placeholder from `CLAUDE_CODE_OAUTH_TOKEN`.
 pub fn guest_files(token: &HostToken, placeholder: &str, now: i64) -> Vec<GuestFile> {
     match token.kind {
-        // Gemini CLI has no host token, see [`GEMINI_UNSUPPORTED`].
-        AgentKind::Claude | AgentKind::Gemini => Vec::new(),
+        AgentKind::Claude => Vec::new(),
+        AgentKind::Gemini => {
+            let mut creds = keep(&token.doc, &["scope", "token_type"]);
+            creds.insert("access_token".to_owned(), placeholder.into());
+            creds.insert("refresh_token".to_owned(), INERT_REFRESH.into());
+            creds.insert("expiry_date".to_owned(), FAR_FUTURE_MS.into());
+            vec![json_file(&["gemini", ".gemini"], "oauth_creds.json", &creds.into())]
+        }
         AgentKind::Codex => {
             let mut tokens = keep(&token.doc["tokens"], &["id_token", "account_id"]);
             tokens.insert("access_token".to_owned(), placeholder.into());
@@ -424,39 +438,18 @@ pub fn guest_files(token: &HostToken, placeholder: &str, now: i64) -> Vec<GuestF
     }
 }
 
-/// What the renewal of one host login does next.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Step {
-    /// Nothing until the login is due, 10 minutes before it expires.
-    Wait(Duration),
-    /// The Mac has no newer login: the user must open the agent there once.
-    ExpiresSoon,
-    /// The Mac has a newer login: show 'Restart to renew'.
-    Notify,
-    /// The Mac has a newer login and nothing works in the shield: restart.
-    Restart,
-    /// The Mac has a newer login, but the shield is busy: try again later.
-    Retry,
-}
-
-/// The next step for a login that expired at `started` when the shield
-/// started. `host` is the expiry of the login on the Mac now, read only
-/// when the login is due. Only a newer login renews: a restart with the
-/// same token would only end the agents. A restart also needs `auto` (the
-/// user turned it on) and no work in the shield.
-pub fn renew_step(started: i64, host: Option<i64>, now: i64, busy: bool, auto: bool) -> Step {
-    let due = started - RENEW_BEFORE_MS;
-    if now < due {
-        return Step::Wait(Duration::from_millis((due - now) as u64));
-    }
-    match host {
-        Some(host) if host > started => match (auto, busy) {
-            (false, _) => Step::Notify,
-            (true, true) => Step::Retry,
-            (true, false) => Step::Restart,
-        },
-        _ => Step::ExpiresSoon,
-    }
+/// The answer of the tokeninfo endpoint for the token: its scopes and
+/// expiry, read on the Mac. `None` if the login names no scope.
+pub fn tokeninfo(token: &HostToken, now: i64) -> Option<Value> {
+    let scope = token.scope.as_deref()?;
+    let expires = token.expires.unwrap_or(now + 3_600_000);
+    let seconds = ((expires - now) / 1000).max(0);
+    Some(serde_json::json!({
+        "scope": scope,
+        "exp": (expires / 1000).to_string(),
+        "expires_in": seconds.to_string(),
+        "access_type": "offline",
+    }))
 }
 
 #[cfg(test)]
@@ -629,15 +622,25 @@ mod tests {
     }
 
     #[test]
-    fn gemini_has_no_host_login_and_the_debug_output_shows_no_token() {
-        let doc = json!({ "access_token": "ya29.secret", "refresh_token": "1//secret", "expiry_date": NOW + 1000 });
-        let err = parse(AgentKind::Gemini, &doc.to_string()).unwrap_err();
-        assert!(err.to_string().contains("not supported yet"), "{err}");
-        assert_eq!(api_host(AgentKind::Gemini), None);
+    fn gemini_gets_a_placeholder_login_and_a_local_tokeninfo() {
+        let doc = json!({ "access_token": "ya29.secret", "refresh_token": "1//secret", "expiry_date": NOW + 60_000,
+            "scope": "openid https://www.googleapis.com/auth/cloud-platform", "token_type": "Bearer", "id_token": "id.secret" });
+        let token = parse(AgentKind::Gemini, &doc.to_string()).unwrap();
+        assert_eq!((token.access.expose(), token.host.as_str()), ("ya29.secret", "cloudcode-pa.googleapis.com"));
+        let [(path, creds)]: [_; 1] = files(&token).try_into().unwrap();
+        assert_eq!(path, "gemini/.gemini/oauth_creds.json");
+        assert_eq!(
+            creds,
+            json!({ "scope": "openid https://www.googleapis.com/auth/cloud-platform", "token_type": "Bearer",
+                "access_token": "$MSB_X$", "refresh_token": INERT_REFRESH, "expiry_date": FAR_FUTURE_MS })
+        );
+        let info = tokeninfo(&token, NOW).unwrap();
+        assert_eq!(info["expires_in"], "60");
+        assert_eq!(info["scope"], "openid https://www.googleapis.com/auth/cloud-platform");
+        assert!(!info.to_string().contains("secret"));
 
-        let token = parse(AgentKind::Claude, &claude_doc("sk-ant-oat-1", NOW)).unwrap();
         let debug = format!("{token:?}");
-        assert!(!debug.contains("sk-ant-oat-1") && !debug.contains("rt-secret"), "{debug}");
+        assert!(!debug.contains("ya29.secret") && !debug.contains("1//secret"), "{debug}");
     }
 
     #[test]
@@ -675,20 +678,5 @@ mod tests {
         user.origin = Origin::User;
         assert!(denied_hosts(&[user]).is_empty());
         assert_eq!(denied_hosts(&[claude.clone(), claude]), ["console.anthropic.com", "platform.claude.com"]);
-    }
-
-    #[test]
-    fn renewal_needs_a_newer_login_on_the_mac() {
-        let started = NOW + 3_600_000;
-        assert_eq!(renew_step(started, None, NOW, false, true), Step::Wait(Duration::from_secs(50 * 60)));
-        let due = started - RENEW_BEFORE_MS;
-        // The same or no login on the Mac: no restart, the user must open the agent.
-        assert_eq!(renew_step(started, Some(started), due, false, true), Step::ExpiresSoon);
-        assert_eq!(renew_step(started, None, started + 1, false, true), Step::ExpiresSoon);
-        let newer = Some(started + 3_600_000);
-        assert_eq!(renew_step(started, newer, due, false, true), Step::Restart);
-        assert_eq!(renew_step(started, newer, due, true, true), Step::Retry);
-        assert_eq!(renew_step(started, newer, due, false, false), Step::Notify);
-        assert_eq!(renew_step(started, newer, due, true, false), Step::Notify);
     }
 }

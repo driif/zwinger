@@ -14,16 +14,26 @@ pub const PATH: &str = "/opt/zwinger/bin:/usr/local/sbin:/usr/local/bin:/usr/sbi
 /// Debian's `/etc/profile` resets `PATH` for login shells, then sources
 /// this dir. So this file puts the wrappers back on `PATH`.
 pub const PROFILE: &str = "/etc/profile.d/zwinger.sh";
-/// Where microsandbox puts its TLS interception CA in the guest
-/// (`microsandbox_protocol::GUEST_TLS_CA_PATH`, not re-exported).
-pub const GUEST_TLS_CA_PATH: &str = "/.msb/tls/ca.pem";
-/// Debian's system CA bundle. The CA env vars of a shield with secrets point here.
+/// The guest dir of the zwinger CA, bound read-only.
+pub const CA_DIR: &str = "/opt/zwinger/ca";
+/// The zwinger CA in the guest: the proxy signs its leaf certificates.
+pub const CA_CERT: &str = "/opt/zwinger/ca/zwinger-ca.pem";
+/// Debian's system CA bundle. The CA env vars point here.
 pub const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-/// The interception CA as a local CA of Debian, so a later install of
+/// The zwinger CA as a local CA of Debian, so a later install of
 /// `ca-certificates` also adds it to the bundle.
-const LOCAL_CA: &str = "/usr/local/share/ca-certificates/zwinger-msb.crt";
-/// The exit code of [`trust_argv`] when the image has no system bundle.
-const NO_BUNDLE: i32 = 3;
+const LOCAL_CA: &str = "/usr/local/share/ca-certificates/zwinger-ca.crt";
+/// The CA bundle vars of OpenSSL, Python requests, curl and git. They point
+/// at the system bundle, which [`trust_argv`] extends with the zwinger CA.
+const CA_ENV: [&str; 4] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"];
+/// Node reads the proxy vars only with `NODE_USE_ENV_PROXY`, and does not
+/// read the system trust store. With `NODE_USE_ENV_PROXY`, Node warns at each
+/// start that its proxy agent is experimental, which an agent TUI would show.
+/// A credential cannot have the name `NODE_OPTIONS`. A wrapper appends the
+/// flag to the user's own `NODE_OPTIONS`.
+const NODE_NET_ENV: [(&str, &str); 3] =
+    [("NODE_USE_ENV_PROXY", "1"), ("NODE_EXTRA_CA_CERTS", CA_CERT), ("NODE_OPTIONS", NODE_FLAG)];
+const NODE_FLAG: &str = "--disable-warning=UNDICI-EHPA";
 
 /// What the shield start found: the facts that pick an agent's program.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,6 +42,24 @@ pub struct Found<'a> {
     pub pi_host: bool,
     /// The guest path of Gemini CLI's entry point, if it runs in the VM.
     pub gemini: Option<&'a str>,
+    /// The URL of the shield's proxy. Each wrapper and headless command sets
+    /// [`net_env`] for it, so an agent that clears its env keeps it.
+    pub proxy: Option<&'a str>,
+}
+
+/// The env of every process in the guest: all traffic goes to the shield's
+/// proxy at `proxy_url`, and the clients trust the zwinger CA.
+pub fn net_env(proxy_url: &str) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        env.push((name.to_owned(), proxy_url.to_owned()));
+        env.push((name.to_ascii_lowercase(), proxy_url.to_owned()));
+    }
+    env.push(("NO_PROXY".to_owned(), String::new()));
+    env.push(("no_proxy".to_owned(), String::new()));
+    env.extend(NODE_NET_ENV.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())));
+    env.extend(CA_ENV.iter().map(|n| ((*n).to_owned(), CA_BUNDLE.to_owned())));
+    env
 }
 
 /// The env that keeps the agent's state in the shield and never the host's.
@@ -56,10 +84,17 @@ pub fn program(kind: AgentKind, found: Found) -> Option<Vec<String>> {
     })
 }
 
-/// `env <state env> <program>`: the start of a headless argv.
+/// The net env of `found`'s proxy, then the state env of `kind`.
+fn all_env(kind: AgentKind, found: Found) -> Vec<(String, String)> {
+    let mut all = found.proxy.map(net_env).unwrap_or_default();
+    all.extend(env(kind).iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())));
+    all
+}
+
+/// `env <net env> <state env> <program>`: the start of a headless argv.
 pub fn command(kind: AgentKind, found: Found) -> Option<Vec<String>> {
     let mut argv = vec!["env".to_owned()];
-    argv.extend(env(kind).iter().map(|(name, value)| format!("{name}={value}")));
+    argv.extend(all_env(kind, found).into_iter().map(|(name, value)| format!("{name}={value}")));
     argv.extend(program(kind, found)?);
     Some(argv)
 }
@@ -128,8 +163,18 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
     if kind == AgentKind::Pi {
         program.extend(["--session-dir".to_owned(), pi::SESSION_DIR.to_owned()]);
     }
-    let env: Vec<String> = env(kind).iter().map(|(name, value)| format!("{name}={}", quote(value))).collect();
+    let env: Vec<String> = all_env(kind, found)
+        .iter()
+        .filter(|(name, _)| name != "NODE_OPTIONS")
+        .map(|(name, value)| format!("{name}={}", quote(value)))
+        .collect();
     let mut script = format!("#!/bin/sh\n# zwinger writes this file at each shield start.\nexport {}\n", env.join(" "));
+    if found.proxy.is_some() {
+        script.push_str(&format!(
+            "case \" $NODE_OPTIONS \" in *\" {NODE_FLAG} \"*) ;; \
+             *) NODE_OPTIONS=\"${{NODE_OPTIONS:+$NODE_OPTIONS }}{NODE_FLAG}\" ;; esac\nexport NODE_OPTIONS\n"
+        ));
+    }
     if let Some(added) = added(kind, unprompted) {
         script.push_str("add=1\n");
         if let Some(subcommands) = added.subcommands {
@@ -153,25 +198,24 @@ pub fn profile_argv() -> Vec<String> {
     ["/bin/sh", "-c", &script, "sh", &profile()].map(str::to_owned).into()
 }
 
-/// The root exec that adds the interception CA to the system trust. With no
-/// system bundle it makes none: a bundle with only this CA would break TLS to
-/// the hosts that the proxy does not intercept.
+/// The root exec that adds the zwinger CA to the system trust. With no
+/// system bundle, the bundle holds only this CA.
 pub fn trust_argv() -> Vec<String> {
     let dir = LOCAL_CA.rsplit_once('/').expect("a dir").0;
     let script = [
         "set -e".to_owned(),
         format!("mkdir -p {dir}"),
-        format!("cp {GUEST_TLS_CA_PATH} {LOCAL_CA}"),
+        format!("cp {CA_CERT} {LOCAL_CA}"),
         "if command -v update-ca-certificates >/dev/null 2>&1; then".to_owned(),
         "  update-ca-certificates >/dev/null".to_owned(),
         format!("elif [ -f {CA_BUNDLE} ]; then"),
         // The second line of the PEM is unique to the CA, so a second run appends nothing.
-        format!(
-            "  grep -qF \"$(sed -n 2p {GUEST_TLS_CA_PATH})\" {CA_BUNDLE} || cat {GUEST_TLS_CA_PATH} >> {CA_BUNDLE}"
-        ),
+        format!("  grep -qF \"$(sed -n 2p {CA_CERT})\" {CA_BUNDLE} || cat {CA_CERT} >> {CA_BUNDLE}"),
         "else".to_owned(),
-        "  echo 'the image has no system CA bundle; install ca-certificates in the shield to add one' >&2".to_owned(),
-        format!("  exit {NO_BUNDLE}"),
+        // All TLS of the shield goes through the proxy, so a bundle with only
+        // the zwinger CA is complete.
+        format!("  mkdir -p \"$(dirname {CA_BUNDLE})\""),
+        format!("  cp {CA_CERT} {CA_BUNDLE}"),
         "fi".to_owned(),
     ]
     .join("\n");
@@ -199,7 +243,9 @@ pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) ->
 mod tests {
     use super::*;
 
-    const HOST: Found = Found { pi_host: true, gemini: Some("/opt/zwinger/host/gemini/bundle/gemini.js") };
+    const PROXY: &str = "http://zw:t@host.microsandbox.internal:4000";
+    const HOST: Found =
+        Found { pi_host: true, gemini: Some("/opt/zwinger/host/gemini/bundle/gemini.js"), proxy: Some(PROXY) };
 
     /// Runs the wrapper with `sh`, with a program that prints its env and arguments.
     fn run(kind: AgentKind, unprompted: bool, args: &[&str]) -> String {
@@ -248,7 +294,7 @@ mod tests {
     #[test]
     fn codex_wrapper_bypasses_or_keeps_the_sandbox_off() {
         let on = wrapper(AgentKind::Codex, HOST, true).unwrap();
-        assert!(on.contains("export CODEX_HOME=/opt/zwinger/state/codex\n"), "{on}");
+        assert!(on.contains(" CODEX_HOME=/opt/zwinger/state/codex\n"), "{on}");
         assert!(on.ends_with("exec /opt/zwinger/codex/bin/codex \"$@\"\n"), "{on}");
         assert_eq!(
             run(AgentKind::Codex, true, &["resume", "--last"]),
@@ -272,7 +318,7 @@ mod tests {
     #[test]
     fn pi_and_gemini_wrappers_run_the_found_install() {
         let pi = wrapper(AgentKind::Pi, HOST, true).unwrap();
-        assert!(pi.contains("export PI_CODING_AGENT_DIR=/opt/zwinger/state/agent\n"), "{pi}");
+        assert!(pi.contains(" PI_CODING_AGENT_DIR=/opt/zwinger/state/agent\n"), "{pi}");
         assert!(!pi.contains("add="), "{pi}");
         assert!(
             pi.ends_with(
@@ -288,7 +334,7 @@ mod tests {
         );
 
         let gemini = wrapper(AgentKind::Gemini, HOST, true).unwrap();
-        assert!(gemini.contains("export HOME=/opt/zwinger/state/gemini\n"), "{gemini}");
+        assert!(gemini.contains(" HOME=/opt/zwinger/state/gemini\n"), "{gemini}");
         assert!(gemini.ends_with("exec node /opt/zwinger/host/gemini/bundle/gemini.js \"$@\"\n"), "{gemini}");
         assert_eq!(
             run(AgentKind::Gemini, true, &["--resume", "latest"]),
@@ -304,7 +350,7 @@ mod tests {
 
     #[test]
     fn odd_paths_are_quoted() {
-        let found = Found { pi_host: false, gemini: Some("/opt/zwinger/host/gemini/it's here.js") };
+        let found = Found { pi_host: false, gemini: Some("/opt/zwinger/host/gemini/it's here.js"), proxy: None };
         let gemini = wrapper(AgentKind::Gemini, found, false).unwrap();
         assert!(gemini.ends_with("exec node '/opt/zwinger/host/gemini/it'\\''s here.js' \"$@\"\n"), "{gemini}");
     }
@@ -315,13 +361,62 @@ mod tests {
             command(AgentKind::Claude, Found::default()).unwrap(),
             ["env", "IS_SANDBOX=1", "HOME=/opt/zwinger/state/claude", "/opt/zwinger/claude/claude"]
         );
+        let pi = command(AgentKind::Pi, HOST).unwrap();
+        assert_eq!(pi[0], "env");
         assert_eq!(
-            command(AgentKind::Pi, HOST).unwrap(),
-            ["env", "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/host/pi/dist/cli.js"]
+            pi[pi.len() - 3..],
+            ["PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/host/pi/dist/cli.js"]
         );
+        for var in [
+            format!("HTTPS_PROXY={PROXY}"),
+            format!("https_proxy={PROXY}"),
+            "NODE_USE_ENV_PROXY=1".to_owned(),
+            format!("NODE_EXTRA_CA_CERTS={CA_CERT}"),
+            format!("SSL_CERT_FILE={CA_BUNDLE}"),
+        ] {
+            assert!(pi.contains(&var), "{var} is not in {pi:?}");
+        }
         assert_eq!(command(AgentKind::Gemini, Found::default()), None);
         assert_eq!(continue_args(AgentKind::Codex), ["resume", "--last"]);
         assert_eq!(continue_args(AgentKind::Gemini), ["--resume", "latest"]);
+    }
+
+    #[test]
+    fn a_wrapper_sets_the_proxy_in_a_cleared_env() {
+        let script = wrapper(AgentKind::Codex, HOST, false).unwrap();
+        assert!(script.contains(&format!(" HTTPS_PROXY='{PROXY}' ")), "{script}");
+        let script = script.replace(
+            "exec /opt/zwinger/codex/bin/codex",
+            "exec printf '%s\\n' \"$HTTPS_PROXY\" \"$NODE_USE_ENV_PROXY\" \"$NODE_EXTRA_CA_CERTS\" \"$NODE_OPTIONS\"",
+        );
+        let run = |node_options: Option<&str>| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.env_clear().arg("-c").arg(&script);
+            if let Some(value) = node_options {
+                command.env("NODE_OPTIONS", value);
+            }
+            String::from_utf8(command.output().unwrap().stdout).unwrap()
+        };
+        let out =
+            |node_options: &str| format!("{PROXY}\n1\n{CA_CERT}\n{node_options}\n--sandbox\ndanger-full-access\n");
+        assert_eq!(run(None), out(NODE_FLAG));
+        // The user's own Node options stay, and the flag is added once.
+        assert_eq!(run(Some("--max-old-space-size=4096")), out(&format!("--max-old-space-size=4096 {NODE_FLAG}")));
+        assert_eq!(run(Some(&format!("--a {NODE_FLAG}"))), out(&format!("--a {NODE_FLAG}")));
+    }
+
+    #[test]
+    fn every_process_uses_the_proxy_and_trusts_the_zwinger_ca() {
+        let env: std::collections::BTreeMap<_, _> =
+            net_env("http://zw:t@host.microsandbox.internal:4000").into_iter().collect();
+        for name in ["HTTP_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            assert_eq!(env[name], "http://zw:t@host.microsandbox.internal:4000", "{name}");
+        }
+        assert_eq!((env["NO_PROXY"].as_str(), env["no_proxy"].as_str()), ("", ""));
+        assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
+        assert_eq!(env["NODE_EXTRA_CA_CERTS"], CA_CERT);
+        assert_eq!(env["NODE_OPTIONS"], "--disable-warning=UNDICI-EHPA");
+        assert_eq!(env["GIT_SSL_CAINFO"], CA_BUNDLE);
     }
 
     #[test]
@@ -345,7 +440,7 @@ mod tests {
     /// dir on `PATH` before the system dirs.
     fn trust(root: &Path, tools: &Path) -> std::process::Output {
         let script = trust_argv()[2]
-            .replace(GUEST_TLS_CA_PATH, &root.join("ca.pem").display().to_string())
+            .replace(CA_CERT, &root.join("ca.pem").display().to_string())
             .replace("/usr/local/share", &root.join("local").display().to_string())
             .replace(CA_BUNDLE, &root.join("bundle.crt").display().to_string());
         std::process::Command::new("/bin/sh")
@@ -376,7 +471,7 @@ mod tests {
         let bundle = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
         assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
         assert_eq!(bundle.matches("ZWINGERCA").count(), 1, "{bundle}");
-        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-msb.crt")).unwrap();
+        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-ca.crt")).unwrap();
         assert!(local.contains("ZWINGERCA"));
     }
 
@@ -396,14 +491,14 @@ mod tests {
     }
 
     #[test]
-    fn trust_makes_no_bundle_with_only_the_ca() {
+    fn trust_makes_a_bundle_with_only_the_ca() {
         let root = trust_root();
         let out = trust(&root, &root.join("tools"));
-        assert_eq!(out.status.code(), Some(NO_BUNDLE));
-        assert!(String::from_utf8_lossy(&out.stderr).contains("no system CA bundle"));
-        assert!(!root.join("bundle.crt").exists());
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let bundle = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
+        assert_eq!(bundle.matches("ZWINGERCA").count(), 1, "{bundle}");
         // A later install of ca-certificates picks it up.
-        assert!(root.join("local/ca-certificates/zwinger-msb.crt").exists());
+        assert!(root.join("local/ca-certificates/zwinger-ca.crt").exists());
     }
 
     #[test]
