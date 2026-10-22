@@ -163,6 +163,11 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     manager.set_guest_sink(Box::new(move |shield_id| {
         let _ = handle.emit("guest-login", shield_id);
     }));
+    let handle = app.clone();
+    manager.set_progress_sink(Box::new(move |shield_id, phase, elapsed_ms| {
+        let payload = serde_json::json!({ "shieldId": shield_id, "phase": phase, "elapsedMs": elapsed_ms });
+        let _ = handle.emit("shield-start-progress", payload);
+    }));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

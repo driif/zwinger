@@ -10,6 +10,7 @@ import {
   removeHostAgent,
 } from "../settings/api";
 import { confirmPaths } from "./api";
+import { StartProgress } from "./StartProgress";
 import { RunSummary } from "../tasks/api";
 import {
   AGENT_NAMES,
@@ -256,7 +257,13 @@ export function ShieldPage({
           <h1 className="page-title">{shield.name}</h1>
           <p className="muted row">
             <span className={`dot ${status.state}`} />
-            {status.state === "error" ? <span className="danger">{status.message}</span> : status.state}
+            {status.state === "error" ? (
+              <span className="danger">{status.message}</span>
+            ) : status.state === "starting" ? (
+              <StartProgress phase={status.phase} />
+            ) : (
+              status.state
+            )}
             {status.state === "running" && shield.loginExpiresAt !== null && <span>· login valid until {time(shield.loginExpiresAt)}</span>}
           </p>
           <CopyField className="mono" value={shield.folder} display={tildePath(shield.folder, home)} title={shield.folder} />
@@ -291,11 +298,12 @@ export function ShieldPage({
         <Button
           size="sm"
           variant={running ? "secondary" : "primary"}
-          iconLeft={running ? <Square size={14} /> : <Play size={14} />}
-          loading={status.state === "starting" || status.state === "stopping"}
+          iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
+          loading={status.state === "stopping"}
+          disabled={status.state === "starting"}
           onClick={onToggle}
         >
-          {running ? "Stop" : "Start"}
+          {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop" : "Start"}
         </Button>
       </header>
       {adding && detection && (

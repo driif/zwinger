@@ -24,6 +24,7 @@ import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { AppsSection } from "../apps/AppsSection";
 import { errorMessage } from "../../shared/errorMessage";
+import { phaseName } from "../shields/StartProgress";
 
 const WORKSPACE = "/workspace";
 
@@ -292,6 +293,26 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
           </ul>
         </CardBody>
       </Card>
+
+      {shield.startTimings && (
+        <Card variant="outlined" padding="md">
+          <CardHeader
+            title="Last start"
+            titleAs="h2"
+            description={`The start took ${shield.startTimings.totalMs} ms. Some phases ran at the same time.`}
+          />
+          <CardBody>
+            <ul className="list">
+              {shield.startTimings.phases.map(({ phase, ms }, i) => (
+                <li key={i} className="row">
+                  <span className="grow">{phaseName(phase)}</span>
+                  <span className="muted mono">{ms} ms</span>
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      )}
 
       <AppsSection
         shield={shield}

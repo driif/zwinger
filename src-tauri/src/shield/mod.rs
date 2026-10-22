@@ -2,6 +2,7 @@ pub(crate) mod apps;
 pub(crate) mod lifecycle;
 pub(crate) mod manager;
 pub(crate) mod network;
+pub(crate) mod progress;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;

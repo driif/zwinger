@@ -95,9 +95,20 @@ export interface HostLogin {
   origin: { kind: "hostLogin"; agent: AgentKind };
 }
 
+/** A phase of a shield start. */
+export type StartPhase =
+  | { step: "vault" | "prepare" | "proxy" | "boot" | "guest" | "node" | "tui" | "gemini" | "setup" | "trust" | "wrappers" | "apps" }
+  | { step: "profile"; agent: AgentKind };
+
+/** The duration of each phase of a start, in the order they ended. Some phases run at the same time. */
+export interface StartTimings {
+  phases: { phase: StartPhase; ms: number }[];
+  totalMs: number;
+}
+
 export type ShieldStatus =
   | { state: "stopped" }
-  | { state: "starting" }
+  | { state: "starting"; phase: StartPhase }
   | { state: "running" }
   | { state: "stopping" }
   | { state: "error"; message: string };
@@ -198,6 +209,8 @@ export interface ShieldView {
   guestLogins: AgentKind[];
   /** The hosts that the shield's agents need, with the proxy's decision on each. */
   agentNeeds: AgentNeed[];
+  /** The phase durations of the start of the running VM. */
+  startTimings: StartTimings | null;
 }
 
 export interface AgentNeed {

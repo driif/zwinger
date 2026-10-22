@@ -18,6 +18,7 @@ use crate::secrets::{self, SecretValue, Vault};
 use crate::shield::apps::AppRunView;
 use crate::shield::lifecycle::mounted;
 use crate::shield::network::placeholders;
+use crate::shield::progress::{Phase, ProgressSink, Timings};
 use crate::shield::{self, HostAgentUse, Pos, Shield};
 use crate::store::Store;
 use crate::task_runs;
@@ -59,6 +60,7 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) run_config: task_runs::Config,
     pub(crate) host: Arc<HostAgents>,
     pub(crate) guest_sink: Arc<OnceLock<GuestSink>>,
+    pub(crate) progress_sink: Arc<OnceLock<ProgressSink>>,
     pub(crate) app_notices: Mutex<Vec<String>>,
 }
 
@@ -78,7 +80,8 @@ pub(crate) struct State<V> {
 }
 
 pub(crate) enum Vm<V> {
-    Starting,
+    /// The phase that the start runs now.
+    Starting(Phase),
     /// `applied` is the config the VM booted with; it differs from the stored
     /// config after an edit, until the next start. `proxy` is the shield's
     /// proxy; a drop stops it. `net` follows the VM's network events. It is
@@ -114,6 +117,8 @@ pub(crate) struct HostRun {
     pub(crate) guest_logins: Vec<AgentKind>,
     /// Looks for guest logins while the VM runs. A stop aborts it.
     pub(crate) guest_watch: Option<AbortHandle>,
+    /// The phase durations of the start.
+    pub(crate) timings: Timings,
 }
 
 impl HostRun {
@@ -146,16 +151,18 @@ pub struct ShieldView {
     pub guest_logins: Vec<AgentKind>,
     /// The hosts that the shield's agents need, with the proxy's decision.
     pub agent_needs: Vec<network::AgentNeed>,
+    /// The phase durations of the start of the running VM.
+    pub start_timings: Option<Timings>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", content = "message", rename_all = "camelCase")]
+#[serde(tag = "state", rename_all = "camelCase")]
 pub enum Status {
     Stopped,
-    Starting,
+    Starting { phase: Phase },
     Running,
     Stopping,
-    Error(String),
+    Error { message: String },
 }
 
 /// Deletes the values that no configured secret uses, such as the values of a
@@ -228,6 +235,7 @@ impl<R: SandboxRuntime> Manager<R> {
             run_config: task_runs::Config::default(),
             host,
             guest_sink: Arc::new(OnceLock::new()),
+            progress_sink: Arc::new(OnceLock::new()),
             app_notices: Mutex::default(),
         })
     }
@@ -242,6 +250,11 @@ impl<R: SandboxRuntime> Manager<R> {
         let _ = self.guest_sink.set(sink);
     }
 
+    /// Only the first sink counts.
+    pub fn set_progress_sink(&self, sink: ProgressSink) {
+        let _ = self.progress_sink.set(sink);
+    }
+
     pub fn list(&self) -> Vec<ShieldView> {
         let state = lock(&self.state);
         state
@@ -250,7 +263,7 @@ impl<R: SandboxRuntime> Manager<R> {
             .map(|shield| {
                 let (status, pending_restart) = match state.vms.get(&shield.id) {
                     None => (Status::Stopped, false),
-                    Some(Vm::Starting) => (Status::Starting, false),
+                    Some(Vm::Starting(phase)) => (Status::Starting { phase: *phase }, false),
                     // A new name, layout, app list, terminal list or network
                     // rule is used at once, so it needs no restart. A new
                     // credential name needs its placeholder in the guest env.
@@ -270,15 +283,20 @@ impl<R: SandboxRuntime> Manager<R> {
                             || placeholders(&applied.network) != placeholders(&shield.network),
                     ),
                     Some(Vm::Stopping) => (Status::Stopping, false),
-                    Some(Vm::Failed(message)) => (Status::Error(message.clone()), false),
+                    Some(Vm::Failed(message)) => (Status::Error { message: message.clone() }, false),
                 };
                 let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
-                let (runtimes, login_expires_at, host_notices, guest_logins) = match state.vms.get(&shield.id) {
-                    Some(Vm::Running { runtimes, host, proxy, .. }) => {
-                        (runtimes.clone(), proxy.login_expires(), host.notices.clone(), host.guest_logins.clone())
-                    }
-                    _ => (Vec::new(), None, Vec::new(), Vec::new()),
-                };
+                let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) =
+                    match state.vms.get(&shield.id) {
+                        Some(Vm::Running { runtimes, host, proxy, .. }) => (
+                            runtimes.clone(),
+                            proxy.login_expires(),
+                            host.notices.clone(),
+                            host.guest_logins.clone(),
+                            Some(host.timings.clone()),
+                        ),
+                        _ => (Vec::new(), None, Vec::new(), Vec::new(), None),
+                    };
                 ShieldView {
                     agent_needs: network::agent_needs(shield),
                     shield: shield.clone(),
@@ -307,6 +325,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     login_expires_at,
                     host_notices,
                     guest_logins,
+                    start_timings,
                 }
             })
             .collect()
@@ -483,7 +502,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 state.shield_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
             // A start can claim the shield between the stop above and this lock.
             match state.vms.get(id) {
-                Some(Vm::Starting) => return Err(Error::Starting),
+                Some(Vm::Starting(_)) => return Err(Error::Starting),
                 Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
                 Some(Vm::Stopping) => return Err(Error::Stopping),
                 None | Some(Vm::Failed(_)) => {}
@@ -566,7 +585,7 @@ mod tests {
     async fn delete_refuses_a_shield_that_is_starting() {
         let (manager, _runtime, id, vault) = manager_with_vault();
         credential(&manager, &id, "api.example.com", "TOKEN", Some("v")).unwrap();
-        lock(&manager.state).vms.insert(id.clone(), Vm::Starting);
+        lock(&manager.state).vms.insert(id.clone(), Vm::Starting(Phase::Vault));
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().len(), 1);
         assert!(vault.get(&id, "TOKEN").unwrap().is_some());

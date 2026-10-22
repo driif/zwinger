@@ -3,6 +3,7 @@ import { Bot, Laptop } from "lucide-react";
 import { PaneNode, SessionKind, ShieldView } from "../../shared/api";
 import type { Pane } from "../../App";
 import { PaneLayout } from "./PaneLayout";
+import { StartProgress } from "../shields/StartProgress";
 
 interface Props {
   shield: ShieldView;
@@ -30,7 +31,12 @@ interface Props {
 export function TerminalTab({ shield, onNewSession, ...layout }: Props) {
   return (
     <div className="terminal-tab">
-      {!shield.paneLayout && (
+      {!shield.paneLayout && shield.status.state === "starting" && (
+        <div className="empty">
+          <StartProgress phase={shield.status.phase} />
+        </div>
+      )}
+      {!shield.paneLayout && shield.status.state !== "starting" && (
         <div className="empty">
           <p className="muted">
             No pane is open. A Mac shell starts in {shield.folder} and needs no shield start. An agent starts in the shield,
@@ -46,7 +52,7 @@ export function TerminalTab({ shield, onNewSession, ...layout }: Props) {
           </div>
         </div>
       )}
-      <PaneLayout layout={shield.paneLayout} {...layout} />
+      <PaneLayout layout={shield.paneLayout} status={shield.status} {...layout} />
     </div>
   );
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Receiver;
@@ -17,12 +17,14 @@ use crate::proxy::ca::Ca;
 use crate::proxy::inject::Login;
 use crate::proxy::log::Entry;
 use crate::proxy::{self, Live, Proxy};
+use crate::runtime;
 use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
 use crate::secrets::{self, SecretValue};
 use crate::shield::apps::APP_SIZE;
 use crate::shield::manager::{HostRun, Manager, Vm, bin_dir, blocking, lock};
 use crate::shield::network::placeholders;
+use crate::shield::progress::{Phase, Progress, Timings};
 use crate::shield::{Shield, WORKSPACE};
 
 pub(crate) const NODE_LIMIT: Duration = Duration::from_secs(15);
@@ -56,38 +58,63 @@ impl<R: SandboxRuntime> Manager<R> {
     /// before the runtime start. The proxy starts before the VM: if it
     /// cannot start, the shield does not start.
     pub async fn start(&self, id: &str) -> Result<()> {
-        let (shield, live) = {
-            let _edit = lock(&self.secret_edit);
-            let shield = self.claim_start(id)?;
-            match self.vault_values(&shield) {
-                Ok(values) => {
-                    let live = Live::new(shield.network.clone(), values);
-                    lock(&self.state).live.insert(id.to_owned(), live.clone());
-                    (shield, live)
-                }
-                Err(e) => {
-                    lock(&self.state).vms.remove(id);
-                    return Err(e);
-                }
-            }
-        };
-        let fail = |e: Error| {
+        let started = Instant::now();
+        let mut timings = Timings::default();
+        let fail = |e: Error, timings: &mut Timings| {
+            timings.finish(started);
+            eprintln!("{} (failed: {e})", timings.line(id));
             let mut state = lock(&self.state);
             state.vms.remove(id);
             state.live.remove(id);
             Err(e)
         };
+        let progress = Arc::new(Progress {
+            id: id.to_owned(),
+            started,
+            state: self.state.clone(),
+            sink: self.progress_sink.clone(),
+        });
+        let (shield, live) = {
+            let _edit = lock(&self.secret_edit);
+            let shield = self.claim_start(id)?;
+            // After the claim: only a shield that is starting reports a phase.
+            progress.begin(Phase::Vault);
+            let values = self.vault_values(&shield);
+            timings.add(Phase::Vault, started.elapsed());
+            match values {
+                Ok(values) => {
+                    let live = Live::new(shield.network.clone(), values);
+                    lock(&self.state).live.insert(id.to_owned(), live.clone());
+                    (shield, live)
+                }
+                Err(e) => return fail(e, &mut timings),
+            }
+        };
+        progress.begin(Phase::Prepare);
+        // The CA load reads the Keychain, as the host logins of `prepare` do, so the two wait at once.
         let prepared = {
-            let (host, data, shield) = (self.host.clone(), self.data.clone(), shield.clone());
-            blocking(move || prepare(&host, &data, &shield)).await
+            let (host, data, shield, progress) =
+                (self.host.clone(), self.data.clone(), shield.clone(), progress.clone());
+            timed(blocking(move || prepare(&host, &data, &shield, &|phase| progress.begin(phase))))
         };
-        let Prepared { mut binds, wanted, mut run, tokens } = match prepared {
+        let ((prepared, prepare_took), (ca, ca_took)) = tokio::join!(prepared, timed(self.ca()));
+        let Prepared { mut binds, wanted, mut run, tokens, profiles, tui_probe } = match prepared {
             Ok(prepared) => prepared,
-            Err(e) => return fail(e),
+            Err(e) => return fail(e, &mut timings),
         };
-        let proxy = match self.start_proxy(id, &shield, live, tokens).await {
+        for (kind, took) in profiles {
+            timings.add(Phase::Profile(kind), took);
+        }
+        timings.add(Phase::Prepare, prepare_took);
+        if let Err(e) = ca {
+            return fail(e, &mut timings);
+        }
+        progress.begin(Phase::Proxy);
+        let (proxy, proxy_took) = timed(self.start_proxy(id, &shield, live, tokens)).await;
+        timings.add(Phase::Proxy, ca_took + proxy_took);
+        let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
-            Err(e) => return fail(e),
+            Err(e) => return fail(e, &mut timings),
         };
         binds.push(Bind { guest: launch::CA_DIR.to_owned(), host: Ca::dir(&self.data) });
         run.proxy = Some(proxy.url());
@@ -113,63 +140,36 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         // The paths again right before and after the boot, which binds them: a
         // folder that was swapped meanwhile is refused.
-        let result = match shield.verify_paths() {
-            Ok(()) => match self.runtime.start(&shield, &net, &self.state_dir(id), &installed, &binds).await {
-                Ok(vm) => {
-                    let checked = match shield.verify_paths() {
-                        Ok(()) => self.check_node(&vm).await,
-                        Err(e) => Err(e),
-                    };
-                    match checked {
-                        Ok(()) => Ok(vm),
-                        Err(e) => {
-                            let _ = self.runtime.stop(&vm).await;
-                            Err(e)
-                        }
+        progress.begin(Phase::Boot);
+        let boot = async {
+            shield.verify_paths()?;
+            self.runtime.start(&shield, &net, &self.state_dir(id), &installed, &binds).await
+        };
+        let (booted, boot_took) = timed(boot).await;
+        timings.add(Phase::Boot, boot_took);
+        let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
+        let result = match booted {
+            Ok(vm) => {
+                progress.begin(Phase::Guest);
+                let at = Instant::now();
+                let set_up = match shield.verify_paths() {
+                    Ok(()) => self.set_up_guest(&vm, tui_probe.as_deref(), &mut run, &mut names, &mut timings).await,
+                    Err(e) => Err(e),
+                };
+                timings.add(Phase::Guest, at.elapsed());
+                match set_up {
+                    Ok(()) => Ok(vm),
+                    Err(e) => {
+                        let _ = self.runtime.stop(&vm).await;
+                        Err(e)
                     }
                 }
-                Err(e) => Err(e),
-            },
+            }
             Err(e) => Err(e),
         };
 
-        let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
-        if let Ok(vm) = &result {
-            if run.pi_host
-                && let Err(e) = self.probe_tui(vm, run.proxy.as_deref()).await
-            {
-                run.pi_host = false;
-                run.notices.push(format!(
-                    "The pi of this Mac does not start in the shield ({e}), so the bundled pi runs. It can be a different version."
-                ));
-            }
-            if let Some(entry) = run.gemini.clone() {
-                let argv = ["node".to_owned(), entry, "--version".to_owned()];
-                match self.probe(vm, &argv).await {
-                    Ok(()) => names.push(AgentKind::Gemini.name()),
-                    Err(e) => {
-                        run.gemini = None;
-                        run.failed.push((AgentKind::Gemini, e));
-                    }
-                }
-            }
-            for (kind, why) in &run.failed {
-                run.notices.push(format!("{} from this Mac does not run in the shield: {why}", kind.label()));
-            }
-            // Before any session starts, so each login shell has the agent commands.
-            if let Err(e) = self.probe(vm, &launch::profile_argv()).await {
-                run.notices.push(format!(
-                    "Login shells do not find the agent commands ({e}). Run them as {}/<agent>.",
-                    launch::BIN_DIR
-                ));
-            }
-            if let Err(e) = self.probe(vm, &launch::trust_argv()).await {
-                run.notices.push(format!(
-                    "Only Node trusts the network proxy of this shield, so curl, git and Python fail TLS: {e}."
-                ));
-            }
-        }
-
+        progress.begin(Phase::Wrappers);
+        let at = Instant::now();
         let net = match &result {
             Ok(vm) => match self.runtime.net_lines(vm).await {
                 Ok(lines) => Some(self.follow_net(id, lines)),
@@ -190,6 +190,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     if let Err(e) = launch::write(&self.bin_dir(id), &mounted(&names), run.found(), unprompted) {
                         run.notices.push(format!("The agent commands could not be written: {e}"));
                     }
+                    timings.add(Phase::Wrappers, at.elapsed());
                     let vm = Arc::new(vm);
                     run.guest_watch = Some(self.watch_guest_logins(id, &vm));
                     state.vms.insert(
@@ -200,6 +201,8 @@ impl<R: SandboxRuntime> Manager<R> {
                     apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
                 }
                 Err(e) => {
+                    timings.finish(started);
+                    eprintln!("{} (failed: {e})", timings.line(id));
                     state.vms.insert(id.to_owned(), Vm::Failed(e.message()));
                     state.live.remove(id);
                     return Err(e);
@@ -208,10 +211,98 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         // An app that cannot start, or a stop that ran meanwhile, does not
         // fail the start. A bad command shows as an exit code.
+        let at = Instant::now();
         for app_id in autostart {
             if let Err(e) = self.start_app(id, &app_id).await {
                 eprintln!("autostart of app {app_id} in {id} failed: {e}");
             }
+        }
+        timings.add(Phase::Apps, at.elapsed());
+        // After the apps, so the total includes them.
+        timings.finish(started);
+        eprintln!("{}", timings.line(id));
+        if let Some(Vm::Running { host, .. }) = lock(&self.state).vms.get_mut(id) {
+            host.timings = timings;
+        }
+        Ok(())
+    }
+
+    /// The checks and the setup in the booted VM. They run at once, each
+    /// with its own timing. A Node check that fails fails the start; else
+    /// the results apply in a fixed order, so the notices do too.
+    /// `tui_probe` is the cache key of the host pi's TUI probe, if it must run.
+    async fn set_up_guest(
+        &self,
+        vm: &R::Vm,
+        tui_probe: Option<&str>,
+        run: &mut HostRun,
+        names: &mut Vec<&'static str>,
+        timings: &mut Timings,
+    ) -> Result<()> {
+        let gemini = run.gemini.clone().map(|entry| ["node".to_owned(), entry, "--version".to_owned()]);
+        let (profile, trust) = (launch::profile_argv(), launch::trust_argv());
+        let proxy = run.proxy.clone();
+        let ((node, node_took), tui, gemini, (profile, profile_took), (trust, trust_took)) = tokio::join!(
+            timed(self.check_node(vm)),
+            async {
+                match tui_probe {
+                    Some(_) => Some(timed(self.probe_tui(vm, proxy.as_deref())).await),
+                    None => None,
+                }
+            },
+            async {
+                match &gemini {
+                    Some(argv) => Some(timed(self.probe(vm, argv)).await),
+                    None => None,
+                }
+            },
+            // Before any session starts, so each login shell has the agent commands.
+            timed(self.probe(vm, &profile)),
+            timed(self.probe(vm, &trust)),
+        );
+        timings.add(Phase::Node, node_took);
+        let tui = tui.map(|(tui, took)| {
+            timings.add(Phase::Tui, took);
+            tui
+        });
+        let gemini = gemini.map(|(gemini, took)| {
+            timings.add(Phase::Gemini, took);
+            gemini
+        });
+        timings.add(Phase::Setup, profile_took);
+        timings.add(Phase::Trust, trust_took);
+        node?;
+        match (tui, tui_probe) {
+            (Some(Ok(())), Some(key)) => cache_tui(&self.data, key).await,
+            (Some(Err(e)), _) => {
+                run.pi_host = false;
+                run.notices.push(format!(
+                    "The pi of this Mac does not start in the shield ({e}), so the bundled pi runs. It can be a different version."
+                ));
+            }
+            _ => {}
+        }
+        match gemini {
+            Some(Ok(())) => names.push(AgentKind::Gemini.name()),
+            Some(Err(e)) => {
+                run.gemini = None;
+                run.failed.push((AgentKind::Gemini, e));
+            }
+            None => {}
+        }
+        for (kind, why) in &run.failed {
+            run.notices.push(format!("{} from this Mac does not run in the shield: {why}", kind.label()));
+        }
+        if let Err(e) = profile {
+            run.notices.push(format!(
+                "Login shells do not find the agent commands ({e}). Run them as {}/<agent>.",
+                launch::BIN_DIR
+            ));
+        }
+        if let Err(e) = trust {
+            run.notices.push(format!(
+                "Only Node trusts the network proxy of this shield, so curl, git and Python fail TLS: {e}."
+            ));
         }
         Ok(())
     }
@@ -333,7 +424,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let mut state = lock(&self.state);
         let shield = state.shield_mut(id)?.clone();
         match state.vms.get(id) {
-            Some(Vm::Starting) => return Err(Error::Starting),
+            Some(Vm::Starting(_)) => return Err(Error::Starting),
             Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
             Some(Vm::Stopping) => return Err(Error::Stopping),
             None | Some(Vm::Failed(_)) => {}
@@ -342,7 +433,7 @@ impl<R: SandboxRuntime> Manager<R> {
         shield.network.check()?;
         shield.check_app_data(&self.data)?;
         shield.check_overlap_with(state.shields.iter().filter(|s| s.id != id))?;
-        state.vms.insert(id.to_owned(), Vm::Starting);
+        state.vms.insert(id.to_owned(), Vm::Starting(Phase::Vault));
         Ok(shield)
     }
 
@@ -366,7 +457,8 @@ impl<R: SandboxRuntime> Manager<R> {
         if tokio::time::timeout(NODE_LIMIT, read).await.is_err() {
             let _ = pipe.input.try_send(PipeInput::Kill);
         }
-        pi::check_node(&String::from_utf8_lossy(&out))
+        let version = String::from_utf8_lossy(&out).trim().to_owned();
+        pi::check_node(&version)
     }
 
     /// The vault value of each credential. A value with a write that still
@@ -447,7 +539,7 @@ impl<R: SandboxRuntime> Manager<R> {
             state.shield_mut(id)?;
             match state.vms.get(id) {
                 Some(Vm::Running { .. }) => {}
-                Some(Vm::Starting) => return Err(Error::Starting),
+                Some(Vm::Starting(_)) => return Err(Error::Starting),
                 Some(Vm::Stopping) => return Err(Error::Stopping),
                 Some(Vm::Failed(_)) | None => return Err(Error::NotRunning),
             }
@@ -522,14 +614,18 @@ pub(crate) struct Prepared {
     /// The host version of each native runtime that a host agent uses.
     pub(crate) wanted: HashMap<&'static str, String>,
     pub(crate) run: HostRun,
+    /// How long the copy of each profile took.
+    pub(crate) profiles: Vec<(AgentKind, Duration)>,
+    /// The cache key of the host pi's TUI probe, if the probe must run.
+    pub(crate) tui_probe: Option<String>,
 }
 
 /// Copies the profiles and links them into the agents' state, reads the
 /// host logins and writes the guest logins, and picks the host packages and
 /// runtime versions. It reads the Keychain and copies files, so it runs on a
 /// blocking thread. The state dir is guest-writable: each write there
-/// follows no link.
-pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield) -> Result<Prepared> {
+/// follows no link. `begin` gets the phase of each profile copy.
+pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &dyn Fn(Phase)) -> Result<Prepared> {
     let state = data.join("shields").join(&shield.id);
     std::fs::create_dir_all(&state)?;
     // Empty: the start writes the wrappers of the agents that run in the VM.
@@ -550,12 +646,17 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield) -> Result
     let home = host.home();
     let mut binds = vec![Bind { guest: launch::BIN_DIR.to_owned(), host: bin }];
     let mut wanted = HashMap::new();
+    let (mut profiles, mut tui_probe) = (Vec::new(), None);
     for kind in host_agents::KINDS {
         let used = shield.host_agent(kind);
         let snapshot_dir = data.join("profiles").join(&shield.id).join(kind.name());
         let mut entries = Vec::new();
         if used.is_some_and(|u| u.profile) {
+            begin(Phase::Profile(kind));
+            let at = Instant::now();
             let snapshot = profile::snapshot(kind, &home, &snapshot_dir)?;
+            profiles.push((kind, at.elapsed()));
+            begin(Phase::Prepare);
             if !snapshot.skipped.is_empty() {
                 run.notices.push(format!(
                     "The {} profile skipped {} entries: links out of their folder, denied names, or files over the size limit.",
@@ -588,6 +689,13 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield) -> Result
                 wanted.insert(kind.name(), found.version.clone());
             }
             (AgentKind::Pi, Some(package), _) => {
+                // The detection can be older than an update of pi.
+                let manifest = std::fs::read_to_string(package.join("package.json")).ok();
+                let manifest = manifest.and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok());
+                let pi = manifest.as_ref().and_then(|m| m["version"].as_str()).unwrap_or(&found.version);
+                // A host pi whose TUI loaded with the same pi, image and runtime is not probed again.
+                let key = format!("{pi} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
+                tui_probe = Some(key).filter(|key| !tui_cached(data, key));
                 binds.push(Bind { guest: pi::HOST_DIR.to_owned(), host: package });
                 run.pi_host = true;
             }
@@ -637,7 +745,36 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield) -> Result
             login::GITHUB_API
         ));
     }
-    Ok(Prepared { tokens, binds, wanted, run })
+    Ok(Prepared { tokens, binds, wanted, run, profiles, tui_probe })
+}
+
+/// Runs `work` and measures it.
+async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
+    let at = Instant::now();
+    let out = work.await;
+    (out, at.elapsed())
+}
+
+/// The file of the host pi TUI probes that passed: one key per line.
+pub(crate) const TUI_CACHE: &str = "tui-probes";
+
+fn tui_cached(data: &Path, key: &str) -> bool {
+    std::fs::read_to_string(data.join(TUI_CACHE)).is_ok_and(|text| text.lines().any(|line| line == key))
+}
+
+/// A lost write only costs one more probe.
+async fn cache_tui(data: &Path, key: &str) {
+    let (path, key) = (data.join(TUI_CACHE), key.to_owned());
+    let written = blocking(move || {
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&key);
+        text.push('\n');
+        Ok(std::fs::write(&path, text)?)
+    })
+    .await;
+    if let Err(e) = written {
+        eprintln!("the TUI probe of pi is not cached: {e}");
+    }
 }
 
 /// The agents that run in the VM: pi always, the others if their runtime is mounted.
@@ -661,7 +798,7 @@ mod tests {
         let (manager, runtime, id) = manager();
         *runtime.node_version.lock().unwrap() = Some("v22.12.0\n".into());
         assert!(matches!(manager.start(&id).await, Err(Error::NodeTooOld(v)) if v == "v22.12.0"));
-        assert!(matches!(manager.list()[0].status, Status::Error(_)));
+        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
     }
 
@@ -974,6 +1111,8 @@ mod tests {
         manager.stop(&id).await.unwrap();
 
         // A darwin-only native module: pi falls back to the bundle, Gemini CLI has none.
+        // The TUI probe passed above, so its cache must go for it to run again.
+        std::fs::remove_file(manager.data.join(super::TUI_CACHE)).unwrap();
         *runtime.probe_fail.lock().unwrap() =
             vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
         manager.start(&id).await.unwrap();
@@ -990,6 +1129,158 @@ mod tests {
         let (plain, _, plain_id) = manager_with_host();
         plain.start(&plain_id).await.unwrap();
         assert!(matches!(plain.open_session(&plain_id, gemini, 24, 80).await, Err(Error::NotHostAgent(_))));
+    }
+
+    fn tui_probes(runtime: &FakeRuntime) -> usize {
+        runtime.argvs.lock().unwrap().iter().filter(|a| a.last().is_some_and(|a| a == "--no-session")).count()
+    }
+
+    #[tokio::test]
+    async fn a_passed_tui_probe_is_cached_and_a_failed_one_is_not() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        *runtime.probe_fail.lock().unwrap() = vec!["/opt/zwinger/host/pi/dist/cli.js".into()];
+        for probes in [1, 2] {
+            manager.start(&id).await.unwrap();
+            assert_eq!(tui_probes(&runtime), probes);
+            assert!(manager.list()[0].host_notices.iter().any(|n| n.contains("bundled pi")));
+            manager.stop(&id).await.unwrap();
+        }
+        runtime.probe_fail.lock().unwrap().clear();
+        for _ in 0..2 {
+            manager.start(&id).await.unwrap();
+            assert_eq!(tui_probes(&runtime), 3);
+            assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("bundled pi")));
+            assert!(wrappers(&manager, &id).contains(&"pi".to_owned()));
+            assert!(
+                std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap().contains("/opt/zwinger/host/pi/")
+            );
+            manager.stop(&id).await.unwrap();
+        }
+        // A new Node in the image does not probe again: the key has the image and the runtime.
+        *runtime.node_version.lock().unwrap() = Some("v24.1.0\n".into());
+        manager.start(&id).await.unwrap();
+        assert_eq!(tui_probes(&runtime), 3);
+    }
+
+    #[tokio::test]
+    async fn an_update_of_the_host_pi_probes_its_tui_again() {
+        // The pi package is a real folder, so the start reads its `package.json`.
+        let (dir, home, package) = (temp_dir(), temp_dir(), temp_dir());
+        std::fs::write(package.join("package.json"), r#"{"version":"1.0.0"}"#).unwrap();
+        let mut fs = mac(&home);
+        fs.links.insert("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent".into(), package.clone());
+        let runtime = FakeRuntime::default();
+        let host = host_with(fs, FakeLogins::default(), NOW);
+        let manager =
+            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host).unwrap();
+        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
+            std::fs::write(package.join("package.json"), format!(r#"{{"version":"{version}"}}"#)).unwrap();
+            manager.start(&id).await.unwrap();
+            assert_eq!(tui_probes(&runtime), probes, "{version}");
+            manager.stop(&id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_check_stops_the_vm_also_when_probes_fail() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
+        *runtime.node_version.lock().unwrap() = Some("v22.12.0\n".into());
+        *runtime.probe_fail.lock().unwrap() =
+            vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
+        *runtime.trust_fail.lock().unwrap() = true;
+        assert!(matches!(manager.start(&id).await, Err(Error::NodeTooOld(_))));
+        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
+        assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
+    }
+
+    #[tokio::test]
+    async fn the_guest_checks_keep_the_order_of_their_notices() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
+        *runtime.probe_fail.lock().unwrap() =
+            vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
+        *runtime.trust_fail.lock().unwrap() = true;
+        manager.start(&id).await.unwrap();
+        let view = manager.list().remove(0);
+        let found: Vec<usize> = ["bundled pi", "Gemini CLI from this Mac", "Only Node trusts"]
+            .iter()
+            .map(|text| view.host_notices.iter().position(|n| n.contains(text)).expect(text))
+            .collect();
+        assert!(found.is_sorted() && found.len() == 3, "{:?}", view.host_notices);
+        assert_eq!(*runtime.trusts.lock().unwrap(), 1);
+        assert_eq!(runtime.profiles.lock().unwrap().len(), 1);
+        // The start timings of the running VM.
+        let timings = view.start_timings.expect("timings");
+        let phases: Vec<Phase> = timings.phases.iter().map(|t| t.phase).collect();
+        assert_eq!(
+            phases,
+            [
+                Phase::Vault,
+                Phase::Prepare,
+                Phase::Proxy,
+                Phase::Boot,
+                Phase::Node,
+                Phase::Tui,
+                Phase::Gemini,
+                Phase::Setup,
+                Phase::Trust,
+                Phase::Guest,
+                Phase::Wrappers,
+                Phase::Apps
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_start_reports_each_phase() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Claude, true, false), false).await.unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        manager.set_progress_sink(Box::new(move |shield, phase, _| {
+            sink.lock().unwrap().push((shield.to_owned(), *phase))
+        }));
+        let gate = Arc::new(PtyGate::default());
+        *runtime.start_gate.lock().unwrap() = Some(gate.clone());
+        let manager = Arc::new(manager);
+        let starting = tokio::spawn({
+            let (manager, id) = (manager.clone(), id.clone());
+            async move { manager.start(&id).await }
+        });
+        gate.entered.notified().await;
+        assert_eq!(manager.list()[0].status, Status::Starting { phase: Phase::Boot });
+        gate.release.notify_one();
+        starting.await.unwrap().unwrap();
+        let phases: Vec<Phase> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(shield, phase)| {
+                assert_eq!(*shield, id);
+                *phase
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                Phase::Vault,
+                Phase::Prepare,
+                Phase::Profile(AgentKind::Claude),
+                Phase::Prepare,
+                Phase::Proxy,
+                Phase::Boot,
+                Phase::Guest,
+                Phase::Wrappers
+            ]
+        );
+        let timings = manager.list().remove(0).start_timings.unwrap();
+        assert_eq!(timings.phases[1].phase, Phase::Profile(AgentKind::Claude));
     }
 
     #[tokio::test]
@@ -1036,7 +1327,7 @@ mod tests {
         gate.release.notify_one();
         assert!(matches!(starting.await.unwrap(), Err(Error::PathChanged(_))));
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
-        assert!(matches!(manager.list()[0].status, Status::Error(_)));
+        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
     }
 
     #[tokio::test]

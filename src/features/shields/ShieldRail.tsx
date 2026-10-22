@@ -55,6 +55,7 @@ import { tildePath, truncateMiddle } from "../../shared/paths";
 import { LaunchAction, launchActions } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import { launchMenu } from "../launcher/SplitLaunch";
+import { StartProgress } from "./StartProgress";
 import "./rail.css";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
@@ -642,9 +643,15 @@ export function ShieldRail({
                           title={shield.status.state === "error" ? shield.status.message : shield.folder}
                         >
                           {shield.name}
-                          <span className="tree-path muted" title={shield.folder}>
-                            {truncateMiddle(tildePath(shield.folder, home), 32)}
-                          </span>
+                          {shield.status.state === "starting" ? (
+                            <span className="tree-path muted">
+                              <StartProgress phase={shield.status.phase} />
+                            </span>
+                          ) : (
+                            <span className="tree-path muted" title={shield.folder}>
+                              {truncateMiddle(tildePath(shield.folder, home), 32)}
+                            </span>
+                          )}
                         </span>
                         {blocked[shield.id] > 0 && (
                           <span className="rail-blocked" title="Blocked network events since you last saw them">

@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { call, Pos, ShieldView } from "../../shared/api";
+import { call, Pos, ShieldView, StartPhase } from "../../shared/api";
 
 export const listShields = () => call<ShieldView[]>("list_shields");
 
@@ -33,6 +33,12 @@ export const confirmPaths = (id: string) => call<void>("confirm_paths", { id });
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (shieldId: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));
+
+/** Each phase change of a shield start. Resolves to the function that stops the listener. */
+export const onStartProgress = (handler: (shieldId: string, phase: StartPhase) => void) =>
+  listen<{ shieldId: string; phase: StartPhase; elapsedMs: number }>("shield-start-progress", ({ payload }) =>
+    handler(payload.shieldId, payload.phase),
+  );
 
 /** Each notice comes once, such as the VMs that the app start removed. */
 export const takeAppNotices = () => call<string[]>("take_app_notices");

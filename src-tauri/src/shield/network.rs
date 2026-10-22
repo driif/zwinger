@@ -587,7 +587,7 @@ mod tests {
             async move { manager.start(&id).await }
         });
         gate.entered.notified().await;
-        assert_eq!(manager.list()[0].status, Status::Starting);
+        assert!(matches!(manager.list()[0].status, Status::Starting { .. }));
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
         gate.release.notify_one();
 

@@ -287,3 +287,15 @@ p {
 .model-picker {
   max-width: 18rem;
 }
+
+/* The phase of a shield start: a short bar and its text. */
+.start-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--zw-gap);
+}
+
+.start-progress > :first-child {
+  width: 4rem;
+  flex: none;
+}

@@ -1,11 +1,13 @@
 //! The agent profile: a host-owned snapshot of the allow-listed entries of an
-//! agent's config dir, copied at each shield start into
+//! agent's config dir, updated in place at each shield start in
 //! `<app_data>/profiles/<shield>/<agent>` and mounted read-only at
 //! `/opt/zwinger/profile/<agent>`. The agent's state home in the guest gets
 //! links into that mount. Only listed entries are copied, and a denied
 //! name is skipped at any depth, so logins, history, sessions and projects
 //! never are.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -98,8 +100,11 @@ pub struct Snapshot {
     /// The top-level entries in the snapshot.
     pub entries: Vec<String>,
     /// The host paths that were skipped: links out of their top-level entry,
-    /// denied names, and files over the limits.
+    /// denied names, and files over the limits. A folder after the file
+    /// limit counts once.
     pub skipped: Vec<String>,
+    /// The files that this snapshot wrote: new or changed ones.
+    pub written: usize,
 }
 
 struct Copy<'a> {
@@ -109,39 +114,42 @@ struct Copy<'a> {
     home: &'a Path,
     size: u64,
     files: usize,
+    /// A file was refused for the size limit.
+    full: bool,
     skipped: Vec<String>,
+    written: usize,
 }
 
-/// Copies the allow-listed entries of the agent's config dir below `home`
-/// into `dest`, which is replaced. A link is copied as its target if the
-/// target stays below the canonical top-level entry that the link is in;
-/// a top-level link must point below the config dir.
+/// Updates `dest` to hold the allow-listed entries of the agent's config dir
+/// below `home`. A file is written only if it is new or its size or mtime
+/// changed; an entry that the source has no more, or that is now skipped,
+/// is removed. A link in `dest` is removed, not followed. After an error
+/// `dest` is removed and copied again in full once; if that fails too, `dest`
+/// stays removed and the error is returned. A link in the
+/// source is copied as its target if the target stays below the canonical
+/// top-level entry that the link is in; a top-level link must point below
+/// the config dir.
 pub fn snapshot(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapshot> {
     let parent = dest.parent().expect("snapshot dir has a parent");
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&tmp)?;
-    let result = copy_entries(kind, home, &tmp);
-    let result = result.and_then(|snapshot| {
-        match fs::remove_dir_all(dest) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        fs::rename(&tmp, dest)?;
-        Ok(snapshot)
+    let result = copy_entries(kind, home, dest).or_else(|_| {
+        remove(dest)?;
+        copy_entries(kind, home, dest)
     });
     if result.is_err() {
-        let _ = fs::remove_dir_all(&tmp);
+        let _ = remove(dest);
     }
     result
 }
 
 fn copy_entries(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapshot> {
+    make_dir(dest)?;
     let config = home.join(config_dir(kind));
     let Ok(root) = config.canonicalize() else {
+        prune(dest, &HashSet::new())?;
         return Ok(Snapshot::default());
     };
-    let mut copy = Copy { root, kind, home, size: 0, files: 0, skipped: Vec::new() };
+    let mut copy = Copy { root, kind, home, size: 0, files: 0, full: false, skipped: Vec::new(), written: 0 };
     let mut copied = Vec::new();
     for name in entries(kind) {
         let src = config.join(name);
@@ -160,13 +168,47 @@ fn copy_entries(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapsho
             copied.push((*name).to_owned());
         }
     }
-    Ok(Snapshot { entries: copied, skipped: copy.skipped })
+    prune(dest, &copied.iter().map(OsString::from).collect())?;
+    Ok(Snapshot { entries: copied, skipped: copy.skipped, written: copy.written })
+}
+
+/// Makes `path` a real folder. A link or a file there is removed first.
+fn make_dir(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => fs::remove_file(path)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::create_dir(path)
+}
+
+/// Removes the entry at `path` and follows no link.
+fn remove(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes the entries of `dir` that are not in `kept`.
+fn prune(dir: &Path, kept: &HashSet<OsString>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !kept.contains(&entry.file_name()) {
+            remove(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 impl Copy<'_> {
-    /// Copies one entry. `rel` is its path below the config dir, and `top`
-    /// is the canonical top-level entry that it is in. Returns false if it
-    /// was skipped or does not exist.
+    /// Copies one entry into `dst`, if it changed. `rel` is its path below
+    /// the config dir, and `top` is the canonical top-level entry that it is
+    /// in. Returns false if it was skipped or does not exist; the caller then
+    /// removes `dst`.
     fn entry(&mut self, src: &Path, dst: &Path, rel: &str, top: &Path, depth: usize) -> io::Result<bool> {
         let meta = match fs::symlink_metadata(src) {
             Ok(meta) => meta,
@@ -197,35 +239,72 @@ impl Copy<'_> {
             return Ok(false);
         }
         if meta.is_dir() {
-            if depth >= DEPTH_LIMIT {
+            // After a limit, a whole folder is skipped and not walked.
+            if depth >= DEPTH_LIMIT || self.files >= FILE_LIMIT || self.full {
                 self.skipped.push(src.display().to_string());
                 return Ok(false);
             }
-            fs::create_dir(dst)?;
+            make_dir(dst)?;
+            let old: Vec<OsString> = fs::read_dir(dst)?.map(|e| e.map(|e| e.file_name())).collect::<io::Result<_>>()?;
             let mut names: Vec<_> = fs::read_dir(&src)?.flatten().map(|e| e.file_name()).collect();
             names.sort();
+            let mut kept = HashSet::new();
             for name in names {
+                // The Mac ignores case: a renamed `Foo` to `foo` would find the old file.
+                if !old.contains(&name)
+                    && let Some(other) = old.iter().find(|o| o.eq_ignore_ascii_case(&name))
+                {
+                    remove(&dst.join(other))?;
+                }
                 let rel = format!("{rel}/{}", name.to_string_lossy());
-                self.entry(&src.join(&name), &dst.join(&name), &rel, top, depth + 1)?;
+                if self.entry(&src.join(&name), &dst.join(&name), &rel, top, depth + 1)? {
+                    kept.insert(name);
+                }
             }
+            prune(dst, &kept)?;
             return Ok(true);
         }
         if !meta.is_file() {
             return Ok(false);
         }
         if self.files >= FILE_LIMIT || self.size + meta.len() > SIZE_LIMIT {
+            self.full |= self.size + meta.len() > SIZE_LIMIT;
             self.skipped.push(src.display().to_string());
             return Ok(false);
         }
         self.files += 1;
         self.size += meta.len();
+        let old = match fs::symlink_metadata(dst) {
+            Ok(old) if old.is_file() => Some(old),
+            Ok(_) => {
+                remove(dst)?;
+                None
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
         match self.filter(rel) {
+            // Small files, made again each time: their size differs from the source.
             Some(filter) => {
-                let text = fs::read_to_string(&src)?;
-                fs::write(dst, filter(self, &text))?;
+                let text = filter(self, &fs::read_to_string(&src)?);
+                if old.is_none() || fs::read(dst)? != text.as_bytes() {
+                    fs::write(dst, text)?;
+                    self.written += 1;
+                }
             }
             None => {
-                fs::copy(&src, dst)?;
+                let modified = meta.modified()?;
+                let same =
+                    old.as_ref().is_some_and(|old| old.len() == meta.len() && old.modified().ok() == Some(modified));
+                if !same {
+                    // The copy takes the source's mode, which can deny a write over it.
+                    if old.is_some() {
+                        fs::remove_file(dst)?;
+                    }
+                    fs::copy(&src, dst)?;
+                    fs::File::open(dst)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+                    self.written += 1;
+                }
             }
         }
         Ok(true)
@@ -452,6 +531,132 @@ mod tests {
         snapshot(AgentKind::Claude, &home, &dest).unwrap();
         assert_eq!(names(&dest), ["agents", "skills"]);
         assert_eq!(names(dest.parent().unwrap()), ["claude"]);
+    }
+
+    #[test]
+    fn a_folder_after_the_size_limit_is_skipped_once() {
+        let home = temp_dir();
+        let claude = home.join(".claude");
+        fs::create_dir_all(claude.join("skills/review")).unwrap();
+        fs::write(claude.join("skills/review/SKILL.md"), "review").unwrap();
+        fs::write(claude.join("skills/review/notes.md"), "notes").unwrap();
+        // Sparse, so the test writes no 256 MiB. `CLAUDE.md` comes before `skills`.
+        fs::File::create(claude.join("CLAUDE.md")).unwrap().set_len(SIZE_LIMIT + 1).unwrap();
+
+        let dest = temp_dir().join("claude");
+        let copied = snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert!(copied.entries.is_empty(), "{:?}", copied.entries);
+        let skipped: Vec<String> = [claude.join("CLAUDE.md"), claude.join("skills")]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(copied.skipped, skipped);
+    }
+
+    /// A Claude Code config dir with a skill, a read-only file and settings.
+    fn claude_home() -> PathBuf {
+        let home = temp_dir();
+        let claude = home.join(".claude");
+        fs::create_dir_all(claude.join("skills/review")).unwrap();
+        fs::write(claude.join("skills/review/SKILL.md"), "review").unwrap();
+        fs::write(claude.join("CLAUDE.md"), "be short").unwrap();
+        fs::write(claude.join("settings.json"), r#"{"model":"opus","env":{"KEY":"sk"}}"#).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(claude.join("CLAUDE.md"), fs::Permissions::from_mode(0o444)).unwrap();
+        home
+    }
+
+    #[test]
+    fn an_unchanged_profile_writes_no_files() {
+        let home = claude_home();
+        let dest = temp_dir().join("claude");
+        assert_eq!(snapshot(AgentKind::Claude, &home, &dest).unwrap().written, 3);
+        let again = snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(again.entries, ["settings.json", "CLAUDE.md", "skills"]);
+        assert_eq!(again.written, 0);
+    }
+
+    #[test]
+    fn a_changed_file_is_copied_and_a_removed_one_goes() {
+        let home = claude_home();
+        let claude = home.join(".claude");
+        let dest = temp_dir().join("claude");
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        // Also a read-only file, whose copy is read-only too.
+        fs::remove_file(claude.join("CLAUDE.md")).unwrap();
+        fs::write(claude.join("CLAUDE.md"), "be shorter").unwrap();
+        fs::remove_dir_all(claude.join("skills/review")).unwrap();
+        fs::create_dir_all(claude.join("skills/new")).unwrap();
+        fs::write(claude.join("skills/new/SKILL.md"), "new").unwrap();
+
+        let copied = snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(copied.written, 2);
+        assert_eq!(fs::read_to_string(dest.join("CLAUDE.md")).unwrap(), "be shorter");
+        assert_eq!(names(&dest.join("skills")), ["new"]);
+
+        fs::remove_file(claude.join("CLAUDE.md")).unwrap();
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(names(&dest), ["settings.json", "skills"]);
+        // No config dir: the snapshot is empty.
+        fs::remove_dir_all(&claude).unwrap();
+        assert_eq!(snapshot(AgentKind::Claude, &home, &dest).unwrap(), Snapshot::default());
+        assert!(names(&dest).is_empty());
+    }
+
+    #[test]
+    fn a_filtered_file_whose_source_changed_is_made_again() {
+        let home = claude_home();
+        let dest = temp_dir().join("claude");
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        let settings =
+            || serde_json::from_str::<Value>(&fs::read_to_string(dest.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings(), json!({ "model": "opus" }));
+        fs::write(home.join(".claude/settings.json"), r#"{"model":"sonnet","env":{"KEY":"sk"}}"#).unwrap();
+        assert_eq!(snapshot(AgentKind::Claude, &home, &dest).unwrap().written, 1);
+        assert_eq!(settings(), json!({ "model": "sonnet" }));
+    }
+
+    #[test]
+    fn a_name_that_is_now_denied_is_removed() {
+        let home = claude_home();
+        let dest = temp_dir().join("claude");
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        // Left by an older snapshot, or a file that is now over a rule.
+        fs::write(dest.join("skills/review/auth.json"), "{}").unwrap();
+        fs::create_dir_all(dest.join("projects")).unwrap();
+        fs::write(home.join(".claude/skills/review/history.jsonl"), "history").unwrap();
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(names(&dest.join("skills/review")), ["SKILL.md"]);
+        assert_eq!(names(&dest), ["CLAUDE.md", "settings.json", "skills"]);
+    }
+
+    #[test]
+    fn a_link_in_the_snapshot_is_replaced_and_not_followed() {
+        let home = claude_home();
+        let dest = temp_dir().join("claude");
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        let outside = temp_dir();
+        fs::write(outside.join("precious"), "host").unwrap();
+        fs::remove_file(dest.join("skills/review/SKILL.md")).unwrap();
+        symlink(outside.join("precious"), dest.join("skills/review/SKILL.md")).unwrap();
+        fs::remove_dir_all(dest.join("skills")).unwrap();
+        symlink(&outside, dest.join("skills")).unwrap();
+        fs::remove_file(dest.join("settings.json")).unwrap();
+        symlink(outside.join("precious"), dest.join("settings.json")).unwrap();
+
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(names(&outside), ["precious"]);
+        assert_eq!(fs::read_to_string(outside.join("precious")).unwrap(), "host");
+        assert!(!fs::symlink_metadata(dest.join("skills")).unwrap().is_symlink());
+        assert!(!fs::symlink_metadata(dest.join("settings.json")).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(dest.join("skills/review/SKILL.md")).unwrap(), "review");
+
+        // The snapshot dir itself as a link.
+        fs::remove_dir_all(&dest).unwrap();
+        symlink(&outside, &dest).unwrap();
+        snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(names(&outside), ["precious"]);
+        assert!(dest.join("skills/review/SKILL.md").is_file());
     }
 
     #[test]

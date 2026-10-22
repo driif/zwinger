@@ -26,6 +26,7 @@ pub(crate) use crate::secrets::fake::MemoryVault;
 pub(crate) use crate::secrets::{self, SecretValue, Vault};
 pub(crate) use crate::shield::manager::*;
 pub(crate) use crate::shield::network::*;
+pub(crate) use crate::shield::progress::Phase;
 pub(crate) use crate::shield::{self, AppDraft, HostAgentUse, Pos, TaskDraft, WORKSPACE};
 pub(crate) use crate::store::Store;
 pub(crate) use crate::terminal::output::*;

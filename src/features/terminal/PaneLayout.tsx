@@ -1,15 +1,18 @@
 import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
 import { Code, Columns2, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, PointerEvent, useRef, useState } from "react";
-import type { PaneNode } from "../../shared/api";
+import type { PaneNode, ShieldStatus } from "../../shared/api";
 import type { Pane } from "../../App";
 import { KindIcon, paneName } from "../shields/ShieldRail";
+import { StartProgress } from "../shields/StartProgress";
 import { Path, place, Rect, setRatio } from "./panes";
 import { TerminalView } from "./TerminalView";
 
 interface Props {
   /** The layout of the shown shield. */
   layout: PaneNode | null;
+  /** The status of the shown shield. A VM pane shows the phase of its start. */
+  status: ShieldStatus;
   /** The terminals of all shields. Each one with a session stays attached, also while it is not shown. */
   panes: Pane[];
   focused?: string;
@@ -45,6 +48,7 @@ const body = (r: Rect): CSSProperties => ({
 /** The panes of the shown shield side by side, with dividers that drag. */
 export function PaneLayout({
   layout,
+  status,
   panes,
   focused,
   visible,
@@ -97,10 +101,16 @@ export function PaneLayout({
           pane &&
           !pane.sessionId && (
             <div key={terminal} className="pane-dormant" style={body(rect)}>
-              <p className="muted">{paneName(pane, panes)} is not running.</p>
-              <Button variant="outline" iconLeft={<Play size={14} />} onClick={() => onReopen(pane)}>
-                Open
-              </Button>
+              {status.state === "starting" && pane.kind.type !== "host" ? (
+                <StartProgress phase={status.phase} />
+              ) : (
+                <>
+                  <p className="muted">{paneName(pane, panes)} is not running.</p>
+                  <Button variant="outline" iconLeft={<Play size={14} />} onClick={() => onReopen(pane)}>
+                    Open
+                  </Button>
+                </>
+              )}
             </div>
           )
         );

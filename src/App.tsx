@@ -23,6 +23,7 @@ import {
   createShield,
   listShields,
   onGuestLogin,
+  onStartProgress,
   resolveFolder,
   startShield,
   stopShield,
@@ -303,6 +304,22 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   // An agent login was made in a shield, or it is gone.
   useEffect(() => {
     const stop = onGuestLogin(() => refresh());
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // The phase of a start that runs. A late event cannot undo a later state, such as running.
+  useEffect(() => {
+    const stop = onStartProgress((shieldId, phase) =>
+      setShields((current) =>
+        current.map((s) =>
+          s.id === shieldId && ["stopped", "starting", "error"].includes(s.status.state)
+            ? { ...s, status: { state: "starting", phase } }
+            : s,
+        ),
+      ),
+    );
     return () => {
       stop.then((unlisten) => unlisten());
     };
