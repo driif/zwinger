@@ -46,7 +46,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: zwinger ${{ github.ref_name }}
-          releaseBody: See the assets below. First start of an unsigned build: docs/release.md.
+          releaseBody: "See the assets below. First start of an unsigned build: docs/release.md."
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
