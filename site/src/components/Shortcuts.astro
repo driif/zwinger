@@ -1,0 +1,64 @@
+---
+import { SHORTCUTS, type ShortcutAction } from "../../../src/shared/useShortcuts.ts";
+
+const DESCRIPTIONS: Record<ShortcutAction, string> = {
+  commands: "Show all actions.",
+  newProject: "Create a project.",
+  newShell: "Open a Mac shell in the project folder.",
+  newVmShell: "Open a VM shell in /workspace of the cage.",
+  openEditor: "Open the folder of the project or of the current terminal in your editor.",
+  newAgent: "Open an agent session in the cage.",
+  close: "Hide the current pane. The terminal continues to run.",
+  next: "Show the next terminal of the project.",
+  previous: "Show the previous terminal of the project.",
+  overview: "Show the project overview.",
+  agents: "Show the last agent session. If there is none, open one.",
+  terminal: "Show the terminal view.",
+  network: "Show the network page of the project.",
+  settings: "Show the settings of the project.",
+  appSettings: "Open the app Settings.",
+  splitRight: "Split the pane to the right and open a Mac shell in it.",
+  splitDown: "Split the pane down and open a Mac shell in it.",
+  focusLeft: "Move the focus to the pane on the left.",
+  focusRight: "Move the focus to the pane on the right.",
+  focusUp: "Move the focus to the pane above.",
+  focusDown: "Move the focus to the pane below.",
+};
+
+const rows = SHORTCUTS.map((s) => {
+  const description = DESCRIPTIONS[s.action];
+  if (!description) throw new Error(`Shortcuts.astro: no description for the shortcut action "${s.action}".`);
+  return { label: s.label, description, terminal: "terminal" in s && s.terminal };
+});
+
+const groups = [
+  { title: "Everywhere", rows: rows.filter((r) => !r.terminal) },
+  { title: "In a terminal", rows: rows.filter((r) => r.terminal) },
+];
+---
+
+{
+  groups.map((group) => (
+    <>
+      <h2>{group.title}</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Keys</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {group.rows.map((row) => (
+            <tr>
+              <td>
+                <kbd>{row.label}</kbd>
+              </td>
+              <td>{row.description}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  ))
+}

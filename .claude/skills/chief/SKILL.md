@@ -25,6 +25,7 @@ Each task uses the same loop.
    - Then run the round again with a new round name.
 4. **Review.** Start a new subagent that did not see the round. Give it `task.md` and `git diff`.
    Tell it to report only critical and major findings: correctness, security, or task not done.
+   It also checks that a change to user-visible behaviour updates `site/src/content/docs/`.
 5. **Fix once.** If the review has findings, do these steps:
    1. Add the findings to `task.md` in the section *Review findings*.
    2. Run one more duo round (`02-fix`).

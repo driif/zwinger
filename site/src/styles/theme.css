@@ -1,0 +1,29 @@
+/* The motiv kinetic palette (see the `:root` and `[data-theme]` tokens of @driif/motiv). */
+:root {
+  --sl-color-accent-low: #3d3447;
+  --sl-color-accent: #9d86b0;
+  --sl-color-accent-high: #d1bddf;
+  --sl-color-white: #fbf7fd;
+  --sl-color-gray-1: #e9e0ef;
+  --sl-color-gray-2: #d5cadd;
+  --sl-color-gray-3: #a897b5;
+  --sl-color-gray-4: #756183;
+  --sl-color-gray-5: #463c52;
+  --sl-color-gray-6: #302938;
+  --sl-color-black: #28232f;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #e3dbea;
+  --sl-color-accent: #756383;
+  --sl-color-accent-high: #4a3c56;
+  --sl-color-white: #2a2231;
+  --sl-color-gray-1: #3b3345;
+  --sl-color-gray-2: #4d4258;
+  --sl-color-gray-3: #66587a;
+  --sl-color-gray-4: #8f80a0;
+  --sl-color-gray-5: #c0b3cc;
+  --sl-color-gray-6: #e6e1ec;
+  --sl-color-gray-7: #f2f1f5;
+  --sl-color-black: #ffffff;
+}

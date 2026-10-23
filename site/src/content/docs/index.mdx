@@ -1,0 +1,37 @@
+---
+title: zwinger
+description: Run AI coding agents in small Linux microVMs on your Mac.
+template: splash
+hero:
+  tagline: Run AI coding agents (Claude Code, Codex, pi, Gemini CLI) in cages, small Linux microVMs on your Mac. An agent sees only the folders that you mount and reaches only the hosts that you allow.
+  image:
+    file: ../../assets/cage.svg
+  actions:
+    - text: Download
+      link: https://github.com/driif/zwinger/releases/latest
+      icon: external
+      variant: primary
+    - text: Get started
+      link: /get-started/
+      icon: right-arrow
+      variant: secondary
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+<CardGrid>
+  <Card title="Projects and cages" icon="laptop">
+    A project is a folder on your Mac. Its cage is a Linux microVM with its own kernel. The agent works in the
+    project folder as `/workspace`.
+  </Card>
+  <Card title="Your logins stay on the Mac" icon="approve-check">
+    The proxy of the cage adds your subscription login to the requests to the provider. The agent sees a placeholder
+    only.
+  </Card>
+  <Card title="Network control" icon="setting">
+    Block or allow each host or service per project. The app shows the hosts that the agent contacts and the hosts that the cage blocks.
+  </Card>
+  <Card title="Tasks for two agents" icon="rocket">
+    Two agents plan, build and review a task together. You see each stage in the run room.
+  </Card>
+</CardGrid>
