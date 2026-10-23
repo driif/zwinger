@@ -30,3 +30,4 @@ src-tauri/resources/pi/
 # docs site
 site/.astro
 site/dist
+.wrangler
