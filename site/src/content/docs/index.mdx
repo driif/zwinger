@@ -17,21 +17,6 @@ hero:
       variant: secondary
 ---
 
-import { Card, CardGrid } from "@astrojs/starlight/components";
+import Features from "../../components/Features.tsx";
 
-<CardGrid>
-  <Card title="Projects and cages" icon="laptop">
-    A project is a folder on your Mac. Its cage is a Linux microVM with its own kernel. The agent works in the
-    project folder as `/workspace`.
-  </Card>
-  <Card title="Your logins stay on the Mac" icon="approve-check">
-    The proxy of the cage adds your subscription login to the requests to the provider. The agent sees a placeholder
-    only.
-  </Card>
-  <Card title="Network control" icon="setting">
-    Block or allow each host or service per project. The app shows the hosts that the agent contacts and the hosts that the cage blocks.
-  </Card>
-  <Card title="Tasks for two agents" icon="rocket">
-    Two agents plan, build and review a task together. You see each stage in the run room.
-  </Card>
-</CardGrid>
+<Features />

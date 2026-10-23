@@ -1,0 +1,11 @@
+---
+import ThemeSwitch from "./ThemeSwitch";
+---
+
+<ThemeSwitch client:load />
+<script is:inline>
+  // Sets the icon before first paint. It runs after the early theme script of Starlight.
+  document.currentScript.previousElementSibling
+    .querySelector("button")
+    .setAttribute("aria-pressed", String(document.documentElement.dataset.theme !== "light"));
+</script>

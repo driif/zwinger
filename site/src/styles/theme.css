@@ -1,29 +1,34 @@
-/* The motiv kinetic palette (see the `:root` and `[data-theme]` tokens of @driif/motiv). */
+/* Starlight first, so that motiv components win over the Starlight reset and content styles. */
+@layer starlight, motiv;
+
+/* Starlight colors from the motiv tokens. The tokens follow `data-theme`, so one block serves both themes. */
 :root {
-  --sl-color-accent-low: #3d3447;
-  --sl-color-accent: #9d86b0;
-  --sl-color-accent-high: #d1bddf;
-  --sl-color-white: #fbf7fd;
-  --sl-color-gray-1: #e9e0ef;
-  --sl-color-gray-2: #d5cadd;
-  --sl-color-gray-3: #a897b5;
-  --sl-color-gray-4: #756183;
-  --sl-color-gray-5: #463c52;
-  --sl-color-gray-6: #302938;
-  --sl-color-black: #28232f;
+  --sl-color-accent-low: color-mix(in oklch, var(--motiv-color-primary) 25%, var(--motiv-color-bg));
+  --sl-color-accent: var(--motiv-color-primary);
+  --sl-color-accent-high: color-mix(in oklch, var(--motiv-color-primary) 60%, var(--motiv-color-text));
+  --sl-color-white: var(--motiv-color-text);
+  --sl-color-gray-1: color-mix(in oklch, var(--motiv-color-text) 92%, var(--motiv-color-bg));
+  --sl-color-gray-2: color-mix(in oklch, var(--motiv-color-text) 80%, var(--motiv-color-bg));
+  --sl-color-gray-3: var(--motiv-color-text-muted);
+  --sl-color-gray-4: color-mix(in oklch, var(--motiv-color-text) 45%, var(--motiv-color-bg));
+  --sl-color-gray-5: var(--motiv-color-border);
+  --sl-color-gray-6: var(--motiv-color-surface);
+  --sl-color-gray-7: color-mix(in oklch, var(--motiv-color-surface) 50%, var(--motiv-color-bg));
+  --sl-color-black: var(--motiv-color-bg);
+  --sl-font: var(--motiv-font-body);
 }
 
-:root[data-theme="light"] {
-  --sl-color-accent-low: #e3dbea;
-  --sl-color-accent: #756383;
-  --sl-color-accent-high: #4a3c56;
-  --sl-color-white: #2a2231;
-  --sl-color-gray-1: #3b3345;
-  --sl-color-gray-2: #4d4258;
-  --sl-color-gray-3: #66587a;
-  --sl-color-gray-4: #8f80a0;
-  --sl-color-gray-5: #c0b3cc;
-  --sl-color-gray-6: #e6e1ec;
-  --sl-color-gray-7: #f2f1f5;
-  --sl-color-black: #ffffff;
+/* motiv.base sets `body { line-height: 1.5 }`; the docs keep the Starlight line height. */
+body {
+  line-height: var(--sl-line-height);
+}
+
+#starlight__sidebar .motiv-glide-nav {
+  max-width: none;
+}
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
 }
