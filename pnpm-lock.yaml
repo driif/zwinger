@@ -18,8 +18,8 @@ importers:
         specifier: 3.2.2
         version: 3.2.2(react@19.3.1)
       '@driif/motiv':
-        specifier: ^0.15.1
-        version: 0.15.1(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+        specifier: ^0.16.0
+        version: 0.16.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       '@tauri-apps/api':
         specifier: ^2
         version: 2.12.4
@@ -91,8 +91,8 @@ importers:
         specifier: ^0.42.6
         version: 0.42.6(astro@7.4.2(@types/node@24.19.2)(yaml@2.9.1))(typescript@6.0.3)
       '@driif/motiv':
-        specifier: ^0.15.1
-        version: 0.15.1(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
+        specifier: ^0.16.0
+        version: 0.16.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       astro:
         specifier: ^7.4.2
         version: 7.4.2(@types/node@24.19.2)(yaml@2.9.1)
@@ -333,8 +333,8 @@ packages:
     peerDependencies:
       react: '>=16.8.0'
 
-  '@driif/motiv@0.15.1':
-    resolution: {integrity: sha512-ow/FNKBggyzvkdS0UXvHPqpBdwYhJ8BlD8stD2DUFWWV+fqYrZ06gavYx/ov1uN6WJfPzVCW7xK9WpAXG0kOCg==}
+  '@driif/motiv@0.16.0':
+    resolution: {integrity: sha512-R6gBwtGxSjwYCaE79v/qEvDnf1Csai9NbLKRGlOgzDqMDYI7/Xrg4ltvy3M5nEiO13SA/WgDD0eSmgWtyS7fmg==}
     peerDependencies:
       react: '>=19'
       react-dom: '>=19'
@@ -2189,7 +2189,7 @@ snapshots:
       react: 19.3.1
       tslib: 2.8.1
 
-  '@driif/motiv@0.15.1(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
+  '@driif/motiv@0.16.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)':
     dependencies:
       react: 19.3.1
       react-dom: 19.3.1(react@19.3.1)

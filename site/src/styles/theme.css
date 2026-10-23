@@ -25,6 +25,8 @@ body {
 
 #starlight__sidebar .motiv-glide-nav {
   max-width: none;
+  --motiv-nav-bg: transparent;
+  --motiv-nav-border-color: transparent;
 }
 
 .features {

@@ -11,12 +11,12 @@ const flatten = (entries: Entry[]): Link[] =>
   entries.flatMap((entry) => (entry.type === "group" ? flatten(entry.entries) : [entry]));
 
 const links = flatten(Astro.locals.starlightRoute.sidebar);
-const items = links.map((link) => ({ id: link.href, label: link.label }));
+const items = links.map((link) => ({ id: link.href, href: link.href, label: link.label }));
 const value = links.find((link) => link.isCurrent)?.href ?? "";
 ---
 
 <SidebarPersister>
-  <DocsNav client:load items={items} value={value} />
+  <DocsNav client:idle items={items} value={value} />
 </SidebarPersister>
 
 <div class="md:sl-hidden">

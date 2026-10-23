@@ -3,6 +3,8 @@ import starlight from "@astrojs/starlight";
 import { defineConfig } from "astro/config";
 
 export default defineConfig({
+  // GlideNav cannot pass `data-astro-prefetch` to its links, so prefetch all links.
+  prefetch: { prefetchAll: true, defaultStrategy: "hover" },
   integrations: [
     react(),
     starlight({
