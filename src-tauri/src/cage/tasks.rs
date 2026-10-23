@@ -4,10 +4,10 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::agent::AgentKind;
+use crate::cage::manager::{Manager, Vm, blocking, lock};
+use crate::cage::{TaskDraft, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
-use crate::shield::manager::{Manager, Vm, blocking, lock};
-use crate::shield::{TaskDraft, WORKSPACE};
 use crate::task_agents::Exec;
 use crate::task_artifacts::{self, Mirror, RoundWriter};
 use crate::task_runs::{self, Control, RunHandle, RunState};
@@ -27,7 +27,7 @@ impl<R: SandboxRuntime> Manager<R> {
         if self.runs.is_running(id, task_id) {
             return Err(Error::TaskRunning);
         }
-        let slug = lock(&self.state).shield_mut(id)?.task(task_id)?.slug.clone();
+        let slug = lock(&self.state).project_mut(id)?.task(task_id)?.slug.clone();
         self.edit(id, |s| s.remove_task(task_id))?;
         self.runs.forget(id, Some(task_id));
         match std::fs::remove_dir_all(self.task_dir(id, &slug)) {
@@ -43,7 +43,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The round folder of a run. Only an existing run of the task counts.
     pub fn round_dir(&self, id: &str, task_id: &str, run: &str) -> Result<PathBuf> {
-        let slug = lock(&self.state).shield_mut(id)?.task(task_id)?.slug.clone();
+        let slug = lock(&self.state).project_mut(id)?.task(task_id)?.slug.clone();
         let dir = self.task_dir(id, &slug);
         if !run_names(&dir).iter().any(|r| r == run) {
             return Err(Error::RunNotFound);
@@ -58,7 +58,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let _start = lock(&self.run_start);
         let (task, vm, applied, pi_host, gemini, proxy, unmounted) = {
             let mut state = lock(&self.state);
-            let task = state.shield_mut(id)?.task(task_id)?.clone();
+            let task = state.project_mut(id)?.task(task_id)?.clone();
             match state.vms.get(id) {
                 Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
                     let unmounted = task
@@ -105,7 +105,7 @@ impl<R: SandboxRuntime> Manager<R> {
             proxy,
         };
         self.runs.start(task_runs::Spec {
-            shield_id: id.to_owned(),
+            project_id: id.to_owned(),
             task,
             run: run.clone(),
             exec,
@@ -124,10 +124,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.runs.find(id, task_id, run)
     }
 
-    /// The runs of all tasks of the shield, oldest first per task.
+    /// The runs of all tasks of the project, oldest first per task.
     pub async fn list_task_runs(&self, id: &str) -> Result<Vec<RunSummary>> {
         let tasks: Vec<(String, PathBuf)> = lock(&self.state)
-            .shield_mut(id)?
+            .project_mut(id)?
             .tasks
             .iter()
             .map(|t| (t.id.clone(), self.task_dir(id, &t.slug)))
@@ -176,7 +176,7 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let (task, vm, harness) = {
             let mut state = lock(&self.state);
-            let task = state.shield_mut(id)?.task(task_id)?.clone();
+            let task = state.project_mut(id)?.task(task_id)?.clone();
             match state.vms.get(id) {
                 Some(Vm::Running { vm, applied, .. }) => (task, vm.clone(), applied.harness.clone()),
                 _ => return Err(Error::NotRunning),
@@ -235,7 +235,7 @@ pub(crate) fn run_names(dir: &std::path::Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[tokio::test]
     async fn tasks_are_saved_and_a_run_needs_a_writable_mirror() {
@@ -247,7 +247,7 @@ mod tests {
         ));
         let task_id = manager.put_task(&id, task_draft(None, "Fix the map!", kinds)).unwrap();
         manager.put_task(&id, task_draft(None, "Fix the map", kinds)).unwrap();
-        let tasks = manager.list()[0].shield.tasks.clone();
+        let tasks = manager.list()[0].project.tasks.clone();
         assert_eq!(tasks.iter().map(|t| t.slug.as_str()).collect::<Vec<_>>(), ["fix-the-map", "fix-the-map-2"]);
         assert_eq!(
             (tasks[0].request.as_str(), tasks[0].gates.as_slice()),
@@ -255,7 +255,7 @@ mod tests {
         );
         // A rename keeps the folder of the runs.
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Renamed", kinds)).unwrap();
-        assert_eq!(manager.list()[0].shield.tasks[0].slug, "fix-the-map");
+        assert_eq!(manager.list()[0].project.tasks[0].slug, "fix-the-map");
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::NotRunning)));
 
         // The harness is in a read-only mount: the run cannot write its mirror.
@@ -277,6 +277,6 @@ mod tests {
         assert!(matches!(manager.round_dir(&id, &task_id, "01"), Err(Error::RunNotFound)));
 
         manager.remove_task(&id, &task_id).unwrap();
-        assert_eq!(manager.list()[0].shield.tasks.len(), 1);
+        assert_eq!(manager.list()[0].project.tasks.len(), 1);
     }
 }

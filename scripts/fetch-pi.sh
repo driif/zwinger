@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Puts the pinned pi bundle in src-tauri/resources/pi. The app mounts it read-only
-# into each shield, so a shield needs no registry access to run pi.
+# into each cage, so a cage needs no registry access to run pi.
 set -euo pipefail
 VERSION=1.3.0
 root=$(cd "$(dirname "$0")/.." && pwd)

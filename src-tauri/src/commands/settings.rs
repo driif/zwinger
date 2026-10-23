@@ -62,7 +62,7 @@ pub async fn storage(app: AppHandle) -> Result<StorageView> {
     Ok(StorageView { app_data, images, runtimes })
 }
 
-/// Removes the cached images that no shield uses. Resolves to the freed bytes, if known.
+/// Removes the cached images that no project uses. Resolves to the freed bytes, if known.
 #[tauri::command]
 pub async fn clean_images() -> Result<Option<u64>> {
     Ok(microsandbox::Image::prune().await?.bytes_reclaimed)

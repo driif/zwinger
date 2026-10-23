@@ -25,7 +25,7 @@ export function EditorsSettings({ editors, prefs, onPrefs, run, onDetect }: Prop
         <CardHeader
           title="Editors"
           titleAs="h2"
-          description="The editors in /Applications, ~/Applications and /Applications/Setapp. Open in editor opens the shield folder, or the current folder of a terminal."
+          description="The editors in /Applications, ~/Applications and /Applications/Setapp. Open in editor opens the project folder, or the current folder of a terminal."
           actions={
             <Button size="sm" variant="outline" iconLeft={<RefreshCw size={14} />} onClick={onDetect}>
               Detect again

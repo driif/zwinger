@@ -1,6 +1,6 @@
 //! The agent profile: a host-owned snapshot of the allow-listed entries of an
-//! agent's config dir, updated in place at each shield start in
-//! `<app_data>/profiles/<shield>/<agent>` and mounted read-only at
+//! agent's config dir, updated in place at each cage start in
+//! `<app_data>/profiles/<project>/<agent>` and mounted read-only at
 //! `/opt/zwinger/profile/<agent>`. The agent's state home in the guest gets
 //! links into that mount. Only listed entries are copied, and a denied
 //! name is skipped at any depth, so logins, history, sessions and projects
@@ -437,7 +437,7 @@ fn filter_toml(text: &str) -> String {
 /// Points the entries of the agent's state home at the snapshot: each
 /// listed entry that the snapshot has becomes a link into the mount. A link
 /// into the mount whose entry the snapshot has no more is removed. `state`
-/// is the host state dir of the shield, which the guest can write, so no
+/// is the host state dir of the project, which the guest can write, so no
 /// link is followed (see [`super::open_parts`]).
 pub fn link(kind: AgentKind, state: &Path, snapshot: &[String]) -> io::Result<()> {
     let dir = super::open_parts(state, state_home(kind))?;
@@ -546,10 +546,8 @@ mod tests {
         let dest = temp_dir().join("claude");
         let copied = snapshot(AgentKind::Claude, &home, &dest).unwrap();
         assert!(copied.entries.is_empty(), "{:?}", copied.entries);
-        let skipped: Vec<String> = [claude.join("CLAUDE.md"), claude.join("skills")]
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
+        let skipped: Vec<String> =
+            [claude.join("CLAUDE.md"), claude.join("skills")].iter().map(|p| p.display().to_string()).collect();
         assert_eq!(copied.skipped, skipped);
     }
 

@@ -2,29 +2,29 @@ import { Button, Card, CardBody, CardHeader, FloatingField, SpringCheckbox } fro
 import { Pencil, Plus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { putApp, removeApp } from "./api";
-import { App, ShieldView } from "../../shared/api";
+import { App, ProjectView } from "../../shared/api";
 import type { Intent, Run } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
 
 type Draft = Omit<App, "id"> & { id?: string; error?: string };
 
 interface Props {
-  shield: ShieldView;
+  project: ProjectView;
   run: Run;
   intent?: Intent;
   onIntentDone: () => void;
 }
 
-/** The saved commands of the shield. They start in the shield VM, never on the host. */
-export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
-  const { id } = shield;
+/** The saved commands of the project. They start in the cage, never on the host. */
+export function AppsSection({ project, run, intent, onIntentDone }: Props) {
+  const { id } = project;
   const [draft, setDraft] = useState<Draft>();
-  const blank = (): Draft => ({ name: "", command: "", cwd: shield.harness ?? "/workspace", autostart: false });
+  const blank = (): Draft => ({ name: "", command: "", cwd: project.harness ?? "/workspace", autostart: false });
 
   useEffect(() => {
     if (!intent) return;
     onIntentDone();
-    const app = shield.apps.find((a) => a.id === intent.appId);
+    const app = project.apps.find((a) => a.id === intent.appId);
     setDraft(app ? { ...app } : blank());
   }, [intent]);
 
@@ -45,7 +45,7 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
       <CardHeader
         title="Apps"
         titleAs="h2"
-        description="Saved commands that run in the shield, such as a dev server. Ports are not published to this computer."
+        description="Saved commands that run in the cage, such as a dev server. Ports are not published to this computer."
         actions={
           <Button
             size="sm"
@@ -86,7 +86,7 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
               onChange={(e) => setDraft({ ...draft, cwd: e.target.value, error: undefined })}
             />
             <SpringCheckbox
-              label="Start with the shield"
+              label="Start with the cage"
               checked={draft.autostart}
               onChange={(e) => setDraft({ ...draft, autostart: e.target.checked })}
             />
@@ -100,7 +100,7 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
             </div>
           </form>
         )}
-        {shield.apps.length === 0 && !draft && (
+        {project.apps.length === 0 && !draft && (
           <div className="row">
             <p className="muted grow">No apps. Save a command that you run often, such as a dev server, to start it with one click.</p>
             <Button size="sm" variant="outline" iconLeft={<Plus size={14} />} onClick={() => setDraft(blank())}>
@@ -109,7 +109,7 @@ export function AppsSection({ shield, run, intent, onIntentDone }: Props) {
           </div>
         )}
         <ul className="list">
-          {shield.apps.map((app) => (
+          {project.apps.map((app) => (
             <li key={app.id} className="row">
               <span>{app.name}</span>
               <span className="grow muted mono" title={`${app.cwd} $ ${app.command}`}>

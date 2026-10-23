@@ -16,7 +16,7 @@ import {
   StorageView,
 } from "./api";
 import { checkUpdate, UpdateInfo } from "../updates/api";
-import { AGENT_NAMES, ShieldView } from "../../shared/api";
+import { AGENT_NAMES, ProjectView } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
 import { HostAgentsSettings } from "./HostAgentsSettings";
@@ -182,12 +182,12 @@ function Storage() {
   return (
     <div className="tab-body">
       <Card variant="outlined" padding="md">
-        <CardHeader title="Storage" titleAs="h2" description="The shields, the VM runtime, the images and the agents of zwinger." />
+        <CardHeader title="Storage" titleAs="h2" description="The projects, the VM runtime, the images and the agents of zwinger." />
         <CardBody className="stack">
           {view && <CopyField label="App data" value={view.appData} />}
           <ul className="list">
             <li className="row">
-              <span className="grow">Shield images</span>
+              <span className="grow">Cage images</span>
               <span className="muted">{view ? size(view.images) : "…"}</span>
               <Button size="sm" variant="outline" iconLeft={<Trash2 size={14} />} loading={busy} onClick={clean}>
                 Clean up
@@ -198,7 +198,7 @@ function Storage() {
               <span className="muted">{view ? size(view.runtimes) : "…"}</span>
             </li>
           </ul>
-          <p className="muted">Clean up removes the images that no shield uses. A shield downloads its image again when it needs it.</p>
+          <p className="muted">Clean up removes the images that no cage uses. A cage downloads its image again when it needs it.</p>
           {legacy.length > 0 && (
             <>
               <h3>Data of earlier versions</h3>
@@ -225,7 +225,7 @@ function About({ version }: { version?: string }) {
         <CardHeader
           title={`zwinger ${version ?? ""}`}
           titleAs="h2"
-          description="Runs AI agents in microVM shields. The agent sees only the folders that you mount and reaches only the hosts that you allow."
+          description="Runs AI agents in microVM cages. The agent sees only the folders that you mount and reaches only the hosts that you allow."
         />
         <CardBody className="row">
           <Button size="sm" variant="outline" iconLeft={<ExternalLink size={14} />} onClick={() => openUrl(REPO)}>
@@ -247,13 +247,13 @@ interface Props {
   /** Looks for the editors again. */
   onDetectEditors: () => void;
   detection?: Detection;
-  shields: ShieldView[];
+  projects: ProjectView[];
   runtimes: Runtimes;
   run: Run;
   /** Detects the agents on this Mac again. */
   onRefresh: () => void;
-  /** Opens the shield's Add agent step for this agent. */
-  onUse: (shieldId: string, agent: HostAgent) => void;
+  /** Opens the project's Add agent step for this agent. */
+  onUse: (projectId: string, agent: HostAgent) => void;
   prefs: Prefs;
   onPrefs: (prefs: Prefs) => Promise<void>;
   update?: UpdateInfo;
@@ -261,14 +261,14 @@ interface Props {
   appearance: Appearance;
 }
 
-/** The settings of the app, for all shields. */
+/** The settings of the app, for all projects. */
 export function AppSettings({
   tab,
   onTab,
   editors,
   onDetectEditors,
   detection,
-  shields,
+  projects,
   runtimes,
   run,
   onRefresh,
@@ -300,7 +300,7 @@ export function AppSettings({
           agents: (
             <HostAgentsSettings
               detection={detection}
-              shields={shields}
+              projects={projects}
               runtimes={runtimes}
               run={run}
               onRefresh={onRefresh}
@@ -313,7 +313,7 @@ export function AppSettings({
                 <CardHeader
                   title="Agent runtimes"
                   titleAs="h2"
-                  description="The Linux builds of the agents, for all shields. A shield uses them when this Mac has no install of the agent."
+                  description="The Linux builds of the agents, for all projects. A cage uses them when this Mac has no install of the agent."
                 />
                 <CardBody>
                   <ul className="list">

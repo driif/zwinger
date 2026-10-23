@@ -41,7 +41,7 @@ The output is in `src-tauri/target/release/bundle/`: `dmg/zwinger_<version>_aarc
 
 The VM runtime (`msb` and `libkrunfw`) is inside the zwinger binary. At the first start, zwinger writes it to its
 runtime home `~/.zwinger/microsandbox` (mode 0700). `msb` must keep the `com.apple.security.hypervisor` entitlement, or
-no shield starts. After the first start of a new build, check it:
+no cage starts. After the first start of a new build, check it:
 
 ```sh
 codesign -d --entitlements - ~/.zwinger/microsandbox/bin/msb
@@ -55,7 +55,7 @@ does not change this file, because the file is not in the bundle.
 The runtime home is short because microsandbox puts the sockets of each VM below it, at
 `<home>/run/sandboxes/<24 hex>/control.sock`, and a macOS socket path must be shorter than 104 bytes. With
 `/Users/<name>/.zwinger/microsandbox`, the user name can have at most 22 bytes. A longer name fails the "VM folder" check
-at start. Shields, preferences and agent runtimes stay in the app data folder
+at start. Projects, preferences and agent runtimes stay in the app data folder
 (`~/Library/Application Support/com.driif.zwinger`).
 
 Earlier builds used `<app data>/microsandbox` or `~/.microsandbox`. At each start, zwinger stops and removes its own

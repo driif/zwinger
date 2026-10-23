@@ -11,18 +11,18 @@ interface Props {
   onLater?: () => void;
 }
 
-/** Installs the update and restarts. A running shield is stopped only after the user agrees. */
+/** Installs the update and restarts. A running cage is stopped only after the user agrees. */
 export function UpdateBanner({ update, onLater }: Props) {
   const [ask, setAsk] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
-  function install(stopShields: boolean) {
+  function install(stopCages: boolean) {
     setBusy(true);
     setError(undefined);
     // On success the app restarts, so only a failure comes back.
-    installUpdate(stopShields).catch((e) => {
-      if (!stopShields && errorCode(e) === "ShieldsRunning") setAsk(true);
+    installUpdate(stopCages).catch((e) => {
+      if (!stopCages && errorCode(e) === "CagesRunning") setAsk(true);
       else setError(errorMessage(e));
       setBusy(false);
     });
@@ -38,7 +38,7 @@ export function UpdateBanner({ update, onLater }: Props) {
               Cancel
             </Button>
             <Button size="sm" variant="danger" loading={busy} onClick={() => install(true)}>
-              Stop shields and restart
+              Stop cages and restart
             </Button>
           </>
         ) : (
@@ -55,7 +55,7 @@ export function UpdateBanner({ update, onLater }: Props) {
         )
       }
     >
-      {ask ? "Shields are running. The restart ends their VMs and the work of their agents." : `Update ${update.version} is available.`}
+      {ask ? "Cages are running. The restart ends their VMs and the work of their agents." : `Update ${update.version} is available.`}
       {error && <span className="danger"> {error}</span>}
     </Notice>
   );

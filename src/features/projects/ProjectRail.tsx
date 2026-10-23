@@ -41,12 +41,12 @@ import {
   startApp,
   stopApp,
 } from "../apps/api";
-import { reorderShields } from "./api";
+import { reorderProjects } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
   SessionKind,
-  ShieldView,
+  ProjectView,
 } from "../../shared/api";
 import type { DroppedFolder, Intent, Pane, Run, View } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
@@ -59,7 +59,7 @@ import { StartProgress } from "./StartProgress";
 import "./rail.css";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
-const FORBIDDEN = "Not allowed: a shield is a security boundary. Items stay in their shield.";
+const FORBIDDEN = "Not allowed: each project has its own cage. Items stay in their project.";
 
 type Group = "terminals" | "apps" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
@@ -71,7 +71,7 @@ const GROUPS: { group: Group; label: string }[] = [
 const kindName = (kind: SessionKind) =>
   kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
 
-/** Where a terminal runs: on this Mac, or in the shield's VM. An agent always runs in the VM. */
+/** Where a terminal runs: on this Mac, or in the cage. An agent always runs in the VM. */
 export function KindIcon({ kind }: { kind: SessionKind }) {
   if (kind.type === "agent") {
     const Icon = AGENT_ICONS[kind.agent];
@@ -80,9 +80,9 @@ export function KindIcon({ kind }: { kind: SessionKind }) {
   return kind.type === "host" ? <Laptop size={14} aria-label="On this Mac" /> : <Box size={14} aria-label="In the VM" />;
 }
 
-/** The name of a terminal: its kind, and its number among the shield's terminals of that kind. */
+/** The name of a terminal: its kind, and its number among the project's terminals of that kind. */
 export function paneName(pane: Pane, panes: Pane[]) {
-  const same = panes.filter((p) => p.shieldId === pane.shieldId && kindName(p.kind) === kindName(pane.kind));
+  const same = panes.filter((p) => p.projectId === pane.projectId && kindName(p.kind) === kindName(pane.kind));
   return `${kindName(pane.kind)} ${same.indexOf(pane) + 1}`;
 }
 
@@ -97,7 +97,7 @@ function runBadge(run: RunSummary | undefined) {
 /** What dnd-kit carries per sortable row. Only rows of the same container can swap. */
 interface DragData {
   container: string;
-  shieldId: string;
+  projectId: string;
   entity: string;
   label: string;
 }
@@ -122,7 +122,7 @@ interface RowProps {
   selected: boolean;
   tabStop: boolean;
   className?: string;
-  shieldDrop?: string;
+  projectDrop?: string;
   row: ReactNode;
   onOpen: () => void;
   /** Opens the row menu on a right-click. */
@@ -131,7 +131,7 @@ interface RowProps {
 }
 
 /** A treeitem. A sortable one is dragged by its own row only, so a drag in a child list does not move the parent. */
-function TreeRow({ id, level, drag, expanded, selected, tabStop, className, shieldDrop, row, onOpen, onMenu, children }: RowProps) {
+function TreeRow({ id, level, drag, expanded, selected, tabStop, className, projectDrop, row, onOpen, onMenu, children }: RowProps) {
   const sortable = useSortable({ id, data: drag, disabled: !drag });
   return (
     <li
@@ -143,7 +143,7 @@ function TreeRow({ id, level, drag, expanded, selected, tabStop, className, shie
       aria-describedby={drag && sortable.attributes["aria-describedby"]}
       tabIndex={tabStop ? 0 : -1}
       data-tree-id={id}
-      data-shield-drop={shieldDrop}
+      data-project-drop={projectDrop}
       className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""}`}
       style={{ transform: CSS.Translate.toString(sortable.transform), transition: sortable.transition }}
       onKeyDown={(event) => event.target === event.currentTarget && sortable.listeners?.onKeyDown?.(event)}
@@ -167,26 +167,26 @@ function TreeRow({ id, level, drag, expanded, selected, tabStop, className, shie
 }
 
 interface Props {
-  shields: ShieldView[];
+  projects: ProjectView[];
   selectedId?: string;
   view: View;
-  /** Per shield, the blocked events that the Network tab has not shown yet. */
+  /** Per project, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
-  /** Per shield, the runs of its tasks. */
+  /** Per project, the runs of its tasks. */
   runs: Record<string, RunSummary[]>;
   panes: Pane[];
   run: Run;
   onSelect: (id: string) => void;
-  onOpen: (shieldId: string, view: View) => void;
-  onIntent: (shieldId: string, kind: Intent["kind"], appId?: string) => void;
-  onRunsChange: (shieldId: string) => void;
-  onToggle: (shield: ShieldView) => void;
-  onNewSession: (shieldId: string, kind: SessionKind) => void;
+  onOpen: (projectId: string, view: View) => void;
+  onIntent: (projectId: string, kind: Intent["kind"], appId?: string) => void;
+  onRunsChange: (projectId: string) => void;
+  onToggle: (project: ProjectView) => void;
+  onNewSession: (projectId: string, kind: SessionKind) => void;
   onClosePane: (key: string) => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
-  /** Saves the order of all terminals of the shield. */
-  onMoveTerminals: (shieldId: string, ids: string[]) => void;
+  /** Saves the order of all terminals of the project. */
+  onMoveTerminals: (projectId: string, ids: string[]) => void;
   onNew: () => void;
   /** Opens the app settings. */
   onSettings: () => void;
@@ -195,14 +195,14 @@ interface Props {
   editors?: Editors;
   /** The home folder, shown as `~`. */
   home?: string;
-  onLaunch: (shieldId: string, action: LaunchAction) => void;
+  onLaunch: (projectId: string, action: LaunchAction) => void;
   onDropDone: (create: boolean) => void;
   children: ReactNode;
 }
 
-/** The shields as a tree: shield → Terminals / Apps / Tasks → items. */
-export function ShieldRail({
-  shields,
+/** The projects as a tree: project → Terminals / Apps / Tasks → items. */
+export function ProjectRail({
+  projects,
   selectedId,
   view,
   blocked,
@@ -233,7 +233,7 @@ export function ShieldRail({
   );
   const [focused, setFocused] = useState<string>();
   const [dragging, setDragging] = useState(false);
-  /** The other shield that a dragged item is over. */
+  /** The other project that a dragged item is over. */
   const [forbidden, setForbidden] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
   /** The row whose menu is open. */
@@ -258,14 +258,14 @@ export function ShieldRail({
       return next;
     });
 
-  function leaves(shield: ShieldView, group: Group): Leaf[] {
-    const sid = shield.id;
+  function leaves(project: ProjectView, group: Group): Leaf[] {
+    const sid = project.id;
     if (group === "terminals")
       return panes
-        .filter((p) => p.shieldId === sid)
+        .filter((p) => p.projectId === sid)
         .map((pane) => {
           const { kind } = pane;
-          const session = shield.sessions.find((s) => s.terminalId === pane.key);
+          const session = project.sessions.find((s) => s.terminalId === pane.key);
           const state = !session ? "dormant" : session.exitCode !== null ? `exited ${session.exitCode}` : undefined;
           const name = paneName(pane, panes);
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
@@ -295,9 +295,9 @@ export function ShieldRail({
                 : [...open, close],
           };
         });
-    const shieldRunning = shield.status.state === "running";
+    const cageRunning = project.status.state === "running";
     if (group === "tasks")
-      return shield.tasks.map((task) => {
+      return project.tasks.map((task) => {
         const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
         const latest = taskRuns[taskRuns.length - 1];
         const live = taskRuns.some((r) => isLive(r.state));
@@ -318,7 +318,7 @@ export function ShieldRail({
             {
               label: "Start run",
               icon: <Play size={14} />,
-              disabled: !shieldRunning || live,
+              disabled: !cageRunning || live,
               run: () =>
                 run(async () => {
                   const next = await startTaskRun(sid, task.id);
@@ -337,8 +337,8 @@ export function ShieldRail({
           ],
         };
       });
-    return shield.apps.map((app) => {
-      const appRun = shield.appRuns.find((r) => r.appId === app.id);
+    return project.apps.map((app) => {
+      const appRun = project.appRuns.find((r) => r.appId === app.id);
       const state = !appRun ? "stopped" : appRun.exitCode === null ? "running" : `exited ${appRun.exitCode}`;
       const running = state === "running";
       return {
@@ -357,13 +357,13 @@ export function ShieldRail({
           {
             label: running ? "Stop" : "Start",
             icon: running ? <Square size={14} /> : <Play size={14} />,
-            disabled: !shieldRunning,
+            disabled: !cageRunning,
             run: () => run(() => (running ? stopApp(sid, app.id) : startApp(sid, app.id))),
           },
           {
             label: "Restart",
             icon: <RotateCw size={14} />,
-            disabled: !shieldRunning,
+            disabled: !cageRunning,
             run: () => run(() => restartApp(sid, app.id)),
           },
           { label: "Edit", icon: <Pencil size={14} />, run: () => onIntent(sid, "app", app.id) },
@@ -381,21 +381,21 @@ export function ShieldRail({
   // The rows in tree order, for the arrow keys, and each row's parent.
   const visible: string[] = [];
   const parentOf: Record<string, string> = {};
-  const lists: Record<string, string[]> = { shields: shields.map((s) => s.id) };
-  const content = shields.map((shield) => {
-    const sid = shield.id;
-    const shieldRow = `s|${sid}`;
-    visible.push(shieldRow);
+  const lists: Record<string, string[]> = { projects: projects.map((s) => s.id) };
+  const content = projects.map((project) => {
+    const sid = project.id;
+    const projectRow = `s|${sid}`;
+    visible.push(projectRow);
     const groups = GROUPS.map(({ group, label }) => {
       const id = `g|${sid}|${group}`;
       const container = `${sid}|${group}`;
-      const items = leaves(shield, group);
+      const items = leaves(project, group);
       lists[container] = items.map((i) => i.entity);
       const open = items.length > 0 && !collapsed.has(id);
-      const showOpen = !collapsed.has(shieldRow);
+      const showOpen = !collapsed.has(projectRow);
       if (showOpen) {
         visible.push(id);
-        parentOf[id] = shieldRow;
+        parentOf[id] = projectRow;
         if (open)
           for (const item of items) {
             visible.push(`i|${container}|${item.entity}`);
@@ -404,7 +404,7 @@ export function ShieldRail({
       }
       return { group, label, id, container, items, open };
     });
-    return { shield, shieldRow, groups };
+    return { project, projectRow, groups };
   });
   const tabStop = focused && visible.includes(focused) ? focused : (visible.find((id) => id === `s|${selectedId}`) ?? visible[0]);
 
@@ -478,19 +478,19 @@ export function ShieldRail({
       ),
     });
 
-  // An item over another shield shows a forbidden drop. The check uses the
+  // An item over another project shows a forbidden drop. The check uses the
   // dragged row's rect, so it works for the pointer and the keyboard.
   function onDragMove({ active }: DragMoveEvent) {
     const data = dataOf(active);
     const rect = active.rect.current.translated;
-    if (data.container === "shields" || !rect) return;
+    if (data.container === "projects" || !rect) return;
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-shield-drop]") ?? [])].find((el) => {
+    const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-project-drop]") ?? [])].find((el) => {
       const r = el.getBoundingClientRect();
       return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-    })?.dataset.shieldDrop;
-    const next = target && target !== data.shieldId ? target : undefined;
+    })?.dataset.projectDrop;
+    const next = target && target !== data.projectId ? target : undefined;
     if (next === forbidden) return;
     setForbidden(next);
     if (next) setAnnouncement(FORBIDDEN);
@@ -504,12 +504,12 @@ export function ShieldRail({
       return;
     }
     if (!over || over.id === active.id) return;
-    const { container, shieldId, entity } = dataOf(active);
+    const { container, projectId, entity } = dataOf(active);
     const list = lists[container];
     const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
-    if (container === "shields") run(() => reorderShields(next));
-    else if (container.endsWith("|apps")) run(() => reorderApps(shieldId, next));
-    else onMoveTerminals(shieldId, next);
+    if (container === "projects") run(() => reorderProjects(next));
+    else if (container.endsWith("|apps")) run(() => reorderApps(projectId, next));
+    else onMoveTerminals(projectId, next);
   }
 
   const announcements: Announcements = {
@@ -519,14 +519,14 @@ export function ShieldRail({
     onDragCancel: ({ active }) => `Moving ${dataOf(active).label} was cancelled.`,
   };
 
-  function groupAction(shield: ShieldView, group: Group) {
-    const id = `g|${shield.id}|terminals`;
+  function groupAction(project: ProjectView, group: Group) {
+    const id = `g|${project.id}|terminals`;
     const [label, action] =
       group === "terminals"
-        ? ["New Mac shell", () => onNewSession(shield.id, { type: "host" })]
+        ? ["New Mac shell", () => onNewSession(project.id, { type: "host" })]
         : group === "apps"
-          ? ["Add app", () => onIntent(shield.id, "app")]
-          : ["New task", () => onOpen(shield.id, { kind: "taskEdit" })];
+          ? ["Add app", () => onIntent(project.id, "app")]
+          : ["New task", () => onOpen(project.id, { kind: "taskEdit" })];
     return (
       <>
         <IconButton
@@ -562,7 +562,7 @@ export function ShieldRail({
         {dropFolder && (
           <Card variant="outlined" padding="sm" className="stack">
             <p>
-              Create a shield for <span className="mono">{dropFolder.folder}</span>?
+              Create a project for <span className="mono">{dropFolder.folder}</span>?
             </p>
             {dropFolder.dropped !== dropFolder.folder && (
               <p className="muted">
@@ -575,7 +575,7 @@ export function ShieldRail({
                 Cancel
               </Button>
               <Button size="sm" onClick={() => onDropDone(true)}>
-                Create shield
+                Create project
               </Button>
             </div>
           </Card>
@@ -602,94 +602,94 @@ export function ShieldRail({
             ref={tree}
             className="tree"
             role="tree"
-            aria-label="Shields"
+            aria-label="Projects"
             onKeyDown={onKeyDown}
             onFocus={(e) => {
               const id = (e.target as HTMLElement).dataset.treeId;
               if (id) setFocused(id);
             }}
           >
-            <SortableContext items={shields.map((s) => `s|${s.id}`)} strategy={verticalListSortingStrategy}>
-              {content.map(({ shield, shieldRow, groups }) => {
-                const shieldOpen = !collapsed.has(shieldRow);
-                const running = shield.status.state === "running";
+            <SortableContext items={projects.map((s) => `s|${s.id}`)} strategy={verticalListSortingStrategy}>
+              {content.map(({ project, projectRow, groups }) => {
+                const projectOpen = !collapsed.has(projectRow);
+                const running = project.status.state === "running";
                 return (
                   <TreeRow
-                    key={shield.id}
-                    id={shieldRow}
+                    key={project.id}
+                    id={projectRow}
                     level={1}
-                    drag={{ container: "shields", shieldId: shield.id, entity: shield.id, label: shield.name }}
-                    expanded={shieldOpen}
-                    selected={selectedRow === shieldRow}
-                    tabStop={tabStop === shieldRow}
-                    className={`tree-shield ${shield.id === selectedId ? "current" : ""} ${forbidden === shield.id ? "forbidden-target" : ""}`}
-                    shieldDrop={shield.id}
-                    onOpen={() => onSelect(shield.id)}
-                    onMenu={() => setMenu(shieldRow)}
+                    drag={{ container: "projects", projectId: project.id, entity: project.id, label: project.name }}
+                    expanded={projectOpen}
+                    selected={selectedRow === projectRow}
+                    tabStop={tabStop === projectRow}
+                    className={`tree-project ${project.id === selectedId ? "current" : ""} ${forbidden === project.id ? "forbidden-target" : ""}`}
+                    projectDrop={project.id}
+                    onOpen={() => onSelect(project.id)}
+                    onMenu={() => setMenu(projectRow)}
                     row={
                       <>
                         <IconButton
-                          icon={<ChevronRight size={14} className={shieldOpen ? "tree-chevron open" : "tree-chevron"} />}
-                          label={shieldOpen ? `Collapse ${shield.name}` : `Expand ${shield.name}`}
+                          icon={<ChevronRight size={14} className={projectOpen ? "tree-chevron open" : "tree-chevron"} />}
+                          label={projectOpen ? `Collapse ${project.name}` : `Expand ${project.name}`}
                           tabIndex={-1}
                           onClick={(e) => {
                             e.stopPropagation();
-                            toggle(shieldRow);
+                            toggle(projectRow);
                           }}
                         />
-                        <span className={`dot ${shield.status.state}`} aria-label={shield.status.state} />
+                        <span className={`dot ${project.status.state}`} aria-label={project.status.state} />
                         <span
                           className="grow tree-name"
-                          title={shield.status.state === "error" ? shield.status.message : shield.folder}
+                          title={project.status.state === "error" ? project.status.message : project.folder}
                         >
-                          {shield.name}
-                          {shield.status.state === "starting" ? (
+                          {project.name}
+                          {project.status.state === "starting" ? (
                             <span className="tree-path muted">
-                              <StartProgress phase={shield.status.phase} />
+                              <StartProgress phase={project.status.phase} />
                             </span>
                           ) : (
-                            <span className="tree-path muted" title={shield.folder}>
-                              {truncateMiddle(tildePath(shield.folder, home), 32)}
+                            <span className="tree-path muted" title={project.folder}>
+                              {truncateMiddle(tildePath(project.folder, home), 32)}
                             </span>
                           )}
                         </span>
-                        {blocked[shield.id] > 0 && (
+                        {blocked[project.id] > 0 && (
                           <span className="rail-blocked" title="Blocked network events since you last saw them">
-                            {blocked[shield.id]}
+                            {blocked[project.id]}
                           </span>
                         )}
                         <IconButton
                           icon={running ? <Square size={12} /> : <Play size={12} />}
-                          label={running ? `Stop ${shield.name}` : `Start ${shield.name}`}
+                          label={running ? `Stop ${project.name} cage` : `Start ${project.name} cage`}
                           tabIndex={-1}
-                          disabled={shield.status.state === "starting" || shield.status.state === "stopping"}
+                          disabled={project.status.state === "starting" || project.status.state === "stopping"}
                           onClick={(e) => {
                             e.stopPropagation();
-                            onToggle(shield);
+                            onToggle(project);
                           }}
                         />
                         <IconButton
                           icon={<Ellipsis size={12} />}
-                          label={`Actions for ${shield.name}`}
+                          label={`Actions for ${project.name}`}
                           aria-haspopup="menu"
-                          aria-expanded={menu === shieldRow}
+                          aria-expanded={menu === projectRow}
                           tabIndex={-1}
                           onClick={(e) => {
                             e.stopPropagation();
-                            setMenu(shieldRow);
+                            setMenu(projectRow);
                           }}
                         />
                       </>
                     }
                   >
-                    {menu === shieldRow && (
+                    {menu === projectRow && (
                       <ActionMenu
-                        label={`Actions for ${shield.name}`}
-                        actions={launchMenu(launchActions(shield, editors), (action) => onLaunch(shield.id, action))}
+                        label={`Actions for ${project.name}`}
+                        actions={launchMenu(launchActions(project, editors), (action) => onLaunch(project.id, action))}
                         onClose={closeMenu}
                       />
                     )}
-                    {shieldOpen && (
+                    {projectOpen && (
                       <ul role="group">
                         {groups.map(({ group, label, id, container, items, open }) => (
                           <TreeRow
@@ -709,7 +709,7 @@ export function ShieldRail({
                                 />
                                 <span className="grow">{label}</span>
                                 <span className="muted tree-state">{items.length}</span>
-                                {groupAction(shield, group)}
+                                {groupAction(project, group)}
                               </>
                             }
                           >
@@ -717,8 +717,8 @@ export function ShieldRail({
                               <ActionMenu
                                 label="New terminal"
                                 actions={launchMenu(
-                                  launchActions(shield, editors).filter((a) => a.type === "session"),
-                                  (action) => onLaunch(shield.id, action),
+                                  launchActions(project, editors).filter((a) => a.type === "session"),
+                                  (action) => onLaunch(project.id, action),
                                 )}
                                 onClose={closeMenu}
                               />
@@ -737,10 +737,10 @@ export function ShieldRail({
                                         id={rowId}
                                         level={3}
                                         // Tasks have no saved order.
-                                        drag={group === "tasks" ? undefined : { container, shieldId: shield.id, entity: item.entity, label: item.name }}
+                                        drag={group === "tasks" ? undefined : { container, projectId: project.id, entity: item.entity, label: item.name }}
                                         selected={selectedRow === rowId}
                                         tabStop={tabStop === rowId}
-                                        onOpen={() => onOpen(shield.id, item.view)}
+                                        onOpen={() => onOpen(project.id, item.view)}
                                         onMenu={() => setMenu(rowId)}
                                         row={
                                           <>
@@ -787,7 +787,7 @@ export function ShieldRail({
       </div>
       <div className="row">
         <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
-          New shield
+          New project
         </Button>
         <Button variant="ghost" size="sm" iconLeft={<Settings size={14} />} onClick={onSettings}>
           Settings <kbd className="muted">⌘,</kbd>

@@ -18,17 +18,17 @@ import {
   setHarness,
   setMountReadonly,
 } from "./api";
-import { deleteShield, renameShield } from "../shields/api";
-import { AGENT_NAMES, ShieldView } from "../../shared/api";
+import { deleteProject, renameProject } from "../projects/api";
+import { AGENT_NAMES, ProjectView } from "../../shared/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { AppsSection } from "../apps/AppsSection";
 import { errorMessage } from "../../shared/errorMessage";
-import { phaseName } from "../shields/StartProgress";
+import { phaseName } from "../projects/StartProgress";
 
 const WORKSPACE = "/workspace";
 
-/** The same rules as `shield::guest_path` in the backend. */
+/** The same rules as `cage::guest_path` in the backend. */
 function guestError(path: string) {
   const parts = path.split("/").filter(Boolean);
   if (!path.startsWith("/") || parts.length === 0 || parts.some((p) => p === "." || p === ".."))
@@ -47,7 +47,7 @@ interface MountDraft {
 }
 
 interface Props {
-  shield: ShieldView;
+  project: ProjectView;
   folders: string[];
   runtimes: Runtimes;
   run: Run;
@@ -55,9 +55,9 @@ interface Props {
   onIntentDone: () => void;
 }
 
-export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDone }: Props) {
-  const { id, status } = shield;
-  const [name, setName] = useState(shield.name);
+export function SettingsTab({ project, folders, runtimes, run, intent, onIntentDone }: Props) {
+  const { id, status } = project;
+  const [name, setName] = useState(project.name);
   const [nameError, setNameError] = useState<string>();
   const [draft, setDraft] = useState<MountDraft>();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -66,13 +66,13 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
 
   const harnessOptions = [
     ...folders.map((f) => `${WORKSPACE}/${f}`),
-    ...shield.mounts.map((m) => m.guest),
+    ...project.mounts.map((m) => m.guest),
   ];
-  if (shield.harness && !harnessOptions.includes(shield.harness)) harnessOptions.push(shield.harness);
+  if (project.harness && !harnessOptions.includes(project.harness)) harnessOptions.push(project.harness);
 
   function rename(event: FormEvent) {
     event.preventDefault();
-    run(() => renameShield(id, name).catch((e) => setNameError(errorMessage(e))));
+    run(() => renameProject(id, name).catch((e) => setNameError(errorMessage(e))));
   }
 
   function draftMount(host: string, dropped?: string) {
@@ -81,7 +81,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
   }
 
   async function pickMount() {
-    const host = await open({ directory: true, title: "Mount a folder into the shield" });
+    const host = await open({ directory: true, title: "Mount a folder into the cage" });
     if (host !== null) draftMount(host);
   }
 
@@ -122,7 +122,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
   return (
     <div className="tab-body">
       <Card variant="outlined" padding="md">
-        <CardHeader title="Shield" titleAs="h2" />
+        <CardHeader title="Project" titleAs="h2" />
         <CardBody className="stack">
           <form className="row" onSubmit={rename}>
             <FloatingField
@@ -139,13 +139,13 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
                 setNameError(undefined);
               }}
             />
-            <Button type="submit" variant="outline" disabled={name.trim() === shield.name}>
+            <Button type="submit" variant="outline" disabled={name.trim() === project.name}>
               Rename
             </Button>
           </form>
           <p className="muted">
-            Folder <span className="mono">{shield.folder}</span> is <span className="mono">{WORKSPACE}</span> in the
-            shield. It is read-write.
+            Folder <span className="mono">{project.folder}</span> is <span className="mono">{WORKSPACE}</span> in the
+            cage. It is read-write.
           </p>
         </CardBody>
       </Card>
@@ -206,9 +206,9 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
               </div>
             </form>
           )}
-          {shield.mounts.length === 0 && !draft && <p className="muted">No mounts. Only {WORKSPACE} is visible.</p>}
+          {project.mounts.length === 0 && !draft && <p className="muted">No mounts. Only {WORKSPACE} is visible.</p>}
           <ul className="list">
-            {shield.mounts.map((m) => (
+            {project.mounts.map((m) => (
               <li key={m.guest} className="row">
                 <span className="mono">{m.guest}</span>
                 <span className="grow muted mono" title={m.host}>
@@ -250,7 +250,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
               { value: "", label: <span className="mono">{WORKSPACE}</span>, hint: "No harness" },
               ...harnessOptions.map((path) => ({ value: path, label: <span className="mono">{path}</span> })),
             ]}
-            value={shield.harness ?? ""}
+            value={project.harness ?? ""}
             onChange={(value) => run(() => setHarness(id, value || null))}
           />
         </CardBody>
@@ -260,17 +260,17 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
         <CardHeader
           title="Agent runtimes"
           titleAs="h2"
-          description="For all shields. A shield mounts the installed runtimes read-only when it starts."
+          description="For all projects. A cage mounts the installed runtimes read-only when it starts."
         />
         <CardBody className="stack">
           <LiquidSwitch
             label="Agents run without permission prompts"
-            checked={shield.agentsUnprompted}
+            checked={project.agentsUnprompted}
             onChange={(on) => run(() => setAgentsUnprompted(id, on))}
           />
           <p className="muted">
-            For this shield: the shield is the sandbox. Run the agents from the Agents group or as claude, codex, pi and
-            gemini in a shield terminal. With no login from this Mac, log in with the agent's own /login: allow its
+            For this project: the cage is the sandbox. Run the agents from the Agents group or as claude, codex, pi and
+            gemini in a cage terminal. With no login from this Mac, log in with the agent's own /login: allow its
             provider hosts first.
           </p>
           <ul className="list">
@@ -283,8 +283,8 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
                 <strong>{AGENT_NAMES[runtime.name]}</strong>
                 <span className="grow muted">
                   {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
-                  {runtime.installed && status.state === "running" && !shield.runtimes.includes(runtime.name)
-                    ? " · restart the shield to use it"
+                  {runtime.installed && status.state === "running" && !project.runtimes.includes(runtime.name)
+                    ? " · restart the cage to use it"
                     : ""}
                 </span>
                 {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
@@ -294,16 +294,16 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
         </CardBody>
       </Card>
 
-      {shield.startTimings && (
+      {project.startTimings && (
         <Card variant="outlined" padding="md">
           <CardHeader
             title="Last start"
             titleAs="h2"
-            description={`The start took ${shield.startTimings.totalMs} ms. Some phases ran at the same time.`}
+            description={`The start took ${project.startTimings.totalMs} ms. Some phases ran at the same time.`}
           />
           <CardBody>
             <ul className="list">
-              {shield.startTimings.phases.map(({ phase, ms }, i) => (
+              {project.startTimings.phases.map(({ phase, ms }, i) => (
                 <li key={i} className="row">
                   <span className="grow">{phaseName(phase)}</span>
                   <span className="muted mono">{ms} ms</span>
@@ -315,22 +315,22 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
       )}
 
       <AppsSection
-        shield={shield}
+        project={project}
         run={run}
         intent={intent?.kind === "app" ? intent : undefined}
         onIntentDone={onIntentDone}
       />
 
       <Card variant="outlined" padding="md">
-        <CardHeader title="Delete shield" titleAs="h2" description="Stops the shield. Your folders stay on disk." />
+        <CardHeader title="Delete project" titleAs="h2" description="Stops the cage. Your folders stay on disk." />
         <CardBody className="row">
           {confirmDelete ? (
             <>
-              <span className="grow danger">Delete {shield.name}?</span>
+              <span className="grow danger">Delete {project.name}?</span>
               <Button variant="ghost" onClick={() => setConfirmDelete(false)}>
                 Cancel
               </Button>
-              <Button variant="danger" iconLeft={<Trash2 size={14} />} onClick={() => run(() => deleteShield(id))}>
+              <Button variant="danger" iconLeft={<Trash2 size={14} />} onClick={() => run(() => deleteProject(id))}>
                 Delete
               </Button>
             </>
@@ -341,7 +341,7 @@ export function SettingsTab({ shield, folders, runtimes, run, intent, onIntentDo
               disabled={status.state === "starting" || status.state === "stopping"}
               onClick={() => setConfirmDelete(true)}
             >
-              Delete shield…
+              Delete project…
             </Button>
           )}
         </CardBody>

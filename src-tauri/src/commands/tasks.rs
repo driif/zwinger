@@ -7,55 +7,55 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tokio::task::AbortHandle;
 
+use crate::cage::tasks::RunSummary;
+use crate::cage::{self, TaskDraft};
 use crate::error::Result;
-use crate::shield::tasks::RunSummary;
-use crate::shield::{self, TaskDraft};
 use crate::task_artifacts::{self, Room};
 use crate::task_runs::{Control, LiveRecord, Status};
 
-use super::Shields;
+use super::Projects;
 
 #[tauri::command]
-pub fn put_task(shields: Shields<'_>, id: String, task: TaskDraft) -> Result<String> {
-    shields.put_task(&id, task)
+pub fn put_task(projects: Projects<'_>, id: String, task: TaskDraft) -> Result<String> {
+    projects.put_task(&id, task)
 }
 
 #[tauri::command]
-pub fn remove_task(shields: Shields<'_>, id: String, task_id: String) -> Result<()> {
-    shields.remove_task(&id, &task_id)
+pub fn remove_task(projects: Projects<'_>, id: String, task_id: String) -> Result<()> {
+    projects.remove_task(&id, &task_id)
 }
 
 // Async, so the run's task starts on the tokio runtime.
 #[tauri::command]
-pub async fn start_task_run(shields: Shields<'_>, shield_id: String, task_id: String) -> Result<String> {
-    shields.start_task_run(&shield_id, &task_id)
+pub async fn start_task_run(projects: Projects<'_>, project_id: String, task_id: String) -> Result<String> {
+    projects.start_task_run(&project_id, &task_id)
 }
 
 #[tauri::command]
 pub fn control_task_run(
-    shields: Shields<'_>,
-    shield_id: String,
+    projects: Projects<'_>,
+    project_id: String,
     task_id: String,
     run: String,
     control: Control,
 ) -> Result<()> {
-    shields.control_task_run(&shield_id, &task_id, &run, control)
+    projects.control_task_run(&project_id, &task_id, &run, control)
 }
 
 #[tauri::command]
-pub async fn list_task_runs(shields: Shields<'_>, shield_id: String) -> Result<Vec<RunSummary>> {
-    shields.list_task_runs(&shield_id).await
+pub async fn list_task_runs(projects: Projects<'_>, project_id: String) -> Result<Vec<RunSummary>> {
+    projects.list_task_runs(&project_id).await
 }
 
 #[tauri::command]
-pub async fn run_diff(shields: Shields<'_>, shield_id: String, task_id: String, run: String) -> Result<String> {
-    shields.run_diff(&shield_id, &task_id, &run).await
+pub async fn run_diff(projects: Projects<'_>, project_id: String, task_id: String, run: String) -> Result<String> {
+    projects.run_diff(&project_id, &task_id, &run).await
 }
 
 /// True if the folder looks like a duo round, so a drop opens its room.
 #[tauri::command]
 pub fn is_round_folder(path: String) -> bool {
-    shield::host_dir(&path).is_ok_and(|dir| task_artifacts::is_round(&dir))
+    cage::host_dir(&path).is_ok_and(|dir| task_artifacts::is_round(&dir))
 }
 
 /// The round that a room shows: a run of a task, or a duo round folder on
@@ -63,7 +63,7 @@ pub fn is_round_folder(path: String) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RoomSource {
-    Run { shield_id: String, task_id: String, run: String },
+    Run { project_id: String, task_id: String, run: String },
     Folder { path: String },
 }
 
@@ -88,17 +88,17 @@ pub struct Watches {
 /// its tasks start on the tokio runtime.
 #[tauri::command]
 pub async fn watch_room(
-    shields: Shields<'_>,
+    projects: Projects<'_>,
     watches: State<'_, Watches>,
     source: RoomSource,
     on_event: Channel<RoomEvent>,
 ) -> Result<u64> {
     let (dir, run) = match source {
-        RoomSource::Run { shield_id, task_id, run } => {
-            (shields.round_dir(&shield_id, &task_id, &run)?, shields.run_handle(&shield_id, &task_id, &run))
+        RoomSource::Run { project_id, task_id, run } => {
+            (projects.round_dir(&project_id, &task_id, &run)?, projects.run_handle(&project_id, &task_id, &run))
         }
         RoomSource::Folder { path } => {
-            let dir = shield::host_dir(&path)?;
+            let dir = cage::host_dir(&path)?;
             if !task_artifacts::is_round(&dir) {
                 return Err(crate::error::Error::NotRound(path));
             }

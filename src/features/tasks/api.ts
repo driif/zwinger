@@ -15,8 +15,8 @@ export const removeTask = (id: string, taskId: string) =>
   call<void>("remove_task", { id, taskId });
 
 /** Resolves to the run name. */
-export const startTaskRun = (shieldId: string, taskId: string) =>
-  call<string>("start_task_run", { shieldId, taskId });
+export const startTaskRun = (projectId: string, taskId: string) =>
+  call<string>("start_task_run", { projectId, taskId });
 
 export type RunControl =
   | { type: "message" | "answer"; text: string }
@@ -24,11 +24,11 @@ export type RunControl =
   | { type: "pickImplementer"; agent: string };
 
 export const controlTaskRun = (
-  shieldId: string,
+  projectId: string,
   taskId: string,
   run: string,
   control: RunControl,
-) => call<void>("control_task_run", { shieldId, taskId, run, control });
+) => call<void>("control_task_run", { projectId, taskId, run, control });
 
 export type RunState =
   "running" | "paused" | "waiting" | "done" | "failed" | "cancelled";
@@ -46,13 +46,13 @@ export interface RunSummary {
   started: string | null;
 }
 
-/** The runs of the shield's tasks, oldest first per task. */
-export const listTaskRuns = (shieldId: string) =>
-  call<RunSummary[]>("list_task_runs", { shieldId });
+/** The runs of the project's tasks, oldest first per task. */
+export const listTaskRuns = (projectId: string) =>
+  call<RunSummary[]>("list_task_runs", { projectId });
 
 /** The change of a run: the commits since its start, the status, then the diff from its start. */
-export const runDiff = (shieldId: string, taskId: string, run: string) =>
-  call<string>("run_diff", { shieldId, taskId, run });
+export const runDiff = (projectId: string, taskId: string, run: string) =>
+  call<string>("run_diff", { projectId, taskId, run });
 
 /** True if the folder looks like a duo round, so a drop opens its room. */
 export const isRoundFolder = (path: string) =>
@@ -166,7 +166,7 @@ export interface Room {
 }
 
 export type RoomSource =
-  | { kind: "run"; shieldId: string; taskId: string; run: string }
+  | { kind: "run"; projectId: string; taskId: string; run: string }
   | { kind: "folder"; path: string };
 
 export type RoomEvent =

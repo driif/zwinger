@@ -1,6 +1,6 @@
 //! Host agents: the agents that are installed on the Mac (Claude Code, Codex,
-//! pi and Gemini CLI) and that shields reuse. `detect` finds them, `profile`
-//! gives a shield a read-only snapshot of their configuration, and `login`
+//! pi and Gemini CLI) and that projects reuse. `detect` finds them, `profile`
+//! gives a project a read-only snapshot of their configuration, and `login`
 //! reuses their subscription login through the network proxy (ADR 0002).
 //! The host filesystem, the host logins and the clock are seams, so tests use
 //! fakes.
@@ -24,7 +24,7 @@ use crate::error::Result;
 use detect::Detection;
 use login::{HostToken, LoginSource};
 
-/// The agents that a shield can take from the host.
+/// The agents that a project can take from the host.
 pub const KINDS: [AgentKind; 4] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi, AgentKind::Gemini];
 /// How long `<bin> --version` may run.
 const VERSION_LIMIT: Duration = Duration::from_secs(3);
@@ -256,7 +256,7 @@ pub fn remove_at(dir: &OwnedFd, name: &str) -> std::io::Result<()> {
             Some(FileType::Directory) => {
                 if depth >= REMOVE_DEPTH {
                     return Err(std::io::Error::other(format!(
-                        "a folder in the shield state is nested more than {REMOVE_DEPTH} levels deep"
+                        "a folder in the project state is nested more than {REMOVE_DEPTH} levels deep"
                     )));
                 }
                 let level = open_level(top, child)?;

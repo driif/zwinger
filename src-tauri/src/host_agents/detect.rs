@@ -12,7 +12,7 @@ use super::{HostFs, profile};
 use crate::agent::{AgentKind, pi};
 use crate::runtimes;
 
-/// Where the shield's copy of the agent comes from.
+/// Where the project's copy of the agent comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Source {
@@ -39,7 +39,7 @@ pub struct HostAgent {
     /// The host has a config dir that the profile can copy.
     pub profile: bool,
     pub login: LoginState,
-    /// The canonical package dir of a JS agent, which a shield mounts.
+    /// The canonical package dir of a JS agent, which a cage mounts.
     #[serde(skip)]
     pub package: Option<PathBuf>,
     /// Gemini CLI's entry point, relative to its package dir.

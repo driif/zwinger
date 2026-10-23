@@ -1,4 +1,4 @@
-//! The agents of a shield: pi, Claude Code, Codex and Gemini CLI. Each one
+//! The agents of a project: pi, Claude Code, Codex and Gemini CLI. Each one
 //! runs in the VM: as its own TUI in an agent session, or headless in a task
 //! run, where its JSONL output becomes pi-shaped records.
 
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// The guest prefix that belongs to zwinger. User mounts may not use it.
 pub const RESERVED: &str = "/opt/zwinger";
-/// The per-shield agent state (`<app_data>/shields/<id>`), mounted read-write.
+/// The per-project agent state (`<app_data>/shields/<id>`), mounted read-write.
 pub const STATE_DIR: &str = "/opt/zwinger/state";
 /// The longest record that an agent may write.
 const MAX_LINE: usize = 16 << 20;

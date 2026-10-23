@@ -59,7 +59,7 @@ pub enum Step {
     Ready,
 }
 
-/// The app start. The shield commands work only in the `Ready` phase.
+/// The app start. The project commands work only in the `Ready` phase.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Startup {
@@ -205,7 +205,7 @@ pub fn disk(free: Option<u64>) -> Check {
             "Disk space",
             Level::Warn,
             format!(
-                "Only {} free. The first shield image and the agents need about 5 GB. Free some space before you start a shield.",
+                "Only {} free. The first cage image and the agents need about 5 GB. Free some space before you start a cage.",
                 gb(free)
             ),
         ),

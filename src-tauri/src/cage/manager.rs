@@ -6,6 +6,11 @@ use serde::Serialize;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, launch};
+use crate::cage::apps::AppRunView;
+use crate::cage::lifecycle::mounted;
+use crate::cage::network::placeholders;
+use crate::cage::progress::{Phase, ProgressSink, Timings};
+use crate::cage::{self, HostAgentUse, Pos, Project};
 use crate::error::{Error, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
@@ -15,31 +20,30 @@ use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, SessionKind};
 use crate::secrets::{self, SecretValue, Vault};
-use crate::shield::apps::AppRunView;
-use crate::shield::lifecycle::mounted;
-use crate::shield::network::placeholders;
-use crate::shield::progress::{Phase, ProgressSink, Timings};
-use crate::shield::{self, HostAgentUse, Pos, Shield};
 use crate::store::Store;
 use crate::task_runs;
 use crate::terminal::{Session, SessionView};
 
-/// The network log entries kept per shield.
+/// The network log entries kept per project.
 pub(crate) const NET_RING: usize = 2000;
 
-/// Gets each new network log entry with its shield id.
+/// The dir of the per-project agent state. It keeps its name from before the
+/// rename to projects, so the agent state of existing projects stays.
+pub(crate) const LEGACY_STATE_DIR: &str = "shields";
+
+/// Gets each new network log entry with its project id.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
 
-/// Gets the id of a shield whose guest logins changed.
+/// Gets the id of a project whose guest logins changed.
 pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
 
-/// Owns the shield configs, the running VMs and their terminal sessions.
+/// Owns the project configs, the running cages and their terminal sessions.
 pub struct Manager<R: SandboxRuntime> {
     pub(crate) runtime: R,
     pub(crate) store: Store,
     /// The app data dir. It holds the agent runtimes, `shields/<id>`, the
-    /// agent state of each shield, and `bin/<id>`, the host-only agent
-    /// wrappers of each shield.
+    /// agent state of each project, and `bin/<id>`, the host-only agent
+    /// wrappers of each project.
     pub(crate) data: PathBuf,
     pub(crate) vault: Arc<dyn Vault>,
     /// The zwinger CA, loaded at the first start.
@@ -65,16 +69,16 @@ pub struct Manager<R: SandboxRuntime> {
 }
 
 pub(crate) struct State<V> {
-    pub(crate) shields: Vec<Shield>,
+    pub(crate) projects: Vec<Project>,
     pub(crate) vms: HashMap<String, Vm<V>>,
     pub(crate) sessions: Vec<Session>,
-    /// Per shield that starts or runs, the policy and the credential values
+    /// Per cage that starts or runs, the policy and the credential values
     /// of its proxy. An edit changes them at once.
     pub(crate) live: HashMap<String, Arc<Live>>,
-    /// Per shield, the last network log entries. They stay after a stop, so
+    /// Per project, the last network log entries. They stay after a stop, so
     /// the user can still allow a blocked host.
     pub(crate) net: HashMap<String, VecDeque<Entry>>,
-    /// Per shield and app, counts the app stops. A start that saw an older
+    /// Per project and app, counts the app stops. A start that saw an older
     /// count was stopped while its process opened.
     pub(crate) app_stops: HashMap<(String, String), u64>,
 }
@@ -83,13 +87,13 @@ pub(crate) enum Vm<V> {
     /// The phase that the start runs now.
     Starting(Phase),
     /// `applied` is the config the VM booted with; it differs from the stored
-    /// config after an edit, until the next start. `proxy` is the shield's
+    /// config after an edit, until the next start. `proxy` is the project's
     /// proxy; a drop stops it. `net` follows the VM's network events. It is
     /// `None` if the runtime log could not be opened. `runtimes` are the
     /// agent runtimes that the start mounted.
     Running {
         vm: Arc<V>,
-        applied: Box<Shield>,
+        applied: Box<Project>,
         proxy: Arc<Proxy>,
         net: Option<AbortHandle>,
         runtimes: Vec<&'static str>,
@@ -100,14 +104,14 @@ pub(crate) enum Vm<V> {
     Failed(String),
 }
 
-/// What a start did for the shield's host agents.
+/// What a start did for the project's host agents.
 #[derive(Default)]
 pub(crate) struct HostRun {
     /// pi runs from the host install; else the bundled pi runs.
     pub(crate) pi_host: bool,
     /// The guest path of Gemini CLI's entry point, if it runs in the VM.
     pub(crate) gemini: Option<String>,
-    /// The URL of the shield's proxy.
+    /// The URL of the cage's proxy.
     pub(crate) proxy: Option<String>,
     /// What the user should know, such as a fallback.
     pub(crate) notices: Vec<String>,
@@ -129,9 +133,9 @@ impl HostRun {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ShieldView {
+pub struct ProjectView {
     #[serde(flatten)]
-    pub shield: Shield,
+    pub project: Project,
     pub status: Status,
     pub pending_restart: bool,
     pub sessions: Vec<SessionView>,
@@ -149,7 +153,7 @@ pub struct ShieldView {
     /// The agents of the running VM with a login that was made in the
     /// guest: the agent can read its real token.
     pub guest_logins: Vec<AgentKind>,
-    /// The hosts that the shield's agents need, with the proxy's decision.
+    /// The hosts that the project's agents need, with the proxy's decision.
     pub agent_needs: Vec<network::AgentNeed>,
     /// The phase durations of the start of the running VM.
     pub start_timings: Option<Timings>,
@@ -166,23 +170,23 @@ pub enum Status {
 }
 
 /// Deletes the values that no configured secret uses, such as the values of a
-/// shield whose delete failed. A failure does not stop the app load.
-pub(crate) fn prune_vault(vault: &dyn Vault, shields: &[Shield]) {
+/// project whose delete failed. A failure does not stop the app load.
+pub(crate) fn prune_vault(vault: &dyn Vault, projects: &[Project]) {
     let accounts = match vault.accounts() {
         Ok(accounts) => accounts,
         Err(e) => return eprintln!("secret prune: cannot list the vault: {e}"),
     };
     // A host login has no value in the vault, so its account is not kept.
-    let mut configured: HashSet<String> = shields
+    let mut configured: HashSet<String> = projects
         .iter()
-        .flat_map(|shield| shield.network.credentials().into_iter().map(|c| secrets::account(&shield.id, &c.name)))
+        .flat_map(|project| project.network.credentials().into_iter().map(|c| secrets::account(&project.id, &c.name)))
         .collect();
     configured.insert(secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1));
     for account in accounts.iter().filter(|a| !configured.contains(*a)) {
-        let Some((shield_id, name)) = account.split_once('/') else {
+        let Some((project_id, name)) = account.split_once('/') else {
             continue;
         };
-        if vault.delete(shield_id, name).is_err() {
+        if vault.delete(project_id, name).is_err() {
             eprintln!("secret prune: cannot delete {account}");
         }
     }
@@ -193,11 +197,11 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<V> State<V> {
-    pub(crate) fn shield_mut(&mut self, id: &str) -> Result<&mut Shield> {
-        self.shields.iter_mut().find(|s| s.id == id).ok_or(Error::ShieldNotFound)
+    pub(crate) fn project_mut(&mut self, id: &str) -> Result<&mut Project> {
+        self.projects.iter_mut().find(|s| s.id == id).ok_or(Error::ProjectNotFound)
     }
 
-    /// Numbers the entry and adds it to the shield's ring.
+    /// Numbers the entry and adds it to the project's ring.
     pub(crate) fn push_net(&mut self, id: &str, mut event: Entry) -> Entry {
         let ring = self.net.entry(id.to_owned()).or_default();
         event.seq = ring.back().map_or(1, |last| last.seq + 1);
@@ -211,8 +215,8 @@ impl<V> State<V> {
 
 impl<R: SandboxRuntime> Manager<R> {
     pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf, host: Arc<HostAgents>) -> Result<Self> {
-        let shields = store.load()?;
-        prune_vault(vault.as_ref(), &shields);
+        let projects = store.load()?;
+        prune_vault(vault.as_ref(), &projects);
         Ok(Self {
             runtime,
             store,
@@ -222,7 +226,7 @@ impl<R: SandboxRuntime> Manager<R> {
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
             state: Arc::new(Mutex::new(State {
-                shields,
+                projects,
                 vms: HashMap::new(),
                 sessions: Vec::new(),
                 live: HashMap::new(),
@@ -255,13 +259,13 @@ impl<R: SandboxRuntime> Manager<R> {
         let _ = self.progress_sink.set(sink);
     }
 
-    pub fn list(&self) -> Vec<ShieldView> {
+    pub fn list(&self) -> Vec<ProjectView> {
         let state = lock(&self.state);
         state
-            .shields
+            .projects
             .iter()
-            .map(|shield| {
-                let (status, pending_restart) = match state.vms.get(&shield.id) {
+            .map(|project| {
+                let (status, pending_restart) = match state.vms.get(&project.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting(phase)) => (Status::Starting { phase: *phase }, false),
                     // A new name, layout, app list, terminal list or network
@@ -269,25 +273,25 @@ impl<R: SandboxRuntime> Manager<R> {
                     // credential name needs its placeholder in the guest env.
                     Some(Vm::Running { applied, .. }) => (
                         Status::Running,
-                        Shield {
-                            name: shield.name.clone(),
-                            layout: shield.layout.clone(),
-                            apps: shield.apps.clone(),
-                            tasks: shield.tasks.clone(),
-                            terminals: shield.terminals.clone(),
-                            pane_layout: shield.pane_layout.clone(),
-                            agents_unprompted: shield.agents_unprompted,
-                            network: shield.network.clone(),
+                        Project {
+                            name: project.name.clone(),
+                            layout: project.layout.clone(),
+                            apps: project.apps.clone(),
+                            tasks: project.tasks.clone(),
+                            terminals: project.terminals.clone(),
+                            pane_layout: project.pane_layout.clone(),
+                            agents_unprompted: project.agents_unprompted,
+                            network: project.network.clone(),
                             ..(**applied).clone()
-                        } != *shield
-                            || placeholders(&applied.network) != placeholders(&shield.network),
+                        } != *project
+                            || placeholders(&applied.network) != placeholders(&project.network),
                     ),
                     Some(Vm::Stopping) => (Status::Stopping, false),
                     Some(Vm::Failed(message)) => (Status::Error { message: message.clone() }, false),
                 };
-                let sessions = state.sessions.iter().filter(|s| s.shield_id == shield.id);
+                let sessions = state.sessions.iter().filter(|s| s.project_id == project.id);
                 let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) =
-                    match state.vms.get(&shield.id) {
+                    match state.vms.get(&project.id) {
                         Some(Vm::Running { runtimes, host, proxy, .. }) => (
                             runtimes.clone(),
                             proxy.login_expires(),
@@ -297,9 +301,9 @@ impl<R: SandboxRuntime> Manager<R> {
                         ),
                         _ => (Vec::new(), None, Vec::new(), Vec::new(), None),
                     };
-                ShieldView {
-                    agent_needs: network::agent_needs(shield),
-                    shield: shield.clone(),
+                ProjectView {
+                    agent_needs: network::agent_needs(project),
+                    project: project.clone(),
                     status,
                     pending_restart,
                     sessions: sessions
@@ -331,37 +335,37 @@ impl<R: SandboxRuntime> Manager<R> {
             .collect()
     }
 
-    /// The host-only dir of the shield's agent wrappers, bound read-only at
+    /// The host-only dir of the project's agent wrappers, bound read-only at
     /// [`launch::BIN_DIR`]. It is not in the state dir: the guest can write that.
     pub(crate) fn bin_dir(&self, id: &str) -> PathBuf {
         bin_dir(&self.data, id)
     }
 
     pub(crate) fn state_dir(&self, id: &str) -> PathBuf {
-        self.data.join("shields").join(id)
+        self.data.join(LEGACY_STATE_DIR).join(id)
     }
 
-    /// The host-owned profile snapshots of the shield's host agents.
+    /// The host-owned profile snapshots of the project's host agents.
     pub(crate) fn profile_dir(&self, id: &str) -> PathBuf {
         self.data.join("profiles").join(id)
     }
 
     pub fn create(&self, folder: &str) -> Result<String> {
-        let shield = Shield::new(folder)?;
-        let id = shield.id.clone();
+        let project = Project::new(folder)?;
+        let id = project.id.clone();
         let mut state = lock(&self.state);
-        state.shields.push(shield);
-        self.store.save(&state.shields)?;
+        state.projects.push(project);
+        self.store.save(&state.projects)?;
         Ok(id)
     }
 
-    /// `ids` must name each shield once.
-    pub fn reorder_shields(&self, ids: &[String]) -> Result<()> {
+    /// `ids` must name each project once.
+    pub fn reorder_projects(&self, ids: &[String]) -> Result<()> {
         let mut state = lock(&self.state);
-        let mut shields = state.shields.clone();
-        shield::reorder(&mut shields, ids, |s| &s.id)?;
-        self.store.save(&shields)?;
-        state.shields = shields;
+        let mut projects = state.projects.clone();
+        cage::reorder(&mut projects, ids, |s| &s.id)?;
+        self.store.save(&projects)?;
+        state.projects = projects;
         Ok(())
     }
 
@@ -375,14 +379,14 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Applies `edit` to the stored config and persists it. The change is kept
     /// only if the save succeeds. A running VM keeps its applied config until
     /// the next start.
-    pub(crate) fn edit(&self, id: &str, edit: impl FnOnce(&mut Shield) -> Result<()>) -> Result<()> {
+    pub(crate) fn edit(&self, id: &str, edit: impl FnOnce(&mut Project) -> Result<()>) -> Result<()> {
         let mut state = lock(&self.state);
-        let mut shields = state.shields.clone();
-        let shield = shields.iter_mut().find(|s| s.id == id).ok_or(Error::ShieldNotFound)?;
-        edit(shield)?;
-        shield.check()?;
-        self.store.save(&shields)?;
-        state.shields = shields;
+        let mut projects = state.projects.clone();
+        let project = projects.iter_mut().find(|s| s.id == id).ok_or(Error::ProjectNotFound)?;
+        edit(project)?;
+        project.check()?;
+        self.store.save(&projects)?;
+        state.projects = projects;
         Ok(())
     }
 
@@ -419,11 +423,11 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn list_folders(&self, id: &str) -> Result<Vec<String>> {
-        let folder = lock(&self.state).shield_mut(id)?.folder.clone();
-        shield::list_folders(&folder)
+        let folder = lock(&self.state).project_mut(id)?.folder.clone();
+        cage::list_folders(&folder)
     }
 
-    /// Adds the host agent to the shield, or changes it: its runtime, and
+    /// Adds the host agent to the project, or changes it: its runtime, and
     /// its profile and host login if `used` asks for them. A login adds the
     /// agent's host-login secret; `allow_hosts` also adds an Allow rule for
     /// its provider host, which the user confirmed. Applies on the next start.
@@ -481,7 +485,7 @@ impl<R: SandboxRuntime> Manager<R> {
         })?;
         // The stored value, not `on`: a later edit may have won the race to the lock.
         let mut state = lock(&self.state);
-        let unprompted = state.shield_mut(id)?.agents_unprompted;
+        let unprompted = state.project_mut(id)?.agents_unprompted;
         if let Some(Vm::Running { runtimes, host, .. }) = state.vms.get(id) {
             launch::write(&self.bin_dir(id), &mounted(runtimes), host.found(), unprompted)?;
         }
@@ -499,26 +503,26 @@ impl<R: SandboxRuntime> Manager<R> {
         let names = {
             let mut state = lock(&self.state);
             let names: Vec<String> =
-                state.shield_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
-            // A start can claim the shield between the stop above and this lock.
+                state.project_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
+            // A start can claim the project between the stop above and this lock.
             match state.vms.get(id) {
                 Some(Vm::Starting(_)) => return Err(Error::Starting),
                 Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
                 Some(Vm::Stopping) => return Err(Error::Stopping),
                 None | Some(Vm::Failed(_)) => {}
             }
-            let shields: Vec<Shield> = state.shields.iter().filter(|s| s.id != id).cloned().collect();
-            self.store.save(&shields)?;
-            state.shields = shields;
+            let projects: Vec<Project> = state.projects.iter().filter(|s| s.id != id).cloned().collect();
+            self.store.save(&projects)?;
+            state.projects = projects;
             state.vms.remove(id);
             state.live.remove(id);
             state.net.remove(id);
             names
         };
-        // Delete accepts a stopped shield, whose host shells still run. Each
+        // Delete accepts a project with a stopped cage, whose host shells still run. Each
         // kill waits for the hangup in its own thread, not in this task.
         lock(&self.state).sessions.retain(|s| {
-            let killed = s.kind == SessionKind::Host && s.shield_id == id;
+            let killed = s.kind == SessionKind::Host && s.project_id == id;
             if killed {
                 s.kill();
             }
@@ -551,8 +555,8 @@ impl<R: SandboxRuntime> Manager<R> {
         result
     }
 
-    /// The shields with a VM that starts, runs or stops. A failed stop
-    /// leaves the shield running.
+    /// The projects with a cage that starts, runs or stops. A failed stop
+    /// leaves the cage running.
     pub fn live(&self) -> usize {
         lock(&self.state).vms.values().filter(|vm| !matches!(vm, Vm::Failed(_))).count()
     }
@@ -579,10 +583,10 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 
 #[cfg(test)]
 mod tests {
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[tokio::test]
-    async fn delete_refuses_a_shield_that_is_starting() {
+    async fn delete_refuses_a_project_that_is_starting() {
         let (manager, _runtime, id, vault) = manager_with_vault();
         credential(&manager, &id, "api.example.com", "TOKEN", Some("v")).unwrap();
         lock(&manager.state).vms.insert(id.clone(), Vm::Starting(Phase::Vault));
@@ -601,7 +605,7 @@ mod tests {
 
         manager.set_agents_unprompted(&id, false).unwrap();
         assert!(!claude().contains("dangerously"));
-        assert!(!manager.list()[0].shield.agents_unprompted);
+        assert!(!manager.list()[0].project.agents_unprompted);
         assert!(!manager.list()[0].pending_restart);
 
         // Stopped: the next start writes the stored setting.
@@ -633,14 +637,14 @@ mod tests {
     #[tokio::test]
     async fn config_persists_across_managers() {
         let dir = temp_dir();
-        let store = || Store::new(dir.join("shields.json"));
+        let store = || Store::new(dir.join("projects.json"));
         let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.add_mount(&id, temp_dir().to_str().unwrap(), "/mnt/data", true).unwrap();
         manager.set_mount_readonly(&id, "/mnt/data", false).unwrap();
 
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let mounts = &reloaded.list()[0].shield.mounts;
+        let mounts = &reloaded.list()[0].project.mounts;
         assert_eq!(mounts.len(), 1);
         assert!(!mounts[0].readonly);
 
@@ -655,11 +659,11 @@ mod tests {
         manager.set_harness(&id, Some("/mnt/agent/skills")).unwrap();
         let error = manager.remove_mount(&id, "/mnt/agent").unwrap_err();
         assert!(error.to_string().contains("harness uses /mnt/agent/skills"), "{error}");
-        assert_eq!(manager.list()[0].shield.mounts.len(), 1);
+        assert_eq!(manager.list()[0].project.mounts.len(), 1);
 
         manager.set_harness(&id, None).unwrap();
         manager.remove_mount(&id, "/mnt/agent").unwrap();
-        assert!(manager.list()[0].shield.mounts.is_empty());
+        assert!(manager.list()[0].project.mounts.is_empty());
     }
 
     #[tokio::test]
@@ -668,7 +672,7 @@ mod tests {
         manager.start(&id).await.unwrap();
         manager.rename(&id, " api ").unwrap();
         let view = &manager.list()[0];
-        assert_eq!(view.shield.name, "api");
+        assert_eq!(view.project.name, "api");
         assert!(!view.pending_restart);
         assert!(matches!(manager.rename(&id, ""), Err(Error::InvalidName(_))));
     }
@@ -680,39 +684,39 @@ mod tests {
         manager.set_layout(&id, Some([("harness".to_owned(), Pos { x: 1.0, y: 2.0 })].into())).unwrap();
         let web = app(&manager, &id, "pnpm dev", false);
         app(&manager, &id, "cargo run", true);
-        let mut ids: Vec<String> = manager.list()[0].shield.apps.iter().map(|a| a.id.clone()).collect();
+        let mut ids: Vec<String> = manager.list()[0].project.apps.iter().map(|a| a.id.clone()).collect();
         ids.reverse();
         manager.reorder_apps(&id, &ids).unwrap();
         manager.remove_app(&id, &web).unwrap();
-        manager.reorder_shields(std::slice::from_ref(&id)).unwrap();
+        manager.reorder_projects(std::slice::from_ref(&id)).unwrap();
         let view = &manager.list()[0];
         assert!(!view.pending_restart);
-        assert_eq!(view.shield.apps.len(), 1);
-        assert_eq!(view.shield.layout.len(), 1);
+        assert_eq!(view.project.apps.len(), 1);
+        assert_eq!(view.project.layout.len(), 1);
     }
 
     #[tokio::test]
-    async fn reorder_shields_persists() {
+    async fn reorder_projects_persists() {
         let dir = temp_dir();
-        let store = || Store::new(dir.join("shields.json"));
+        let store = || Store::new(dir.join("projects.json"));
         let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
         let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
-        assert!(matches!(manager.reorder_shields(std::slice::from_ref(&b)), Err(Error::InvalidOrder)));
-        manager.reorder_shields(&[b.clone(), a.clone()]).unwrap();
+        assert!(matches!(manager.reorder_projects(std::slice::from_ref(&b)), Err(Error::InvalidOrder)));
+        manager.reorder_projects(&[b.clone(), a.clone()]).unwrap();
 
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let order: Vec<String> = reloaded.list().into_iter().map(|v| v.shield.id).collect();
+        let order: Vec<String> = reloaded.list().into_iter().map(|v| v.project.id).collect();
         assert_eq!(order, [b, a]);
     }
 
     #[test]
-    fn list_folders_reads_the_shield_folder() {
+    fn list_folders_reads_the_project_folder() {
         let (manager, _, id) = manager();
-        let folder = manager.list()[0].shield.folder.clone();
+        let folder = manager.list()[0].project.folder.clone();
         std::fs::create_dir(folder.join("web")).unwrap();
         assert_eq!(manager.list_folders(&id).unwrap(), ["web"]);
-        assert!(matches!(manager.list_folders("nope"), Err(Error::ShieldNotFound)));
+        assert!(matches!(manager.list_folders("nope"), Err(Error::ProjectNotFound)));
     }
 
     #[tokio::test]
@@ -728,13 +732,13 @@ mod tests {
     #[test]
     fn load_prunes_values_with_no_credential_and_keeps_the_ca_key() {
         let dir = temp_dir();
-        let store = || Store::new(dir.join("shields.json"));
+        let store = || Store::new(dir.join("projects.json"));
         let vault = vault();
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
-        vault.set("deleted-shield", "KEY", &SecretValue::new("y")).unwrap();
+        vault.set("deleted-project", "KEY", &SecretValue::new("y")).unwrap();
         vault.set(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1, &SecretValue::new("ca")).unwrap();
 
         Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
@@ -749,7 +753,7 @@ mod tests {
     #[test]
     fn failed_delete_is_an_error_but_does_not_stop_the_load() {
         let dir = temp_dir();
-        let store = || Store::new(dir.join("shields.json"));
+        let store = || Store::new(dir.join("projects.json"));
         let vault = vault();
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();

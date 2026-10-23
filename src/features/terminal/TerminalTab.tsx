@@ -1,18 +1,18 @@
 import { Button } from "@driif/motiv";
 import { Bot, Laptop } from "lucide-react";
-import { PaneNode, SessionKind, ShieldView } from "../../shared/api";
+import { PaneNode, SessionKind, ProjectView } from "../../shared/api";
 import type { Pane } from "../../App";
 import { PaneLayout } from "./PaneLayout";
-import { StartProgress } from "../shields/StartProgress";
+import { StartProgress } from "../projects/StartProgress";
 
 interface Props {
-  shield: ShieldView;
-  /** The terminals of all shields. */
+  project: ProjectView;
+  /** The terminals of all projects. */
   panes: Pane[];
-  /** The focused pane of the shown shield. */
+  /** The focused pane of the shown project. */
   focused?: string;
   visible: boolean;
-  /** `agent` opens the shield's first agent. */
+  /** `agent` opens the project's first agent. */
   onNewSession: (kind: SessionKind | "agent") => void;
   onFocus: (key: string) => void;
   onLayout: (layout: PaneNode) => void;
@@ -27,20 +27,20 @@ interface Props {
   onHide: (key: string) => void;
 }
 
-/** The pane layout of the shown shield. The terminals of every shield stay attached. */
-export function TerminalTab({ shield, onNewSession, ...layout }: Props) {
+/** The pane layout of the shown project. The terminals of every project stay attached. */
+export function TerminalTab({ project, onNewSession, ...layout }: Props) {
   return (
     <div className="terminal-tab">
-      {!shield.paneLayout && shield.status.state === "starting" && (
+      {!project.paneLayout && project.status.state === "starting" && (
         <div className="empty">
-          <StartProgress phase={shield.status.phase} />
+          <StartProgress phase={project.status.phase} />
         </div>
       )}
-      {!shield.paneLayout && shield.status.state !== "starting" && (
+      {!project.paneLayout && project.status.state !== "starting" && (
         <div className="empty">
           <p className="muted">
-            No pane is open. A Mac shell starts in {shield.folder} and needs no shield start. An agent starts in the shield,
-            in {shield.harness ?? "/workspace"}.
+            No pane is open. A Mac shell starts in {project.folder} and needs no cage start. An agent starts in the cage,
+            in {project.harness ?? "/workspace"}.
           </p>
           <div className="row">
             <Button variant="outline" iconLeft={<Laptop size={14} />} onClick={() => onNewSession({ type: "host" })}>
@@ -52,7 +52,7 @@ export function TerminalTab({ shield, onNewSession, ...layout }: Props) {
           </div>
         </div>
       )}
-      <PaneLayout layout={shield.paneLayout} status={shield.status} {...layout} />
+      <PaneLayout layout={project.paneLayout} status={project.status} {...layout} />
     </div>
   );
 }

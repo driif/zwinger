@@ -1,6 +1,6 @@
 //! How each agent starts in the VM: the env that keeps its state in the
-//! shield, its program, and its flags. The task runs use it for headless
-//! calls; the agent sessions and the shield terminals use the wrappers that
+//! project, its program, and its flags. The task runs use it for headless
+//! calls; the agent sessions and the project terminals use the wrappers that
 //! it writes, which are on `PATH` at [`BIN_DIR`].
 
 use std::path::Path;
@@ -35,19 +35,19 @@ const NODE_NET_ENV: [(&str, &str); 3] =
     [("NODE_USE_ENV_PROXY", "1"), ("NODE_EXTRA_CA_CERTS", CA_CERT), ("NODE_OPTIONS", NODE_FLAG)];
 const NODE_FLAG: &str = "--disable-warning=UNDICI-EHPA";
 
-/// What the shield start found: the facts that pick an agent's program.
+/// What the cage start found: the facts that pick an agent's program.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Found<'a> {
     /// pi runs from the host install; else the bundled pi runs.
     pub pi_host: bool,
     /// The guest path of Gemini CLI's entry point, if it runs in the VM.
     pub gemini: Option<&'a str>,
-    /// The URL of the shield's proxy. Each wrapper and headless command sets
+    /// The URL of the cage's proxy. Each wrapper and headless command sets
     /// [`net_env`] for it, so an agent that clears its env keeps it.
     pub proxy: Option<&'a str>,
 }
 
-/// The env of every process in the guest: all traffic goes to the shield's
+/// The env of every process in the guest: all traffic goes to the cage's
 /// proxy at `proxy_url`, and the clients trust the zwinger CA.
 pub fn net_env(proxy_url: &str) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
@@ -62,7 +62,7 @@ pub fn net_env(proxy_url: &str) -> Vec<(String, String)> {
     env
 }
 
-/// The env that keeps the agent's state in the shield and never the host's.
+/// The env that keeps the agent's state in the cage and never the host's.
 pub fn env(kind: AgentKind) -> &'static [(&'static str, &'static str)] {
     match kind {
         // The guest runs as root. Claude Code refuses
@@ -119,9 +119,9 @@ struct Added {
 
 const CODEX_SUBCOMMANDS: Option<&str> = Some("login|logout|mcp");
 
-/// `unprompted` is the shield setting "Agents run without permission
-/// prompts". It is acceptable because the shield is the sandbox: the VM has
-/// only the shield's mounts and allowed hosts.
+/// `unprompted` is the project setting "Agents run without permission
+/// prompts". It is acceptable because the cage is the sandbox: the VM has
+/// only the project's mounts and allowed hosts.
 fn added(kind: AgentKind, unprompted: bool) -> Option<Added> {
     match (kind, unprompted) {
         (AgentKind::Claude, true) => Some(Added {
@@ -168,7 +168,7 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
         .filter(|(name, _)| name != "NODE_OPTIONS")
         .map(|(name, value)| format!("{name}={}", quote(value)))
         .collect();
-    let mut script = format!("#!/bin/sh\n# zwinger writes this file at each shield start.\nexport {}\n", env.join(" "));
+    let mut script = format!("#!/bin/sh\n# zwinger writes this file at each cage start.\nexport {}\n", env.join(" "));
     if found.proxy.is_some() {
         script.push_str(&format!(
             "case \" $NODE_OPTIONS \" in *\" {NODE_FLAG} \"*) ;; \
@@ -238,7 +238,7 @@ pub fn trust_argv() -> Vec<String> {
         // The second line of the PEM is unique to the CA, so a second run appends nothing.
         format!("  grep -qF \"$(sed -n 2p {CA_CERT})\" {CA_BUNDLE} || cat {CA_CERT} >> {CA_BUNDLE}"),
         "else".to_owned(),
-        // All TLS of the shield goes through the proxy, so a bundle with only
+        // All TLS of the cage goes through the proxy, so a bundle with only
         // the zwinger CA is complete.
         format!("  mkdir -p \"$(dirname {CA_BUNDLE})\""),
         format!("  cp {CA_CERT} {CA_BUNDLE}"),
@@ -295,7 +295,7 @@ mod tests {
     fn claude_wrapper_sets_its_state_and_skips_permissions() {
         assert_eq!(
             wrapper(AgentKind::Claude, Found::default(), true).unwrap(),
-            "#!/bin/sh\n# zwinger writes this file at each shield start.\n\
+            "#!/bin/sh\n# zwinger writes this file at each cage start.\n\
              export IS_SANDBOX=1 HOME=/opt/zwinger/state/claude\n\
              add=1\n\
              case \"$1\" in mcp|config|doctor|update) add= ;; esac\n\

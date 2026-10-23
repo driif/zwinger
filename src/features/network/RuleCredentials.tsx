@@ -7,7 +7,7 @@ import {
 import { KeyRound, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { Service, setRuleCredential } from "./api";
-import { Credential, Inject, Rule, ShieldView } from "../../shared/api";
+import { Credential, Inject, Rule, ProjectView } from "../../shared/api";
 import type { Run } from "../../App";
 import { echoHost } from "./echoHost";
 import { errorMessage } from "../../shared/errorMessage";
@@ -62,7 +62,7 @@ function draftOf(credential: Credential): Draft {
 }
 
 interface Props {
-  shield: ShieldView;
+  project: ProjectView;
   rule: Rule;
   catalog: Service[];
   run: Run;
@@ -72,7 +72,7 @@ interface Props {
  * The credentials of a rule. The proxy adds them to the HTTPS requests to the rule's credential hosts.
  * On a Block rule they are inactive: they stay, but the proxy adds them nowhere.
  */
-export function RuleCredentials({ shield, rule, catalog, run }: Props) {
+export function RuleCredentials({ project, rule, catalog, run }: Props) {
   const credentials = rule.credentials ?? [];
   const hosts = credentialHosts(rule, catalog);
   const [header, template] = serviceOf(rule.target, catalog)?.credential ?? [
@@ -83,7 +83,7 @@ export function RuleCredentials({ shield, rule, catalog, run }: Props) {
   const [removing, setRemoving] = useState<string>();
   // Rules can share a name, and with it one value.
   const stored = new Set(
-    shield.network.rules.flatMap((r) =>
+    project.network.rules.flatMap((r) =>
       (r.credentials ?? []).map((c) => c.name),
     ),
   );
@@ -116,7 +116,7 @@ export function RuleCredentials({ shield, rule, catalog, run }: Props) {
           };
     run(() =>
       setRuleCredential(
-        shield.id,
+        project.id,
         rule.id,
         name,
         inject,
@@ -168,7 +168,7 @@ export function RuleCredentials({ shield, rule, catalog, run }: Props) {
               <KeyRound size={14} />
               <span
                 className="mono"
-                title={`$${credential.name} is $MSB_${credential.name}$ in the shield`}
+                title={`$${credential.name} is $MSB_${credential.name}$ in the cage`}
               >
                 {credential.name}
               </span>
@@ -191,7 +191,7 @@ export function RuleCredentials({ shield, rule, catalog, run }: Props) {
                     onClick={() =>
                       run(() =>
                         setRuleCredential(
-                          shield.id,
+                          project.id,
                           rule.id,
                           credential.name,
                           null,

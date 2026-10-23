@@ -4,10 +4,10 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::cage::AppDraft;
+use crate::cage::manager::{Manager, Vm, lock};
 use crate::error::{Error, Result};
 use crate::runtime::{PtyInput, SandboxRuntime, SessionKind};
-use crate::shield::AppDraft;
-use crate::shield::manager::{Manager, Vm, lock};
 use crate::terminal::Session;
 use crate::terminal::output::{Output, pump};
 
@@ -55,11 +55,11 @@ impl<R: SandboxRuntime> Manager<R> {
     /// backend owns, and returns its session id. A run that has exited is
     /// replaced. Fails if the VM is not running, or if it stopped or started
     /// again while the process opened.
-    pub async fn start_app(&self, shield_id: &str, app_id: &str) -> Result<String> {
-        let key = (shield_id.to_owned(), app_id.to_owned());
+    pub async fn start_app(&self, project_id: &str, app_id: &str) -> Result<String> {
+        let key = (project_id.to_owned(), app_id.to_owned());
         let (vm, app, stops) = {
             let mut state = lock(&self.state);
-            let app = state.shield_mut(shield_id)?.app(app_id)?.clone();
+            let app = state.project_mut(project_id)?.app(app_id)?.clone();
             let stops = state.app_stops.get(&key).copied().unwrap_or(0);
             if state
                 .sessions
@@ -68,7 +68,7 @@ impl<R: SandboxRuntime> Manager<R> {
             {
                 return Err(Error::AppRunning);
             }
-            match state.vms.get(shield_id) {
+            match state.vms.get(project_id) {
                 Some(Vm::Running { vm, .. }) => (vm.clone(), app, stops),
                 _ => return Err(Error::NotRunning),
             }
@@ -82,7 +82,7 @@ impl<R: SandboxRuntime> Manager<R> {
         {
             let mut state = lock(&self.state);
             let same_vm = matches!(
-                state.vms.get(shield_id),
+                state.vms.get(project_id),
                 Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
             );
             let running = state
@@ -93,7 +93,7 @@ impl<R: SandboxRuntime> Manager<R> {
             // process opened.
             let error = if !same_vm {
                 Some(Error::NotRunning)
-            } else if state.shield_mut(shield_id).and_then(|s| s.app(app_id)).is_err() {
+            } else if state.project_mut(project_id).and_then(|s| s.app(app_id)).is_err() {
                 Some(Error::AppNotFound)
             } else if state.app_stops.get(&key).copied().unwrap_or(0) != stops {
                 Some(Error::AppStopped)
@@ -109,7 +109,7 @@ impl<R: SandboxRuntime> Manager<R> {
             state.sessions.retain(|s| s.app.as_ref().is_none_or(|r| r.app_id != app_id));
             state.sessions.push(Session {
                 id: id.clone(),
-                shield_id: shield_id.to_owned(),
+                project_id: project_id.to_owned(),
                 kind: SessionKind::Shell,
                 host_group: None,
                 input: pty.input,
@@ -131,18 +131,18 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Kills the app's run and forgets it, so the app shows as stopped. A start
     /// that is in progress fails. An app with no run is not an error.
-    pub fn stop_app(&self, shield_id: &str, app_id: &str) -> Result<()> {
-        self.kill_app(shield_id, app_id);
+    pub fn stop_app(&self, project_id: &str, app_id: &str) -> Result<()> {
+        self.kill_app(project_id, app_id);
         Ok(())
     }
 
     /// Does the work of `stop_app` and returns the exit of the killed run.
-    pub(crate) fn kill_app(&self, shield_id: &str, app_id: &str) -> Option<watch::Receiver<bool>> {
+    pub(crate) fn kill_app(&self, project_id: &str, app_id: &str) -> Option<watch::Receiver<bool>> {
         let mut state = lock(&self.state);
-        *state.app_stops.entry((shield_id.to_owned(), app_id.to_owned())).or_default() += 1;
+        *state.app_stops.entry((project_id.to_owned(), app_id.to_owned())).or_default() += 1;
         let mut exited = None;
         state.sessions.retain(|s| match &s.app {
-            Some(run) if s.shield_id == shield_id && run.app_id == app_id => {
+            Some(run) if s.project_id == project_id && run.app_id == app_id => {
                 let _ = s.input.send(PtyInput::Kill);
                 exited = Some(run.exited.clone());
                 false
@@ -154,21 +154,21 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Starts the app again after its old run has exited, so the new run can
     /// take the ports of the old one.
-    pub async fn restart_app(&self, shield_id: &str, app_id: &str) -> Result<String> {
-        if let Some(mut exited) = self.kill_app(shield_id, app_id) {
+    pub async fn restart_app(&self, project_id: &str, app_id: &str) -> Result<String> {
+        if let Some(mut exited) = self.kill_app(project_id, app_id) {
             // An error means that the run task ended, so the process is gone.
             let wait = exited.wait_for(|done| *done);
             if tokio::time::timeout(CLOSE_LIMIT, wait).await.is_err() {
                 return Err(Error::AppStillRunning);
             }
         }
-        self.start_app(shield_id, app_id).await
+        self.start_app(project_id, app_id).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[tokio::test]
     async fn autostart_runs_apps_after_start() {

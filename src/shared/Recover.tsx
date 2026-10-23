@@ -5,13 +5,13 @@ import { Component, ReactNode, useEffect, useState } from "react";
 import { BACKEND_LOST } from "./api";
 import { errorMessage } from "./errorMessage";
 
-/** The reload screen. The shields keep running in the backend. */
+/** The reload screen. The projects keep running in the backend. */
 export function ReloadScreen({ title, detail }: { title: string; detail?: string }) {
   return (
     <div className="empty">
       <TriangleAlert size={40} className="warn" />
       <h1>{title}</h1>
-      <p className="muted">Your shields keep running. Reload the window to continue.</p>
+      <p className="muted">Your cages keep running. Reload the window to continue.</p>
       {detail && <p className="muted mono">{detail}</p>}
       <Button iconLeft={<RotateCw size={16} />} onClick={() => location.reload()}>
         Reload

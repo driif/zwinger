@@ -39,7 +39,7 @@ pub enum NetKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetEvent {
-    /// Per shield. `parse` sets 0; the manager sets the number.
+    /// Per project. `parse` sets 0; the manager sets the number.
     pub seq: u64,
     /// Milliseconds since the Unix epoch, from the log line.
     pub at: u64,

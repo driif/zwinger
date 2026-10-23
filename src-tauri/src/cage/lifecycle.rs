@@ -9,6 +9,11 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
+use crate::cage::apps::APP_SIZE;
+use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, Vm, bin_dir, blocking, lock};
+use crate::cage::network::placeholders;
+use crate::cage::progress::{Phase, Progress, Timings};
+use crate::cage::{Project, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
@@ -21,18 +26,13 @@ use crate::runtime;
 use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
 use crate::runtimes;
 use crate::secrets::{self, SecretValue};
-use crate::shield::apps::APP_SIZE;
-use crate::shield::manager::{HostRun, Manager, Vm, bin_dir, blocking, lock};
-use crate::shield::network::placeholders;
-use crate::shield::progress::{Phase, Progress, Timings};
-use crate::shield::{Shield, WORKSPACE};
 
 pub(crate) const NODE_LIMIT: Duration = Duration::from_secs(15);
 
 /// The bytes of `node --version` output that are kept.
 pub(crate) const NODE_OUT: usize = 1 << 10;
 
-/// How long a shield stop waits for its task runs to write their manifests.
+/// How long a cage stop waits for its task runs to write their manifests.
 pub(crate) const RUN_STOP_LIMIT: Duration = Duration::from_secs(15);
 
 /// How long the check that a host package loads in the VM may run.
@@ -44,10 +44,10 @@ pub(crate) const TUI_PROBE: Duration = Duration::from_secs(4);
 /// The bytes of a probe's stderr that a notice shows.
 pub(crate) const PROBE_ERR: usize = 512;
 
-/// The shields that `stop_all` stops at once.
+/// The cages that `stop_all` stops at once.
 pub(crate) const STOP_PARALLEL: usize = 4;
 
-/// How often a running shield looks for agent logins that were made in the guest.
+/// How often a running cage looks for agent logins that were made in the guest.
 pub(crate) const GUEST_LOGIN_POLL: Duration = Duration::from_secs(10);
 
 impl<R: SandboxRuntime> Manager<R> {
@@ -56,7 +56,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// the start reaches the proxy. The lock is released before the host
     /// logins are read (the Keychain can wait for the macOS prompt) and
     /// before the runtime start. The proxy starts before the VM: if it
-    /// cannot start, the shield does not start.
+    /// cannot start, the cage does not start.
     pub async fn start(&self, id: &str) -> Result<()> {
         let started = Instant::now();
         let mut timings = Timings::default();
@@ -74,18 +74,18 @@ impl<R: SandboxRuntime> Manager<R> {
             state: self.state.clone(),
             sink: self.progress_sink.clone(),
         });
-        let (shield, live) = {
+        let (project, live) = {
             let _edit = lock(&self.secret_edit);
-            let shield = self.claim_start(id)?;
-            // After the claim: only a shield that is starting reports a phase.
+            let project = self.claim_start(id)?;
+            // After the claim: only a cage that is starting reports a phase.
             progress.begin(Phase::Vault);
-            let values = self.vault_values(&shield);
+            let values = self.vault_values(&project);
             timings.add(Phase::Vault, started.elapsed());
             match values {
                 Ok(values) => {
-                    let live = Live::new(shield.network.clone(), values);
+                    let live = Live::new(project.network.clone(), values);
                     lock(&self.state).live.insert(id.to_owned(), live.clone());
-                    (shield, live)
+                    (project, live)
                 }
                 Err(e) => return fail(e, &mut timings),
             }
@@ -93,9 +93,9 @@ impl<R: SandboxRuntime> Manager<R> {
         progress.begin(Phase::Prepare);
         // The CA load reads the Keychain, as the host logins of `prepare` do, so the two wait at once.
         let prepared = {
-            let (host, data, shield, progress) =
-                (self.host.clone(), self.data.clone(), shield.clone(), progress.clone());
-            timed(blocking(move || prepare(&host, &data, &shield, &|phase| progress.begin(phase))))
+            let (host, data, project, progress) =
+                (self.host.clone(), self.data.clone(), project.clone(), progress.clone());
+            timed(blocking(move || prepare(&host, &data, &project, &|phase| progress.begin(phase))))
         };
         let ((prepared, prepare_took), (ca, ca_took)) = tokio::join!(prepared, timed(self.ca()));
         let Prepared { mut binds, wanted, mut run, tokens, profiles, tui_probe } = match prepared {
@@ -110,7 +110,7 @@ impl<R: SandboxRuntime> Manager<R> {
             return fail(e, &mut timings);
         }
         progress.begin(Phase::Proxy);
-        let (proxy, proxy_took) = timed(self.start_proxy(id, &shield, live, tokens)).await;
+        let (proxy, proxy_took) = timed(self.start_proxy(id, &project, live, tokens)).await;
         timings.add(Phase::Proxy, ca_took + proxy_took);
         let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
@@ -119,8 +119,8 @@ impl<R: SandboxRuntime> Manager<R> {
         binds.push(Bind { guest: launch::CA_DIR.to_owned(), host: Ca::dir(&self.data) });
         run.proxy = Some(proxy.url());
         let mut env = launch::net_env(&proxy.url());
-        let names = shield.logins.iter().map(|l| l.name.clone());
-        env.extend(names.chain(placeholders(&shield.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
+        let names = project.logins.iter().map(|l| l.name.clone());
+        env.extend(names.chain(placeholders(&project.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
         let net = GuestNet { port: proxy.port, env };
         let installed = runtimes::installed(&self.data, &wanted);
         for kind in [AgentKind::Claude, AgentKind::Codex] {
@@ -130,20 +130,20 @@ impl<R: SandboxRuntime> Manager<R> {
             let label = kind.label();
             let used = match installed.iter().find(|r| r.name == kind.name()) {
                 Some(r) if r.version == *version => continue,
-                Some(r) => format!(", so the shield uses {label} {}", r.version),
+                Some(r) => format!(", so the cage uses {label} {}", r.version),
                 None => String::new(),
             };
             run.notices.push(format!(
                 "The Linux build of {label} {version} is not downloaded yet{used}. \
-                 Download it in the Agents settings, then restart the shield."
+                 Download it in the Agents settings, then restart the cage."
             ));
         }
         // The paths again right before and after the boot, which binds them: a
         // folder that was swapped meanwhile is refused.
         progress.begin(Phase::Boot);
         let boot = async {
-            shield.verify_paths()?;
-            self.runtime.start(&shield, &net, &self.state_dir(id), &installed, &binds).await
+            project.verify_paths()?;
+            self.runtime.start(&project, &net, &self.state_dir(id), &installed, &binds).await
         };
         let (booted, boot_took) = timed(boot).await;
         timings.add(Phase::Boot, boot_took);
@@ -152,7 +152,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Ok(vm) => {
                 progress.begin(Phase::Guest);
                 let at = Instant::now();
-                let set_up = match shield.verify_paths() {
+                let set_up = match project.verify_paths() {
                     Ok(()) => self.set_up_guest(&vm, tui_probe.as_deref(), &mut run, &mut names, &mut timings).await,
                     Err(e) => Err(e),
                 };
@@ -186,7 +186,7 @@ impl<R: SandboxRuntime> Manager<R> {
             match result {
                 Ok(vm) => {
                     // In the lock, so an edit of the setting cannot write between the read and the write.
-                    let unprompted = state.shield_mut(id).is_ok_and(|s| s.agents_unprompted);
+                    let unprompted = state.project_mut(id).is_ok_and(|s| s.agents_unprompted);
                     if let Err(e) = launch::write(&self.bin_dir(id), &mounted(&names), run.found(), unprompted) {
                         run.notices.push(format!("The agent commands could not be written: {e}"));
                     }
@@ -195,9 +195,16 @@ impl<R: SandboxRuntime> Manager<R> {
                     run.guest_watch = Some(self.watch_guest_logins(id, &vm));
                     state.vms.insert(
                         id.to_owned(),
-                        Vm::Running { vm, applied: Box::new(shield), proxy, net, runtimes: names, host: Box::new(run) },
+                        Vm::Running {
+                            vm,
+                            applied: Box::new(project),
+                            proxy,
+                            net,
+                            runtimes: names,
+                            host: Box::new(run),
+                        },
                     );
-                    let apps = state.shield_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
+                    let apps = state.project_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
                     apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
                 }
                 Err(e) => {
@@ -277,7 +284,7 @@ impl<R: SandboxRuntime> Manager<R> {
             (Some(Err(e)), _) => {
                 run.pi_host = false;
                 run.notices.push(format!(
-                    "The pi of this Mac does not start in the shield ({e}), so the bundled pi runs. It can be a different version."
+                    "The pi of this Mac does not start in the cage ({e}), so the bundled pi runs. It can be a different version."
                 ));
             }
             _ => {}
@@ -291,7 +298,7 @@ impl<R: SandboxRuntime> Manager<R> {
             None => {}
         }
         for (kind, why) in &run.failed {
-            run.notices.push(format!("{} from this Mac does not run in the shield: {why}", kind.label()));
+            run.notices.push(format!("{} from this Mac does not run in the cage: {why}", kind.label()));
         }
         if let Err(e) = profile {
             run.notices.push(format!(
@@ -301,7 +308,7 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         if let Err(e) = trust {
             run.notices.push(format!(
-                "Only Node trusts the network proxy of this shield, so curl, git and Python fail TLS: {e}."
+                "Only Node trusts the network proxy of this cage, so curl, git and Python fail TLS: {e}."
             ));
         }
         Ok(())
@@ -319,16 +326,16 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(ca.clone())
     }
 
-    /// Starts the shield's proxy. Its log entries go to the shield's ring and the sink.
+    /// Starts the cage's proxy. Its log entries go to the project's ring and the sink.
     pub(crate) async fn start_proxy(
         &self,
         id: &str,
-        shield: &Shield,
+        project: &Project,
         live: Arc<Live>,
         tokens: Vec<HostToken>,
     ) -> Result<Proxy> {
         let ca = self.ca().await?;
-        let logins = shield
+        let logins = project
             .logins
             .iter()
             .zip(tokens)
@@ -341,7 +348,7 @@ impl<R: SandboxRuntime> Manager<R> {
             ca,
             live,
             logins,
-            refresh: login::denied_hosts(&shield.logins),
+            refresh: login::denied_hosts(&project.logins),
             sink: Arc::new(move |entry| {
                 let entry = lock(&state).push_net(&id, entry);
                 if let Some(sink) = sink.get() {
@@ -385,7 +392,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Deletes the agent's login that was made in the guest.
     pub fn remove_guest_login(&self, id: &str, kind: AgentKind) -> Result<()> {
-        lock(&self.state).shield_mut(id)?;
+        lock(&self.state).project_mut(id)?;
         let dir = self.state_dir(id);
         guest_login::remove(&dir, kind)?;
         let found = guest_login::found(&dir);
@@ -395,7 +402,7 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Turns the runtime log lines into the shield's log: the direct
+    /// Turns the runtime log lines into the project's log: the direct
     /// connections that the VM blocked, because a tool ignores the proxy.
     pub(crate) fn follow_net(&self, id: &str, mut lines: Receiver<String>) -> AbortHandle {
         let state = self.state.clone();
@@ -419,22 +426,22 @@ impl<R: SandboxRuntime> Manager<R> {
         .abort_handle()
     }
 
-    /// Checks the shield, marks it as starting and returns its config.
-    pub(crate) fn claim_start(&self, id: &str) -> Result<Shield> {
+    /// Checks the project, marks it as starting and returns its config.
+    pub(crate) fn claim_start(&self, id: &str) -> Result<Project> {
         let mut state = lock(&self.state);
-        let shield = state.shield_mut(id)?.clone();
+        let project = state.project_mut(id)?.clone();
         match state.vms.get(id) {
             Some(Vm::Starting(_)) => return Err(Error::Starting),
             Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
             Some(Vm::Stopping) => return Err(Error::Stopping),
             None | Some(Vm::Failed(_)) => {}
         }
-        shield.verify_paths()?;
-        shield.network.check()?;
-        shield.check_app_data(&self.data)?;
-        shield.check_overlap_with(state.shields.iter().filter(|s| s.id != id))?;
+        project.verify_paths()?;
+        project.network.check()?;
+        project.check_app_data(&self.data)?;
+        project.check_overlap_with(state.projects.iter().filter(|s| s.id != id))?;
         state.vms.insert(id.to_owned(), Vm::Starting(Phase::Vault));
-        Ok(shield)
+        Ok(project)
     }
 
     /// pi needs a newer Node than some `node:22-slim` images have.
@@ -463,11 +470,11 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The vault value of each credential. A value with a write that still
     /// runs fails the start: the vault may not match the config yet.
-    pub(crate) fn vault_values(&self, shield: &Shield) -> Result<HashMap<String, SecretValue>> {
+    pub(crate) fn vault_values(&self, project: &Project) -> Result<HashMap<String, SecretValue>> {
         let mut values = HashMap::new();
-        for credential in shield.network.credentials() {
-            self.settle(&shield.id, &credential.name)?;
-            match self.vault.get(&shield.id, &credential.name)? {
+        for credential in project.network.credentials() {
+            self.settle(&project.id, &credential.name)?;
+            match self.vault.get(&project.id, &credential.name)? {
                 Some(value) => values.insert(credential.name.clone(), value),
                 None => return Err(Error::SecretMissing(credential.name.clone())),
             };
@@ -530,13 +537,13 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// The VM stays tracked until the runtime confirms shutdown, so a failed
-    /// stop leaves the shield running and the user can retry.
+    /// stop leaves the cage running and the user can retry.
     pub async fn stop(&self, id: &str) -> Result<()> {
         // First, so each run settles its manifest before its processes die with the VM.
-        self.runs.cancel_shield(id, "the shield stopped", RUN_STOP_LIMIT).await;
+        self.runs.cancel_project(id, "the cage stopped", RUN_STOP_LIMIT).await;
         let (vm, applied, proxy, net, runtimes, host) = {
             let mut state = lock(&self.state);
-            state.shield_mut(id)?;
+            state.project_mut(id)?;
             match state.vms.get(id) {
                 Some(Vm::Running { .. }) => {}
                 Some(Vm::Starting(_)) => return Err(Error::Starting),
@@ -550,7 +557,7 @@ impl<R: SandboxRuntime> Manager<R> {
             };
             // A host shell runs on the Mac, so it outlives the VM.
             state.sessions.retain(|s| {
-                let ends = s.shield_id == id && s.kind != SessionKind::Host;
+                let ends = s.project_id == id && s.kind != SessionKind::Host;
                 if ends {
                     let _ = s.input.send(PtyInput::Kill);
                 }
@@ -579,7 +586,7 @@ impl<R: SandboxRuntime> Manager<R> {
         result
     }
 
-    /// Stops the running shields, `STOP_PARALLEL` at a time. `limit` bounds
+    /// Stops the running cages, `STOP_PARALLEL` at a time. `limit` bounds
     /// the total time, so app exit cannot hang on a stuck VM.
     pub async fn stop_all(&self, limit: Duration) {
         let running: Vec<String> = lock(&self.state)
@@ -606,7 +613,7 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 }
 
-/// What a start needs for the shield's host agents.
+/// What a start needs for the project's host agents.
 pub(crate) struct Prepared {
     /// The token of each host login, in the order of the config.
     pub(crate) tokens: Vec<HostToken>,
@@ -625,11 +632,11 @@ pub(crate) struct Prepared {
 /// runtime versions. It reads the Keychain and copies files, so it runs on a
 /// blocking thread. The state dir is guest-writable: each write there
 /// follows no link. `begin` gets the phase of each profile copy.
-pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &dyn Fn(Phase)) -> Result<Prepared> {
-    let state = data.join("shields").join(&shield.id);
+pub(crate) fn prepare(host: &HostAgents, data: &Path, project: &Project, begin: &dyn Fn(Phase)) -> Result<Prepared> {
+    let state = data.join(LEGACY_STATE_DIR).join(&project.id);
     std::fs::create_dir_all(&state)?;
     // Empty: the start writes the wrappers of the agents that run in the VM.
-    let bin = bin_dir(data, &shield.id);
+    let bin = bin_dir(data, &project.id);
     if let Err(e) = std::fs::remove_dir_all(&bin)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -648,8 +655,8 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
     let mut wanted = HashMap::new();
     let (mut profiles, mut tui_probe) = (Vec::new(), None);
     for kind in host_agents::KINDS {
-        let used = shield.host_agent(kind);
-        let snapshot_dir = data.join("profiles").join(&shield.id).join(kind.name());
+        let used = project.host_agent(kind);
+        let snapshot_dir = data.join("profiles").join(&project.id).join(kind.name());
         let mut entries = Vec::new();
         if used.is_some_and(|u| u.profile) {
             begin(Phase::Profile(kind));
@@ -680,7 +687,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
                 AgentKind::Gemini => run.failed.push((kind, "it is not installed on this Mac".to_owned())),
                 _ => run
                     .notices
-                    .push(format!("{} is not installed on this Mac, so the shield uses its own copy.", kind.label())),
+                    .push(format!("{} is not installed on this Mac, so the cage uses its own copy.", kind.label())),
             }
             continue;
         };
@@ -713,7 +720,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
     // After the links, so no link of the profile replaces a login file.
     let now = host.now_ms();
     let mut tokens = Vec::new();
-    for secret in &shield.logins {
+    for secret in &project.logins {
         let crate::secrets::Origin::HostLogin { agent } = secret.origin else {
             continue;
         };
@@ -721,7 +728,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
         if !secret.hosts.contains(&token.host) {
             return Err(Error::HostLogin(
                 agent.name().to_owned(),
-                format!("it now uses {}; add the agent to the shield again", token.host),
+                format!("it now uses {}; add the agent to the project again", token.host),
             ));
         }
         for file in login::guest_files(&token, &secret.placeholder(), now) {
@@ -731,7 +738,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
         if token.expires.is_none() {
             run.notices.push(format!(
                 "The {} login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. \
-                 Restart the shield when the agent reports a login error.",
+                 Restart the cage when the agent reports a login error.",
                 agent.label()
             ));
         }
@@ -739,9 +746,9 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, shield: &Shield, begin: &d
     }
     // After the host logins: a placeholder that replaced a guest login is not one.
     run.guest_logins = guest_login::found(&state);
-    if login::denied_hosts(&shield.logins).contains(&login::GITHUB_API) {
+    if login::denied_hosts(&project.logins).contains(&login::GITHUB_API) {
         run.notices.push(format!(
-            "The GitHub API ({}) is blocked in this shield: pi's Copilot login is refreshed there.",
+            "The GitHub API ({}) is blocked in this cage: pi's Copilot login is refreshed there.",
             login::GITHUB_API
         ));
     }
@@ -791,7 +798,7 @@ pub(crate) fn probe_error(out: &[u8], code: i32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[tokio::test]
     async fn start_refuses_old_node() {
@@ -814,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn start_refuses_changed_path() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].shield.folder.clone();
+        let folder = manager.list()[0].project.folder.clone();
         std::fs::remove_dir_all(&folder).unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::MissingPath(_))));
         assert_eq!(manager.list()[0].status, Status::Stopped);
@@ -822,11 +829,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_all_stops_running_shields() {
+    async fn stop_all_stops_running_cages() {
         let dir = temp_dir();
         let runtime = FakeRuntime::default();
         let manager =
-            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host()).unwrap();
+            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host()).unwrap();
         let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
         let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
         manager.create(temp_dir().to_str().unwrap()).unwrap();
@@ -840,15 +847,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_update_restarts_only_when_no_shield_is_live() {
+    async fn the_update_restarts_only_when_no_cage_is_live() {
         let (manager, runtime, id) = manager();
         assert!(crate::updates::restart_guard(manager.live()).is_ok());
         manager.start(&id).await.unwrap();
-        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::ShieldsRunning(1))));
+        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::CagesRunning(1))));
 
         *runtime.fail_stop.lock().unwrap() = true;
         manager.stop_all(Duration::from_secs(2)).await;
-        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::ShieldsRunning(1))));
+        assert!(matches!(crate::updates::restart_guard(manager.live()), Err(Error::CagesRunning(1))));
 
         *runtime.fail_stop.lock().unwrap() = false;
         manager.stop_all(Duration::from_secs(2)).await;
@@ -867,7 +874,7 @@ mod tests {
         assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
         assert!(manager.list()[0].sessions.is_empty());
         // The terminal stays as a dormant row.
-        assert_eq!(manager.list()[0].shield.terminals.len(), 1);
+        assert_eq!(manager.list()[0].project.terminals.len(), 1);
     }
 
     #[tokio::test]
@@ -896,13 +903,13 @@ mod tests {
         assert!(lock(&manager.state).live.is_empty());
     }
 
-    /// `shields.json` can be edited by hand. A rule that the checks do not
+    /// `projects.json` can be edited by hand. A rule that the checks do not
     /// accept must refuse the start.
     #[tokio::test]
     async fn start_refuses_an_invalid_stored_host() {
         let (manager, runtime, id) = manager();
         allow(&manager, &id, "a.io");
-        lock(&manager.state).shields[0].network.rules[0].target = Target::Host { host: "*".into() };
+        lock(&manager.state).projects[0].network.rules[0].target = Target::Host { host: "*".into() };
 
         assert!(matches!(manager.start(&id).await, Err(Error::InvalidDomain(..))));
         assert_eq!(manager.list()[0].status, Status::Stopped);
@@ -916,13 +923,13 @@ mod tests {
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), true).await.unwrap();
 
-        let shield = manager.list().remove(0).shield;
-        let rules: Vec<_> = shield.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
+        let project = manager.list().remove(0).project;
+        let rules: Vec<_> = project.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
         assert_eq!(rules, [(Target::Host { host: "api.anthropic.com".into() }, Action::Allow)]);
-        assert_eq!(shield.logins[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
-        assert_eq!(shield.logins[0].origin, crate::secrets::Origin::HostLogin { agent: AgentKind::Claude });
+        assert_eq!(project.logins[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
+        assert_eq!(project.logins[0].origin, crate::secrets::Origin::HostLogin { agent: AgentKind::Claude });
         // A credential cannot take its name, and the vault never holds it.
-        let rule = shield.network.rules[0].id.clone();
+        let rule = project.network.rules[0].id.clone();
         assert!(matches!(
             manager.set_rule_credential(&id, &rule, "CLAUDE_CODE_OAUTH_TOKEN", bearer(), value("x")),
             Err(Error::DuplicateSecret(_))
@@ -989,15 +996,15 @@ mod tests {
             auth.contains("$MSB_CODEX_HOST_LOGIN$") && auth.contains(login::INERT_REFRESH) && auth.contains("id.real")
         );
         assert!(!auth.contains("at-real") && !auth.contains("rt-real"));
-        assert_eq!(manager.list()[0].shield.logins[0].hosts, ["chatgpt.com"]);
+        assert_eq!(manager.list()[0].project.logins[0].hosts, ["chatgpt.com"]);
         assert!(!format!("{:?}", runtime.net.lock().unwrap()).contains("at-real"));
         // The access token here is no JWT, so its expiry is unknown.
         let notices = manager.list().remove(0).host_notices;
         assert_eq!(
             notices,
             [
-                "The Codex login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. Restart the shield when the agent reports a login error.",
-                "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings, then restart the shield.",
+                "The Codex login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. Restart the cage when the agent reports a login error.",
+                "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings, then restart the cage.",
             ]
         );
         // Installed: no download notice.
@@ -1048,11 +1055,11 @@ mod tests {
             manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await,
             Err(Error::RefreshHostConflict(..))
         ));
-        let github = manager.list()[0].shield.network.rules[1].id.clone();
+        let github = manager.list()[0].project.network.rules[1].id.clone();
         manager.remove_rule(&id, &github).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await.unwrap();
-        let shield = manager.list().remove(0).shield;
-        let hosts: Vec<_> = shield.network.rules.iter().map(|r| r.label()).collect();
+        let project = manager.list().remove(0).project;
+        let hosts: Vec<_> = project.network.rules.iter().map(|r| r.label()).collect();
         assert_eq!(hosts, ["cloudcode-pa.googleapis.com", "api.business.githubcopilot.com"]);
 
         manager.start(&id).await.unwrap();
@@ -1125,7 +1132,7 @@ mod tests {
         assert_eq!(wrappers(&manager, &id), ["pi"]);
         assert!(wrapper("pi").contains("exec node /opt/zwinger/pi/cli.js "));
 
-        // Gemini CLI that is no host agent of the shield.
+        // Gemini CLI that is no host agent of the project.
         let (plain, _, plain_id) = manager_with_host();
         plain.start(&plain_id).await.unwrap();
         assert!(matches!(plain.open_session(&plain_id, gemini, 24, 80).await, Err(Error::NotHostAgent(_))));
@@ -1173,7 +1180,7 @@ mod tests {
         let runtime = FakeRuntime::default();
         let host = host_with(fs, FakeLogins::default(), NOW);
         let manager =
-            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault(), temp_dir(), host).unwrap();
+            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
         for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
@@ -1243,8 +1250,8 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Claude, true, false), false).await.unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        manager.set_progress_sink(Box::new(move |shield, phase, _| {
-            sink.lock().unwrap().push((shield.to_owned(), *phase))
+        manager.set_progress_sink(Box::new(move |project, phase, _| {
+            sink.lock().unwrap().push((project.to_owned(), *phase))
         }));
         let gate = Arc::new(PtyGate::default());
         *runtime.start_gate.lock().unwrap() = Some(gate.clone());
@@ -1261,8 +1268,8 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(shield, phase)| {
-                assert_eq!(*shield, id);
+            .map(|(project, phase)| {
+                assert_eq!(*project, id);
                 *phase
             })
             .collect();
@@ -1284,7 +1291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_shield_trusts_the_zwinger_ca_or_says_why_not() {
+    async fn each_project_trusts_the_zwinger_ca_or_says_why_not() {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
         assert_eq!(*runtime.trusts.lock().unwrap(), 1);
@@ -1303,7 +1310,7 @@ mod tests {
     #[tokio::test]
     async fn start_refuses_a_folder_swapped_at_the_same_path() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].shield.folder.clone();
+        let folder = manager.list()[0].project.folder.clone();
         std::fs::rename(&folder, folder.with_extension("was")).unwrap();
         std::fs::create_dir(&folder).unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::PathChanged(_))));
@@ -1313,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn a_folder_swapped_during_the_boot_stops_the_vm() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].shield.folder.clone();
+        let folder = manager.list()[0].project.folder.clone();
         let gate = Arc::new(PtyGate::default());
         *runtime.start_gate.lock().unwrap() = Some(gate.clone());
         let manager = Arc::new(manager);
@@ -1331,10 +1338,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_all_stops_four_shields_at_a_time() {
+    async fn stop_all_stops_four_cages_at_a_time() {
         let runtime = FakeRuntime::default();
         let manager =
-            Manager::new(runtime.clone(), Store::new(temp_dir().join("shields.json")), vault(), temp_dir(), host())
+            Manager::new(runtime.clone(), Store::new(temp_dir().join("projects.json")), vault(), temp_dir(), host())
                 .unwrap();
         let ids: Vec<String> = (0..6).map(|_| manager.create(temp_dir().to_str().unwrap()).unwrap()).collect();
         for id in &ids {
@@ -1376,16 +1383,16 @@ mod tests {
         assert_eq!(manager.list()[0].guest_logins, [AgentKind::Codex]);
     }
 
-    /// Boots a real shield. Needs microsandbox and network:
+    /// Boots a real project. Needs microsandbox and network:
     /// `cargo test -- --ignored live_`.
     #[tokio::test]
     #[ignore]
-    async fn live_shield_boots() {
+    async fn live_cage_boots() {
         use crate::runtime::Microsandbox;
 
         let (folder, readonly, pi, data) = (temp_dir(), temp_dir(), temp_dir(), temp_dir());
         std::fs::write(folder.join("hello.txt"), "from the host").unwrap();
-        let store = Store::new(data.join("shields.json"));
+        let store = Store::new(data.join("projects.json"));
         let manager = Manager::new(Microsandbox { pi }, store, vault(), data.clone(), host()).unwrap();
         let id = manager.create(folder.to_str().unwrap()).unwrap();
         manager.add_mount(&id, readonly.to_str().unwrap(), "/mnt/ro", true).unwrap();
@@ -1397,7 +1404,7 @@ mod tests {
         manager.start(&id).await.unwrap();
         let vm = match lock(&manager.state).vms.get(&id) {
             Some(Vm::Running { vm, .. }) => vm.clone(),
-            _ => panic!("the shield does not run"),
+            _ => panic!("the cage does not run"),
         };
         let run = |script: &'static str| sh(&manager, &vm, script);
 

@@ -2,7 +2,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { call, PaneNode, SessionKind } from "../../shared/api";
 import type { CursorStyle } from "../settings/api";
 
-/** Saves the split tree of the shield's terminal view. */
+/** Saves the split tree of the project's terminal view. */
 export const setPaneLayout = (id: string, layout: PaneNode | null) =>
   call<void>("set_pane_layout", { id, layout });
 
@@ -62,21 +62,21 @@ export const detachSession = (sessionId: string, token: number) =>
 export const ackSession = (sessionId: string, token: number) =>
   call<void>("ack_session", { sessionId, token });
 
-/** Adds a terminal to the end of the shield's list and opens it. Resolves to the session id. */
+/** Adds a terminal to the end of the project's list and opens it. Resolves to the session id. */
 export const openSession = (
-  shieldId: string,
+  projectId: string,
   kind: SessionKind,
   rows: number,
   cols: number,
-) => call<string>("open_session", { shieldId, kind, rows, cols });
+) => call<string>("open_session", { projectId, kind, rows, cols });
 
 /** Opens a dormant or exited terminal again, under the same id. Resolves to the session id. */
 export const reopenTerminal = (
-  shieldId: string,
+  projectId: string,
   terminalId: string,
   rows: number,
   cols: number,
-) => call<string>("reopen_terminal", { shieldId, terminalId, rows, cols });
+) => call<string>("reopen_terminal", { projectId, terminalId, rows, cols });
 
 export const writeSession = (id: string, data: string) =>
   call<void>("write_session", { id, data });
@@ -85,5 +85,5 @@ export const resizeSession = (id: string, rows: number, cols: number) =>
   call<void>("resize_session", { id, rows, cols });
 
 /** Removes the terminal and ends its process. */
-export const closeTerminal = (shieldId: string, terminalId: string) =>
-  call<void>("close_terminal", { shieldId, terminalId });
+export const closeTerminal = (projectId: string, terminalId: string) =>
+  call<void>("close_terminal", { projectId, terminalId });

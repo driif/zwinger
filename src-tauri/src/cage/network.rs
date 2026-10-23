@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cage::manager::{Manager, Vm, lock};
+use crate::cage::{self, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::network::{Credential, DefaultAction, Inject, NetworkPolicy, RuleDraft};
 use crate::proxy::log::Entry;
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::secrets::{self, SecretValue};
-use crate::shield::manager::{Manager, Vm, lock};
-use crate::shield::{self, WORKSPACE};
 
 /// How long the network test may run in the guest.
 pub(crate) const NET_TEST_LIMIT: Duration = Duration::from_secs(25);
@@ -24,7 +24,7 @@ pub struct NetStage {
     pub detail: String,
 }
 
-/// The network test: the shield reaches its proxy, then the host through it.
+/// The network test: the cage reaches its proxy, then the host through it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetTest {
@@ -36,7 +36,7 @@ pub struct NetTest {
 impl<R: SandboxRuntime> Manager<R> {
     pub fn list_net_events(&self, id: &str) -> Result<Vec<Entry>> {
         let mut state = lock(&self.state);
-        state.shield_mut(id)?;
+        state.project_mut(id)?;
         Ok(state.net.get(id).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
     }
 
@@ -52,15 +52,15 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(out.expect("the edit ran"))
     }
 
-    /// Sends the stored policy to the shield's proxy, if it has one, in one
+    /// Sends the stored policy to the cage's proxy, if it has one, in one
     /// step with the new `value` of a credential.
     pub(crate) fn publish(&self, id: &str, value: Option<(&str, SecretValue)>) {
         let state = lock(&self.state);
         if let Some(live) = state.live.get(id)
-            && let Some(shield) = state.shields.iter().find(|s| s.id == id)
+            && let Some(project) = state.projects.iter().find(|s| s.id == id)
         {
             live.edit(|policy, values| {
-                *policy = shield.network.clone();
+                *policy = project.network.clone();
                 if let Some((name, value)) = value {
                     values.insert(name.to_owned(), value);
                 }
@@ -95,12 +95,12 @@ impl<R: SandboxRuntime> Manager<R> {
         self.drop_unused(id, removed.credentials.iter().map(|c| c.name.as_str()))
     }
 
-    /// Deletes the values of `names` that no credential of the shield uses.
+    /// Deletes the values of `names` that no credential of the project uses.
     pub(crate) fn drop_unused<'a>(&self, id: &str, names: impl Iterator<Item = &'a str>) -> Result<()> {
         let (used, live) = {
             let mut state = lock(&self.state);
             let used: Vec<String> =
-                state.shield_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
+                state.project_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
             (used, state.live.get(id).cloned())
         };
         let mut result = Ok(());
@@ -163,10 +163,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.settle(id, &name)?;
         let is_new = {
             let state = lock(&self.state);
-            let mut shield = state.shields.iter().find(|s| s.id == id).ok_or(Error::ShieldNotFound)?.clone();
-            let is_new = !shield.network.credentials().iter().any(|c| c.name == name);
-            put(&mut shield.network)?;
-            shield.check()?;
+            let mut project = state.projects.iter().find(|s| s.id == id).ok_or(Error::ProjectNotFound)?.clone();
+            let is_new = !project.network.credentials().iter().any(|c| c.name == name);
+            put(&mut project.network)?;
+            project.check()?;
             is_new
         };
         let Some(value) = value else {
@@ -193,10 +193,10 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Tests the network from inside the running shield: first a TCP connect
+    /// Tests the network from inside the running cage: first a TCP connect
     /// to the proxy, then a request to `host` through it.
     pub async fn test_network(&self, id: &str, host: &str) -> Result<NetTest> {
-        let host = shield::domain(host)?;
+        let host = cage::domain(host)?;
         if host.starts_with("*.") {
             return Err(Error::InvalidDomain(host, "test one host, not a wildcard".into()));
         }
@@ -279,7 +279,7 @@ pub(crate) const NET_TEST: &str = r#"const net = require("net");
 const host = process.argv[1];
 const say = (stage, ok, detail) => console.log(JSON.stringify({ stage, ok, detail }));
 let proxy;
-try { proxy = new URL(process.env.HTTPS_PROXY); } catch { say("proxy", false, "the shield has no proxy setting"); process.exit(0); }
+try { proxy = new URL(process.env.HTTPS_PROXY); } catch { say("proxy", false, "the cage has no proxy setting"); process.exit(0); }
 const socket = net.connect(Number(proxy.port), proxy.hostname);
 socket.setTimeout(5000);
 socket.on("timeout", () => { say("proxy", false, "no answer from " + proxy.host); socket.destroy(); });
@@ -326,7 +326,7 @@ pub(crate) fn placeholders(policy: &NetworkPolicy) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[test]
     fn the_network_test_knows_the_responses_of_the_proxy() {
@@ -350,15 +350,15 @@ mod tests {
             dns_denied("2999-01-01T00:00:00.2Z", "example.com"),
         ];
         let (tx, mut rx) = mpsc::unbounded_channel();
-        manager.set_net_sink(Box::new(move |shield, event| {
-            let _ = tx.send((shield.to_owned(), event.clone()));
+        manager.set_net_sink(Box::new(move |project, event| {
+            let _ = tx.send((project.to_owned(), event.clone()));
         }));
         manager.start(&id).await.unwrap();
 
         let mut sent = Vec::new();
         for _ in 0..2 {
-            let (shield, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
-            assert_eq!(shield, id);
+            let (project, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(project, id);
             sent.push(event);
         }
         assert_eq!(hosts(&sent), [(1, "google.com"), (2, "example.com")]);
@@ -443,10 +443,10 @@ mod tests {
             manager.put_rule(&id, host_rule("https://example.com", Action::Allow)),
             Err(Error::InvalidDomain(..))
         ));
-        assert!(matches!(manager.put_rule("nope", host_rule("a.io", Action::Allow)), Err(Error::ShieldNotFound)));
+        assert!(matches!(manager.put_rule("nope", host_rule("a.io", Action::Allow)), Err(Error::ProjectNotFound)));
         manager.remove_rule(&id, &first).unwrap();
         assert!(matches!(manager.remove_rule(&id, &first), Err(Error::RuleNotFound)));
-        let rules = manager.list()[0].shield.network.rules.clone();
+        let rules = manager.list()[0].project.network.rules.clone();
         assert_eq!(rules.iter().map(|r| r.label()).collect::<Vec<_>>(), ["*.anthropic.com"]);
     }
 
@@ -455,12 +455,12 @@ mod tests {
         let (manager, runtime, id, vault) = manager_with_vault();
         credential(&manager, &id, "api.openai.com", " OPENAI_API_KEY ", Some("sk-hidden")).unwrap();
         assert_eq!(stored(&vault, &id, "OPENAI_API_KEY").as_deref(), Some("sk-hidden"));
-        let rules = manager.list()[0].shield.network.rules.clone();
+        let rules = manager.list()[0].project.network.rules.clone();
         assert_eq!(rules[0].credentials[0].name, "OPENAI_API_KEY");
 
         let config = std::fs::read_to_string(manager.store.path()).unwrap();
-        let shields = serde_json::to_string(&manager.list()).unwrap();
-        for text in [config, shields] {
+        let projects = serde_json::to_string(&manager.list()).unwrap();
+        for text in [config, projects] {
             assert!(text.contains("OPENAI_API_KEY") && !text.contains("sk-hidden"), "{text}");
         }
 
@@ -480,20 +480,20 @@ mod tests {
         };
         assert!(matches!(set("KEY", bearer(), None), Err(Error::SecretValueRequired(_))));
         assert!(matches!(set("KEY", bearer(), value("")), Err(Error::SecretValueRequired(_))));
-        assert!(manager.list()[0].shield.network.rules[0].credentials.is_empty());
+        assert!(manager.list()[0].project.network.rules[0].credentials.is_empty());
 
         set("KEY", bearer(), value("v1")).unwrap();
         let replace = Inject::Replace {
             places: secrets::Places { header_fields: vec!["x-api-key".into()], query: false, body: false },
         };
         set("KEY", Some(replace.clone()), None).unwrap();
-        assert_eq!(manager.list()[0].shield.network.rules[0].credentials[0].inject, replace);
+        assert_eq!(manager.list()[0].project.network.rules[0].credentials[0].inject, replace);
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
 
         assert!(matches!(set("PATH", bearer(), value("x")), Err(Error::InvalidSecret(..))));
         assert!(matches!(
             manager.set_rule_credential("nope", &rule, "KEY", bearer(), value("x")),
-            Err(Error::ShieldNotFound)
+            Err(Error::ProjectNotFound)
         ));
         let wildcard = manager.put_rule(&id, host_rule("*.b.io", Action::Allow)).unwrap();
         assert!(matches!(
@@ -511,7 +511,7 @@ mod tests {
                 RuleDraft { id: Some(rule), target: Target::Host { host: "a.io".into() }, action: Action::Block },
             )
             .unwrap();
-        assert_eq!(manager.list()[0].shield.network.rules[0].credentials.len(), 1);
+        assert_eq!(manager.list()[0].project.network.rules[0].credentials.len(), 1);
     }
 
     #[test]
@@ -527,7 +527,7 @@ mod tests {
         let error = manager.set_rule_credential(&id, &rule, "NEW", bearer(), value("fresh")).unwrap_err();
         assert!(!error.to_string().contains("fresh"));
         assert_eq!(stored(&vault, &id, "NEW"), None);
-        let names: Vec<_> = manager.list()[0].shield.network.credentials().iter().map(|c| c.name.clone()).collect();
+        let names: Vec<_> = manager.list()[0].project.network.credentials().iter().map(|c| c.name.clone()).collect();
         assert_eq!(names, ["OLD"]);
     }
 
@@ -547,13 +547,13 @@ mod tests {
         break_store(&manager);
         assert!(manager.remove_rule(&id, &b).is_err());
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v"));
-        assert_eq!(manager.list()[0].shield.network.credentials().len(), 1);
+        assert_eq!(manager.list()[0].project.network.credentials().len(), 1);
 
         let path = manager.store.path().to_owned();
         std::fs::remove_dir_all(&path).unwrap();
         manager.remove_rule(&id, &b).unwrap();
         assert_eq!(stored(&vault, &id, "KEY"), None);
-        assert!(manager.list()[0].shield.network.credentials().is_empty());
+        assert!(manager.list()[0].project.network.credentials().is_empty());
     }
 
     #[tokio::test]
@@ -605,7 +605,7 @@ mod tests {
         let vault = Arc::new(GatedVault::default());
         let runtime = FakeRuntime::default();
         let manager = Arc::new(
-            Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host())
+            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
                 .unwrap(),
         );
         let id = manager.create(dir.to_str().unwrap()).unwrap();
@@ -644,7 +644,7 @@ mod tests {
         let vault = Arc::new(secrets::Ordered::alone(slow.clone(), Duration::from_millis(50)));
         let manager = Manager::new(
             FakeRuntime::default(),
-            Store::new(dir.join("shields.json")),
+            Store::new(dir.join("projects.json")),
             vault.clone(),
             temp_dir(),
             host(),
@@ -686,7 +686,7 @@ mod tests {
         let vault = Arc::new(secrets::Ordered::alone(slow.clone(), Duration::from_millis(50)));
         let manager = Manager::new(
             FakeRuntime::default(),
-            Store::new(dir.join("shields.json")),
+            Store::new(dir.join("projects.json")),
             vault.clone(),
             temp_dir(),
             host(),

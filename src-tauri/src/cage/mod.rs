@@ -25,14 +25,14 @@ const COMMAND_LIMIT: usize = 4096;
 const REQUEST_LIMIT: usize = 64 << 10;
 const MODEL_LIMIT: usize = 128;
 const GATE_COUNT: usize = 16;
-/// The saved map positions per shield; more entries are dropped.
+/// The saved map positions per project; more entries are dropped.
 const LAYOUT_LIMIT: usize = 1000;
 /// The deepest split of a pane layout.
 const PANE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Shield {
+pub struct Project {
     pub id: String,
     pub name: String,
     pub folder: PathBuf,
@@ -63,17 +63,17 @@ pub struct Shield {
     pub apps: Vec<App>,
     #[serde(default)]
     pub tasks: Vec<Task>,
-    /// The terminals of the shield, in tree order. A terminal with no live
+    /// The terminals of the project, in tree order. A terminal with no live
     /// session is dormant: it opens again under the same id.
     #[serde(default)]
     pub terminals: Vec<Terminal>,
     /// The split tree of the terminal view. `None`: no pane is open.
     #[serde(default)]
     pub pane_layout: Option<PaneNode>,
-    /// The agents that the shield takes from the host. At most one per kind.
+    /// The agents that the project takes from the host. At most one per kind.
     #[serde(default)]
     pub host_agents: Vec<HostAgentUse>,
-    /// The agent commands skip their permission prompts: the shield is the sandbox.
+    /// The agent commands skip their permission prompts: the cage is the sandbox.
     #[serde(default = "yes")]
     pub agents_unprompted: bool,
 }
@@ -82,7 +82,7 @@ fn yes() -> bool {
     true
 }
 
-/// A host agent of a shield: its runtime, and if the shield also gets the
+/// A host agent of a project: its runtime, and if the project also gets the
 /// agent's profile (read-only) and its host login.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +98,7 @@ pub struct Pos {
     pub y: f64,
 }
 
-/// A saved, named, long-running command of a shield.
+/// A saved, named, long-running command of a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct App {
@@ -109,7 +109,7 @@ pub struct App {
     pub autostart: bool,
 }
 
-/// A shell or agent terminal of a shield. It stays when its process ends.
+/// A shell or agent terminal of a project. It stays when its process ends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Terminal {
@@ -189,7 +189,7 @@ pub struct AppDraft {
     pub autostart: bool,
 }
 
-/// A request that two agents of a shield plan, build and review together.
+/// A request that two agents of a project plan, build and review together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -252,7 +252,7 @@ impl FileId {
     }
 }
 
-impl Shield {
+impl Project {
     pub fn new(folder: &str) -> Result<Self> {
         let (folder, folder_id) = host_dir_with_id(folder)?;
         let name =
@@ -347,7 +347,7 @@ impl Shield {
         self.pane_layout = self.pane_layout.take().and_then(|layout| layout.without(id));
     }
 
-    /// Each pane names a terminal of the shield, and each terminal is in at
+    /// Each pane names a terminal of the project, and each terminal is in at
     /// most one pane.
     pub fn set_pane_layout(&mut self, layout: Option<PaneNode>) -> Result<()> {
         if let Some(layout) = &layout {
@@ -425,7 +425,7 @@ impl Shield {
         Ok(id)
     }
 
-    /// A kebab-case slug of the title that no other task of the shield has.
+    /// A kebab-case slug of the title that no other task of the project has.
     fn new_slug(&self, title: &str) -> String {
         let mut base = String::new();
         for c in title.chars().flat_map(char::to_lowercase) {
@@ -629,7 +629,7 @@ impl Shield {
 
     /// Two host paths may not be nested, in either direction, when either one is
     /// writable: the guest could then write through one mount into the other.
-    /// The shield folder is writable.
+    /// The project folder is writable.
     pub fn check_overlap(&self) -> Result<()> {
         let paths: Vec<(&Path, bool)> = std::iter::once((self.folder.as_path(), true))
             .chain(self.mounts.iter().map(|m| (m.host.as_path(), !m.readonly)))
@@ -644,10 +644,10 @@ impl Shield {
         Ok(())
     }
 
-    /// A writable path of another shield may not nest with any path of this
-    /// shield, in either direction: a guest of one shield could then swap a
-    /// folder that the other shield binds at start.
-    pub fn check_overlap_with<'a>(&self, others: impl IntoIterator<Item = &'a Shield>) -> Result<()> {
+    /// A writable path of another project may not nest with any path of this
+    /// project, in either direction: a guest of one project could then swap a
+    /// folder that the other project binds at start.
+    pub fn check_overlap_with<'a>(&self, others: impl IntoIterator<Item = &'a Project>) -> Result<()> {
         let ours: Vec<&Path> =
             std::iter::once(self.folder.as_path()).chain(self.mounts.iter().map(|m| m.host.as_path())).collect();
         for other in others {
@@ -663,7 +663,7 @@ impl Shield {
     }
 
     /// No host path may nest with the app data dir, in either direction, even
-    /// read-only: it holds the pi runtime and the agent state of every shield.
+    /// read-only: it holds the pi runtime and the agent state of every project.
     pub fn check_app_data(&self, data: &Path) -> Result<()> {
         let paths = std::iter::once(&self.folder).chain(self.mounts.iter().map(|m| &m.host));
         for path in paths {
@@ -825,7 +825,7 @@ pub fn guest_path(path: &str) -> Result<String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
-/// The top-level folders of a shield folder, for display: real directories
+/// The top-level folders of a project folder, for display: real directories
 /// only (no symlinks, no hidden names), sorted, at most `FOLDER_LIMIT`.
 pub fn list_folders(folder: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
@@ -922,13 +922,13 @@ mod tests {
 
     #[test]
     fn app_data_may_not_nest_with_any_path() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data", "data/app", "other"]);
-        shield.add_mount(&path(&root, "other"), "/mnt/other", true).unwrap();
-        assert!(shield.check_app_data(&root.join("data/app")).is_ok());
+        let (mut project, root) = project_with_dirs(&["project", "data", "data/app", "other"]);
+        project.add_mount(&path(&root, "other"), "/mnt/other", true).unwrap();
+        assert!(project.check_app_data(&root.join("data/app")).is_ok());
 
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        assert!(matches!(shield.check_app_data(&root.join("data/app")), Err(Error::AppDataOverlap(..))));
-        assert!(matches!(shield.check_app_data(&shield.folder.join("x")), Err(Error::AppDataOverlap(..))));
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        assert!(matches!(project.check_app_data(&root.join("data/app")), Err(Error::AppDataOverlap(..))));
+        assert!(matches!(project.check_app_data(&project.folder.join("x")), Err(Error::AppDataOverlap(..))));
     }
 
     #[test]
@@ -939,19 +939,19 @@ mod tests {
 
     #[test]
     fn add_mount_rejects_duplicate_guest_path() {
-        let mut shield = Shield::new(temp_dir("dup").to_str().unwrap()).unwrap();
+        let mut project = Project::new(temp_dir("dup").to_str().unwrap()).unwrap();
         let data = temp_dir("dup-data");
-        shield.add_mount(data.to_str().unwrap(), "/mnt/a", true).unwrap();
-        assert!(matches!(shield.add_mount(data.to_str().unwrap(), "/mnt/a/", false), Err(Error::DuplicateMount(_))));
+        project.add_mount(data.to_str().unwrap(), "/mnt/a", true).unwrap();
+        assert!(matches!(project.add_mount(data.to_str().unwrap(), "/mnt/a/", false), Err(Error::DuplicateMount(_))));
     }
 
-    fn shield_with_dirs(names: &[&str]) -> (Shield, PathBuf) {
+    fn project_with_dirs(names: &[&str]) -> (Project, PathBuf) {
         let root = temp_dir("overlap").canonicalize().unwrap();
         for name in names {
             std::fs::create_dir_all(root.join(name)).unwrap();
         }
-        let shield = Shield::new(root.join("project").to_str().unwrap()).unwrap();
-        (shield, root)
+        let project = Project::new(root.join("project").to_str().unwrap()).unwrap();
+        (project, root)
     }
 
     fn path(root: &Path, name: &str) -> String {
@@ -960,167 +960,167 @@ mod tests {
 
     #[test]
     fn mount_inside_folder_is_rejected() {
-        let (mut shield, root) = shield_with_dirs(&["project/sub"]);
+        let (mut project, root) = project_with_dirs(&["project/sub"]);
         assert!(matches!(
-            shield.add_mount(&path(&root, "project/sub"), "/mnt/sub", true),
+            project.add_mount(&path(&root, "project/sub"), "/mnt/sub", true),
             Err(Error::MountOverlap(..))
         ));
-        assert!(shield.mounts.is_empty());
+        assert!(project.mounts.is_empty());
     }
 
     #[test]
     fn mount_containing_folder_is_rejected() {
-        let (mut shield, root) = shield_with_dirs(&["project"]);
-        assert!(matches!(shield.add_mount(root.to_str().unwrap(), "/mnt/root", true), Err(Error::MountOverlap(..))));
+        let (mut project, root) = project_with_dirs(&["project"]);
+        assert!(matches!(project.add_mount(root.to_str().unwrap(), "/mnt/root", true), Err(Error::MountOverlap(..))));
     }
 
     #[test]
     fn mount_inside_rw_mount_is_rejected() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data/inner"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", false).unwrap();
+        let (mut project, root) = project_with_dirs(&["project", "data/inner"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", false).unwrap();
         assert!(matches!(
-            shield.add_mount(&path(&root, "data/inner"), "/mnt/inner", true),
+            project.add_mount(&path(&root, "data/inner"), "/mnt/inner", true),
             Err(Error::MountOverlap(..))
         ));
     }
 
     #[test]
-    fn shield_inside_other_shields_folder_is_rejected() {
-        let (mut other, root) = shield_with_dirs(&["project/inner", "data"]);
+    fn project_inside_other_projects_folder_is_rejected() {
+        let (mut other, root) = project_with_dirs(&["project/inner", "data"]);
         other.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        let inner = Shield::new(&path(&root, "project/inner")).unwrap();
+        let inner = Project::new(&path(&root, "project/inner")).unwrap();
         assert!(matches!(inner.check_overlap_with([&other]), Err(Error::MountOverlap(..))));
-        let data = Shield::new(&path(&root, "data")).unwrap();
+        let data = Project::new(&path(&root, "data")).unwrap();
         data.check_overlap_with([&other]).unwrap();
     }
 
     #[test]
     fn nested_readonly_mounts_are_accepted() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data/inner"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.add_mount(&path(&root, "data/inner"), "/mnt/inner", true).unwrap();
-        assert_eq!(shield.mounts.len(), 2);
+        let (mut project, root) = project_with_dirs(&["project", "data/inner"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.add_mount(&path(&root, "data/inner"), "/mnt/inner", true).unwrap();
+        assert_eq!(project.mounts.len(), 2);
     }
 
     #[test]
     fn readwrite_toggle_that_creates_overlap_is_rejected() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data/inner"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.add_mount(&path(&root, "data/inner"), "/mnt/inner", true).unwrap();
-        shield.mount_mut("/mnt/data").unwrap().readonly = false;
-        assert!(matches!(shield.check_overlap(), Err(Error::MountOverlap(..))));
+        let (mut project, root) = project_with_dirs(&["project", "data/inner"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.add_mount(&path(&root, "data/inner"), "/mnt/inner", true).unwrap();
+        project.mount_mut("/mnt/data").unwrap().readonly = false;
+        assert!(matches!(project.check_overlap(), Err(Error::MountOverlap(..))));
     }
 
     #[test]
     fn verify_paths_detects_symlink_swap() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data", "elsewhere"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.verify_paths().unwrap();
+        let (mut project, root) = project_with_dirs(&["project", "data", "elsewhere"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.verify_paths().unwrap();
 
         std::fs::remove_dir(root.join("data")).unwrap();
         std::os::unix::fs::symlink(root.join("elsewhere"), root.join("data")).unwrap();
-        assert!(matches!(shield.verify_paths(), Err(Error::PathChanged(_))));
+        assert!(matches!(project.verify_paths(), Err(Error::PathChanged(_))));
     }
 
     #[test]
     fn verify_paths_detects_a_swapped_folder_at_the_same_path() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        assert!(shield.folder_id.is_some() && shield.mounts[0].id.is_some());
+        let (mut project, root) = project_with_dirs(&["project", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        assert!(project.folder_id.is_some() && project.mounts[0].id.is_some());
 
         std::fs::rename(root.join("data"), root.join("old")).unwrap();
         std::fs::create_dir(root.join("data")).unwrap();
-        assert!(matches!(shield.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("data")));
+        assert!(matches!(project.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("data")));
 
         std::fs::remove_dir(root.join("data")).unwrap();
         std::fs::rename(root.join("old"), root.join("data")).unwrap();
-        shield.verify_paths().unwrap();
+        project.verify_paths().unwrap();
         std::fs::rename(root.join("project"), root.join("was")).unwrap();
         std::fs::create_dir(root.join("project")).unwrap();
-        assert!(matches!(shield.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("project")));
+        assert!(matches!(project.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("project")));
     }
 
     #[test]
     fn fill_ids_sets_only_missing_ids_of_unmoved_folders() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data", "gone"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.add_mount(&path(&root, "gone"), "/mnt/gone", true).unwrap();
-        let ids = (shield.folder_id, shield.mounts[0].id);
-        shield.folder_id = None;
-        shield.mounts[0].id = None;
-        shield.mounts[1].id = None;
+        let (mut project, root) = project_with_dirs(&["project", "data", "gone"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.add_mount(&path(&root, "gone"), "/mnt/gone", true).unwrap();
+        let ids = (project.folder_id, project.mounts[0].id);
+        project.folder_id = None;
+        project.mounts[0].id = None;
+        project.mounts[1].id = None;
         std::fs::remove_dir(root.join("gone")).unwrap();
-        assert!(shield.fill_ids());
-        assert_eq!((shield.folder_id, shield.mounts[0].id, shield.mounts[1].id), (ids.0, ids.1, None));
-        assert!(!shield.fill_ids());
+        assert!(project.fill_ids());
+        assert_eq!((project.folder_id, project.mounts[0].id, project.mounts[1].id), (ids.0, ids.1, None));
+        assert!(!project.fill_ids());
         // A folder that appears later at the path is refused until it is confirmed.
         std::fs::create_dir(root.join("gone")).unwrap();
-        assert!(matches!(shield.verify_paths(), Err(Error::PathUnverified(p)) if p.ends_with("gone")));
-        assert!(shield.fill_ids());
-        shield.verify_paths().unwrap();
+        assert!(matches!(project.verify_paths(), Err(Error::PathUnverified(p)) if p.ends_with("gone")));
+        assert!(project.fill_ids());
+        project.verify_paths().unwrap();
     }
 
     #[test]
     fn verify_paths_detects_missing_folder() {
-        let (shield, root) = shield_with_dirs(&["project"]);
+        let (project, root) = project_with_dirs(&["project"]);
         std::fs::remove_dir(root.join("project")).unwrap();
-        assert!(matches!(shield.verify_paths(), Err(Error::MissingPath(_))));
+        assert!(matches!(project.verify_paths(), Err(Error::MissingPath(_))));
     }
 
     #[test]
     fn set_harness_accepts_workspace_folders_and_mounts() {
-        let (mut shield, root) = shield_with_dirs(&["project/agent", "data"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        let (mut project, root) = project_with_dirs(&["project/agent", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
         for (input, stored) in
             [("//workspace/agent/", "/workspace/agent"), ("/mnt/data", "/mnt/data"), ("/mnt/data/sub", "/mnt/data/sub")]
         {
-            shield.set_harness(Some(input)).unwrap();
-            assert_eq!(shield.harness.as_deref(), Some(stored));
+            project.set_harness(Some(input)).unwrap();
+            assert_eq!(project.harness.as_deref(), Some(stored));
         }
-        shield.set_harness(None).unwrap();
-        assert_eq!(shield.harness, None);
+        project.set_harness(None).unwrap();
+        assert_eq!(project.harness, None);
     }
 
     #[test]
     fn set_harness_rejects_other_paths() {
-        let (mut shield, _) = shield_with_dirs(&["project"]);
+        let (mut project, _) = project_with_dirs(&["project"]);
         for input in ["agent", "/workspace/../etc", "/"] {
-            assert!(matches!(shield.set_harness(Some(input)), Err(Error::InvalidGuestPath(_))), "{input}");
+            assert!(matches!(project.set_harness(Some(input)), Err(Error::InvalidGuestPath(_))), "{input}");
         }
-        assert!(matches!(shield.set_harness(Some("/workspace/missing")), Err(Error::MissingPath(_))));
+        assert!(matches!(project.set_harness(Some("/workspace/missing")), Err(Error::MissingPath(_))));
         for input in ["/workspace", "/mnt/data", "/etc"] {
-            assert!(matches!(shield.set_harness(Some(input)), Err(Error::HarnessTarget(_))), "{input}");
+            assert!(matches!(project.set_harness(Some(input)), Err(Error::HarnessTarget(_))), "{input}");
         }
     }
 
     #[test]
     fn check_refuses_harness_without_its_mount() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.set_harness(Some("/mnt/data")).unwrap();
-        shield.mounts.clear();
-        assert!(matches!(shield.check(), Err(Error::HarnessTarget(h)) if h == "/mnt/data"));
+        let (mut project, root) = project_with_dirs(&["project", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.set_harness(Some("/mnt/data")).unwrap();
+        project.mounts.clear();
+        assert!(matches!(project.check(), Err(Error::HarnessTarget(h)) if h == "/mnt/data"));
     }
 
     #[test]
     fn mount_change_that_moves_the_harness_is_refused() {
-        let (mut shield, root) = shield_with_dirs(&["project", "outer", "inner"]);
-        shield.add_mount(&path(&root, "outer"), "/mnt", true).unwrap();
-        shield.add_mount(&path(&root, "inner"), "/mnt/sub", true).unwrap();
-        shield.set_harness(Some("/mnt/sub/agent")).unwrap();
+        let (mut project, root) = project_with_dirs(&["project", "outer", "inner"]);
+        project.add_mount(&path(&root, "outer"), "/mnt", true).unwrap();
+        project.add_mount(&path(&root, "inner"), "/mnt/sub", true).unwrap();
+        project.set_harness(Some("/mnt/sub/agent")).unwrap();
         assert!(matches!(
-            shield.remove_mount("/mnt/sub"),
+            project.remove_mount("/mnt/sub"),
             Err(Error::HarnessMount(h, m)) if h == "/mnt/sub/agent" && m == "/mnt/sub"
         ));
-        assert_eq!(shield.mounts.len(), 2);
-        shield.remove_mount("/mnt").unwrap();
+        assert_eq!(project.mounts.len(), 2);
+        project.remove_mount("/mnt").unwrap();
 
-        shield.set_harness(Some("/mnt/sub/deeper")).unwrap();
+        project.set_harness(Some("/mnt/sub/deeper")).unwrap();
         assert!(matches!(
-            shield.add_mount(&path(&root, "outer"), "/mnt/sub/deeper", true),
+            project.add_mount(&path(&root, "outer"), "/mnt/sub/deeper", true),
             Err(Error::HarnessMount(..))
         ));
-        assert_eq!(shield.mounts.len(), 1);
+        assert_eq!(project.mounts.len(), 1);
     }
 
     fn draft(name: &str, command: &str, cwd: &str) -> AppDraft {
@@ -1129,53 +1129,53 @@ mod tests {
 
     #[test]
     fn put_app_validates_name_command_and_cwd() {
-        let (mut shield, root) = shield_with_dirs(&["project/web", "data"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        let (mut project, root) = project_with_dirs(&["project/web", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
         for cwd in ["/workspace", "//workspace/web/", "/mnt/data", "/mnt/data/sub"] {
-            shield.put_app(draft(" web ", " pnpm dev ", cwd)).unwrap();
+            project.put_app(draft(" web ", " pnpm dev ", cwd)).unwrap();
         }
-        assert_eq!(shield.apps[0].name, "web");
-        assert_eq!(shield.apps[0].command, "pnpm dev");
-        assert_eq!(shield.apps[1].cwd, "/workspace/web");
+        assert_eq!(project.apps[0].name, "web");
+        assert_eq!(project.apps[0].command, "pnpm dev");
+        assert_eq!(project.apps[1].cwd, "/workspace/web");
 
-        assert!(matches!(shield.put_app(draft("", "x", "/workspace")), Err(Error::InvalidName(_))));
+        assert!(matches!(project.put_app(draft("", "x", "/workspace")), Err(Error::InvalidName(_))));
         for command in ["", "   ", "a\nb", &"x".repeat(COMMAND_LIMIT + 1)] {
             assert!(
-                matches!(shield.put_app(draft("a", command, "/workspace")), Err(Error::InvalidApp(..))),
+                matches!(project.put_app(draft("a", command, "/workspace")), Err(Error::InvalidApp(..))),
                 "{command:?}"
             );
         }
-        assert!(matches!(shield.put_app(draft("a", "x", "workspace")), Err(Error::InvalidGuestPath(_))));
-        assert!(matches!(shield.put_app(draft("a", "x", "/workspace/missing")), Err(Error::MissingPath(_))));
-        assert!(matches!(shield.put_app(draft("a", "x", "/etc")), Err(Error::GuestDirTarget(_))));
-        assert_eq!(shield.apps.len(), 4);
+        assert!(matches!(project.put_app(draft("a", "x", "workspace")), Err(Error::InvalidGuestPath(_))));
+        assert!(matches!(project.put_app(draft("a", "x", "/workspace/missing")), Err(Error::MissingPath(_))));
+        assert!(matches!(project.put_app(draft("a", "x", "/etc")), Err(Error::GuestDirTarget(_))));
+        assert_eq!(project.apps.len(), 4);
     }
 
     #[test]
     fn put_app_with_id_replaces_and_unknown_id_fails() {
-        let (mut shield, _) = shield_with_dirs(&["project"]);
-        let id = shield.put_app(draft("web", "pnpm dev", "/workspace")).unwrap();
-        shield
+        let (mut project, _) = project_with_dirs(&["project"]);
+        let id = project.put_app(draft("web", "pnpm dev", "/workspace")).unwrap();
+        project
             .put_app(AppDraft { id: Some(id.clone()), autostart: true, ..draft("api", "cargo run", "/workspace") })
             .unwrap();
-        assert_eq!(shield.apps.len(), 1);
-        assert_eq!((shield.apps[0].id.as_str(), shield.apps[0].name.as_str()), (id.as_str(), "api"));
-        assert!(shield.apps[0].autostart);
+        assert_eq!(project.apps.len(), 1);
+        assert_eq!((project.apps[0].id.as_str(), project.apps[0].name.as_str()), (id.as_str(), "api"));
+        assert!(project.apps[0].autostart);
         assert!(matches!(
-            shield.put_app(AppDraft { id: Some("nope".into()), ..draft("a", "x", "/workspace") }),
+            project.put_app(AppDraft { id: Some("nope".into()), ..draft("a", "x", "/workspace") }),
             Err(Error::AppNotFound)
         ));
-        shield.remove_app(&id).unwrap();
-        assert!(matches!(shield.remove_app(&id), Err(Error::AppNotFound)));
+        project.remove_app(&id).unwrap();
+        assert!(matches!(project.remove_app(&id), Err(Error::AppNotFound)));
     }
 
     #[test]
     fn check_refuses_an_app_without_its_mount() {
-        let (mut shield, root) = shield_with_dirs(&["project", "data"]);
-        shield.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        shield.put_app(draft("web", "x", "/mnt/data")).unwrap();
-        shield.remove_mount("/mnt/data").unwrap();
-        assert!(matches!(shield.check(), Err(Error::AppCwd(n, c)) if n == "web" && c == "/mnt/data"));
+        let (mut project, root) = project_with_dirs(&["project", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        project.put_app(draft("web", "x", "/mnt/data")).unwrap();
+        project.remove_mount("/mnt/data").unwrap();
+        assert!(matches!(project.check(), Err(Error::AppCwd(n, c)) if n == "web" && c == "/mnt/data"));
     }
 
     #[test]
@@ -1192,8 +1192,8 @@ mod tests {
 
     #[test]
     fn set_layout_keeps_finite_positions() {
-        let (mut shield, _) = shield_with_dirs(&["project"]);
-        shield.set_layout(Some(
+        let (mut project, _) = project_with_dirs(&["project"]);
+        project.set_layout(Some(
             [
                 ("harness".to_owned(), Pos { x: 1.0, y: 2.0 }),
                 ("host:a.io".to_owned(), Pos { x: f64::NAN, y: 0.0 }),
@@ -1201,26 +1201,26 @@ mod tests {
             ]
             .into(),
         ));
-        assert_eq!(shield.layout.keys().collect::<Vec<_>>(), ["harness"]);
-        shield.set_layout(None);
-        assert!(shield.layout.is_empty());
+        assert_eq!(project.layout.keys().collect::<Vec<_>>(), ["harness"]);
+        project.set_layout(None);
+        assert!(project.layout.is_empty());
     }
 
     #[test]
     fn rename_trims_and_limits() {
-        let (mut shield, _) = shield_with_dirs(&["project"]);
-        shield.rename("  api  ").unwrap();
-        assert_eq!(shield.name, "api");
-        shield.rename(&"ü".repeat(64)).unwrap();
+        let (mut project, _) = project_with_dirs(&["project"]);
+        project.rename("  api  ").unwrap();
+        assert_eq!(project.name, "api");
+        project.rename(&"ü".repeat(64)).unwrap();
         for name in ["", "   ", "a\nb", "tab\there", &"x".repeat(65)] {
-            assert!(matches!(shield.rename(name), Err(Error::InvalidName(_))), "{name:?}");
+            assert!(matches!(project.rename(name), Err(Error::InvalidName(_))), "{name:?}");
         }
-        assert_eq!(shield.name, "ü".repeat(64));
+        assert_eq!(project.name, "ü".repeat(64));
     }
 
     #[test]
     fn list_folders_returns_visible_real_directories() {
-        let (_, root) = shield_with_dirs(&["project/web", "project/api", "project/.git", "outside"]);
+        let (_, root) = project_with_dirs(&["project/web", "project/api", "project/.git", "outside"]);
         let folder = root.join("project");
         std::fs::write(folder.join("README.md"), "x").unwrap();
         std::os::unix::fs::symlink(root.join("outside"), folder.join("link")).unwrap();
@@ -1229,7 +1229,7 @@ mod tests {
 
     #[test]
     fn list_folders_caps_the_count() {
-        let (_, root) = shield_with_dirs(&["project"]);
+        let (_, root) = project_with_dirs(&["project"]);
         let folder = root.join("project");
         for i in 0..60 {
             std::fs::create_dir(folder.join(format!("d{i:02}"))).unwrap();
@@ -1282,7 +1282,7 @@ mod tests {
 
     #[test]
     fn host_agents_keep_one_entry_and_one_login_per_kind() {
-        let mut shield = Shield::new(temp_dir("host").to_str().unwrap()).unwrap();
+        let mut project = Project::new(temp_dir("host").to_str().unwrap()).unwrap();
         let login = |agent| Secret {
             name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
             hosts: vec!["api.anthropic.com".into()],
@@ -1290,57 +1290,57 @@ mod tests {
             origin: Origin::HostLogin { agent },
         };
         let claude = |profile, login| HostAgentUse { kind: AgentKind::Claude, profile, login };
-        shield.put_host_agent(claude(true, true), Some(login(AgentKind::Claude)));
-        shield.put_host_agent(claude(false, true), Some(login(AgentKind::Claude)));
-        shield.check().unwrap();
-        assert_eq!((shield.host_agents.len(), shield.logins.len()), (1, 1));
-        assert!(!shield.host_agents[0].profile);
+        project.put_host_agent(claude(true, true), Some(login(AgentKind::Claude)));
+        project.put_host_agent(claude(false, true), Some(login(AgentKind::Claude)));
+        project.check().unwrap();
+        assert_eq!((project.host_agents.len(), project.logins.len()), (1, 1));
+        assert!(!project.host_agents[0].profile);
 
         // The login off removes its secret.
-        shield.put_host_agent(claude(false, false), None);
-        assert!(shield.logins.is_empty());
-        shield.check().unwrap();
+        project.put_host_agent(claude(false, false), None);
+        assert!(project.logins.is_empty());
+        project.check().unwrap();
 
         // A host-login secret with no host login, and two entries of a kind, are refused.
-        shield.logins.push(login(AgentKind::Claude));
-        assert!(matches!(shield.check(), Err(Error::InvalidSecret(..))));
-        shield.remove_host_agent(AgentKind::Claude);
-        assert!(shield.logins.is_empty() && shield.host_agents.is_empty());
-        shield.host_agents = vec![claude(false, false), claude(true, false)];
-        assert!(matches!(shield.check(), Err(Error::DuplicateHostAgent(_))));
+        project.logins.push(login(AgentKind::Claude));
+        assert!(matches!(project.check(), Err(Error::InvalidSecret(..))));
+        project.remove_host_agent(AgentKind::Claude);
+        assert!(project.logins.is_empty() && project.host_agents.is_empty());
+        project.host_agents = vec![claude(false, false), claude(true, false)];
+        assert!(matches!(project.check(), Err(Error::DuplicateHostAgent(_))));
     }
 
     #[test]
     fn pi_copilot_login_conflicts_with_a_github_api_credential() {
         use crate::network::{Action, Credential, Inject, RuleDraft, Target};
 
-        let mut shield = Shield::new(temp_dir("copilot").to_str().unwrap()).unwrap();
+        let mut project = Project::new(temp_dir("copilot").to_str().unwrap()).unwrap();
         let pi = HostAgentUse { kind: AgentKind::Pi, profile: false, login: true };
-        shield.put_host_agent(pi, Some(login::secret(AgentKind::Pi, "api.business.githubcopilot.com")));
+        project.put_host_agent(pi, Some(login::secret(AgentKind::Pi, "api.business.githubcopilot.com")));
         // Allowing GitHub is fine: the proxy blocks api.github.com anyway.
         let github = Target::Service { id: "github".into() };
-        let rule = shield.network.put_rule(RuleDraft { id: None, target: github, action: Action::Allow }).unwrap();
-        shield.check().unwrap();
+        let rule = project.network.put_rule(RuleDraft { id: None, target: github, action: Action::Allow }).unwrap();
+        project.check().unwrap();
 
         let token = Credential {
             name: "GITHUB_TOKEN".into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
         };
-        shield.network.rule_mut(&rule).unwrap().credentials.push(token.clone());
-        let err = shield.check().unwrap_err();
+        project.network.rule_mut(&rule).unwrap().credentials.push(token.clone());
+        let err = project.check().unwrap_err();
         assert!(matches!(&err, Error::RefreshHostConflict(h, _) if h == "api.github.com"), "{err}");
         // On a Block rule the credential is inactive, so it may stay.
-        shield.network.rule_mut(&rule).unwrap().action = Action::Block;
-        shield.check().unwrap();
-        shield.network.rule_mut(&rule).unwrap().action = Action::Allow;
-        assert!(matches!(shield.check(), Err(Error::RefreshHostConflict(..))));
+        project.network.rule_mut(&rule).unwrap().action = Action::Block;
+        project.check().unwrap();
+        project.network.rule_mut(&rule).unwrap().action = Action::Allow;
+        assert!(matches!(project.check(), Err(Error::RefreshHostConflict(..))));
         // Without the login, the GitHub API is open again.
-        shield.remove_host_agent(AgentKind::Pi);
-        shield.check().unwrap();
+        project.remove_host_agent(AgentKind::Pi);
+        project.check().unwrap();
         // A credential may not take the name of a host login.
         let claude = HostAgentUse { kind: AgentKind::Claude, profile: false, login: true };
-        shield.put_host_agent(claude, Some(login::secret(AgentKind::Claude, "api.anthropic.com")));
-        shield.network.rule_mut(&rule).unwrap().credentials[0].name = "CLAUDE_CODE_OAUTH_TOKEN".into();
-        assert!(matches!(shield.check(), Err(Error::DuplicateSecret(_))));
+        project.put_host_agent(claude, Some(login::secret(AgentKind::Claude, "api.anthropic.com")));
+        project.network.rule_mut(&rule).unwrap().credentials[0].name = "CLAUDE_CODE_OAUTH_TOKEN".into();
+        assert!(matches!(project.check(), Err(Error::DuplicateSecret(_))));
     }
 }

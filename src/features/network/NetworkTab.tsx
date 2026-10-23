@@ -33,7 +33,7 @@ import {
   AGENT_NAMES,
   DefaultAction,
   Rule,
-  ShieldView,
+  ProjectView,
   Target,
 } from "../../shared/api";
 import type { Intent, Run } from "../../App";
@@ -73,7 +73,7 @@ function domainError(input: string) {
 }
 
 interface Props {
-  shield: ShieldView;
+  project: ProjectView;
   events: NetEvent[];
   run: Run;
   intent?: Intent;
@@ -85,7 +85,7 @@ interface Props {
 }
 
 export function NetworkTab({
-  shield,
+  project,
   events,
   run,
   intent,
@@ -93,7 +93,7 @@ export function NetworkTab({
   active,
   onSeen,
 }: Props) {
-  const { id, network } = shield;
+  const { id, network } = project;
   const catalog = useCatalog();
   const [adding, setAdding] = useState<"service" | "host">();
   const [host, setHost] = useState("");
@@ -106,7 +106,7 @@ export function NetworkTab({
   const activity = useRef<HTMLDivElement>(null);
   const [activityVisible, setActivityVisible] = useState(false);
   const latestSeq = events[events.length - 1]?.seq ?? 0;
-  const running = shield.status.state === "running";
+  const running = project.status.state === "running";
 
   useEffect(() => {
     if (intent?.kind !== "addRule") return;
@@ -164,10 +164,10 @@ export function NetworkTab({
   );
 
   const loginsOf = (rule: Rule) =>
-    shield.logins.filter((l) =>
+    project.logins.filter((l) =>
       l.hosts.some((h) => ruleDomains(rule, catalog).some((d) => covers(d, h))),
     );
-  const blockedNeeds = shield.agentNeeds.filter((need) => !need.allowed);
+  const blockedNeeds = project.agentNeeds.filter((need) => !need.allowed);
   const unused = catalog.filter(
     (s) =>
       !network.rules.some(
@@ -238,7 +238,7 @@ export function NetworkTab({
               disabled={
                 !running || test === "running" || testHost.trim() === ""
               }
-              title={running ? undefined : "Start the shield to test"}
+              title={running ? undefined : "Start the cage to test"}
             >
               {test === "running" ? "Testing…" : "Test"}
             </Button>
@@ -382,7 +382,7 @@ export function NetworkTab({
                   )}
                   {credentialsOf === rule.id && takesCredentials && (
                     <RuleCredentials
-                      shield={shield}
+                      project={project}
                       rule={rule}
                       catalog={catalog}
                       run={run}
@@ -478,7 +478,7 @@ export function NetworkTab({
 
       <div ref={activity}>
         <NetworkActivity
-          shield={shield}
+          project={project}
           events={events}
           catalog={catalog}
           run={run}

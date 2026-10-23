@@ -1,19 +1,19 @@
 import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
 import { Code, Columns2, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, PointerEvent, useRef, useState } from "react";
-import type { PaneNode, ShieldStatus } from "../../shared/api";
+import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
-import { KindIcon, paneName } from "../shields/ShieldRail";
-import { StartProgress } from "../shields/StartProgress";
+import { KindIcon, paneName } from "../projects/ProjectRail";
+import { StartProgress } from "../projects/StartProgress";
 import { Path, place, Rect, setRatio } from "./panes";
 import { TerminalView } from "./TerminalView";
 
 interface Props {
-  /** The layout of the shown shield. */
+  /** The layout of the shown project. */
   layout: PaneNode | null;
-  /** The status of the shown shield. A VM pane shows the phase of its start. */
-  status: ShieldStatus;
-  /** The terminals of all shields. Each one with a session stays attached, also while it is not shown. */
+  /** The status of the shown project. A VM pane shows the phase of its start. */
+  status: CageStatus;
+  /** The terminals of all projects. Each one with a session stays attached, also while it is not shown. */
   panes: Pane[];
   focused?: string;
   visible: boolean;
@@ -45,7 +45,7 @@ const body = (r: Rect): CSSProperties => ({
   height: `calc(${r.height * 100}% - var(--zw-pane-header))`,
 });
 
-/** The panes of the shown shield side by side, with dividers that drag. */
+/** The panes of the shown project side by side, with dividers that drag. */
 export function PaneLayout({
   layout,
   status,

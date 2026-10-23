@@ -46,13 +46,13 @@ export interface NetStage {
   detail: string;
 }
 
-/** `target` is null if the shield did not reach its proxy. */
+/** `target` is null if the project did not reach its proxy. */
 export interface NetTest {
   proxy: NetStage;
   target: NetStage | null;
 }
 
-/** First the shield reaches its proxy, then the host through it. */
+/** First the project reaches its proxy, then the host through it. */
 export const testNetwork = (id: string, host: string) =>
   call<NetTest>("test_network", { id, host });
 
@@ -60,7 +60,7 @@ export const testNetwork = (id: string, host: string) =>
 export const wildcardFor = (host: string) =>
   call<string | null>("wildcard_for", { host });
 
-/** A request of the proxy log, or a direct connection that the VM blocked. `seq` counts per shield; `at` is in ms since the epoch. */
+/** A request of the proxy log, or a direct connection that the VM blocked. `seq` counts per project; `at` is in ms since the epoch. */
 export interface NetEvent {
   seq: number;
   at: number;
@@ -83,14 +83,14 @@ export interface NetEvent {
   note?: string;
 }
 
-/** The events that the backend keeps for the shield, oldest first. */
-export const listNetEvents = (shieldId: string) =>
-  call<NetEvent[]>("list_net_events", { shieldId });
+/** The events that the backend keeps for the project, oldest first. */
+export const listNetEvents = (projectId: string) =>
+  call<NetEvent[]>("list_net_events", { projectId });
 
 /** Resolves to the function that stops the listener. */
 export const onNetEvent = (
-  handler: (shieldId: string, event: NetEvent) => void,
+  handler: (projectId: string, event: NetEvent) => void,
 ) =>
-  listen<{ shieldId: string; event: NetEvent }>("net-event", ({ payload }) =>
-    handler(payload.shieldId, payload.event),
+  listen<{ projectId: string; event: NetEvent }>("net-event", ({ payload }) =>
+    handler(payload.projectId, payload.event),
   );

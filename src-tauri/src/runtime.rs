@@ -10,10 +10,10 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
+use crate::cage::{Project, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::netlog;
 use crate::runtimes::Installed;
-use crate::shield::{Shield, WORKSPACE};
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -44,7 +44,7 @@ pub enum SessionKind {
     /// A login shell in the VM. The UI calls it "VM shell"; the name stays
     /// `shell`, so saved terminals load.
     Shell,
-    /// The user's login shell on the Mac, unsandboxed, in the shield's folder.
+    /// The user's login shell on the Mac, unsandboxed, in the project's folder.
     Host,
     /// The agent's own TUI, through its wrapper. `resume` continues the
     /// agent's last session.
@@ -71,7 +71,7 @@ impl SessionKind {
 /// of [`launch::PROFILE`] puts the wrappers back.
 pub const PTY_ENV: [(&str, &str); 3] = [("PATH", launch::PATH), ("TERM", "xterm-256color"), ("COLORTERM", "truecolor")];
 
-/// What the guest needs to use the shield's proxy: the host port that the
+/// What the guest needs to use the cage's proxy: the host port that the
 /// VM may reach, and the env of every process (see [`launch::net_env`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestNet {
@@ -129,17 +129,17 @@ pub struct Pipe {
     pub events: Receiver<PipeEvent>,
 }
 
-/// The seam between the shield manager and the VM backend, so tests do not boot VMs.
+/// The seam between the project manager and the VM backend, so tests do not boot VMs.
 pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
     /// The VM reaches only `net.port` on the host. `state` is the host dir
-    /// of the shield's agent state. Each runtime in `runtimes` is mounted
+    /// of the project's agent state. Each runtime in `runtimes` is mounted
     /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
     /// its guest path.
     fn start(
         &self,
-        shield: &Shield,
+        project: &Project,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
@@ -164,7 +164,7 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
 }
 
-/// The outer wall of the shield (ADR 0003): all egress is denied but TCP to
+/// The outer wall of the cage (ADR 0003): all egress is denied but TCP to
 /// the proxy's port on the host, with no DNS. Ingress is denied. The VM runs
 /// with the SingleTenant profile: the public-only floor of MultiTenant
 /// denies the host, so the guest could not reach the proxy.
@@ -179,8 +179,8 @@ pub fn sandbox_policy(port: u16) -> Result<microsandbox::NetworkPolicy> {
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-/// The shield id of a VM name that [`Microsandbox`] gave.
-pub fn shield_id(vm_name: &str) -> Option<&str> {
+/// The project id of a VM name that [`Microsandbox`] gave.
+pub fn project_id(vm_name: &str) -> Option<&str> {
     vm_name.strip_prefix(NAME_PREFIX)
 }
 
@@ -238,14 +238,14 @@ impl SandboxRuntime for Microsandbox {
 
     async fn start(
         &self,
-        shield: &Shield,
+        project: &Project,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<Sandbox> {
         let policy = sandbox_policy(net.port)?;
-        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", shield.id))
+        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", project.id))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
             .deployment_profile(DeploymentProfile::SingleTenant)
@@ -254,8 +254,8 @@ impl SandboxRuntime for Microsandbox {
             // The network events are debug lines of the runtime log.
             .log_level(LogLevel::Debug)
             .workdir(WORKSPACE)
-            .volume(WORKSPACE, |m| m.bind(&shield.folder));
-        for mount in &shield.mounts {
+            .volume(WORKSPACE, |m| m.bind(&project.folder));
+        for mount in &project.mounts {
             builder = builder.volume(&mount.guest, |m| {
                 let m = m.bind(&mount.host);
                 if mount.readonly { m.readonly() } else { m }
@@ -280,7 +280,7 @@ impl SandboxRuntime for Microsandbox {
     }
 
     /// A graceful stop has no deadline in microsandbox, so a stuck VM is
-    /// killed. The shield then always leaves the Stopping state.
+    /// killed. The cage then always leaves the Stopping state.
     async fn stop(&self, vm: &Sandbox) -> Result<()> {
         if vm.stop_with_timeout(STOP_LIMIT).await.is_ok() {
             return Ok(());
@@ -499,7 +499,7 @@ pub mod fake {
     }
 
     pub struct FakeVm {
-        pub shield_id: String,
+        pub project_id: String,
     }
 
     impl SandboxRuntime for FakeRuntime {
@@ -507,7 +507,7 @@ pub mod fake {
 
         async fn start(
             &self,
-            shield: &Shield,
+            project: &Project,
             net: &GuestNet,
             _: &Path,
             runtimes: &[Installed],
@@ -520,9 +520,9 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.log.lock().unwrap().push(format!("start {}", shield.id));
+            self.log.lock().unwrap().push(format!("start {}", project.id));
             *self.net.lock().unwrap() = Some(net.clone());
-            Ok(FakeVm { shield_id: shield.id.clone() })
+            Ok(FakeVm { project_id: project.id.clone() })
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {
@@ -536,7 +536,7 @@ pub mod fake {
                 tokio::time::sleep(delay).await;
             }
             self.stopping.fetch_sub(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push(format!("stop {}", vm.shield_id));
+            self.log.lock().unwrap().push(format!("stop {}", vm.project_id));
             Ok(())
         }
 

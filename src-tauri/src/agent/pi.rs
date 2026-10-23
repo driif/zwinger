@@ -1,4 +1,4 @@
-//! The pi agent: the bundled pi, or the host install that a shield mounts.
+//! The pi agent: the bundled pi, or the host install that a cage mounts.
 
 use std::path::{Path, PathBuf};
 
@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 
 /// The pi bundle, mounted read-only.
 pub const PI_DIR: &str = "/opt/zwinger/pi";
-/// The host install of pi, mounted read-only when the shield uses it.
+/// The host install of pi, mounted read-only when the project uses it.
 pub const HOST_DIR: &str = "/opt/zwinger/host/pi";
 /// The entry point in the host package. Detection accepts only this layout.
 pub const HOST_ENTRY: &str = "dist/cli.js";

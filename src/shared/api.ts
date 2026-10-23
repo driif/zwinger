@@ -21,13 +21,13 @@ export async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
 }
 
 /**
- * `host`: the user's login shell on the Mac, unsandboxed, in the shield folder. `shell`: a VM shell in /workspace.
+ * `host`: the user's login shell on the Mac, unsandboxed, in the project folder. `shell`: a VM shell in /workspace.
  * `agent`: an agent's own TUI in the harness; `resume` continues the agent's last session.
  */
 export type SessionKind =
   { type: "host" } | { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
 
-/** The split tree of a shield's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
+/** The split tree of a project's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
 export type PaneNode =
   | { type: "split"; direction: "row" | "column"; ratio: number; a: PaneNode; b: PaneNode }
   | { type: "leaf"; terminal: string };
@@ -95,7 +95,7 @@ export interface HostLogin {
   origin: { kind: "hostLogin"; agent: AgentKind };
 }
 
-/** A phase of a shield start. */
+/** A phase of a cage start. */
 export type StartPhase =
   | { step: "vault" | "prepare" | "proxy" | "boot" | "guest" | "node" | "tui" | "gemini" | "setup" | "trust" | "wrappers" | "apps" }
   | { step: "profile"; agent: AgentKind };
@@ -106,7 +106,7 @@ export interface StartTimings {
   totalMs: number;
 }
 
-export type ShieldStatus =
+export type CageStatus =
   | { state: "stopped" }
   | { state: "starting"; phase: StartPhase }
   | { state: "running" }
@@ -121,7 +121,7 @@ export interface SessionView {
   terminalId: string | null;
 }
 
-/** A host shell, VM shell or agent terminal of a shield. With no session it is dormant, and it can open again. */
+/** A host shell, VM shell or agent terminal of a project. With no session it is dormant, and it can open again. */
 export interface Terminal {
   id: string;
   kind: SessionKind;
@@ -132,7 +132,7 @@ export interface Pos {
   y: number;
 }
 
-/** A saved, named, long-running command of a shield. */
+/** A saved, named, long-running command of a project. */
 export interface App {
   id: string;
   name: string;
@@ -168,14 +168,14 @@ export interface Task {
   workdir: string;
 }
 
-/** A host agent of a shield: its runtime, and its read-only profile and host login if set. */
+/** A host agent of a project: its runtime, and its read-only profile and host login if set. */
 export interface HostAgentUse {
   kind: AgentKind;
   profile: boolean;
   login: boolean;
 }
 
-export interface ShieldView {
+export interface ProjectView {
   id: string;
   name: string;
   folder: string;
@@ -192,14 +192,14 @@ export interface ShieldView {
   terminals: Terminal[];
   /** `null`: no pane is open. */
   paneLayout: PaneNode | null;
-  status: ShieldStatus;
+  status: CageStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
   appRuns: AppRun[];
   /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
   runtimes: ("claude" | "codex" | "gemini")[];
   hostAgents: HostAgentUse[];
-  /** The agent commands skip their permission prompts: the shield is the sandbox. */
+  /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
   /** The earliest expiry of the host logins that the proxy has now, in ms since the epoch. The proxy reads a newer login when it is due. */
   loginExpiresAt: number | null;
@@ -207,7 +207,7 @@ export interface ShieldView {
   hostNotices: string[];
   /** The agents of the running VM with a login made in the guest: the agent can read its real token. */
   guestLogins: AgentKind[];
-  /** The hosts that the shield's agents need, with the proxy's decision on each. */
+  /** The hosts that the project's agents need, with the proxy's decision on each. */
   agentNeeds: AgentNeed[];
   /** The phase durations of the start of the running VM. */
   startTimings: StartTimings | null;

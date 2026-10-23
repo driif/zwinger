@@ -13,5 +13,5 @@ export function errorMessage(e: unknown): string {
   return String(e);
 }
 
-/** The backend's error variant, such as `ShieldsRunning`. */
+/** The backend's error variant, such as `CagesRunning`. */
 export const errorCode = (e: unknown) => (isBackendError(e) ? e.code : undefined);

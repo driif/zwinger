@@ -1,4 +1,4 @@
-//! The shared fixture of the shield and terminal tests.
+//! The shared fixture of the project and terminal tests.
 
 pub(crate) use std::collections::BTreeMap;
 pub(crate) use std::path::{Path, PathBuf};
@@ -9,6 +9,10 @@ pub(crate) use tokio::sync::mpsc;
 pub(crate) use tokio::time::Instant;
 
 pub(crate) use crate::agent::{AgentKind, launch};
+pub(crate) use crate::cage::manager::*;
+pub(crate) use crate::cage::network::*;
+pub(crate) use crate::cage::progress::Phase;
+pub(crate) use crate::cage::{self, AppDraft, HostAgentUse, Pos, TaskDraft, WORKSPACE};
 pub(crate) use crate::error::{Error, Result};
 pub(crate) use crate::host_agents::HostAgents;
 pub(crate) use crate::host_agents::fake::{FakeClock, FakeFs};
@@ -24,10 +28,6 @@ pub(crate) use crate::runtime::{Bind, PipeEvent, PtyEvent, PtyInput, SandboxRunt
 pub(crate) use crate::runtimes;
 pub(crate) use crate::secrets::fake::MemoryVault;
 pub(crate) use crate::secrets::{self, SecretValue, Vault};
-pub(crate) use crate::shield::manager::*;
-pub(crate) use crate::shield::network::*;
-pub(crate) use crate::shield::progress::Phase;
-pub(crate) use crate::shield::{self, AppDraft, HostAgentUse, Pos, TaskDraft, WORKSPACE};
 pub(crate) use crate::store::Store;
 pub(crate) use crate::terminal::output::*;
 
@@ -67,7 +67,8 @@ pub(crate) fn manager_with_vault() -> (Manager<FakeRuntime>, FakeRuntime, String
     let runtime = FakeRuntime::default();
     let vault = vault();
     let manager =
-        Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host()).unwrap();
+        Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
+            .unwrap();
     let id = manager.create(dir.to_str().unwrap()).unwrap();
     (manager, runtime, id, vault)
 }
@@ -116,10 +117,10 @@ pub(crate) fn credential<R: SandboxRuntime>(
 }
 
 pub(crate) fn live(manager: &Manager<FakeRuntime>, id: &str) -> Arc<Live> {
-    lock(&manager.state).live.get(id).cloned().expect("the shield has a proxy")
+    lock(&manager.state).live.get(id).cloned().expect("the cage has a proxy")
 }
 
-/// Stops the shield (and in the second case starts it again) while
+/// Stops the cage (and in the second case starts it again) while
 /// `open_pty` is held, then releases it.
 pub(crate) async fn open_during(restart: bool) {
     let (manager, runtime, id) = manager();
@@ -188,7 +189,7 @@ pub(crate) fn task_draft(id: Option<String>, title: &str, kinds: [AgentKind; 2])
         id,
         title: title.into(),
         request: "  Fix the map.  ".into(),
-        agents: kinds.map(|kind| shield::TaskAgent { kind, model: None }),
+        agents: kinds.map(|kind| cage::TaskAgent { kind, model: None }),
         gates: vec!["pnpm build".into(), "  ".into()],
         workdir: "/workspace".into(),
     }
@@ -218,7 +219,7 @@ pub(crate) async fn until(mut done: impl FnMut() -> bool) {
 }
 
 pub(crate) fn terminal_ids(manager: &Manager<FakeRuntime>) -> Vec<String> {
-    manager.list()[0].shield.terminals.iter().map(|t| t.id.clone()).collect()
+    manager.list()[0].project.terminals.iter().map(|t| t.id.clone()).collect()
 }
 
 pub(crate) async fn app_start_during(remove: bool) {
@@ -274,20 +275,20 @@ pub(crate) struct GatedVault {
 }
 
 impl Vault for GatedVault {
-    fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
         if let Some((entered, release)) = self.gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv().unwrap();
         }
-        self.inner.set(shield_id, name, value)
+        self.inner.set(project_id, name, value)
     }
 
-    fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        self.inner.get(shield_id, name)
+    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        self.inner.get(project_id, name)
     }
 
-    fn delete(&self, shield_id: &str, name: &str) -> Result<()> {
-        self.inner.delete(shield_id, name)
+    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
+        self.inner.delete(project_id, name)
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
@@ -329,7 +330,7 @@ pub(crate) fn host_manager(
     let vault = vault();
     let host = host_with(mac(&home), logins, now);
     let manager =
-        Manager::new(runtime.clone(), Store::new(dir.join("shields.json")), vault.clone(), temp_dir(), host).unwrap();
+        Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host).unwrap();
     let id = manager.create(dir.to_str().unwrap()).unwrap();
     (manager, runtime, id, vault)
 }
@@ -345,7 +346,7 @@ pub(crate) fn manager_with_host() -> (Manager<FakeRuntime>, FakeRuntime, String)
 
 /// The hosts of the rules with a credential.
 pub(crate) fn holders(manager: &Manager<FakeRuntime>) -> Vec<String> {
-    let rules = manager.list().remove(0).shield.network.rules;
+    let rules = manager.list().remove(0).project.network.rules;
     rules.iter().filter(|r| !r.credentials.is_empty()).map(|r| r.label()).collect()
 }
 

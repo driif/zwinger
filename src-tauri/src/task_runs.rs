@@ -1,4 +1,4 @@
-//! Task runs: two agents of a shield plan, agree, build and review a task,
+//! Task runs: two agents of a project plan, agree, build and review a task,
 //! with the duo stages. One tokio task per run is the only writer of its
 //! round; the user controls it through a channel.
 //!
@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::agent::cli::{iso, now_ms};
+use crate::cage::Task;
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
-use crate::shield::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
 use crate::task_artifacts::{RoundWriter, TURNS};
 
@@ -59,7 +59,7 @@ pub enum Control {
         text: String,
     },
     Cancel {
-        /// Set by the app, as for a shield stop. The user's cancel has none.
+        /// Set by the app, as for a cage stop. The user's cancel has none.
         #[serde(skip)]
         reason: Option<String>,
     },
@@ -169,7 +169,7 @@ impl Cancel {
 
 /// An in-app run, as the commands see it.
 pub struct RunHandle {
-    pub shield_id: String,
+    pub project_id: String,
     pub task_id: String,
     pub run: String,
     pub agents: [String; 2],
@@ -243,7 +243,7 @@ pub struct Registry {
 
 /// What a run needs to start.
 pub struct Spec<R: SandboxRuntime> {
-    pub shield_id: String,
+    pub project_id: String,
     pub task: Task,
     pub run: String,
     pub exec: Exec<R>,
@@ -252,12 +252,14 @@ pub struct Spec<R: SandboxRuntime> {
 }
 
 impl Registry {
-    pub fn find(&self, shield_id: &str, task_id: &str, run: &str) -> Option<Arc<RunHandle>> {
-        lock(&self.runs).iter().find(|r| r.shield_id == shield_id && r.task_id == task_id && r.run == run).cloned()
+    pub fn find(&self, project_id: &str, task_id: &str, run: &str) -> Option<Arc<RunHandle>> {
+        lock(&self.runs).iter().find(|r| r.project_id == project_id && r.task_id == task_id && r.run == run).cloned()
     }
 
-    pub fn is_running(&self, shield_id: &str, task_id: &str) -> bool {
-        lock(&self.runs).iter().any(|r| r.shield_id == shield_id && r.task_id == task_id && r.status().state.is_live())
+    pub fn is_running(&self, project_id: &str, task_id: &str) -> bool {
+        lock(&self.runs)
+            .iter()
+            .any(|r| r.project_id == project_id && r.task_id == task_id && r.status().state.is_live())
     }
 
     pub fn start<R: SandboxRuntime>(&self, spec: Spec<R>) -> Arc<RunHandle> {
@@ -275,7 +277,7 @@ impl Registry {
         });
         let live = Arc::new(Live { tx: broadcast::channel(LIVE_QUEUE).0, recent: Mutex::new(VecDeque::new()) });
         let handle = Arc::new(RunHandle {
-            shield_id: spec.shield_id.clone(),
+            project_id: spec.project_id.clone(),
             task_id: spec.task.id.clone(),
             run: spec.run.clone(),
             agents: names.clone(),
@@ -305,17 +307,17 @@ impl Registry {
         };
         tokio::spawn(actor.run());
         let mut runs = lock(&self.runs);
-        runs.retain(|r| !(r.shield_id == handle.shield_id && r.task_id == handle.task_id && r.run == handle.run));
+        runs.retain(|r| !(r.project_id == handle.project_id && r.task_id == handle.task_id && r.run == handle.run));
         runs.push(handle.clone());
         handle
     }
 
-    /// Cancels the live runs of a shield and waits up to `limit` until each
+    /// Cancels the live runs of a project and waits up to `limit` until each
     /// one has written its manifest.
-    pub async fn cancel_shield(&self, shield_id: &str, reason: &str, limit: Duration) {
+    pub async fn cancel_project(&self, project_id: &str, reason: &str, limit: Duration) {
         let runs: Vec<Arc<RunHandle>> = lock(&self.runs)
             .iter()
-            .filter(|r| r.shield_id == shield_id && r.status().state.is_live())
+            .filter(|r| r.project_id == project_id && r.status().state.is_live())
             .cloned()
             .collect();
         for run in &runs {
@@ -330,9 +332,9 @@ impl Registry {
         .await;
     }
 
-    /// Forgets the runs of a shield or of one of its tasks.
-    pub fn forget(&self, shield_id: &str, task_id: Option<&str>) {
-        lock(&self.runs).retain(|r| r.shield_id != shield_id || task_id.is_some_and(|t| r.task_id != t));
+    /// Forgets the runs of a project or of one of its tasks.
+    pub fn forget(&self, project_id: &str, task_id: Option<&str>) {
+        lock(&self.runs).retain(|r| r.project_id != project_id || task_id.is_some_and(|t| r.task_id != t));
     }
 }
 
@@ -1384,9 +1386,9 @@ mod tests {
 
     use super::*;
     use crate::agent::AgentKind;
+    use crate::cage::TaskAgent;
     use crate::runtime::fake::{FakePipe, FakeRuntime, FakeVm};
     use crate::runtime::{PipeEvent, PipeInput};
-    use crate::shield::TaskAgent;
     use crate::task_agents::{claude_result_line, codex_result_lines};
     use crate::task_artifacts::{Mirror, read_room};
 
@@ -1636,12 +1638,12 @@ mod tests {
         };
         let registry = Registry::default();
         let handle = registry.start(Spec {
-            shield_id: "s".into(),
+            project_id: "s".into(),
             task,
             run: "01".into(),
             exec: Exec {
                 runtime,
-                vm: Arc::new(FakeVm { shield_id: "s".into() }),
+                vm: Arc::new(FakeVm { project_id: "s".into() }),
                 cwd: "/workspace".into(),
                 artifacts: Some("/workspace/.zwinger/tasks/fix/01".into()),
                 pi_host: false,
@@ -1872,8 +1874,8 @@ mod tests {
         .await
         .unwrap();
         run.handle.control(Control::Cancel { reason: None }).unwrap();
-        // A shield stop that races with it does not settle again.
-        let _ = run.handle.control.send(Control::Cancel { reason: Some("the shield stopped".into()) });
+        // A cage stop that races with it does not settle again.
+        let _ = run.handle.control.send(Control::Cancel { reason: Some("the cage stopped".into()) });
         let manifest = settled(&run).await;
         assert_eq!(run.handle.status().state, RunState::Cancelled);
         assert_eq!(manifest["stopped"], "cancelled by the user");
@@ -2116,7 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_shield_stop_cancels_a_snapshot_with_its_reason() {
+    async fn a_cage_stop_cancels_a_snapshot_with_its_reason() {
         let run = start_full(
             Duration::from_secs(5),
             |script| if is_snapshot(script) { Fake::Hang } else { no_git(script) },
@@ -2129,10 +2131,10 @@ mod tests {
         })
         .await
         .unwrap();
-        run.registry.cancel_shield("s", "the shield stopped", Duration::from_secs(5)).await;
+        run.registry.cancel_project("s", "the cage stopped", Duration::from_secs(5)).await;
         assert_eq!(run.handle.status().state, RunState::Cancelled);
         let manifest = settled(&run).await;
-        assert_eq!(manifest["stopped"], "the shield stopped");
+        assert_eq!(manifest["stopped"], "the cage stopped");
         assert_eq!(manifest["violations"], json!([]));
         assert!(calls_of(&run, Stage::Plan).is_empty());
         let events = events(&run);

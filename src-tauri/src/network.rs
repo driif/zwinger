@@ -1,4 +1,4 @@
-//! The network policy of a shield (ADR 0003): one default, a list of Allow
+//! The network policy of a project (ADR 0003): one default, a list of Allow
 //! and Block rules where Block always wins, and the always-blocked floor in
 //! the proxy. A credential belongs to a rule; the proxy injects it only for
 //! an Allow rule. On a Block rule it is inactive. The service catalog ships
@@ -7,12 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
+use crate::cage::{self, Project};
 use crate::error::{Error, Result};
 use crate::host_agents::{self, login};
 use crate::proxy::decide::{self, Decision};
 use crate::runtime::SessionKind;
 use crate::secrets::{self, Origin, Places};
-use crate::shield::{self, Shield};
 
 /// The marks of a credential template that the proxy replaces.
 pub const SECRET_MARK: &str = "{secret}";
@@ -20,7 +20,7 @@ pub const SECRET_MARK: &str = "{secret}";
 const BASIC_MARK: &str = "{basic:";
 /// The longest template.
 const TEMPLATE_LIMIT: usize = 512;
-/// The most rules of a shield.
+/// The most rules of a project.
 const RULE_LIMIT: usize = 500;
 /// The most credentials of one rule.
 const CREDENTIAL_LIMIT: usize = 16;
@@ -72,7 +72,7 @@ pub enum Inject {
     Replace { places: Places },
 }
 
-/// The value is in the vault, at the account `<shield>/<name>`. Rules can
+/// The value is in the vault, at the account `<project>/<name>`. Rules can
 /// share a name, and with it one value. The guest gets the placeholder in
 /// the variable `name`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +246,7 @@ impl NetworkPolicy {
             return Ok(id);
         }
         if self.rules.len() >= RULE_LIMIT {
-            return Err(Error::InvalidRule(format!("a shield has at most {RULE_LIMIT} rules")));
+            return Err(Error::InvalidRule(format!("a project has at most {RULE_LIMIT} rules")));
         }
         let rule = Rule::new(target, draft.action);
         let id = rule.id.clone();
@@ -329,7 +329,7 @@ fn normalize_target(target: Target) -> Result<Target> {
             Some(_) => Ok(Target::Service { id }),
             None => Err(Error::InvalidRule(format!("unknown service {id}"))),
         },
-        Target::Host { host } => Ok(Target::Host { host: shield::domain(&host)? }),
+        Target::Host { host } => Ok(Target::Host { host: cage::domain(&host)? }),
     }
 }
 
@@ -542,7 +542,7 @@ pub fn service(id: &str) -> Option<&'static Service> {
     CATALOG.iter().find(|s| s.id == id)
 }
 
-/// A host that an agent of the shield needs, and the proxy's decision on it.
+/// A host that an agent of the project needs, and the proxy's decision on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentNeed {
@@ -553,27 +553,27 @@ pub struct AgentNeed {
     pub allowed: bool,
 }
 
-/// The hosts that the shield's agents need: pi the provider of its Mac
+/// The hosts that the project's agents need: pi the provider of its Mac
 /// login, and npm for the extensions of its Mac profile; Claude Code the
 /// Anthropic API; Codex the OpenAI API; Gemini CLI Google Gemini. An agent
 /// with a Mac login needs the hosts of the login. The agents are the ones
 /// of the host agents, the terminals and the tasks. `allowed` is the
 /// decision of the proxy on the name, before the address check.
-pub fn agent_needs(shield: &Shield) -> Vec<AgentNeed> {
-    let terminals = shield.terminals.iter().filter_map(|t| match t.kind {
+pub fn agent_needs(project: &Project) -> Vec<AgentNeed> {
+    let terminals = project.terminals.iter().filter_map(|t| match t.kind {
         SessionKind::Agent { agent, .. } => Some(agent),
         SessionKind::Shell | SessionKind::Host => None,
     });
-    let used: Vec<AgentKind> = shield
+    let used: Vec<AgentKind> = project
         .host_agents
         .iter()
         .map(|a| a.kind)
         .chain(terminals)
-        .chain(shield.tasks.iter().flat_map(|t| t.agents.iter().map(|a| a.kind)))
+        .chain(project.tasks.iter().flat_map(|t| t.agents.iter().map(|a| a.kind)))
         .collect();
     let mut needs: Vec<(AgentKind, String)> = Vec::new();
     for kind in host_agents::KINDS.into_iter().filter(|k| used.contains(k)) {
-        let logins: Vec<String> = shield
+        let logins: Vec<String> = project
             .logins
             .iter()
             .filter(|l| matches!(l.origin, Origin::HostLogin { agent } if agent == kind))
@@ -590,13 +590,13 @@ pub fn agent_needs(shield: &Shield) -> Vec<AgentNeed> {
         } else if let Some(host) = fallback.and_then(service).and_then(|s| s.domains.first()) {
             needs.push((kind, (*host).to_owned()));
         }
-        if kind == AgentKind::Pi && shield.host_agent(kind).is_some_and(|a| a.profile) {
+        if kind == AgentKind::Pi && project.host_agent(kind).is_some_and(|a| a.profile) {
             needs.push((kind, "registry.npmjs.org".to_owned()));
         }
     }
-    let refresh = login::denied_hosts(&shield.logins);
-    let tokeninfo = shield.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
-    let ctx = decide::Context { policy: &shield.network, refresh: &refresh, tokeninfo };
+    let refresh = login::denied_hosts(&project.logins);
+    let tokeninfo = project.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
+    let ctx = decide::Context { policy: &project.network, refresh: &refresh, tokeninfo };
     needs
         .into_iter()
         .filter_map(|(agent, host)| {
@@ -712,26 +712,26 @@ mod tests {
     #[test]
     fn agent_needs_follow_the_agents_and_the_rules() {
         use crate::agent::AgentKind;
-        use crate::shield::HostAgentUse;
+        use crate::cage::HostAgentUse;
 
-        let mut shield = Shield::new("/tmp").unwrap();
-        shield.host_agents = vec![
+        let mut project = Project::new("/tmp").unwrap();
+        project.host_agents = vec![
             HostAgentUse { kind: AgentKind::Pi, profile: true, login: true },
             HostAgentUse { kind: AgentKind::Codex, profile: false, login: false },
         ];
-        shield.logins = vec![login::secret(AgentKind::Pi, "api.anthropic.com")];
-        shield.terminals = vec![crate::shield::Terminal {
+        project.logins = vec![login::secret(AgentKind::Pi, "api.anthropic.com")];
+        project.terminals = vec![crate::cage::Terminal {
             id: "t".into(),
             kind: SessionKind::Agent { agent: AgentKind::Gemini, resume: false },
         }];
-        shield.network.rules = vec![
+        project.network.rules = vec![
             Rule::new(Target::Service { id: "anthropic".into() }, Action::Allow),
             Rule::new(host("registry.npmjs.org"), Action::Allow),
             Rule::new(Target::Service { id: "openai".into() }, Action::Block),
         ];
         let need = |agent, service, host: &str, allowed| AgentNeed { agent, service, host: host.into(), allowed };
         assert_eq!(
-            agent_needs(&shield),
+            agent_needs(&project),
             [
                 need(AgentKind::Codex, "openai", "api.openai.com", false),
                 need(AgentKind::Pi, "anthropic", "api.anthropic.com", true),

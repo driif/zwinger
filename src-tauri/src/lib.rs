@@ -1,6 +1,7 @@
 mod agent;
 mod appearance;
 mod bootstrap;
+mod cage;
 mod commands;
 mod editor;
 mod error;
@@ -12,7 +13,6 @@ mod proxy;
 mod runtime;
 mod runtimes;
 mod secrets;
-mod shield;
 mod store;
 mod task_agents;
 mod task_artifacts;
@@ -29,13 +29,13 @@ use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 
 use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
+use crate::cage::manager::Manager;
 use crate::host_agents::HostAgents;
 use crate::runtime::{Microsandbox, SandboxRuntime};
 use crate::secrets::Vault;
-use crate::shield::manager::Manager;
 
 pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
-/// The open files that the app asks for. Each shield's proxy holds guest and
+/// The open files that the app asks for. Each cage's proxy holds guest and
 /// upstream connections; the default soft limit of macOS is 256.
 const OPEN_FILES: libc::rlim_t = 8192;
 pub(crate) const STOP_ALL_LIMIT: Duration = Duration::from_secs(20);
@@ -93,8 +93,8 @@ fn report_panics(app: AppHandle) {
     }));
 }
 
-/// Removes the VMs of an earlier run, loads the shields and makes the
-/// manager. The manager starts with no VMs, so every shield shows as
+/// Removes the VMs of an earlier run, loads the projects and makes the
+/// manager. The manager starts with no VMs, so every cage shows as
 /// stopped; a notice names the removed VMs.
 fn boot<R: SandboxRuntime>(
     runtime: R,
@@ -102,6 +102,7 @@ fn boot<R: SandboxRuntime>(
     data: &Path,
     host: Arc<HostAgents>,
 ) -> error::Result<Manager<R>> {
+    store::migrate_legacy(data)?;
     // The timer must be made inside the runtime, so it is in the future.
     let reaped = tauri::async_runtime::block_on(async { tokio::time::timeout(REAP_LIMIT, runtime.reap()).await });
     let reaped = match reaped {
@@ -115,15 +116,15 @@ fn boot<R: SandboxRuntime>(
             Vec::new()
         }
     };
-    let store = store::Store::new(data.join("shields.json"));
+    let store = store::Store::new(data.join(store::FILE));
     let manager = Manager::new(runtime, store, vault, data.to_owned(), host)?;
     if !reaped.is_empty() {
-        let shields = manager.list();
+        let projects = manager.list();
         let names: Vec<String> = reaped
             .iter()
             .map(|vm| {
-                let shield = runtime::shield_id(vm).and_then(|id| shields.iter().find(|v| v.shield.id == id));
-                shield.map_or_else(|| vm.clone(), |v| v.shield.name.clone())
+                let project = runtime::project_id(vm).and_then(|id| projects.iter().find(|v| v.project.id == id));
+                project.map_or_else(|| vm.clone(), |v| v.project.name.clone())
             })
             .collect();
         manager
@@ -156,17 +157,17 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     // One app-wide event, so the rail and the map update while the
     // Network tab is closed.
     let handle = app.clone();
-    manager.set_net_sink(Box::new(move |shield_id, event| {
-        let _ = handle.emit("net-event", serde_json::json!({ "shieldId": shield_id, "event": event }));
+    manager.set_net_sink(Box::new(move |project_id, event| {
+        let _ = handle.emit("net-event", serde_json::json!({ "projectId": project_id, "event": event }));
     }));
     let handle = app.clone();
-    manager.set_guest_sink(Box::new(move |shield_id| {
-        let _ = handle.emit("guest-login", shield_id);
+    manager.set_guest_sink(Box::new(move |project_id| {
+        let _ = handle.emit("guest-login", project_id);
     }));
     let handle = app.clone();
-    manager.set_progress_sink(Box::new(move |shield_id, phase, elapsed_ms| {
-        let payload = serde_json::json!({ "shieldId": shield_id, "phase": phase, "elapsedMs": elapsed_ms });
-        let _ = handle.emit("shield-start-progress", payload);
+    manager.set_progress_sink(Box::new(move |project_id, phase, elapsed_ms| {
+        let payload = serde_json::json!({ "projectId": project_id, "phase": phase, "elapsedMs": elapsed_ms });
+        let _ = handle.emit("cage-start-progress", payload);
     }));
 }
 
@@ -184,7 +185,7 @@ pub fn run() {
             }
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
-            // Canonical, like the host paths of the shields it is compared with.
+            // Canonical, like the host paths of the projects it is compared with.
             let data = data.canonicalize()?;
             let pi = agent::pi::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
             let runtime = Microsandbox { pi };
@@ -206,7 +207,7 @@ pub fn run() {
             app.manage(preferences::Preferences::load(data.join("preferences.json")));
             app.manage(appearance::Themes { dir: data.join("themes") });
             // Off the main thread: the runtime install and the reap take seconds.
-            // The shield commands need the manager, so the UI shows the shields
+            // The project commands need the manager, so the UI shows the projects
             // only in the Ready phase.
             let handle = app.handle().clone();
             let host_agents = host.clone();
@@ -252,12 +253,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::shields::list_shields,
-            commands::shields::create_shield,
-            commands::shields::delete_shield,
-            commands::shields::rename_shield,
-            commands::shields::reorder_shields,
-            commands::shields::set_layout,
+            commands::projects::list_projects,
+            commands::projects::create_project,
+            commands::projects::delete_project,
+            commands::projects::rename_project,
+            commands::projects::reorder_projects,
+            commands::projects::set_layout,
             commands::apps::put_app,
             commands::apps::remove_app,
             commands::apps::reorder_apps,
@@ -269,12 +270,12 @@ pub fn run() {
             commands::terminal::attach_session,
             commands::terminal::detach_session,
             commands::terminal::ack_session,
-            commands::shields::resolve_folder,
-            commands::shields::set_harness,
-            commands::shields::list_folders,
-            commands::shields::add_mount,
-            commands::shields::remove_mount,
-            commands::shields::set_mount_readonly,
+            commands::projects::resolve_folder,
+            commands::projects::set_harness,
+            commands::projects::list_folders,
+            commands::projects::add_mount,
+            commands::projects::remove_mount,
+            commands::projects::set_mount_readonly,
             commands::network::network_catalog,
             commands::network::set_network_default,
             commands::network::set_offline,
@@ -284,8 +285,8 @@ pub fn run() {
             commands::network::test_network,
             commands::network::wildcard_for,
             commands::network::list_net_events,
-            commands::shields::start_shield,
-            commands::shields::stop_shield,
+            commands::projects::start_cage,
+            commands::projects::stop_cage,
             commands::terminal::open_session,
             commands::terminal::reopen_terminal,
             commands::terminal::write_session,
@@ -296,9 +297,9 @@ pub fn run() {
             commands::settings::cancel_runtime_install,
             commands::settings::host_agents,
             commands::settings::detect_host_agents,
-            commands::shields::put_host_agent,
-            commands::shields::remove_host_agent,
-            commands::shields::set_agents_unprompted,
+            commands::projects::put_host_agent,
+            commands::projects::remove_host_agent,
+            commands::projects::set_agents_unprompted,
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,
@@ -308,9 +309,9 @@ pub fn run() {
             commands::tasks::is_round_folder,
             commands::tasks::watch_room,
             commands::tasks::unwatch_room,
-            commands::shields::take_app_notices,
-            commands::shields::remove_guest_login,
-            commands::shields::confirm_paths,
+            commands::projects::take_app_notices,
+            commands::projects::remove_guest_login,
+            commands::projects::confirm_paths,
             commands::settings::startup_status,
             commands::settings::get_preferences,
             commands::settings::set_preferences,
@@ -321,7 +322,7 @@ pub fn run() {
             commands::settings::remove_legacy_runtime,
             commands::editors::detect_editors,
             commands::editors::open_in_editor,
-            commands::editors::reveal_shield,
+            commands::editors::reveal_project,
             commands::appearance::list_themes,
             commands::appearance::save_theme,
             commands::appearance::delete_theme,
@@ -379,10 +380,10 @@ mod tests {
         let data = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(data.join("proj")).unwrap();
         let data = data.canonicalize().unwrap();
-        let shield = shield::Shield::new(data.join("proj").to_str().unwrap()).unwrap();
-        store::Store::new(data.join("shields.json")).save(std::slice::from_ref(&shield)).unwrap();
+        let project = cage::Project::new(data.join("proj").to_str().unwrap()).unwrap();
+        store::Store::new(data.join("projects.json")).save(std::slice::from_ref(&project)).unwrap();
         let runtime = FakeRuntime::default();
-        *runtime.reaped.lock().unwrap() = vec![format!("zwinger-{}", shield.id), "zwinger-gone".into()];
+        *runtime.reaped.lock().unwrap() = vec![format!("zwinger-{}", project.id), "zwinger-gone".into()];
         let host = Arc::new(HostAgents::new(
             Arc::new(FakeFs::default()),
             Arc::new(FakeLogins::default()),
@@ -415,7 +416,7 @@ mod tests {
         let handler = &source[source.find("generate_handler![").unwrap()..];
         let handler = &handler[..handler.find("])").unwrap()];
         assert!(handler.contains("commands::terminal::open_session,"));
-        assert!(handler.contains("commands::shields::set_agents_unprompted,"));
+        assert!(handler.contains("commands::projects::set_agents_unprompted,"));
         for gone in ["open_agent", "agent_call", "close_agent", "list_chats", "delete_chat", "rename_chat"] {
             assert!(!handler.contains(&format!("::{gone},")), "{gone}");
         }

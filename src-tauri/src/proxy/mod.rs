@@ -1,6 +1,6 @@
-//! The egress proxy of a running shield (ADR 0003). It listens on
+//! The egress proxy of a running cage (ADR 0003). It listens on
 //! `127.0.0.1` on a free port, the only host port that the VM can reach.
-//! Each request needs the shield's proxy token. A CONNECT is decided on its
+//! Each request needs the cage's proxy token. A CONNECT is decided on its
 //! host and its checked addresses, then terminated with a leaf of the zwinger
 //! CA, so each inner request is decided, logged and gets its credentials.
 //! Plain HTTP is decided and logged the same, but gets no credentials.
@@ -66,7 +66,7 @@ use log::{Entry, Sink};
 pub const GUEST_HOST: &str = "host.microsandbox.internal";
 /// The user name in the proxy URL. Only the token counts.
 const USER: &str = "zw";
-/// The connections from one shield at once. More are closed at once.
+/// The connections from one cage at once. More are closed at once.
 const MAX_CONNECTIONS: usize = 256;
 /// The most bytes of a request head.
 const HEADER_BYTES: usize = 256 << 10;
@@ -107,7 +107,7 @@ pub struct Snapshot {
     pub values: Arc<HashMap<String, SecretValue>>,
 }
 
-/// The parts of a shield's proxy that edits change while it runs: the
+/// The parts of a cage's proxy that edits change while it runs: the
 /// next request uses them. An edit replaces the policy and the values in one
 /// step, so no request sees a new rule with an old value.
 pub struct Live {
@@ -194,7 +194,7 @@ impl Proxy {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let upstreams = Arc::new(Upstreams {
             resolver: config.resolver,
-            limits: Limits::shield(),
+            limits: Limits::project(),
             pins: Mutex::new(LruCache::new(NonZeroUsize::new(PINS).expect("not zero"))),
         });
         let shared = Arc::new(Shared {

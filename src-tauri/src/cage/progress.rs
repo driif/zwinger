@@ -1,4 +1,4 @@
-//! The phases of a shield start, their durations, and the progress that the UI shows.
+//! The phases of a cage start, their durations, and the progress that the UI shows.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::agent::AgentKind;
-use crate::shield::manager::{State, Vm, lock};
+use crate::cage::manager::{State, Vm, lock};
 
-/// Gets the shield id, the phase that begins, and the ms since the start began.
+/// Gets the project id, the phase that begins, and the ms since the start began.
 pub type ProgressSink = Box<dyn Fn(&str, &Phase, u64) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -37,7 +37,7 @@ pub enum Phase {
     Trust,
     /// The network log and the agent commands.
     Wrappers,
-    /// The autostart apps, after the shield runs.
+    /// The autostart apps, after the cage runs.
     Apps,
 }
 
@@ -97,7 +97,7 @@ pub(crate) fn ms(took: Duration) -> u64 {
     u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Marks the phase that a start begins: in the shield's status and through the sink.
+/// Marks the phase that a start begins: in the project's status and through the sink.
 pub(crate) struct Progress<V> {
     pub(crate) id: String,
     pub(crate) started: Instant,

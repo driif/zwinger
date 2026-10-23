@@ -1,4 +1,4 @@
-//! The request log of a shield. An entry has no query values, no header and
+//! The request log of a project. An entry has no query values, no header and
 //! no body: only names, sizes and the decision.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ const PATH_LIMIT: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
-    /// Per shield. The manager sets it.
+    /// Per project. The manager sets it.
     pub seq: u64,
     /// Milliseconds since the Unix epoch.
     pub at: u64,

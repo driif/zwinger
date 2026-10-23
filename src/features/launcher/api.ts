@@ -15,7 +15,7 @@ export interface Editors {
   default: string | null;
 }
 
-/** What Open in editor did. A fall back opened the default editor or the shield folder instead. */
+/** What Open in editor did. A fall back opened the default editor or the project folder instead. */
 export interface Opened {
   editor: string;
   folder: string;
@@ -26,9 +26,9 @@ export interface Opened {
 /** Looks in /Applications, ~/Applications and /Applications/Setapp again. */
 export const detectEditors = () => call<Editors>("detect_editors");
 
-/** Opens the shield folder, or the current folder of the terminal. `null` editor: the default. */
-export const openInEditor = (shieldId: string, editorId: string | null, terminalId: string | null) =>
-  call<Opened>("open_in_editor", { shieldId, editorId, terminalId });
+/** Opens the project folder, or the current folder of the terminal. `null` editor: the default. */
+export const openInEditor = (projectId: string, editorId: string | null, terminalId: string | null) =>
+  call<Opened>("open_in_editor", { projectId, editorId, terminalId });
 
-/** Shows the shield folder in Finder. */
-export const revealShield = (shieldId: string) => call<void>("reveal_shield", { shieldId });
+/** Shows the project folder in Finder. */
+export const revealProject = (projectId: string) => call<void>("reveal_project", { projectId });

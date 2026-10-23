@@ -2,7 +2,7 @@
 //! Codex. They are npm packages, fetched on the host from the registry,
 //! checked against a pinned SHA-512 (and the registry's `dist.integrity`,
 //! which must name the same hash) and unpacked into
-//! `<app_data>/runtimes/<name>/<version>/`. A shield start mounts one
+//! `<app_data>/runtimes/<name>/<version>/`. A cage start mounts one
 //! installed version of each runtime read-only at `/opt/zwinger/<name>`.
 //!
 //! A host agent asks for the Linux build of the host's version. A version
@@ -173,7 +173,7 @@ pub enum Progress {
     Extract,
 }
 
-/// An installed runtime, for a shield start.
+/// An installed runtime, for a cage start.
 #[derive(Debug, Clone)]
 pub struct Installed {
     pub name: &'static str,

@@ -2,7 +2,7 @@ import { Button, Card, CardBody, CardHeader, CommandMenu } from "@driif/motiv";
 import { Download, RefreshCw, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import { Detection, HostAgent, RuntimeName } from "./api";
-import { AGENT_NAMES, ShieldView } from "../../shared/api";
+import { AGENT_NAMES, ProjectView } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 
@@ -17,30 +17,30 @@ export const time = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: 
 
 function source(agent: HostAgent) {
   if (agent.source === "host") return "Runs from the install on this Mac, mounted read-only.";
-  if (agent.source === "cached") return `The Linux build of ${agent.version} is downloaded and shared by all shields.`;
-  return `Shields use the pinned build until the Linux build of ${agent.version} is downloaded.`;
+  if (agent.source === "cached") return `The Linux build of ${agent.version} is downloaded and shared by all projects.`;
+  return `Projects use the pinned build until the Linux build of ${agent.version} is downloaded.`;
 }
 
 function login(agent: HostAgent) {
   if (agent.login.state === "expired") return `The login has expired. Open ${AGENT_NAMES[agent.kind]} on this Mac once to renew it.`;
   if (agent.login.state === "none") return "No subscription login on this Mac.";
   if (agent.kind === "claude")
-    return "Login found in the Keychain. When a shield starts, macOS asks once to allow access: select Allow.";
+    return "Login found in the Keychain. When a cage starts, macOS asks once to allow access: select Allow.";
   return agent.login.expires ? `Login found, valid until ${time(agent.login.expires)}.` : "Login found.";
 }
 
 interface Props {
   detection?: Detection;
-  shields: ShieldView[];
+  projects: ProjectView[];
   runtimes: Runtimes;
   run: Run;
   onRefresh: () => void;
-  /** Opens the shield's Add agent step for this agent. */
-  onUse: (shieldId: string, agent: HostAgent) => void;
+  /** Opens the project's Add agent step for this agent. */
+  onUse: (projectId: string, agent: HostAgent) => void;
 }
 
-/** The agents on this Mac, for all shields. A tab of the app settings. */
-export function HostAgentsSettings({ detection, shields, runtimes, run, onRefresh, onUse }: Props) {
+/** The agents on this Mac, for all projects. A tab of the app settings. */
+export function HostAgentsSettings({ detection, projects, runtimes, run, onRefresh, onUse }: Props) {
   /** The agent whose unpinned download waits for a confirm. */
   const [confirming, setConfirming] = useState<RuntimeName>();
 
@@ -48,8 +48,8 @@ export function HostAgentsSettings({ detection, shields, runtimes, run, onRefres
     <div className="tab-body">
       <div className="row">
         <p className="muted grow">
-          Shields can use these agents instead of their own copies, with your profile (read-only) and your subscription
-          login. The agent never sees the login: the shield's proxy adds it to requests to the provider only.
+          Projects can use these agents instead of their own copies, with your profile (read-only) and your subscription
+          login. The agent never sees the login: the cage's proxy adds it to requests to the provider only.
         </p>
         <Button size="sm" variant="outline" iconLeft={<RefreshCw size={14} />} loading={!detection} onClick={onRefresh}>
           Refresh detection
@@ -57,7 +57,7 @@ export function HostAgentsSettings({ detection, shields, runtimes, run, onRefres
       </div>
       {detection?.agents.length === 0 && (
         <p className="muted">
-          No supported agent is installed on this Mac. Install Claude Code or Codex on this Mac, then refresh. Shields can
+          No supported agent is installed on this Mac. Install Claude Code or Codex on this Mac, then refresh. Projects can
           also use their own copies: see Runtimes.
         </p>
       )}
@@ -108,12 +108,12 @@ export function HostAgentsSettings({ detection, shields, runtimes, run, onRefres
                 )}
                 <CommandMenu
                   className="model-picker"
-                  menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a shield`}
-                  placeholder="Use in shields"
-                  commands={shields.map((shield) => ({
-                    id: shield.id,
-                    label: shield.hostAgents.some((a) => a.kind === agent.kind) ? `${shield.name} (in use)` : shield.name,
-                    onSelect: () => run(async () => onUse(shield.id, agent)),
+                  menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a cage`}
+                  placeholder="Use in projects"
+                  commands={projects.map((project) => ({
+                    id: project.id,
+                    label: project.hostAgents.some((a) => a.kind === agent.kind) ? `${project.name} (in use)` : project.name,
+                    onSelect: () => run(async () => onUse(project.id, agent)),
                   }))}
                 />
               </div>

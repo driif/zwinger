@@ -2,9 +2,9 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager as _};
 use tauri_plugin_updater::UpdaterExt as _;
 
+use crate::cage::manager::Manager;
 use crate::error::{Error, Result};
 use crate::runtime::Microsandbox;
-use crate::shield::manager::Manager;
 
 #[derive(Serialize)]
 pub struct UpdateInfo {
@@ -18,10 +18,10 @@ impl From<tauri_plugin_updater::Error> for Error {
     }
 }
 
-/// The app restarts only when no shield is live: a restart would end its VM
+/// The app restarts only when no cage is live: a restart would end its VM
 /// and the work of its agents.
 pub fn restart_guard(live: usize) -> Result<()> {
-    if live > 0 { Err(Error::ShieldsRunning(live)) } else { Ok(()) }
+    if live > 0 { Err(Error::CagesRunning(live)) } else { Ok(()) }
 }
 
 fn live(app: &AppHandle) -> usize {
@@ -34,17 +34,17 @@ pub async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>> {
     Ok(update.map(|u| UpdateInfo { version: u.version, notes: u.body }))
 }
 
-/// Fails with `ShieldsRunning` while a shield is live, unless `stop_shields`.
+/// Fails with `CagesRunning` while a cage is live, unless `stop_cages`.
 /// Then it stops them, and restarts only if all of them stopped. If not, the
 /// update applies at the next start.
 #[tauri::command]
-pub async fn install_update(app: AppHandle, stop_shields: bool) -> Result<()> {
-    if !stop_shields {
+pub async fn install_update(app: AppHandle, stop_cages: bool) -> Result<()> {
+    if !stop_cages {
         restart_guard(live(&app))?;
     }
     let update = app.updater()?.check().await?.ok_or_else(|| Error::Update("no update is available now".into()))?;
     update.download_and_install(|_, _| {}, || {}).await?;
-    if stop_shields && let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
+    if stop_cages && let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
         manager.stop_all(crate::STOP_ALL_LIMIT).await;
     }
     restart_guard(live(&app))?;

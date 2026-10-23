@@ -1,6 +1,6 @@
 # Security
 
-The security model of the shields is in the ADRs:
+The security model of the cages is in the ADRs:
 
 - [0001 Shields are Linux microVMs](adr/0001-shields-are-linux-microvms.md)
 - [0002 A host agent's subscription login is proxy-injected](adr/0002-host-agent-login-is-proxy-injected.md)
@@ -26,7 +26,7 @@ the app and talks only to the Rust backend. It loads nothing from the network.
 | `frame-ancestors` | `'none'` | No page can embed the app. |
 
 `devCsp` is `null`: `pnpm tauri dev` loads from the Vite dev server, which needs inline styles and a WebSocket for
-hot reload. Check a CSP change with `pnpm tauri build` and open the terminal, the shield map and a task run.
+hot reload. Check a CSP change with `pnpm tauri build` and open the terminal, the project map and a task run.
 
 ## Capabilities
 
@@ -36,9 +36,9 @@ hot reload. Check a CSP change with `pnpm tauri build` and open the terminal, th
 |---|---|
 | `core:default` | Commands, events, channels, the app version and the window. |
 | `opener:default` | Open `http(s)` links in the default browser, such as the links in About. |
-| `dialog:allow-open` | The folder picker for a new shield or a mount. |
+| `dialog:allow-open` | The folder picker for a new project or a mount. |
 
 The updater and the restart are not webview permissions. The webview calls the app commands `check_update` and
-`install_update`. Rust installs the update and restarts only when no shield runs, so a script in the webview cannot
-restart the app while a shield works. There is no shell and no file system plugin: every file operation is an app
+`install_update`. Rust installs the update and restarts only when no cage runs, so a script in the webview cannot
+restart the app while a cage works. There is no shell and no file system plugin: every file operation is an app
 command that checks its paths.

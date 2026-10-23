@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
 import { Button } from "@driif/motiv";
-import { Plus, RotateCw, Shield, TriangleAlert } from "lucide-react";
+import { Plus, RotateCw, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
 import {
@@ -20,15 +20,15 @@ import {
   setPreferences,
 } from "./features/settings/api";
 import {
-  createShield,
-  listShields,
+  createProject,
+  listProjects,
   onGuestLogin,
   onStartProgress,
   resolveFolder,
-  startShield,
-  stopShield,
+  startCage,
+  stopCage,
   takeAppNotices,
-} from "./features/shields/api";
+} from "./features/projects/api";
 import {
   isLive,
   isRoundFolder,
@@ -58,23 +58,24 @@ import {
   INVALID_ORDER,
   PaneNode,
   SessionKind,
-  ShieldView,
+  ProjectView,
 } from "./shared/api";
 import { AppSettings } from "./features/settings/AppSettings";
 import { CommandBar } from "./shared/CommandBar";
 import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
-import { ShieldPage } from "./features/shields/ShieldPage";
-import { ShieldRail } from "./features/shields/ShieldRail";
+import { ProjectPage } from "./features/projects/ProjectPage";
+import { ProjectRail } from "./features/projects/ProjectRail";
 import { agentsOf, LaunchAction } from "./features/launcher/actions";
-import { detectEditors, Editors, openInEditor, revealShield } from "./features/launcher/api";
+import { detectEditors, Editors, openInEditor, revealProject } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
 import { Appearance, useAppearance } from "./features/appearance/themes";
-import { clampRail, RailHandle } from "./features/shields/RailHandle";
+import { clampRail, RailHandle } from "./features/projects/RailHandle";
 import { Notice } from "./shared/Notice";
 import { ShortcutAction, useShortcuts } from "./shared/useShortcuts";
 import { errorCode, errorMessage, isBackendError } from "./shared/errorMessage";
 import { LOST_TITLE, ReloadScreen, useBackendLost } from "./shared/Recover";
+import { CageMark } from "./shared/CageMark";
 
 const TaskRoom = lazy(() => import("./features/tasks/TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
@@ -83,7 +84,7 @@ const NET_RING = 2000;
 
 export type TabView = "overview" | "network" | "settings";
 
-/** What the main area shows for the selected shield. */
+/** What the main area shows for the selected project. */
 export type View =
   | { kind: TabView }
   /** `key` is the focused pane. No `key`: no pane is focused. */
@@ -94,10 +95,10 @@ export type View =
   /** No `taskId` adds a task. */
   | { kind: "taskEdit"; taskId?: string };
 
-/** A terminal of a shield. `key` is the terminal id. No `sessionId`: the terminal is dormant or has exited. */
+/** A terminal of a project. `key` is the terminal id. No `sessionId`: the terminal is dormant or has exited. */
 export interface Pane {
   key: string;
-  shieldId: string;
+  projectId: string;
   kind: SessionKind;
   sessionId?: string;
 }
@@ -134,11 +135,11 @@ export interface Runtimes {
 /** The order of the start phases. A late reply must not take the phase back. */
 const PHASE_ORDER: Record<Startup["phase"], number> = { checking: 0, installing: 1, ready: 2, blocked: 2 };
 
-/** Shows the first-run steps once, then the shields when the runtime is ready. */
+/** Shows the first-run steps once, then the projects when the runtime is ready. */
 export default function App() {
   const [startup, setStartup] = useState<Startup>();
   const [prefs, setPrefs] = useState<Prefs>();
-  const [firstShield, setFirstShield] = useState<string>();
+  const [firstProject, setFirstProject] = useState<string>();
   const [error, setError] = useState<string>();
   const [update, setUpdate] = useState<UpdateInfo>();
   const [updateLater, setUpdateLater] = useState(false);
@@ -182,9 +183,9 @@ export default function App() {
         startup={startup}
         banner={banner}
         onEditor={(id) => savePrefs({ ...prefs, editors: { ...prefs.editors, default: id } })}
-        onDone={async (shieldId) => {
+        onDone={async (projectId) => {
           // Set first: the workspace reads it once, when it mounts.
-          setFirstShield(shieldId);
+          setFirstProject(projectId);
           await savePrefs({ ...prefs, onboarded: true });
         }}
       />
@@ -192,7 +193,7 @@ export default function App() {
   if (startup.phase !== "ready") return <StartupScreen startup={startup} banner={banner} />;
   return (
     <Workspace
-      firstShield={firstShield}
+      firstProject={firstProject}
       prefs={prefs}
       onPrefs={savePrefs}
       banner={banner}
@@ -204,8 +205,8 @@ export default function App() {
 }
 
 interface WorkspaceProps {
-  /** The shield that the first-run steps made. */
-  firstShield?: string;
+  /** The project that the first-run steps made. */
+  firstProject?: string;
   prefs: Prefs;
   onPrefs: (prefs: Prefs) => Promise<void>;
   /** The update banner of the app. */
@@ -215,11 +216,11 @@ interface WorkspaceProps {
   appearance: Appearance;
 }
 
-function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
-  const [shields, setShields] = useState<ShieldView[]>([]);
-  const [selectedId, setSelectedId] = useState(firstShield);
+function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
+  const [projects, setProjects] = useState<ProjectView[]>([]);
+  const [selectedId, setSelectedId] = useState(firstProject);
   const [view, setView] = useState<View>({ kind: "overview" });
-  /** Per shield, the terminal of the pane that has the focus. */
+  /** Per project, the terminal of the pane that has the focus. */
   const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [appNotices, setAppNotices] = useState<string[]>([]);
@@ -227,25 +228,25 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
   const [net, setNet] = useState<Record<string, NetEvent[]>>({});
-  /** Per shield, the last `seq` that the Network tab showed. */
+  /** Per project, the last `seq` that the Network tab showed. */
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
   const [runs, setRuns] = useState<Record<string, RunSummary[]>>({});
-  /** A duo round folder on the host that the main area shows instead of a shield. */
+  /** A duo round folder on the host that the main area shows instead of a project. */
   const [roundFolder, setRoundFolder] = useState<string>();
   const [dropFolder, setDropFolder] = useState<DroppedFolder>();
   const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
   const [detection, setDetection] = useState<Detection>();
-  /** The tab of the app settings, which the main area shows instead of a shield. */
+  /** The tab of the app settings, which the main area shows instead of a project. */
   const [settingsTab, setSettingsTab] = useState<string>();
   const showSettings = settingsTab !== undefined;
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
   const [home, setHome] = useState<string>();
-  /** Per shield, the host agent that its Add agent step shows. */
+  /** Per project, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
   const [railWidth, setRailWidth] = useState(() => clampRail(prefs.railWidth));
 
@@ -256,9 +257,9 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the list it read.
   const refresh = () => {
     const request = ++refreshes.current;
-    return listShields().then(
+    return listProjects().then(
       (next) => {
-        if (request === refreshes.current) setShields(next);
+        if (request === refreshes.current) setProjects(next);
         return next;
       },
       (e) => {
@@ -301,7 +302,7 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     await loadEditors();
   };
 
-  // An agent login was made in a shield, or it is gone.
+  // An agent login was made in a cage, or it is gone.
   useEffect(() => {
     const stop = onGuestLogin(() => refresh());
     return () => {
@@ -311,10 +312,10 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
 
   // The phase of a start that runs. A late event cannot undo a later state, such as running.
   useEffect(() => {
-    const stop = onStartProgress((shieldId, phase) =>
-      setShields((current) =>
+    const stop = onStartProgress((projectId, phase) =>
+      setProjects((current) =>
         current.map((s) =>
-          s.id === shieldId && ["stopped", "starting", "error"].includes(s.status.state)
+          s.id === projectId && ["stopped", "starting", "error"].includes(s.status.state)
             ? { ...s, status: { state: "starting", phase } }
             : s,
         ),
@@ -352,15 +353,15 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   };
 
   // Merged by seq: the live events and the backfill can overlap.
-  const addNet = (shieldId: string, events: NetEvent[]) =>
+  const addNet = (projectId: string, events: NetEvent[]) =>
     setNet((current) => {
-      const bySeq = new Map((current[shieldId] ?? []).map((e) => [e.seq, e]));
+      const bySeq = new Map((current[projectId] ?? []).map((e) => [e.seq, e]));
       for (const event of events) bySeq.set(event.seq, event);
-      return { ...current, [shieldId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
+      return { ...current, [projectId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
     });
 
   useEffect(() => {
-    const stop = onNetEvent((shieldId, event) => addNet(shieldId, [event]));
+    const stop = onNetEvent((projectId, event) => addNet(projectId, [event]));
     stop.then(() => setListening(true));
     return () => {
       stop.then((unlisten) => unlisten());
@@ -370,85 +371,85 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
   // The backfill starts after the listener, so no event falls between the two.
   useEffect(() => {
     if (!listening) return;
-    for (const { id } of shields) {
+    for (const { id } of projects) {
       if (backfilled.current.has(id)) continue;
       backfilled.current.add(id);
       listNetEvents(id).then((events) => addNet(id, events), () => {});
     }
-  }, [shields, listening]);
+  }, [projects, listening]);
 
   const reloadRuns = (id: string) =>
     listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
 
-  const shieldIds = shields.map((s) => s.id).join(" ");
+  const projectIds = projects.map((s) => s.id).join(" ");
   useEffect(() => {
-    for (const { id } of shields) if (!(id in runs)) reloadRuns(id);
-  }, [shieldIds]);
+    for (const { id } of projects) if (!(id in runs)) reloadRuns(id);
+  }, [projectIds]);
 
   // The tree shows the stage of each live run, so the list polls while one runs.
-  const liveRunShields = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
+  const liveRunProjects = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
   useEffect(() => {
-    if (!liveRunShields) return;
-    const timer = setInterval(() => liveRunShields.split(" ").forEach(reloadRuns), 2000);
+    if (!liveRunProjects) return;
+    const timer = setInterval(() => liveRunProjects.split(" ").forEach(reloadRuns), 2000);
     return () => clearInterval(timer);
-  }, [liveRunShields]);
+  }, [liveRunProjects]);
 
   // An app can exit while no view is attached, so the list polls while one runs.
-  const appsRunning = shields.some((s) => s.appRuns.some((r) => r.exitCode === null));
+  const appsRunning = projects.some((s) => s.appRuns.some((r) => r.exitCode === null));
   useEffect(() => {
     if (!appsRunning) return;
     const timer = setInterval(refresh, 2000);
     return () => clearInterval(timer);
   }, [appsRunning]);
 
-  const panes: Pane[] = shields.flatMap((s) =>
+  const panes: Pane[] = projects.flatMap((s) =>
     s.terminals.map((t) => ({
       key: t.id,
-      shieldId: s.id,
+      projectId: s.id,
       kind: t.kind,
       sessionId: s.sessions.find((session) => session.terminalId === t.id && session.exitCode === null)?.id,
     })),
   );
-  const shield = shields.find((s) => s.id === selectedId) ?? shields[0];
-  const shieldPanes = panes.filter((p) => p.shieldId === shield?.id);
-  /** The focused pane of a shield; a stale one gives way to the first pane. */
-  const focusedOf = (target: ShieldView) => {
+  const project = projects.find((s) => s.id === selectedId) ?? projects[0];
+  const projectPanes = panes.filter((p) => p.projectId === project?.id);
+  /** The focused pane of a project; a stale one gives way to the first pane. */
+  const focusedOf = (target: ProjectView) => {
     const shown = leaves(target.paneLayout);
     return shown.includes(focusedPanes[target.id]) ? focusedPanes[target.id] : shown[0];
   };
-  const focused = shield && focusedOf(shield);
+  const focused = project && focusedOf(project);
   /** The pane whose folder ⌘⇧E and the command menu open. */
   const here = view.kind === "terminal" && !showSettings ? focused : undefined;
-  const events = (shield && net[shield.id]) ?? [];
+  const events = (project && net[project.id]) ?? [];
 
   // A deleted app or task has no view.
   useEffect(() => {
-    if (view.kind === "app" && shield && !shield.apps.some((a) => a.id === view.appId)) setView({ kind: "overview" });
-    if (view.kind === "task" && shield && !shield.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
-  }, [view, shield]);
+    if (view.kind === "app" && project && !project.apps.some((a) => a.id === view.appId)) setView({ kind: "overview" });
+    if (view.kind === "task" && project && !project.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
+  }, [view, project]);
 
   const blocked = Object.fromEntries(
-    shields.map(({ id }) => [id, (net[id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[id] ?? 0)).length]),
+    projects.map(({ id }) => [id, (net[id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[id] ?? 0)).length]),
   );
 
   /** Saves at once on the screen, then in the backend. */
-  function saveLayout(shieldId: string, layout: PaneNode | null) {
-    setShields((current) => current.map((s) => (s.id === shieldId ? { ...s, paneLayout: layout } : s)));
-    setPaneLayout(shieldId, layout).then(refresh, (e) => {
+  function saveLayout(projectId: string, layout: PaneNode | null) {
+    setProjects((current) => current.map((s) => (s.id === projectId ? { ...s, paneLayout: layout } : s)));
+    setPaneLayout(projectId, layout).then(refresh, (e) => {
       setError(errorMessage(e));
       return refresh();
     });
   }
 
   /** A focus event of the pane calls it too, so an unchanged focus keeps the state. */
-  function focusPane(key: string | undefined, shieldId = shield?.id) {
-    if (shieldId && key)
-      setFocusedPanes((current) => (current[shieldId] === key ? current : { ...current, [shieldId]: key }));
+  function focusPane(key: string | undefined, projectId = project?.id) {
+    if (projectId && key)
+      setFocusedPanes((current) => (current[projectId] === key ? current : { ...current, [projectId]: key }));
     setView((current) => (current.kind === "terminal" && current.key === key ? current : { kind: "terminal", key }));
   }
 
   /** Focuses the pane of the terminal. A terminal with no pane takes the place of the focused pane; the replaced terminal keeps running. */
-  function showPane(key: string | undefined, target = shield) {
+  function showPane(key: string | undefined, target = project) {
     if (!target) return;
     if (key && !leaves(target.paneLayout).includes(key))
       saveLayout(target.id, replace(target.paneLayout, focusedOf(target), key));
@@ -457,35 +458,35 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
 
   /** ⌘W or a pane's close button: hides the pane. The terminal and its process stay in the tree. */
   function hidePane(key = focused) {
-    if (!shield || !key) return;
-    const layout = remove(shield.paneLayout, key);
-    saveLayout(shield.id, layout);
+    if (!project || !key) return;
+    const layout = remove(project.paneLayout, key);
+    saveLayout(project.id, layout);
     focusPane(key === focused ? leaves(layout)[0] : focused);
   }
 
   function moveFocus(direction: Direction) {
-    const next = shield?.paneLayout && focused && neighbor(shield.paneLayout, focused, direction);
+    const next = project?.paneLayout && focused && neighbor(project.paneLayout, focused, direction);
     if (next) focusPane(next);
   }
 
-  /** Items belong to one shield, so another shield shows its Overview instead. */
+  /** Items belong to one project, so another project shows its Overview instead. */
   function select(id: string) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
     setSelectedId(id);
-    if (id === shield?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
+    if (id === project?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
-  function openView(shieldId: string, next: View) {
+  function openView(projectId: string, next: View) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
-    setSelectedId(shieldId);
-    if (next.kind === "terminal") showPane(next.key, shields.find((s) => s.id === shieldId));
+    setSelectedId(projectId);
+    if (next.kind === "terminal") showPane(next.key, projects.find((s) => s.id === projectId));
     else setView(next);
   }
 
-  async function addShield(folder: string) {
-    setSelectedId(await createShield(folder));
+  async function addProject(folder: string) {
+    setSelectedId(await createProject(folder));
     setView({ kind: "overview" });
   }
 
@@ -494,28 +495,28 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     if (folder !== null) setRoundFolder(folder);
   }
 
-  async function newShield() {
-    const folder = await open({ directory: true, title: "Choose the shield folder" });
-    if (folder !== null) await addShield(folder);
+  async function newProject() {
+    const folder = await open({ directory: true, title: "Choose the project folder" });
+    if (folder !== null) await addProject(folder);
   }
 
   /**
-   * Opens a terminal, or the first agent of the shield: host agents come first. It shows in the focused pane, or in a new
+   * Opens a terminal, or the first agent of the project: host agents come first. It shows in the focused pane, or in a new
    * pane right of the pane `at` (`row`) or below it (`column`); no `at` splits the focused pane.
    */
-  async function newSession(kind: SessionKind | "agent", target = shield, direction?: "row" | "column", at?: string) {
+  async function newSession(kind: SessionKind | "agent", target = project, direction?: "row" | "column", at?: string) {
     if (!target) return;
     if (direction && tooDeep(target.paneLayout, at ?? focusedOf(target)))
       throw new Error("This pane cannot split again. Close a pane first.");
-    // A stopped shield does not know its mounted agents. Read them after the start. A Mac shell needs no start.
+    // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
     if (target.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
-      await startShield(target.id);
-      target = (await listShields()).find((s) => s.id === target!.id) ?? target;
+      await startCage(target.id);
+      target = (await listProjects()).find((s) => s.id === target!.id) ?? target;
     }
     const mounted = agentsOf(target);
     const session: SessionKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
     if (session.type === "agent" && !mounted.includes(session.agent))
-      throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this shield.`);
+      throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this cage.`);
     const { rows, cols } = fittedSize();
     const sessionId = await openSession(target.id, session, rows, cols);
     const list = await refresh();
@@ -529,20 +530,20 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     } else showPane(terminalId, fresh);
   }
 
-  /** Opens the shield folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
-  async function openEditor(target: ShieldView, editorId?: string, terminalId?: string) {
+  /** Opens the project folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
+  async function openEditor(target: ProjectView, editorId?: string, terminalId?: string) {
     const askedId = editorId ?? editors?.default ?? null;
     const opened = await openInEditor(target.id, askedId, terminalId ?? null);
     const asked = editors?.editors.find((e) => e.id === askedId)?.name ?? "The editor";
     const notes = [
       opened.editorFellBack && asked !== opened.editor && `${asked} is not available, so ${opened.editor} opened.`,
-      opened.folderFellBack && `The folder of the terminal is unknown, so ${opened.editor} opened the shield folder ${tildePath(opened.folder, home)}.`,
+      opened.folderFellBack && `The folder of the terminal is unknown, so ${opened.editor} opened the project folder ${tildePath(opened.folder, home)}.`,
     ].filter((note): note is string => !!note);
     if (notes.length > 0) setAppNotices((all) => [...all, notes.join(" ")]);
   }
 
   /** A choice of an editor makes it the default, so the launchers switch to it. */
-  function launch(target: ShieldView, action: LaunchAction, terminalId?: string) {
+  function launch(target: ProjectView, action: LaunchAction, terminalId?: string) {
     switch (action.type) {
       case "session":
         return run(() => newSession(action.kind, target));
@@ -555,21 +556,21 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
       case "copyPath":
         return run(() => navigator.clipboard.writeText(target.folder));
       case "reveal":
-        return run(() => revealShield(target.id));
+        return run(() => revealProject(target.id));
     }
   }
 
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
-    if (pane.kind.type !== "host" && shields.find((s) => s.id === pane.shieldId)?.status.state !== "running")
-      await startShield(pane.shieldId);
+    if (pane.kind.type !== "host" && projects.find((s) => s.id === pane.projectId)?.status.state !== "running")
+      await startCage(pane.projectId);
     const { rows, cols } = fittedSize();
-    await reopenTerminal(pane.shieldId, pane.key, rows, cols);
-    showPane(pane.key, (await refresh())?.find((s) => s.id === pane.shieldId));
+    await reopenTerminal(pane.projectId, pane.key, rows, cols);
+    showPane(pane.key, (await refresh())?.find((s) => s.id === pane.projectId));
   }
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
-  // empty rail space creates a shield. The map has its own listener.
+  // empty rail space creates a project. The map has its own listener.
   useEffect(() => {
     const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
@@ -597,59 +598,59 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
     });
 
   function cycle(step: number) {
-    if (shieldPanes.length === 0) return;
-    const index = shieldPanes.findIndex((p) => p.key === focused);
-    showPane(shieldPanes[(index + step + shieldPanes.length) % shieldPanes.length].key);
+    if (projectPanes.length === 0) return;
+    const index = projectPanes.findIndex((p) => p.key === focused);
+    showPane(projectPanes[(index + step + projectPanes.length) % projectPanes.length].key);
   }
 
   /** Removes the terminal and ends its process. The backend also removes its pane. */
   function closePane(key: string) {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
-    run(() => closeTerminal(pane.shieldId, key));
+    run(() => closeTerminal(pane.projectId, key));
     if (view.kind === "terminal" && view.key === key) setView({ kind: "terminal" });
   }
 
-  /** Saves the order of the shield's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
-  const moveTerminals = (shieldId: string, ids: string[]) =>
-    reorderTerminals(shieldId, ids).then(refresh, (e) => {
+  /** Saves the order of the project's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
+  const moveTerminals = (projectId: string, ids: string[]) =>
+    reorderTerminals(projectId, ids).then(refresh, (e) => {
       if (errorCode(e) !== INVALID_ORDER) setError(errorMessage(e));
       return refresh();
     });
 
-  const toggle = (shield: ShieldView) =>
-    run(() => (shield.status.state === "running" ? stopShield(shield.id) : startShield(shield.id)));
+  const toggle = (project: ProjectView) =>
+    run(() => (project.status.state === "running" ? stopCage(project.id) : startCage(project.id)));
 
   function startIntent(kind: Intent["kind"], appId?: string) {
     setView({ kind: kind === "addRule" ? "network" : "settings" });
     setIntent({ kind, appId, at: Date.now() });
   }
 
-  const restart = (id: string) => run(() => stopShield(id).then(() => startShield(id)));
+  const restart = (id: string) => run(() => stopCage(id).then(() => startCage(id)));
 
   const actions: Record<ShortcutAction, () => void> = {
     // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
     commands: () => commandBar.current?.querySelector("button")?.click(),
-    newShield: () => run(newShield),
+    newProject: () => run(newProject),
     newShell: () => run(() => newSession({ type: "host" })),
     newVmShell: () => run(() => newSession({ type: "shell" })),
-    openEditor: () => shield && run(() => openEditor(shield, undefined, here)),
+    openEditor: () => project && run(() => openEditor(project, undefined, here)),
     newAgent: () => run(() => newSession("agent")),
     close: () => view.kind === "terminal" && hidePane(),
     next: () => cycle(1),
     previous: () => cycle(-1),
     overview: () => setView({ kind: "overview" }),
     agents: () => {
-      const agents = shieldPanes.filter((p) => p.kind.type === "agent");
+      const agents = projectPanes.filter((p) => p.kind.type === "agent");
       if (agents.length > 0) showPane(agents[agents.length - 1].key);
       else run(() => newSession("agent"));
     },
-    terminal: () => showPane(focused ?? shieldPanes[shieldPanes.length - 1]?.key),
+    terminal: () => showPane(focused ?? projectPanes[projectPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
     appSettings: () => setSettingsTab("agents"),
-    splitRight: () => run(() => newSession({ type: "host" }, shield, "row")),
-    splitDown: () => run(() => newSession({ type: "host" }, shield, "column")),
+    splitRight: () => run(() => newSession({ type: "host" }, project, "row")),
+    splitDown: () => run(() => newSession({ type: "host" }, project, "column")),
     focusLeft: () => moveFocus("left"),
     focusRight: () => moveFocus("right"),
     focusUp: () => moveFocus("up"),
@@ -659,9 +660,9 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
 
   return (
     <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
-      <ShieldRail
-        shields={shields}
-        selectedId={shield?.id}
+      <ProjectRail
+        projects={projects}
+        selectedId={project?.id}
         view={view}
         blocked={blocked}
         runs={runs}
@@ -675,29 +676,29 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
         }}
         onRunsChange={reloadRuns}
         onToggle={toggle}
-        onNewSession={(id, kind) => run(() => newSession(kind, shields.find((s) => s.id === id)))}
+        onNewSession={(id, kind) => run(() => newSession(kind, projects.find((s) => s.id === id)))}
         onClosePane={closePane}
         onReopen={(pane) => run(() => reopen(pane))}
         onMoveTerminals={moveTerminals}
-        onNew={actions.newShield}
+        onNew={actions.newProject}
         onSettings={actions.appSettings}
         dropFolder={dropFolder}
         editors={editors}
         home={home}
         onLaunch={(id, action) => {
-          const target = shields.find((s) => s.id === id);
+          const target = projects.find((s) => s.id === id);
           if (target) launch(target, action);
         }}
         onDropDone={(create) => {
           setDropFolder(undefined);
-          if (create && dropFolder) run(() => addShield(dropFolder.folder));
+          if (create && dropFolder) run(() => addProject(dropFolder.folder));
         }}
       >
         <CommandBar
           ref={commandBar}
-          shields={shields}
-          shield={shield}
-          panes={shieldPanes}
+          projects={projects}
+          project={project}
+          panes={projectPanes}
           focused={focused}
           here={here}
           actions={actions}
@@ -712,10 +713,10 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
           editors={editors}
-          onLaunch={(action) => shield && launch(shield, action, here)}
+          onLaunch={(action) => project && launch(project, action, here)}
           run={run}
         />
-      </ShieldRail>
+      </ProjectRail>
       <RailHandle
         width={railWidth}
         onResize={setRailWidth}
@@ -733,16 +734,16 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
             </Notice>
           ))}
           {banner}
-          {!showSettings && !roundFolder && shield?.pendingRestart && (
+          {!showSettings && !roundFolder && project?.pendingRestart && (
             <Notice
               icon={<RotateCw size={14} className="warn" />}
               actions={
-                <Button size="sm" variant="outline" onClick={() => restart(shield.id)}>
+                <Button size="sm" variant="outline" onClick={() => restart(project.id)}>
                   Restart
                 </Button>
               }
             >
-              The running shield uses an older config. Restart it to apply the changes.
+              The running cage uses an older config. Restart it to apply the changes.
             </Notice>
           )}
         </div>
@@ -753,13 +754,13 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
             editors={editors}
             onDetectEditors={loadEditors}
             detection={detection}
-            shields={shields}
+            projects={projects}
             runtimes={runtimes}
             run={run}
             onRefresh={() => detect(true)}
-            onUse={(shieldId, agent) => {
-              select(shieldId);
-              setAdding((current) => ({ ...current, [shieldId]: agent.kind }));
+            onUse={(projectId, agent) => {
+              select(projectId);
+              setAdding((current) => ({ ...current, [projectId]: agent.kind }));
             }}
             prefs={prefs}
             onPrefs={savePrefs}
@@ -775,52 +776,52 @@ function Workspace({ firstShield, prefs, onPrefs, banner, update, onUpdate, appe
               </Suspense>
             </div>
           </section>
-        ) : shield ? (
-          <ShieldPage
-            shield={shield}
+        ) : project ? (
+          <ProjectPage
+            project={project}
             events={events}
             view={view}
             onView={setView}
             intent={intent}
             onIntentDone={() => setIntent(undefined)}
-            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [shield.id]: seq }))}
+            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [project.id]: seq }))}
             onDropFolder={dropMount}
             runtimes={runtimes}
             detection={detection}
-            adding={adding[shield.id]}
-            onAdding={(kind) => setAdding((current) => ({ ...current, [shield.id]: kind }))}
+            adding={adding[project.id]}
+            onAdding={(kind) => setAdding((current) => ({ ...current, [project.id]: kind }))}
             onHostAgents={() => setSettingsTab("agents")}
             editors={editors}
             home={home}
-            onLaunch={(action) => launch(shield, action)}
+            onLaunch={(action) => launch(project, action)}
             onEditorSettings={() => setSettingsTab("editors")}
-            onSplit={(key, direction) => run(() => newSession({ type: "host" }, shield, direction, key))}
-            onOpenEditor={(key) => run(() => openEditor(shield, undefined, key))}
+            onSplit={(key, direction) => run(() => newSession({ type: "host" }, project, direction, key))}
+            onOpenEditor={(key) => run(() => openEditor(project, undefined, key))}
             onHide={hidePane}
-            runs={runs[shield.id] ?? []}
-            onRunsChange={() => reloadRuns(shield.id)}
+            runs={runs[project.id] ?? []}
+            onRunsChange={() => reloadRuns(project.id)}
             onRefresh={refresh}
             panes={panes}
             focused={focused}
             run={run}
-            onToggle={() => toggle(shield)}
+            onToggle={() => toggle(project)}
             onNewSession={(kind) => run(() => newSession(kind))}
             onReopen={(pane) => run(() => reopen(pane))}
             onFocus={(key) => focusPane(key)}
-            onLayout={(layout) => saveLayout(shield.id, layout)}
+            onLayout={(layout) => saveLayout(project.id, layout)}
             onPaneExit={refresh}
             onPaneError={(e) => setError(errorMessage(e))}
           />
         ) : (
           <div className="empty">
-            <Shield size={40} className="muted" />
-            <h1>No shields yet</h1>
+            <CageMark size={40} />
+            <h1>No projects yet</h1>
             <p className="muted">
-              A shield runs an AI agent in a microVM. The agent sees only the folders that you mount and reaches only
+              A project runs an AI agent in its cage, a microVM. The agent sees only the folders that you mount and reaches only
               the hosts that you allow.
             </p>
-            <Button iconLeft={<Plus size={16} />} onClick={actions.newShield}>
-              Create shield
+            <Button iconLeft={<Plus size={16} />} onClick={actions.newProject}>
+              Create project
             </Button>
           </div>
         )}

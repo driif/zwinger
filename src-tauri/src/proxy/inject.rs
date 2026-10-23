@@ -166,7 +166,7 @@ impl TokenSource for HostAgents {
     }
 }
 
-/// The host login of an agent in a running shield.
+/// The host login of an agent in a running cage.
 pub struct Login {
     pub kind: AgentKind,
     /// The name of its placeholder.

@@ -20,7 +20,7 @@ pub struct Prefs {
     pub follow_system: bool,
     pub light_theme: String,
     pub dark_theme: String,
-    /// The width of the shield rail, in CSS pixels.
+    /// The width of the project rail, in CSS pixels.
     pub rail_width: u32,
     pub terminal: TerminalPrefs,
     pub editors: EditorPrefs,

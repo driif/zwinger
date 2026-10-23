@@ -22,7 +22,7 @@ use tokio::sync::OnceCell;
 use crate::error::{Error, Result};
 use crate::secrets::{SecretValue, Vault};
 
-/// The vault entry of the CA key, as `(shield id, name)`. No shield has this id.
+/// The vault entry of the CA key, as `(project id, name)`. No project has this id.
 pub const KEY_ENTRY: (&str, &str) = ("zwinger", "PROXY_CA_KEY");
 /// The file of the CA certificate in [`Ca::dir`], bound read-only into each guest.
 pub const CERT_FILE: &str = "zwinger-ca.pem";
@@ -70,14 +70,14 @@ pub fn provider() -> Arc<CryptoProvider> {
 impl Ca {
     /// Reads the key from the vault, or makes and stores a new one when the
     /// vault has none. A vault that fails or does not answer fails the load,
-    /// so no shield starts without its CA.
+    /// so no cage starts without its CA.
     pub fn load(vault: &dyn Vault, dir: &Path) -> Result<Self> {
-        let (shield, name) = KEY_ENTRY;
-        let key = match vault.get(shield, name)? {
+        let (project, name) = KEY_ENTRY;
+        let key = match vault.get(project, name)? {
             Some(pem) => KeyPair::from_pem(pem.expose()).map_err(ca_error)?,
             None => {
                 let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(ca_error)?;
-                vault.set(shield, name, &SecretValue::new(key.serialize_pem()))?;
+                vault.set(project, name, &SecretValue::new(key.serialize_pem()))?;
                 key
             }
         };

@@ -279,7 +279,7 @@ fn exit_code(child: &mut Box<dyn portable_pty::Child + Send + Sync>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shield::testing::host_sh;
+    use crate::cage::testing::host_sh;
 
     async fn read_until_exit(pty: &mut Pty) -> (String, i32) {
         let mut out = Vec::new();

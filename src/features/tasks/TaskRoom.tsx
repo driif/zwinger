@@ -14,7 +14,7 @@ import {
   runDiff,
   watchRoom,
 } from "./api";
-import { ShieldView, Task } from "../../shared/api";
+import { ProjectView, Task } from "../../shared/api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -24,7 +24,7 @@ type Props =
   | { kind: "folder"; path: string }
   | {
       kind: "task";
-      shield: ShieldView;
+      project: ProjectView;
       task: Task;
       runs: RunSummary[];
       /** No `run` shows the latest run. */
@@ -32,7 +32,7 @@ type Props =
       onRun: (run: string) => void;
       onRunsChange: () => void;
       onEdit: () => void;
-      onStartShield: () => void;
+      onStartCage: () => void;
     };
 
 /** The live room of a round: stages, messages, positions, disagreements and verdicts. */
@@ -43,7 +43,7 @@ export function TaskRoom(props: Props) {
     props.kind === "folder"
       ? { kind: "folder", path: props.path }
       : run
-        ? { kind: "run", shieldId: props.shield.id, taskId: props.task.id, run }
+        ? { kind: "run", projectId: props.project.id, taskId: props.task.id, run }
         : undefined;
   const sourceKey = JSON.stringify(source ?? null);
 
@@ -96,9 +96,9 @@ export function TaskRoom(props: Props) {
   }, [active?.id]);
 
   const inApp = props.kind === "task" ? props : undefined;
-  const shieldRunning = inApp?.shield.status.state === "running";
+  const cageRunning = inApp?.project.status.state === "running";
   const liveRun = status !== null && isLive(status.state);
-  const canStart = inApp && shieldRunning && !runs.some((r) => isLive(r.state));
+  const canStart = inApp && cageRunning && !runs.some((r) => isLive(r.state));
 
   const act = (work: () => Promise<unknown>) => {
     setError(undefined);
@@ -107,11 +107,11 @@ export function TaskRoom(props: Props) {
       (e) => setError(errorMessage(e)),
     );
   };
-  const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.shield.id, inApp.task.id, run, c));
+  const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.project.id, inApp.task.id, run, c));
   const start = () =>
     inApp &&
     act(async () => {
-      const next = await startTaskRun(inApp.shield.id, inApp.task.id);
+      const next = await startTaskRun(inApp.project.id, inApp.task.id);
       inApp.onRun(next);
     });
 
@@ -209,7 +209,7 @@ export function TaskRoom(props: Props) {
               size="sm"
               iconLeft={<Play size={14} />}
               disabled={!canStart}
-              title={shieldRunning ? undefined : "Start the shield first"}
+              title={cageRunning ? undefined : "Start the cage first"}
               onClick={start}
             >
               New run
@@ -238,12 +238,12 @@ export function TaskRoom(props: Props) {
           <p className="muted">
             {inApp.task.agents.map((a) => a.kind + (a.model ? ` (${a.model})` : "")).join(" and ")} work in{" "}
             <span className="mono">{inApp.task.workdir}</span>.{" "}
-            {shieldRunning ? "Start a run to see them plan." : "Start the shield, then start a run."}
+            {cageRunning ? "Start a run to see them plan." : "Start the cage, then start a run."}
           </p>
-          {!shieldRunning && (
+          {!cageRunning && (
             <div className="row end">
-              <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={inApp.onStartShield}>
-                Start shield
+              <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={inApp.onStartCage}>
+                Start cage
               </Button>
             </div>
           )}
@@ -301,9 +301,9 @@ export function TaskRoom(props: Props) {
                   size="sm"
                   variant="outline"
                   iconLeft={<FileDiff size={14} />}
-                  disabled={!shieldRunning}
-                  title={shieldRunning ? undefined : "Start the shield to read the working dir"}
-                  onClick={() => run && act(() => runDiff(inApp.shield.id, inApp.task.id, run).then(setDiff))}
+                  disabled={!cageRunning}
+                  title={cageRunning ? undefined : "Start the cage to read the working dir"}
+                  onClick={() => run && act(() => runDiff(inApp.project.id, inApp.task.id, run).then(setDiff))}
                 >
                   {diff === undefined ? "Show the diff" : "Read the diff again"}
                 </Button>

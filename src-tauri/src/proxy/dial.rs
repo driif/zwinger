@@ -1,7 +1,7 @@
 //! The one way the proxy connects upstream. It resolves the host once on
 //! the Mac, checks every address, and connects only to a checked address,
 //! so a name that resolves to a private address (DNS rebinding) is refused.
-//! Each upstream connection holds a permit of its shield and of the app.
+//! Each upstream connection holds a permit of its project and of the app.
 
 use std::future::Future;
 use std::io;
@@ -19,9 +19,9 @@ use super::local;
 /// The longest wait for the name and the TCP connect together, and for the
 /// permits before them.
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
-/// The upstream connections of one shield at once, idle ones included.
-const SHIELD_UPSTREAMS: usize = 128;
-/// The upstream connections of all shields at once.
+/// The upstream connections of one project at once, idle ones included.
+const PROJECT_UPSTREAMS: usize = 128;
+/// The upstream connections of all projects at once.
 const APP_UPSTREAMS: usize = 1024;
 
 static APP: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(APP_UPSTREAMS)));
@@ -30,38 +30,38 @@ static APP: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(
 #[derive(Clone)]
 pub struct Limits {
     app: Arc<Semaphore>,
-    shield: Arc<Semaphore>,
+    project: Arc<Semaphore>,
 }
 
 /// The permits of one upstream connection. A drop gives them back.
 pub struct Permits {
     _app: OwnedSemaphorePermit,
-    _shield: OwnedSemaphorePermit,
+    _project: OwnedSemaphorePermit,
 }
 
 impl Limits {
-    /// A new shield cap, under the cap of the app.
-    pub fn shield() -> Self {
-        Self { app: APP.clone(), shield: Arc::new(Semaphore::new(SHIELD_UPSTREAMS)) }
+    /// A new project cap, under the cap of the app.
+    pub fn project() -> Self {
+        Self { app: APP.clone(), project: Arc::new(Semaphore::new(PROJECT_UPSTREAMS)) }
     }
 
     #[cfg(test)]
-    pub fn new(app: &Arc<Semaphore>, shield: usize) -> Self {
-        Self { app: app.clone(), shield: Arc::new(Semaphore::new(shield)) }
+    pub fn new(app: &Arc<Semaphore>, project: usize) -> Self {
+        Self { app: app.clone(), project: Arc::new(Semaphore::new(project)) }
     }
 
-    /// The permits of the shield that connections hold.
+    /// The permits of the project that connections hold.
     #[cfg(test)]
     pub fn used(&self) -> usize {
-        SHIELD_UPSTREAMS - self.shield.available_permits()
+        PROJECT_UPSTREAMS - self.project.available_permits()
     }
 
-    /// Waits for a permit of the shield, then of the app.
+    /// Waits for a permit of the project, then of the app.
     pub async fn acquire(&self, host: &str) -> Result<Permits, DialError> {
         let acquire = async {
-            let shield = self.shield.clone().acquire_owned().await.expect("never closed");
+            let project = self.project.clone().acquire_owned().await.expect("never closed");
             let app = self.app.clone().acquire_owned().await.expect("never closed");
-            Permits { _app: app, _shield: shield }
+            Permits { _app: app, _project: project }
         };
         tokio::time::timeout(CONNECT_LIMIT, acquire).await.map_err(|_| DialError::Busy(host.into()))
     }
@@ -220,12 +220,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_permits_of_the_shield_and_of_the_app_cap_the_connections() {
+    async fn the_permits_of_the_project_and_of_the_app_cap_the_connections() {
         let app = Arc::new(Semaphore::new(2));
         let (a, b) = (Limits::new(&app, 1), Limits::new(&app, 2));
         let wait = Duration::from_millis(50);
         let first = a.acquire("x").await.unwrap();
-        // The shield cap: a second connection of `a` waits.
+        // The project cap: a second connection of `a` waits.
         assert!(tokio::time::timeout(wait, a.acquire("x")).await.is_err());
         let second = b.acquire("y").await.unwrap();
         // The app cap: `b` has a free permit, but the app has none.

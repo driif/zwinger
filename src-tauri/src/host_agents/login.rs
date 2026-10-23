@@ -1,5 +1,5 @@
 //! The host login of an agent (ADR 0002). zwinger reads the subscription
-//! token on the Mac at each shield start and never writes the host Keychain
+//! token on the Mac at each cage start and never writes the host Keychain
 //! or the host login files. The guest gets a login with placeholders only:
 //! the proxy puts the real access token into the `authorization` header of
 //! requests to the provider's exact hosts. The refresh token in the guest is
@@ -48,7 +48,7 @@ const CHATGPT: Provider = Provider { pi: "openai-codex", host: "chatgpt.com", re
 const COPILOT: Provider =
     Provider { pi: "github-copilot", host: "api.individual.githubcopilot.com", refresh: &[GITHUB_API] };
 /// Copilot's refresh host. It is also the API of `gh` and of other GitHub
-/// tools, so a shield with pi's Copilot login cannot use them.
+/// tools, so a cage with pi's Copilot login cannot use them.
 pub const GITHUB_API: &str = "api.github.com";
 const COPILOT_DOMAIN: &str = ".githubcopilot.com";
 /// The Code Assist API of a Google login.
@@ -95,7 +95,7 @@ fn copilot_endpoint(access: &str) -> Option<(String, usize)> {
 }
 
 /// The refresh hosts that the network policy denies: the ones of the
-/// providers of the shield's host logins.
+/// providers of the project's host logins.
 pub fn denied_hosts(secrets: &[Secret]) -> Vec<&'static str> {
     let mut denied = Vec::new();
     for secret in secrets.iter().filter(|s| matches!(s.origin, Origin::HostLogin { .. })) {
@@ -228,7 +228,7 @@ fn keychain_exists() -> bool {
     false
 }
 
-/// A host login, read at a shield start.
+/// A host login, read at a cage start.
 pub struct HostToken {
     pub kind: AgentKind,
     pub access: SecretValue,
@@ -382,7 +382,7 @@ pub fn secret(kind: AgentKind, host: &str) -> Secret {
     }
 }
 
-/// A file of a guest login, below the shield's state dir.
+/// A file of a guest login, below the project's state dir.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GuestFile {
     /// The folders below the state dir.

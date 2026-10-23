@@ -12,8 +12,8 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
+use crate::cage::TaskAgent;
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
-use crate::shield::TaskAgent;
 
 /// How long a killed process has to exit.
 const KILL_WAIT: Duration = Duration::from_secs(10);
@@ -114,11 +114,11 @@ impl std::fmt::Display for Failure {
 pub fn argv(agent: &TaskAgent, access: Access, found: launch::Found) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
     let Some(mut argv) = launch::command(agent.kind, found) else {
-        return Err(Failure::Start("Gemini CLI is not mounted in the shield".to_owned()));
+        return Err(Failure::Start("Gemini CLI is not mounted in the cage".to_owned()));
     };
     match agent.kind {
         AgentKind::Claude => {
-            // `--dangerously-skip-permissions` as in the agent sessions: the shield is the sandbox.
+            // `--dangerously-skip-permissions` as in the agent sessions: the cage is the sandbox.
             argv.extend(
                 [
                     "-p",
@@ -149,7 +149,7 @@ pub fn argv(agent: &TaskAgent, access: Access, found: launch::Found) -> Result<V
         }
         AgentKind::Gemini => {
             argv.extend(["--output-format".to_owned(), "stream-json".to_owned()]);
-            // `--yolo` approves each tool call: acceptable only because the agent runs inside the shield.
+            // `--yolo` approves each tool call: acceptable only because the agent runs inside the cage.
             if access == Access::Write {
                 argv.push("--yolo".to_owned());
             }
@@ -294,18 +294,18 @@ pub enum SnapshotError {
 /// Gets each live record of the call.
 pub type Live<'a> = &'a (dyn Fn(Value) + Send + Sync);
 
-/// Runs processes in a shield's VM, in one working dir.
+/// Runs processes in a cage, in one working dir.
 pub struct Exec<R: SandboxRuntime> {
     pub runtime: R,
     pub vm: Arc<R::Vm>,
     pub cwd: String,
     /// The guest path of the run's artifact folder, which git checks skip.
     pub artifacts: Option<String>,
-    /// pi runs from the host install that the shield mounts.
+    /// pi runs from the host install that the cage mounts.
     pub pi_host: bool,
-    /// The guest path of Gemini CLI's entry point, if the shield mounts it.
+    /// The guest path of Gemini CLI's entry point, if the cage mounts it.
     pub gemini: Option<String>,
-    /// The URL of the shield's proxy.
+    /// The URL of the cage's proxy.
     pub proxy: Option<String>,
 }
 

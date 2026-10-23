@@ -1,19 +1,20 @@
 import { Button, Card, CardBody, CardHeader, RadioGroup, StepProgress } from "@driif/motiv";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ArrowRight, Bot, CircleCheck, CircleX, Folder, FolderOpen, Globe, Shield, TriangleAlert } from "lucide-react";
+import { ArrowRight, Bot, CircleCheck, CircleX, Folder, FolderOpen, Globe, TriangleAlert } from "lucide-react";
 import { ReactNode, useEffect, useState } from "react";
 import { Startup, StartupStep } from "./api";
 import { Detection, hostAgents, putHostAgent } from "../settings/api";
-import { createShield, resolveFolder } from "../shields/api";
+import { createProject, resolveFolder } from "../projects/api";
 import { detectEditors, Editors } from "../launcher/api";
 import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
+import { CageMark } from "../../shared/CageMark";
 import "./onboarding.css";
 
 const STEPS = [
   { id: "welcome", label: "Check this Mac" },
-  { id: "shield", label: "Create a shield" },
+  { id: "project", label: "Create a project" },
   { id: "agent", label: "Add an agent" },
   { id: "editor", label: "Your editor" },
   { id: "done", label: "Done" },
@@ -22,8 +23,8 @@ const STEPS = [
 const PHASES: Record<Startup["phase"], string> = {
   checking: "Checking this Mac…",
   installing: "Preparing the VM runtime. The first start takes a moment.",
-  ready: "This Mac is ready for shields.",
-  blocked: "zwinger cannot run shields on this Mac until the failed check passes.",
+  ready: "This Mac is ready for projects.",
+  blocked: "zwinger cannot run cages on this Mac until the failed check passes.",
 };
 
 const RUNTIME_STEPS: { id: StartupStep; label: string }[] = [
@@ -90,7 +91,7 @@ export function StartupScreen({ startup, banner }: { startup: Startup; banner?: 
 }
 
 /**
- * The first run: the checks, a first shield, an agent from this Mac, the default editor. `onDone` opens the shield, if
+ * The first run: the checks, a first project, an agent from this Mac, the default editor. `onDone` opens the project, if
  * one was made.
  */
 export function Onboarding({
@@ -104,10 +105,10 @@ export function Onboarding({
   banner?: ReactNode;
   /** Saves the default editor. */
   onEditor: (id: string) => Promise<void>;
-  onDone: (shieldId?: string) => Promise<void>;
+  onDone: (projectId?: string) => Promise<void>;
 }) {
   const [step, setStep] = useState(0);
-  const [shieldId, setShieldId] = useState<string>();
+  const [projectId, setProjectId] = useState<string>();
   const [detection, setDetection] = useState<Detection>();
   const [added, setAdded] = useState<AgentKind[]>([]);
   const [editors, setEditors] = useState<Editors>();
@@ -128,7 +129,7 @@ export function Onboarding({
   }
 
   async function create(folder: string) {
-    setShieldId(await createShield(await resolveFolder(folder)));
+    setProjectId(await createProject(await resolveFolder(folder)));
     setStep(2);
   }
 
@@ -154,12 +155,12 @@ export function Onboarding({
 
   const add = (kind: AgentKind, profile: boolean, login: boolean) =>
     act(async () => {
-      // The login needs its provider host, so the shield allows it.
-      await putHostAgent(shieldId!, { kind, profile, login }, login);
+      // The login needs its provider host, so the project allows it.
+      await putHostAgent(projectId!, { kind, profile, login }, login);
       setAdded((current) => [...current, kind]);
     });
 
-  const finish = () => act(() => onDone(shieldId));
+  const finish = () => act(() => onDone(projectId));
 
   return (
     <div className="onboarding">
@@ -168,15 +169,15 @@ export function Onboarding({
       <StepProgress label="First steps" steps={STEPS} current={step} completed={step === 4} />
       {step === 0 && (
         <Card variant="outlined" padding="md">
-          <CardHeader title="What a shield is" titleAs="h2" />
+          <CardHeader title="What a project is" titleAs="h2" />
           <CardBody className="stack">
-            <p>A shield runs an AI agent in a small Linux VM on this Mac.</p>
+            <p>A project is a folder. Its cage runs an AI agent in a small Linux VM on this Mac.</p>
             <p>The agent sees only the folders that you mount, and reaches only the hosts that you allow.</p>
-            <p>Your logins stay on this Mac: the shield adds them to requests, and the agent sees a placeholder.</p>
+            <p>Your logins stay on this Mac: the cage adds them to requests, and the agent sees a placeholder.</p>
             <div className="row onboarding-picture" aria-hidden>
               <Folder size={28} />
               <ArrowRight size={16} className="muted" />
-              <Shield size={36} className="ok" />
+              <CageMark size={36} />
               <ArrowRight size={16} className="muted" />
               <Globe size={28} />
             </div>
@@ -187,7 +188,7 @@ export function Onboarding({
       {step === 1 && (
         <Card variant="outlined" padding="md">
           <CardHeader
-            title="Create your first shield"
+            title="Create your first project"
             titleAs="h2"
             description="Pick the project folder. The agent works in it as /workspace. You can also drop the folder on this window."
           />
@@ -197,7 +198,7 @@ export function Onboarding({
               loading={busy}
               onClick={() =>
                 act(async () => {
-                  const folder = await open({ directory: true, title: "Choose the shield folder" });
+                  const folder = await open({ directory: true, title: "Choose the project folder" });
                   if (folder !== null) await create(folder);
                 })
               }
@@ -212,12 +213,12 @@ export function Onboarding({
           <CardHeader
             title="Add an agent"
             titleAs="h2"
-            description="The shield can use the agents of this Mac, with your profile (read-only) and your subscription login. You can change this later in Settings."
+            description="The project can use the agents of this Mac, with your profile (read-only) and your subscription login. You can change this later in Settings."
           />
           <CardBody className="stack">
             {!detection && <p className="muted">Looking for agents on this Mac…</p>}
             {detection?.agents.length === 0 && (
-              <p className="muted">No agent is installed on this Mac. The shield has pi built in; add Claude Code or Codex later in Settings.</p>
+              <p className="muted">No agent is installed on this Mac. The project has pi built in; add Claude Code or Codex later in Settings.</p>
             )}
             <ul className="list">
               {detection?.agents.map((agent) => {
@@ -243,7 +244,7 @@ export function Onboarding({
               })}
             </ul>
             {added.includes("claude") && (
-              <p className="muted">When the shield starts, macOS asks once to allow access to the Claude login: select Allow.</p>
+              <p className="muted">When the cage starts, macOS asks once to allow access to the Claude login: select Allow.</p>
             )}
           </CardBody>
         </Card>
@@ -253,7 +254,7 @@ export function Onboarding({
           <CardHeader
             title="Your editor"
             titleAs="h2"
-            description="Open in editor opens the shield folder, or the current folder of a terminal, in this editor. You can change it later in Settings."
+            description="Open in editor opens the project folder, or the current folder of a terminal, in this editor. You can change it later in Settings."
           />
           <CardBody className="stack">
             {!editors && <p className="muted">Looking for editors on this Mac…</p>}
@@ -272,9 +273,9 @@ export function Onboarding({
       )}
       {step === 4 && (
         <Card variant="outlined" padding="md">
-          <CardHeader title="Your shield is ready" titleAs="h2" />
+          <CardHeader title="Your project is ready" titleAs="h2" />
           <CardBody className="stack">
-            <p>Start the shield, then open an agent with ⌘P or a shell with ⌘T.</p>
+            <p>Start the cage, then open an agent with ⌘P or a shell with ⌘T.</p>
             <p className="muted">⌘K shows all actions. ⌘, opens Settings.</p>
           </CardBody>
         </Card>
@@ -315,7 +316,7 @@ export function Onboarding({
         )}
         {step === 4 && (
           <Button loading={busy} onClick={finish}>
-            Open the shield
+            Open the project
           </Button>
         )}
       </div>

@@ -25,7 +25,7 @@ export function RailHandle({ width, onResize, onDone }: Props) {
       className={dragging ? "rail-handle dragging" : "rail-handle"}
       role="separator"
       aria-orientation="vertical"
-      aria-label="Resize the shield list"
+      aria-label="Resize the project list"
       aria-valuenow={width}
       aria-valuemin={MIN}
       aria-valuemax={MAX}

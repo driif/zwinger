@@ -45,9 +45,9 @@ pub enum Decision {
 
 pub struct Context<'a> {
     pub policy: &'a NetworkPolicy,
-    /// The refresh hosts of the shield's host logins.
+    /// The refresh hosts of the project's host logins.
     pub refresh: &'a [&'static str],
-    /// The shield has a Gemini host login, whose tokeninfo check the proxy
+    /// The project has a Gemini host login, whose tokeninfo check the proxy
     /// answers. The login is the allow that the check needs.
     pub tokeninfo: bool,
 }

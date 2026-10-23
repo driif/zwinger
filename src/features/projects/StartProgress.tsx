@@ -40,7 +40,7 @@ export function phaseName(phase: StartPhase) {
   return phase.step === "profile" ? `${AGENT_NAMES[phase.agent]} profile` : phase.step;
 }
 
-/** The current phase of a shield start, as text with a progress bar. */
+/** The current phase of a cage start, as text with a progress bar. */
 export function StartProgress({ phase }: { phase: StartPhase }) {
   const text = phaseText(phase);
   return (

@@ -8,9 +8,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
+use crate::cage;
 use crate::error::{Error, Result};
 use crate::host_agents::login;
-use crate::shield;
 
 const SERVICE: &str = "zwinger";
 /// The longest wait for a Keychain call, which can show the macOS access prompt.
@@ -62,7 +62,7 @@ pub enum Origin {
     /// The vault: the user sets the value.
     #[default]
     User,
-    /// The agent's login on the Mac, read at each shield start. The vault
+    /// The agent's login on the Mac, read at each cage start. The vault
     /// never has its value, and the user cannot edit it.
     HostLogin { agent: AgentKind },
 }
@@ -113,7 +113,7 @@ pub fn is_token(field: &str) -> bool {
 }
 
 /// The trimmed name of a secret or credential: a variable name that the
-/// shield does not set.
+/// project does not set.
 pub fn check_name(name: &str) -> Result<String> {
     let name = name.trim();
     let invalid = |reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
@@ -124,7 +124,7 @@ pub fn check_name(name: &str) -> Result<String> {
         return Err(invalid("use A-Z, 0-9 and _, and do not start with a digit"));
     }
     if RESERVED.contains(&name) || name.starts_with("MSB_") {
-        return Err(invalid("the shield sets this variable"));
+        return Err(invalid("the cage sets this variable"));
     }
     Ok(name.to_owned())
 }
@@ -164,7 +164,7 @@ impl Secret {
         let invalid = |reason: &str| Error::InvalidSecret(name.to_owned(), reason.to_owned());
         let mut hosts: Vec<String> = Vec::new();
         for host in &self.hosts {
-            let host = shield::domain(host)?;
+            let host = cage::domain(host)?;
             if host.starts_with("*.") {
                 return Err(invalid("use exact hosts, not wildcards"));
             }
@@ -226,20 +226,20 @@ impl fmt::Debug for SecretValue {
 }
 
 /// The vault account of a secret value.
-pub fn account(shield_id: &str, name: &str) -> String {
-    format!("{shield_id}/{name}")
+pub fn account(project_id: &str, name: &str) -> String {
+    format!("{project_id}/{name}")
 }
 
-/// Stores secret values per shield.
+/// Stores secret values per project.
 pub trait Vault: Send + Sync {
-    fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()>;
-    fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>>;
+    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()>;
+    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>>;
     /// Deleting an absent value is not an error.
-    fn delete(&self, shield_id: &str, name: &str) -> Result<()>;
+    fn delete(&self, project_id: &str, name: &str) -> Result<()>;
     /// The [`account`]s of all stored values. Reads no values.
     fn accounts(&self) -> Result<Vec<String>>;
     /// A write of the value passed its deadline and still runs.
-    fn is_pending(&self, _shield_id: &str, _name: &str) -> bool {
+    fn is_pending(&self, _project_id: &str, _name: &str) -> bool {
         false
     }
 }
@@ -350,28 +350,28 @@ impl Ordered {
 }
 
 impl Vault for Ordered {
-    fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-        let (id, key, value) = (shield_id.to_owned(), name.to_owned(), value.clone());
-        self.write(account(shield_id, name), move |v| v.set(&id, &key, &value))
+    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        let (id, key, value) = (project_id.to_owned(), name.to_owned(), value.clone());
+        self.write(account(project_id, name), move |v| v.set(&id, &key, &value))
     }
 
-    fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        let (id, key) = (shield_id.to_owned(), name.to_owned());
+    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        let (id, key) = (project_id.to_owned(), name.to_owned());
         self.read(move |v| v.get(&id, &key))
     }
 
-    fn delete(&self, shield_id: &str, name: &str) -> Result<()> {
-        let (id, key) = (shield_id.to_owned(), name.to_owned());
-        self.write(account(shield_id, name), move |v| v.delete(&id, &key))
+    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
+        let (id, key) = (project_id.to_owned(), name.to_owned());
+        self.write(account(project_id, name), move |v| v.delete(&id, &key))
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
         self.read(|v| v.accounts())
     }
 
-    fn is_pending(&self, shield_id: &str, name: &str) -> bool {
+    fn is_pending(&self, project_id: &str, name: &str) -> bool {
         let pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        pending.contains_key(&account(shield_id, name))
+        pending.contains_key(&account(project_id, name))
     }
 }
 
@@ -385,8 +385,8 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 #[cfg(target_os = "macos")]
 impl Keychain {
-    fn entry(shield_id: &str, name: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE, &account(shield_id, name)).map_err(keychain_error)
+    fn entry(project_id: &str, name: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(SERVICE, &account(project_id, name)).map_err(keychain_error)
     }
 
     fn query() -> security_framework::item::ItemSearchOptions {
@@ -404,12 +404,12 @@ fn keychain_error(e: impl fmt::Display) -> Error {
 
 #[cfg(target_os = "macos")]
 impl Vault for Keychain {
-    fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-        Self::entry(shield_id, name)?.set_password(value.expose()).map_err(keychain_error)
+    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        Self::entry(project_id, name)?.set_password(value.expose()).map_err(keychain_error)
     }
 
-    fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        match Self::entry(shield_id, name)?.get_password() {
+    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        match Self::entry(project_id, name)?.get_password() {
             Ok(value) => Ok(Some(SecretValue::new(value))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(keychain_error(e)),
@@ -417,8 +417,8 @@ impl Vault for Keychain {
     }
 
     /// Not through keyring, because keyring drops the result of the delete.
-    fn delete(&self, shield_id: &str, name: &str) -> Result<()> {
-        match Self::query().account(&account(shield_id, name)).delete() {
+    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
+        match Self::query().account(&account(project_id, name)).delete() {
             Err(e) if e.code() != ERR_SEC_ITEM_NOT_FOUND => Err(keychain_error(e)),
             _ => Ok(()),
         }
@@ -478,20 +478,20 @@ pub mod fake {
     }
 
     impl Vault for SlowVault {
-        fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
             self.wait()?;
-            self.writes.lock().unwrap().push((account(shield_id, name), Some(value.expose().to_owned())));
-            self.memory.set(shield_id, name, value)
+            self.writes.lock().unwrap().push((account(project_id, name), Some(value.expose().to_owned())));
+            self.memory.set(project_id, name, value)
         }
 
-        fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>> {
-            self.memory.get(shield_id, name)
+        fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+            self.memory.get(project_id, name)
         }
 
-        fn delete(&self, shield_id: &str, name: &str) -> Result<()> {
+        fn delete(&self, project_id: &str, name: &str) -> Result<()> {
             self.wait()?;
-            self.writes.lock().unwrap().push((account(shield_id, name), None));
-            self.memory.delete(shield_id, name)
+            self.writes.lock().unwrap().push((account(project_id, name), None));
+            self.memory.delete(project_id, name)
         }
 
         fn accounts(&self) -> Result<Vec<String>> {
@@ -508,21 +508,21 @@ pub mod fake {
     }
 
     impl Vault for MemoryVault {
-        fn set(&self, shield_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-            self.values.lock().unwrap().insert(account(shield_id, name), value.clone());
+        fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+            self.values.lock().unwrap().insert(account(project_id, name), value.clone());
             Ok(())
         }
 
-        fn get(&self, shield_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            Ok(self.values.lock().unwrap().get(&account(shield_id, name)).cloned())
+            Ok(self.values.lock().unwrap().get(&account(project_id, name)).cloned())
         }
 
-        fn delete(&self, shield_id: &str, name: &str) -> Result<()> {
+        fn delete(&self, project_id: &str, name: &str) -> Result<()> {
             if self.fail_delete.load(Ordering::SeqCst) {
                 return Err(Error::Keychain("delete failed".into()));
             }
-            self.values.lock().unwrap().remove(&account(shield_id, name));
+            self.values.lock().unwrap().remove(&account(project_id, name));
             Ok(())
         }
 
@@ -540,10 +540,10 @@ pub mod tests {
     const DEADLINE: Duration = Duration::from_millis(50);
 
     /// Waits until no write of the account is pending.
-    pub fn until_settled(vault: &dyn Vault, shield_id: &str, name: &str) {
+    pub fn until_settled(vault: &dyn Vault, project_id: &str, name: &str) {
         let end = std::time::Instant::now() + Duration::from_secs(5);
-        while vault.is_pending(shield_id, name) {
-            assert!(std::time::Instant::now() < end, "{shield_id}/{name} stays pending");
+        while vault.is_pending(project_id, name) {
+            assert!(std::time::Instant::now() < end, "{project_id}/{name} stays pending");
             std::thread::sleep(Duration::from_millis(5));
         }
     }

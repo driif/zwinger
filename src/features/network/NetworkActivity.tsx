@@ -2,8 +2,8 @@ import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
 import { Ban, Check, KeyRound, Play } from "lucide-react";
 import { useEffect, useState } from "react";
 import { NetEvent, putRule, Service, wildcardFor } from "./api";
-import { startShield } from "../shields/api";
-import { Action, ShieldView, Target } from "../../shared/api";
+import { startCage } from "../projects/api";
+import { Action, ProjectView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
 
@@ -35,14 +35,14 @@ interface Group {
 }
 
 interface Props {
-  shield: ShieldView;
+  project: ProjectView;
   events: NetEvent[];
   catalog: Service[];
   run: Run;
 }
 
-export function NetworkActivity({ shield, events, catalog, run }: Props) {
-  const { id, network } = shield;
+export function NetworkActivity({ project, events, catalog, run }: Props) {
+  const { id, network } = project;
   const [filter, setFilter] = useState("all");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
@@ -133,7 +133,7 @@ export function NetworkActivity({ shield, events, catalog, run }: Props) {
       <CardHeader
         title="Activity"
         titleAs="h2"
-        description="The requests of the shield, by host. The newest host is first."
+        description="The requests of the cage, by host. The newest host is first."
       />
       <CardBody className="stack">
         <FilterChips
@@ -148,7 +148,7 @@ export function NetworkActivity({ shield, events, catalog, run }: Props) {
         {shown.length === 0 &&
           (events.length > 0 ? (
             <p className="muted">No {filter} activity.</p>
-          ) : shield.status.state === "running" ? (
+          ) : project.status.state === "running" ? (
             <p className="muted">
               No network activity yet. The hosts show here when the agent
               reaches out.
@@ -156,14 +156,14 @@ export function NetworkActivity({ shield, events, catalog, run }: Props) {
           ) : (
             <div className="row">
               <p className="muted grow">
-                No network activity. Start the shield to see the hosts that the
+                No network activity. Start the cage to see the hosts that the
                 agent reaches.
               </p>
               <Button
                 size="sm"
                 variant="outline"
                 iconLeft={<Play size={14} />}
-                onClick={() => run(() => startShield(id))}
+                onClick={() => run(() => startCage(id))}
               >
                 Start
               </Button>

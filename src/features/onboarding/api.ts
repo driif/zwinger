@@ -14,7 +14,7 @@ export interface Check {
 export type StartupStep =
   "resolve" | "reapLegacy" | "install" | "reap" | "ready";
 
-/** The shield commands work only in the `ready` phase. `blocked`: a check failed. */
+/** The project commands work only in the `ready` phase. `blocked`: a check failed. */
 export interface Startup {
   phase: "checking" | "installing" | "ready" | "blocked";
   checks: Check[];

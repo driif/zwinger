@@ -7,8 +7,8 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::Instant;
 
+use crate::cage::manager::{State, lock};
 use crate::runtime::PtyEvent;
-use crate::shield::manager::{State, lock};
 
 /// The output bytes kept per session, for a view that attaches later.
 pub(crate) const RING: usize = 1 << 20;
@@ -310,7 +310,7 @@ pub(crate) async fn pump<V>(
 #[cfg(test)]
 mod tests {
     use super::{OSC7_LIMIT, Osc7};
-    use crate::shield::testing::*;
+    use crate::cage::testing::*;
 
     #[tokio::test]
     async fn a_stale_detach_keeps_the_new_sink() {

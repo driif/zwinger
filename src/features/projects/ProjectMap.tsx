@@ -15,14 +15,15 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Maximize, Minus, Network, Plus, Shield } from "lucide-react";
+import { Maximize, Minus, Network, Plus } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NetEvent } from "../network/api";
 import { setLayout } from "./api";
 import { isRoundFolder } from "../tasks/api";
-import { Pos, ShieldView } from "../../shared/api";
+import { Pos, ProjectView } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
+import { CageMark } from "../../shared/CageMark";
 import { BoundaryData, ItemData, Jump, MapNode, mapLayout } from "./mapLayout";
 import "./map.css";
 
@@ -57,7 +58,7 @@ function BoundaryNode({ data }: NodeProps<Node<BoundaryData, "boundary">>) {
   return (
     <div className={`map-boundary ${data.state}`}>
       <div className="map-boundary-header">
-        <Shield size={18} />
+        <CageMark size={18} />
         <span className="map-title">{data.name}</span>
         <span className="map-state">microVM · {data.state}</span>
       </div>
@@ -92,20 +93,20 @@ const sameData = (a: Record<string, unknown>, b: Record<string, unknown>) =>
   );
 
 interface Props {
-  shield: ShieldView;
-  /** `undefined` until the folders of this shield are listed. */
+  project: ProjectView;
+  /** `undefined` until the folders of this project are listed. */
   folders?: string[];
-  /** The shield's network events, oldest first. */
+  /** The project's network events, oldest first. */
   events: NetEvent[];
   visible: boolean;
   run: Run;
   onJump: (tab: Jump) => void;
-  /** A folder from Finder was dropped on the shield boundary. */
+  /** A folder from Finder was dropped on the project boundary. */
   onDropFolder: (path: string) => void;
 }
 
 /** Host paths on the left, the microVM in the middle, egress on the right. The user can drag the nodes. */
-export function ShieldMap(props: Props) {
+export function ProjectMap(props: Props) {
   return (
     <ReactFlowProvider>
       <MapCanvas {...props} />
@@ -113,15 +114,15 @@ export function ShieldMap(props: Props) {
   );
 }
 
-function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder }: Props) {
+function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolder }: Props) {
   const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
   const container = useRef<HTMLDivElement>(null);
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
   const catalog = useCatalog();
-  // The layout that the last save sent, until the shield list has it.
+  // The layout that the last save sent, until the project list has it.
   const [saved, setSaved] = useState<{ base: Record<string, Pos>; layout: Record<string, Pos> }>();
-  const layout = saved?.base === shield.layout ? saved.layout : shield.layout;
+  const layout = saved?.base === project.layout ? saved.layout : project.layout;
 
   // Ticks while an event is recent, so the activity dots and blocked hosts expire.
   useEffect(() => {
@@ -136,8 +137,8 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   }, [latest]);
 
   const map = useMemo(
-    () => mapLayout({ ...shield, layout }, folders ?? [], events, catalog, now),
-    [shield, layout, folders, events, catalog, now],
+    () => mapLayout({ ...project, layout }, folders ?? [], events, catalog, now),
+    [project, layout, folders, events, catalog, now],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 
@@ -164,8 +165,8 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   }, [map]);
 
   function save(next: Record<string, Pos> | null) {
-    setSaved({ base: shield.layout, layout: next ?? {} });
-    run(() => setLayout(shield.id, next));
+    setSaved({ base: project.layout, layout: next ?? {} });
+    run(() => setLayout(project.id, next));
   }
 
   // Positions of nodes that no longer exist are dropped. Folder nodes are
@@ -179,7 +180,7 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
 
   // The auto layout fits the box when it shows and when the box resizes. A saved
   // layout keeps its viewport, unless the nodes do not fit in the box anymore.
-  const auto = Object.keys(shield.layout).length === 0;
+  const auto = Object.keys(project.layout).length === 0;
   useEffect(() => {
     if (!visible) return;
     const box = container.current!;
@@ -231,7 +232,7 @@ function MapCanvas({ shield, folders, events, visible, run, onJump, onDropFolder
   const jump = (node?: MapNode) => node?.type === "item" && node.data.jump && onJump(node.data.jump);
 
   return (
-    <div ref={container} className="map" role="group" aria-label={`Map of shield ${shield.name}`}>
+    <div ref={container} className="map" role="group" aria-label={`Map of project ${project.name}`}>
       <ReactFlow<MapNode>
         nodes={nodes}
         edges={map.edges}

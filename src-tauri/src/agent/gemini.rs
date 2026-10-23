@@ -1,4 +1,4 @@
-//! Gemini CLI: one `gemini --output-format stream-json` per task call. It runs from the host install, which the shield
+//! Gemini CLI: one `gemini --output-format stream-json` per task call. It runs from the host install, which the cage
 //! mounts read-only: Gemini CLI has no pinned runtime. It authenticates
 //! with the host login (ADR 0002) or a `GEMINI_API_KEY` credential.
 
@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 /// The host package of Gemini CLI, mounted read-only.
 pub const DIR: &str = "/opt/zwinger/host/gemini";
-/// Its `HOME`, so `~/.gemini` is in the shield's state and never the host's.
+/// Its `HOME`, so `~/.gemini` is in the project's state and never the host's.
 pub const HOME: &str = "/opt/zwinger/state/gemini";
 
 fn assistant(content: Value) -> Value {

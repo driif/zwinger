@@ -56,7 +56,7 @@ export function installRuntime(
   });
 }
 
-/** Where a shield's copy of a host agent comes from. */
+/** Where a project's copy of a host agent comes from. */
 export type RuntimeSource = "host" | "cached" | "pinned";
 
 export type LoginState =
@@ -100,7 +100,7 @@ export const putHostAgent = (
 export const removeHostAgent = (id: string, agent: AgentKind) =>
   call<void>("remove_host_agent", { id, agent });
 
-/** Needs no restart: the running shield gets new agent commands at once. */
+/** Needs no restart: the running cage gets new agent commands at once. */
 export const setAgentsUnprompted = (id: string, on: boolean) =>
   call<void>("set_agents_unprompted", { id, on });
 
@@ -123,7 +123,7 @@ export interface Prefs {
   followSystem: boolean;
   lightTheme: string;
   darkTheme: string;
-  /** The width of the shield rail, in px. */
+  /** The width of the project rail, in px. */
   railWidth: number;
   terminal: TerminalPrefs;
   editors: EditorPrefs;
@@ -186,5 +186,5 @@ export const legacyStorage = () => call<LegacyView[]>("legacy_storage");
 export const removeLegacyRuntime = (legacy: Legacy) =>
   call<void>("remove_legacy_runtime", { legacy });
 
-/** Removes the cached images that no shield uses. Resolves to the freed bytes, if known. */
+/** Removes the cached images that no project uses. Resolves to the freed bytes, if known. */
 export const cleanImages = () => call<number | null>("clean_images");

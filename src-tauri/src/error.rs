@@ -79,7 +79,7 @@ pub enum Error {
     RuleNotFound,
     #[error("invalid rule: {0}")]
     InvalidRule(String),
-    #[error("the network proxy of the shield does not start, so the shield does not start: {0}")]
+    #[error("the network proxy of the cage does not start, so the cage does not start: {0}")]
     Proxy(String),
     #[error("secret {0} has no value in the Keychain; set it again")]
     SecretMissing(String),
@@ -89,8 +89,8 @@ pub enum Error {
     KeychainTimeout,
     #[error("a Keychain change of secret {0} has not finished; answer the macOS prompt, then try again")]
     SecretPending(String),
-    #[error("shield not found")]
-    ShieldNotFound,
+    #[error("project not found")]
+    ProjectNotFound,
     #[error("mount not found")]
     MountNotFound,
     #[error("session not found")]
@@ -101,17 +101,17 @@ pub enum Error {
     TerminalOpen,
     #[error("invalid pane layout: {0}")]
     InvalidPaneLayout(String),
-    #[error("shield is not running")]
+    #[error("cage is not running")]
     NotRunning,
-    #[error("shield is already started")]
+    #[error("cage is already started")]
     AlreadyStarted,
-    #[error("shield is starting")]
+    #[error("cage is starting")]
     Starting,
-    #[error("shield is stopping")]
+    #[error("cage is stopping")]
     Stopping,
     #[error("session process ended")]
     SessionClosed,
-    #[error("the shield image has Node {0}, but pi needs Node 22.19 or newer")]
+    #[error("the cage image has Node {0}, but pi needs Node 22.19 or newer")]
     NodeTooOld(String),
     #[error("the agent process ended")]
     AgentClosed,
@@ -119,7 +119,7 @@ pub enum Error {
     UnknownRuntime(String),
     #[error("{0} is not installed")]
     RuntimeMissing(String),
-    #[error("{0} was installed after the shield started; restart the shield")]
+    #[error("{0} was installed after the cage started; restart the cage")]
     RuntimeNotMounted(String),
     #[error("{0} is being installed")]
     RuntimeInstalling(String),
@@ -129,30 +129,30 @@ pub enum Error {
     UnsupportedArch(String),
     #[error("{0} {1} has no hash that zwinger pins; confirm the download of this version first")]
     UnpinnedVersion(String, String),
-    #[error("{0} is already a host agent of this shield")]
+    #[error("{0} is already a host agent of this project")]
     DuplicateHostAgent(String),
     #[error("{0} is not installed on this Mac")]
     HostAgentMissing(String),
-    #[error("{0} runs only from this Mac; add it to the shield with Add agent, then restart the shield")]
+    #[error("{0} runs only from this Mac; add it to the project with Add agent, then restart the cage")]
     NotHostAgent(String),
-    #[error("{0} from this Mac does not run in the shield: {1}")]
+    #[error("{0} from this Mac does not run in the cage: {1}")]
     HostAgentFailed(String, String),
     #[error("the {0} login on this Mac: {1}")]
     HostLogin(String, String),
     #[error("{0} has no login on this Mac; log in with {0} on the Mac first")]
     HostLoginMissing(String),
-    #[error("the {0} login on this Mac has expired; open {0} on the Mac once to renew it, then start the shield again")]
+    #[error("the {0} login on this Mac has expired; open {0} on the Mac once to renew it, then start the cage again")]
     HostLoginExpired(String),
     #[error(
-        "{0} is blocked in this shield: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off"
+        "{0} is blocked in this cage: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off"
     )]
     RefreshHostConflict(String, String),
     #[error("the download of {0} does not match its integrity hash")]
     IntegrityMismatch(String),
     #[error("invalid package of {0}: {1}")]
     BadPackage(String, String),
-    #[error("{0} shields still run; stop them to restart for the update")]
-    ShieldsRunning(usize),
+    #[error("{0} cages still run; stop them to restart for the update")]
+    CagesRunning(usize),
     #[error("MSB_PATH names a VM runtime that does not work: {0}; fix MSB_PATH or remove it, then open zwinger again")]
     DeveloperRuntime(String),
     #[error("no editor is on; turn one on in Settings, Editors")]
@@ -189,7 +189,7 @@ impl Error {
             Error::Io(e) => format!("A file operation on this Mac failed: {e}."),
             Error::Json(e) => format!("zwinger could not read its saved data: {e}."),
             Error::Sandbox(e) => sandbox_message(e),
-            Error::ShieldsRunning(1) => "A shield still runs. Stop it, then restart to update.".into(),
+            Error::CagesRunning(1) => "A cage still runs. Stop it, then restart to update.".into(),
             other => sentence(&other.to_string()),
         }
     }
@@ -203,11 +203,11 @@ fn sandbox_message(error: &microsandbox::MicrosandboxError) -> String {
         }
         E::Http(_) => "The download failed. Check the internet connection, then try again.".into(),
         E::Image(e) => {
-            format!("zwinger could not get the shield image. Check the internet connection, then try again ({e}).")
+            format!("zwinger could not get the cage image. Check the internet connection, then try again ({e}).")
         }
-        E::BootStart { .. } => format!("The shield VM did not start: {error}."),
+        E::BootStart { .. } => format!("The cage did not start: {error}."),
         E::Database(_) => "The VM database is not available. Quit zwinger and open it again.".into(),
-        E::ExecTimeout(_) => "The command in the shield did not answer in time.".into(),
+        E::ExecTimeout(_) => "The command in the cage did not answer in time.".into(),
         _ => format!("The VM runtime failed: {error}."),
     }
 }
@@ -249,7 +249,7 @@ mod tests {
             serde_json::to_value(Error::MissingPath("/x".into())).unwrap(),
             json!({ "code": "MissingPath", "message": "Path does not exist: /x." })
         );
-        assert_eq!(Error::ShieldNotFound.message(), "Shield not found.");
+        assert_eq!(Error::ProjectNotFound.message(), "Project not found.");
         assert_eq!(Error::RunState("paused").code(), "RunState");
     }
 
@@ -257,8 +257,8 @@ mod tests {
     fn keeps_the_app_name_and_the_full_stop() {
         assert_eq!(sentence("zwinger stopped."), "zwinger stopped.");
         assert_eq!(sentence("done?"), "Done?");
-        assert_eq!(Error::ShieldsRunning(1).message(), "A shield still runs. Stop it, then restart to update.");
-        assert_eq!(Error::ShieldsRunning(2).message(), "2 shields still run; stop them to restart for the update.");
+        assert_eq!(Error::CagesRunning(1).message(), "A cage still runs. Stop it, then restart to update.");
+        assert_eq!(Error::CagesRunning(2).message(), "2 cages still run; stop them to restart for the update.");
     }
 
     #[test]

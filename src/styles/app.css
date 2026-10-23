@@ -288,7 +288,7 @@ p {
   max-width: 18rem;
 }
 
-/* The phase of a shield start: a short bar and its text. */
+/* The phase of a cage start: a short bar and its text. */
 .start-progress {
   display: inline-flex;
   align-items: center;

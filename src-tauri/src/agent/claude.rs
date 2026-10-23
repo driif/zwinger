@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 /// The installed runtime, mounted read-only.
 pub const DIR: &str = "/opt/zwinger/claude";
-/// Its `HOME`, so `~/.claude` is in the shield's state and never the host's.
+/// Its `HOME`, so `~/.claude` is in the project's state and never the host's.
 pub const HOME: &str = "/opt/zwinger/state/claude";
 
 fn text_of(content: &Value) -> String {

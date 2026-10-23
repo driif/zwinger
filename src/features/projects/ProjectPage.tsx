@@ -17,7 +17,7 @@ import {
   AgentKind,
   PaneNode,
   SessionKind,
-  ShieldView,
+  ProjectView,
 } from "../../shared/api";
 import { time } from "../settings/HostAgentsSettings";
 import { decide, useCatalog } from "../network/network";
@@ -33,8 +33,8 @@ import { LaunchAction, launchActions } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
 
-// React Flow and the run room are large and not on the first screen of every shield.
-const ShieldMap = lazy(() => import("./ShieldMap").then((m) => ({ default: m.ShieldMap })));
+// React Flow and the run room are large and not on the first screen of every project.
+const ProjectMap = lazy(() => import("./ProjectMap").then((m) => ({ default: m.ProjectMap })));
 const TaskRoom = lazy(() => import("../tasks/TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
 /** The provider host of each host login. pi's depends on its login. */
@@ -44,38 +44,38 @@ const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
   gemini: "cloudcode-pa.googleapis.com",
 };
 
-/** The step that adds a host agent to the shield, or changes or removes it. */
-function AddAgent({ shield, detection, kind, run, onDone }: {
-  shield: ShieldView;
+/** The step that adds a host agent to the project, or changes or removes it. */
+function AddAgent({ project, detection, kind, run, onDone }: {
+  project: ProjectView;
   detection: Detection;
   kind: AgentKind;
   run: Run;
   onDone: () => void;
 }) {
   const agent = detection.agents.find((a) => a.kind === kind);
-  const current = shield.hostAgents.find((a) => a.kind === kind);
+  const current = project.hostAgents.find((a) => a.kind === kind);
   const catalog = useCatalog();
   const canLogin = agent?.login.state === "found";
   const [profile, setProfile] = useState(current?.profile ?? agent?.profile === true);
   const [login, setLogin] = useState(current?.login ?? canLogin);
   const host = LOGIN_HOSTS[kind];
-  const blocked = host === undefined || !decide(shield.network, host, catalog).allowed;
+  const blocked = host === undefined || !decide(project.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
   if (!agent) return null;
   const name = AGENT_NAMES[kind];
   const save = () =>
-    run(() => putHostAgent(shield.id, { kind, profile, login }, login && blocked && allow).then(onDone));
+    run(() => putHostAgent(project.id, { kind, profile, login }, login && blocked && allow).then(onDone));
 
   return (
     <Card variant="outlined" padding="md">
       <CardHeader
         title={`${current ? "Change" : "Add"} ${name} ${agent.version} from this Mac`}
         titleAs="h2"
-        description="The shield uses the agent of this Mac. Changes apply on the next start."
+        description="The project uses the agent of this Mac. Changes apply on the next start."
       />
       <CardBody className="stack">
         <SpringCheckbox
-          label="Profile, read-only: your skills, instructions and settings. The agent cannot change them in the shield."
+          label="Profile, read-only: your skills, instructions and settings. The agent cannot change them in the cage."
           checked={profile}
           disabled={!agent.profile}
           onChange={(e) => setProfile(e.target.checked)}
@@ -98,11 +98,11 @@ function AddAgent({ shield, detection, kind, run, onDone }: {
           />
         )}
         {login && kind === "claude" && (
-          <span className="muted">When the shield starts, macOS asks once to allow access to the login: select Allow.</span>
+          <span className="muted">When the cage starts, macOS asks once to allow access to the login: select Allow.</span>
         )}
         <div className="row end">
           {current && (
-            <Button variant="danger" onClick={() => run(() => removeHostAgent(shield.id, kind).then(onDone))}>
+            <Button variant="danger" onClick={() => run(() => removeHostAgent(project.id, kind).then(onDone))}>
               Remove
             </Button>
           )}
@@ -124,15 +124,15 @@ const TABS = [
 ];
 
 interface Props {
-  shield: ShieldView;
-  /** The shield's network events, oldest first. */
+  project: ProjectView;
+  /** The project's network events, oldest first. */
   events: NetEvent[];
   view: View;
   onView: (view: View) => void;
   intent?: Intent;
   onIntentDone: () => void;
   onNetSeen: (seq: number) => void;
-  /** A folder from Finder was dropped on the shield boundary of the map. */
+  /** A folder from Finder was dropped on the project boundary of the map. */
   onDropFolder: (path: string) => void;
   runtimes: Runtimes;
   /** The agents on this Mac. */
@@ -142,17 +142,17 @@ interface Props {
   onAdding: (kind?: AgentKind) => void;
   /** Opens the Host agents settings. */
   onHostAgents: () => void;
-  /** The runs of the shield's tasks. */
+  /** The runs of the project's tasks. */
   runs: RunSummary[];
   onRunsChange: () => void;
-  /** Reads the shields again. Resolves when the new state is set. */
+  /** Reads the projects again. Resolves when the new state is set. */
   onRefresh: () => Promise<unknown>;
   panes: Pane[];
-  /** The focused pane of this shield. */
+  /** The focused pane of this project. */
   focused?: string;
   run: Run;
   onToggle: () => void;
-  /** `agent` opens the shield's first agent. */
+  /** `agent` opens the project's first agent. */
   onNewSession: (kind: SessionKind | "agent") => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
@@ -173,9 +173,9 @@ interface Props {
   onEditorSettings: () => void;
 }
 
-// Not keyed by shield: the terminal view keeps the panes of every shield attached.
-export function ShieldPage({
-  shield,
+// Not keyed by project: the terminal view keeps the panes of every project attached.
+export function ProjectPage({
+  project,
   events,
   view,
   onView,
@@ -201,14 +201,14 @@ export function ShieldPage({
   onEditorSettings,
   ...terminal
 }: Props) {
-  const { status } = shield;
+  const { status } = project;
   const [listed, setListed] = useState<{ id: string; folders: string[] }>();
   const [reloads, setReloads] = useState(0);
-  /** The host notices that the user dismissed in the current running period of a shield. */
-  const [dismissed, setDismissed] = useState<{ shield: string; notices: string[] }>();
-  if (dismissed?.shield === shield.id && status.state !== "running") setDismissed(undefined);
-  const hidden = dismissed?.shield === shield.id ? dismissed.notices : [];
-  const folders = listed?.id === shield.id ? listed.folders : undefined;
+  /** The host notices that the user dismissed in the current running period of a project. */
+  const [dismissed, setDismissed] = useState<{ project: string; notices: string[] }>();
+  if (dismissed?.project === project.id && status.state !== "running") setDismissed(undefined);
+  const hidden = dismissed?.project === project.id ? dismissed.notices : [];
+  const folders = listed?.id === project.id ? listed.folders : undefined;
   // The tab that shows again after a terminal, app or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
@@ -218,12 +218,12 @@ export function ShieldPage({
   // Folders change outside the app, so the list reloads on focus and after each edit.
   useEffect(() => {
     let live = true;
-    const id = shield.id;
+    const id = project.id;
     listFolders(id).then((folders) => live && setListed({ id, folders }), () => {});
     return () => {
       live = false;
     };
-  }, [shield.id, reloads]);
+  }, [project.id, reloads]);
 
   useEffect(() => {
     const reload = () => setReloads((n) => n + 1);
@@ -240,12 +240,12 @@ export function ShieldPage({
     );
 
   const running = status.state === "running" || status.state === "stopping";
-  const sessions = shield.sessions.filter((s) => s.exitCode === null).length;
+  const sessions = project.sessions.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
-  const unverified = [...(shield.folderId ? [] : [shield.folder]), ...shield.mounts.filter((m) => !m.id).map((m) => m.host)];
-  const app = view.kind === "app" ? shield.apps.find((a) => a.id === view.appId) : undefined;
-  const task = view.kind === "task" ? shield.tasks.find((t) => t.id === view.taskId) : undefined;
-  const actions = launchActions(shield, editors);
+  const unverified = [...(project.folderId ? [] : [project.folder]), ...project.mounts.filter((m) => !m.id).map((m) => m.host)];
+  const app = view.kind === "app" ? project.apps.find((a) => a.id === view.appId) : undefined;
+  const task = view.kind === "task" ? project.tasks.find((t) => t.id === view.taskId) : undefined;
+  const actions = launchActions(project, editors);
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
   const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
@@ -254,7 +254,7 @@ export function ShieldPage({
     <section className="page">
       <header className="page-header row">
         <div className="grow">
-          <h1 className="page-title">{shield.name}</h1>
+          <h1 className="page-title">{project.name}</h1>
           <p className="muted row">
             <span className={`dot ${status.state}`} />
             {status.state === "error" ? (
@@ -264,9 +264,9 @@ export function ShieldPage({
             ) : (
               status.state
             )}
-            {status.state === "running" && shield.loginExpiresAt !== null && <span>· login valid until {time(shield.loginExpiresAt)}</span>}
+            {status.state === "running" && project.loginExpiresAt !== null && <span>· login valid until {time(project.loginExpiresAt)}</span>}
           </p>
-          <CopyField className="mono" value={shield.folder} display={tildePath(shield.folder, home)} title={shield.folder} />
+          <CopyField className="mono" value={project.folder} display={tildePath(project.folder, home)} title={project.folder} />
         </div>
         <SplitLaunch
           label="New terminal"
@@ -277,7 +277,7 @@ export function ShieldPage({
             ...launchMenu(newTerminals, onLaunch),
             // Host agents are set up here, next to the agents that they add.
             ...(detection?.agents ?? []).map((agent) => ({
-              label: `${shield.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+              label: `${project.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
               icon: <Plus size={14} />,
               run: () => onAdding(agent.kind),
             })),
@@ -303,18 +303,18 @@ export function ShieldPage({
           disabled={status.state === "starting"}
           onClick={onToggle}
         >
-          {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop" : "Start"}
+          {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
         </Button>
       </header>
       {adding && detection && (
-        <AddAgent key={adding} shield={shield} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
+        <AddAgent key={adding} project={project} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
       )}
       <div className="notices">
         {unverified.length > 0 && (
           <Notice
             icon={<TriangleAlert size={14} className="warn" />}
             actions={
-              <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(shield.id).then(onRefresh))}>
+              <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(project.id).then(onRefresh))}>
                 Confirm folders
               </Button>
             }
@@ -324,25 +324,25 @@ export function ShieldPage({
           </Notice>
         )}
         {status.state === "running" &&
-          shield.hostNotices
+          project.hostNotices
             .filter((notice) => !hidden.includes(notice))
             .map((notice) => (
               <Notice
                 key={notice}
                 icon={<Info size={14} className="muted" />}
-                onDismiss={() => setDismissed({ shield: shield.id, notices: [...hidden, notice] })}
+                onDismiss={() => setDismissed({ project: project.id, notices: [...hidden, notice] })}
               >
                 {notice}
               </Notice>
             ))}
         {status.state === "running" &&
-          shield.guestLogins.map((agent) => (
+          project.guestLogins.map((agent) => (
             <Notice
               key={agent}
               icon={<TriangleAlert size={14} className="warn" />}
               actions={
                 <>
-                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(shield.id, agent).then(onRefresh))}>
+                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(project.id, agent).then(onRefresh))}>
                     Remove it
                   </Button>
                   <Button size="sm" variant="outline" onClick={onHostAgents}>
@@ -351,7 +351,7 @@ export function ShieldPage({
                 </>
               }
             >
-              {AGENT_NAMES[agent]} has its own login in this shield. Its real token is in the shield, where the agent can
+              {AGENT_NAMES[agent]} has its own login in this cage. Its real token is in the cage, where the agent can
               read and send it.
             </Notice>
           ))}
@@ -359,14 +359,14 @@ export function ShieldPage({
       <ElasticTabs
           className="tabs"
           hidden={!isTab}
-          label="Shield"
+          label="Project"
           tabs={TABS}
           value={tab}
           onChange={(value) => jump(value as TabView)}
           panels={{
             overview: (
               <div className="overview">
-                {shield.terminals.length === 0 && (
+                {project.terminals.length === 0 && (
                   <Notice
                     icon={<Info size={14} className="muted" />}
                     actions={
@@ -380,15 +380,15 @@ export function ShieldPage({
                       </>
                     }
                   >
-                    {shield.hostAgents.length === 0 && detection && detection.agents.length > 0
+                    {project.hostAgents.length === 0 && detection && detection.agents.length > 0
                       ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
-                      : "Next: open an agent, or a shell on this Mac in the shield folder."}
+                      : "Next: open an agent, or a shell on this Mac in the project folder."}
                   </Notice>
                 )}
                 <Suspense>
-                  <ShieldMap
-                    key={shield.id}
-                    shield={shield}
+                  <ProjectMap
+                    key={project.id}
+                    project={project}
                     folders={folders}
                     events={events}
                     visible={isTab && tab === "overview"}
@@ -400,14 +400,14 @@ export function ShieldPage({
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
-                    <dd className="mono">{shield.harness ?? "/workspace"}</dd>
+                    <dd className="mono">{project.harness ?? "/workspace"}</dd>
                   </div>
                   <div>
                     <dt>Network</dt>
                     <dd>
-                      {shield.network.offline
+                      {project.network.offline
                         ? "Offline"
-                        : `${shield.network.default === "allow" ? "Allow" : "Block"} everything else, ${shield.network.rules.length} rules`}
+                        : `${project.network.default === "allow" ? "Allow" : "Block"} everything else, ${project.network.rules.length} rules`}
                     </dd>
                   </div>
                   <div>
@@ -416,13 +416,13 @@ export function ShieldPage({
                   </div>
                   <div>
                     <dt>Apps running</dt>
-                    <dd>{shield.appRuns.filter((r) => r.exitCode === null).length}</dd>
+                    <dd>{project.appRuns.filter((r) => r.exitCode === null).length}</dd>
                   </div>
-                  {shield.hostAgents.length > 0 && (
+                  {project.hostAgents.length > 0 && (
                     <div>
                       <dt>From this Mac</dt>
                       <dd>
-                        {shield.hostAgents
+                        {project.hostAgents
                           .map((a) => [AGENT_NAMES[a.kind], a.profile && "profile", a.login && "login"].filter(Boolean).join(" + "))
                           .join(", ")}
                       </dd>
@@ -433,8 +433,8 @@ export function ShieldPage({
             ),
             network: (
               <NetworkTab
-                key={shield.id}
-                shield={shield}
+                key={project.id}
+                project={project}
                 events={events}
                 run={edit}
                 intent={tab === "network" ? intent : undefined}
@@ -445,8 +445,8 @@ export function ShieldPage({
             ),
             settings: (
               <SettingsTab
-                key={shield.id}
-                shield={shield}
+                key={project.id}
+                project={project}
                 folders={folders ?? []}
                 runtimes={runtimes}
                 run={edit}
@@ -460,7 +460,7 @@ export function ShieldPage({
         <div className="view">
           <AppView
             key={app.id}
-            shield={shield}
+            project={project}
             app={app}
             run={run}
             onExit={terminal.onPaneExit}
@@ -474,14 +474,14 @@ export function ShieldPage({
             <TaskRoom
               key={task.id}
               kind="task"
-              shield={shield}
+              project={project}
               task={task}
               runs={runs.filter((r) => r.taskId === task.id)}
               run={view.run}
               onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
               onRunsChange={onRunsChange}
               onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
-              onStartShield={onToggle}
+              onStartCage={onToggle}
             />
           </Suspense>
         </div>
@@ -490,7 +490,7 @@ export function ShieldPage({
         <div className="view task-view">
           <TaskDialog
             key={view.taskId ?? "new"}
-            shield={shield}
+            project={project}
             taskId={view.taskId}
             onDone={async (taskId) => {
               // The tree and the task view need the saved task.
@@ -502,7 +502,7 @@ export function ShieldPage({
       )}
       <div className="view" hidden={view.kind !== "terminal"}>
         <TerminalTab
-          shield={shield}
+          project={project}
           panes={panes}
           focused={focused}
           editor={defaultEditor?.editor.name}
