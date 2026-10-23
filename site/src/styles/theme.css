@@ -15,6 +15,10 @@
   --sl-color-gray-6: var(--motiv-color-surface);
   --sl-color-gray-7: color-mix(in oklch, var(--motiv-color-surface) 50%, var(--motiv-color-bg));
   --sl-color-black: var(--motiv-color-bg);
+  /* Dividers between header, sidebar, content and outline: the motiv border color, as on the search field. */
+  --sl-color-hairline: var(--motiv-color-border);
+  --sl-color-hairline-light: var(--motiv-color-border);
+  --sl-color-hairline-shade: var(--motiv-color-border);
   --sl-font: var(--motiv-font-body);
 }
 
