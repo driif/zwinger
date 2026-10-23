@@ -6,6 +6,15 @@ disable-model-invocation: true
 
 **Predictability** (the same _process_ each run, not the same output) is the primary skill quality; all levers below serve it. Terms: [GLOSSARY.md](GLOSSARY.md).
 
+## Files
+
+A skill is two files, always in this repo, never global:
+
+- `.claude/skills/<name>/SKILL.md`: the skill.
+- `.agents/skills/<name>/SKILL.md`: the Codex entrypoint. Same `name` and `description`; the body only points to the shared skill. A user-invoked skill also gets `.agents/skills/<name>/agents/openai.yaml` with `allow_implicit_invocation: false`.
+
+A rename, a new skill or a deleted skill changes both files.
+
 ## Invocation
 
 - **Model-invoked**: its **description** lets the agent and other skills start it. Adds **context load** each turn.

@@ -15,7 +15,4 @@ Do not make control components or CSS for buttons, inputs, switches or other con
 ## Workflow
 
 1. Read the motiv exports (`src/index.ts`). Use the existing props first.
-2. If a control, prop or variant is missing, follow `AGENTS.md` in motiv.
-   Get a decision from the user before you add a new public API.
-3. Test locally with `pnpm add @driif/motiv@link:../motiv`. Never commit the `link:` dependency.
-4. After the motiv release, run `pnpm up @driif/motiv@latest`.
+2. If a control, prop, variant or look is missing or wrong, use the `changing-motiv` skill.
