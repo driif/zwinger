@@ -1,5 +1,5 @@
 import { Button, IconButton } from "@driif/motiv";
-import { Box, ChevronDown, Code, Copy, FolderOpen, History, Laptop } from "lucide-react";
+import { Box, ChevronDown, Code, Copy, FolderOpen, History, Laptop, ShieldOff } from "lucide-react";
 import { ReactNode, useRef, useState } from "react";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
@@ -14,13 +14,20 @@ function icon(action: LaunchAction) {
   if (kind.type === "host") return <Laptop size={14} />;
   if (kind.type === "shell") return <Box size={14} />;
   if (kind.resume) return <History size={14} />;
+  if (kind.type === "hostAgent") return <ShieldOff size={14} />;
   const Icon = AGENT_ICONS[kind.agent];
   return <Icon size={14} />;
 }
 
 /** The launch actions as menu items. */
 export const launchMenu = (actions: LaunchAction[], onLaunch: (action: LaunchAction) => void): MenuAction[] =>
-  actions.map((action) => ({ label: action.label, icon: icon(action), run: () => onLaunch(action) }));
+  actions.map((action) => ({
+    label: action.label,
+    icon: icon(action),
+    disabled: !!action.disabled,
+    reason: action.disabled,
+    run: () => onLaunch(action),
+  }));
 
 interface Props {
   label: string;

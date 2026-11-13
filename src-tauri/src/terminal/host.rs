@@ -15,7 +15,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
-use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput, TerminalKind};
+use crate::agent::launch::CA_ENV;
+use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput};
 
 /// How long the exit waits for the last output after the shell exits. A
 /// background job can keep the terminal open after its shell has exited.
@@ -47,6 +48,37 @@ pub(crate) fn login_shell() -> String {
             .then(|| CStr::from_ptr((*entry).pw_shell).to_string_lossy().into_owned())
     };
     passwd.filter(|s| executable(s)).unwrap_or_else(|| "/bin/zsh".to_owned())
+}
+
+/// The argv of a host shell: the login shell.
+pub(crate) fn shell_argv() -> Vec<String> {
+    vec![login_shell(), "-l".to_owned()]
+}
+
+/// `argv` through the login shell, so `node` and `PATH` come from the
+/// user's profile.
+pub(crate) fn login_exec(argv: Vec<String>) -> Vec<String> {
+    let mut all = vec![login_shell(), "-l".to_owned(), "-c".to_owned(), r#"exec "$@""#.to_owned(), "zwinger".to_owned()];
+    all.extend(argv);
+    all
+}
+
+/// The names of `env` that a host process does not get: the proxy, CA and
+/// Node net env of a cage, and the VM runtime's env. A user profile can set
+/// them again.
+fn scrubbed_env(env: impl IntoIterator<Item = String>) -> Vec<String> {
+    const NAMES: [&str; 7] =
+        ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "NODE_USE_ENV_PROXY", "NODE_OPTIONS"];
+    let proxy = |name: &str| ["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains(&name);
+    env.into_iter()
+        .filter(|name| {
+            NAMES.contains(&name.as_str())
+                || proxy(name)
+                || CA_ENV.contains(&name.as_str())
+                || name == "IS_SANDBOX"
+                || name.starts_with("MSB_")
+        })
+        .collect()
 }
 
 /// The process group of a host shell. The shell is a session leader
@@ -137,14 +169,16 @@ fn fallback_lang(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
     ["LANG", "LC_ALL", "LC_CTYPE"].iter().all(|name| var(name).is_none_or(|v| v.is_empty())).then_some("en_US.UTF-8")
 }
 
-/// Starts the login shell in `folder`. Returns the PTY and the shell's
-/// process group, so an app exit can kill it without the async runtime.
-/// The env is the app's env with the terminal names; it has no proxy and
-/// no VM env.
-pub(crate) fn open_host_pty(folder: &Path, rows: u16, cols: u16) -> Result<(Pty, HostGroup)> {
+/// Starts `argv` in `folder`. Returns the PTY and the process group, so an
+/// app exit can kill it without the async runtime. The env is the app's env
+/// with the terminal names, less [`scrubbed_env`].
+pub(crate) fn open_host_pty(folder: &Path, argv: Vec<String>, rows: u16, cols: u16) -> Result<(Pty, HostGroup)> {
     let pair =
         native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(pty_error)?;
-    let mut command = CommandBuilder::from_argv(TerminalKind::Host.argv().into_iter().map(Into::into).collect());
+    let mut command = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
+    for name in scrubbed_env(std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned())) {
+        command.env_remove(name);
+    }
     command.cwd(folder);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -315,7 +349,7 @@ mod tests {
         let dir = temp_dir();
         let (mut pty, _) = {
             host_sh();
-            open_host_pty(&dir, 24, 80)
+            open_host_pty(&dir, shell_argv(), 24, 80)
         }
         .unwrap();
         pty.input.send(PtyInput::Data(b"echo \"in $(pwd) as $TERM_PROGRAM\"; exit 3\n".to_vec())).unwrap();
@@ -329,7 +363,7 @@ mod tests {
         let dir = temp_dir();
         let (mut pty, group) = {
             host_sh();
-            open_host_pty(&dir, 24, 80)
+            open_host_pty(&dir, shell_argv(), 24, 80)
         }
         .unwrap();
         let pgid = group.id().unwrap();
@@ -374,6 +408,46 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the group or the job is still running");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[tokio::test]
+    async fn a_host_agent_execs_its_argv_through_the_login_shell() {
+        let dir = temp_dir();
+        let (mut pty, _) = {
+            host_sh();
+            open_host_pty(&dir, login_exec(vec!["printf".into(), "%s|".into(), "a b".into(), "$HOME".into()]), 24, 80)
+        }
+        .unwrap();
+        let (out, code) = read_until_exit(&mut pty).await;
+        // Each argument stays one word, and the shell expands none.
+        assert!(out.contains("a b|$HOME|"), "{out}");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn a_host_process_gets_no_proxy_ca_or_vm_env() {
+        let cage = [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS",
+            "NODE_USE_ENV_PROXY",
+            "NODE_OPTIONS",
+            "IS_SANDBOX",
+            "MSB_PATH",
+            "MSB_HOME",
+        ];
+        let env = cage.iter().chain(&["MY_PROJECT_TOKEN", "PATH", "HOME"]).map(|n| (*n).to_owned());
+        assert_eq!(scrubbed_env(env), cage);
     }
 
     #[test]

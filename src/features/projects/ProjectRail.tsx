@@ -30,6 +30,7 @@ import {
   Fence,
   History,
   Laptop,
+  ShieldOff,
   ListChecks,
   Pencil,
   Play,
@@ -65,8 +66,8 @@ import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import { tildePath, truncateMiddle } from "../../shared/paths";
 import { LaunchAction, launchActions } from "../launcher/actions";
-import { launchCage } from "../cages/sessionCage";
 import { Editors } from "../launcher/api";
+import type { Detection } from "../settings/api";
 import { launchMenu } from "../launcher/SplitLaunch";
 import { StartProgress } from "./StartProgress";
 import { mostUrgent } from "./agentState";
@@ -83,7 +84,17 @@ const GROUPS: { group: Group; label: string }[] = [
 ];
 
 const kindName = (kind: TerminalKind) =>
-  kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
+  kind.type === "host"
+    ? "Mac shell"
+    : kind.type === "shell"
+      ? "VM shell"
+      : kind.type === "hostAgent"
+        ? `${AGENT_NAMES[kind.agent]} (no cage)`
+        : AGENT_NAMES[kind.agent];
+
+const NO_CAGE = "No cage: runs on this Mac";
+/** The `NoCage` error text: a task needs a cage. */
+const NO_CAGE_TASKS = "this session has no cage; pick a cage for it or a default cage for its workspace";
 
 function AgentStatusGlyph({ state }: { state: AgentState | null }) {
   if (!state) return null;
@@ -102,8 +113,14 @@ function AgentStatusGlyph({ state }: { state: AgentState | null }) {
   );
 }
 
-/** Where a terminal runs: on this Mac, or in the cage. An agent always runs in the VM. */
+/** Where a terminal runs, from its kind: on this Mac, in the cage, or an agent on this Mac with no cage. */
 export function KindIcon({ kind }: { kind: TerminalKind }) {
+  if (kind.type === "hostAgent")
+    return (
+      <span role="img" aria-label={NO_CAGE} title={NO_CAGE} className="warn">
+        <ShieldOff size={14} aria-hidden="true" />
+      </span>
+    );
   if (kind.type === "agent") {
     const Icon = AGENT_ICONS[kind.agent];
     return <Icon size={14} aria-label="In the VM" />;
@@ -283,6 +300,7 @@ interface Props {
   /** A folder dropped from Finder on the rail. */
   dropFolder?: DroppedFolder;
   editors?: Editors;
+  detection?: Detection;
   /** The home folder, shown as `~`. */
   home?: string;
   onLaunch: (sessionId: string, action: LaunchAction) => void;
@@ -315,6 +333,7 @@ export function ProjectRail({
   dropFolder,
   onDropDone,
   editors,
+  detection,
   home,
   onLaunch,
   children,
@@ -376,6 +395,8 @@ export function ProjectRail({
           const { kind } = pane;
           const process = session.processes.find((s) => s.terminalId === pane.key);
           const state = !process ? "dormant" : process.exitCode !== null ? `exited ${process.exitCode}` : undefined;
+          // A Mac agent does not open again in a session that has a cage now.
+          const hasCage = kind.type === "hostAgent" && !!state && !!session.effectiveCage;
           const name = paneName(pane, panes);
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
           const open: MenuAction[] = state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : [];
@@ -386,15 +407,17 @@ export function ProjectRail({
                 <span className="grow">
                   {name}
                   {state && <span className="muted"> · {state}</span>}
+                  {hasCage && <span className="danger"> · the session has a cage</span>}
                 </span>
                 <AgentStatusGlyph state={process?.exitCode === null ? process.agent : null} />
               </>
             ),
             name,
+            title: hasCage ? `${name}: this session has a cage, so an agent with no cage does not open in it.` : undefined,
             icon: <KindIcon kind={kind} />,
             view: { kind: "terminal", key: pane.key },
             menu:
-              kind.type === "agent"
+              kind.type === "agent" || kind.type === "hostAgent"
                 ? [
                     ...open,
                     {
@@ -407,7 +430,8 @@ export function ProjectRail({
                 : [...open, close],
           };
         });
-    const cageRunning = vmCage?.status.state === "running";
+    // An old VM can still run after the session loses its cage.
+    const cageRunning = !!session.effectiveCage && vmCage?.status.state === "running";
     return session.tasks.map((task) => {
       const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
       const latest = taskRuns[taskRuns.length - 1];
@@ -430,6 +454,7 @@ export function ProjectRail({
             label: "Start run",
             icon: <Play size={14} />,
             disabled: !cageRunning || live,
+            reason: session.effectiveCage ? undefined : NO_CAGE_TASKS,
             run: () =>
               run(async () => {
                 const next = await startTaskRun(sid, task.id);
@@ -954,7 +979,7 @@ export function ProjectRail({
                         {sessions.map(({ target, session, sessionRow, groups }) => {
                           const sessionExpanded = !collapsed.has(sessionRow);
                           const status = target.vmCage?.status ?? { state: "stopped" as const };
-                          const launch = launchActions(launchCage(target), editors);
+                          const launch = launchActions(target, detection, editors);
                           const running = status.state === "running";
                           const effective = session.effectiveCage;
                           const shared = running && target.vmCage && target.vmCage.members.length > 1 ? target.vmCage : null;

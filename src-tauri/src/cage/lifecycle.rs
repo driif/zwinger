@@ -800,9 +800,9 @@ impl<R: SandboxRuntime> Manager<R> {
             else {
                 unreachable!("checked above");
             };
-            // A host shell runs on the Mac, so it outlives the VM.
+            // A host shell or agent runs on the Mac, so it outlives the VM.
             state.terminals.retain(|t| {
-                let ends = members.contains(&t.session_id) && t.kind != TerminalKind::Host;
+                let ends = members.contains(&t.session_id) && !t.kind.on_host();
                 if ends {
                     let _ = t.input.send(PtyInput::Kill);
                     if let (None, Some(terminal_id)) = (t.exit_code, &t.terminal_id) {
@@ -935,7 +935,7 @@ fn label(kind: TerminalKind) -> &'static str {
     match kind {
         TerminalKind::Shell => "VM shell",
         TerminalKind::Host => "Mac shell",
-        TerminalKind::Agent { agent, .. } => agent.label(),
+        TerminalKind::Agent { agent, .. } | TerminalKind::HostAgent { agent, .. } => agent.label(),
     }
 }
 

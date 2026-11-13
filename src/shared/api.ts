@@ -22,10 +22,14 @@ export async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
 
 /**
  * `host`: the user's login shell on the Mac, unsandboxed, in the session folder. `shell`: a VM shell in /workspace.
- * `agent`: an agent's own TUI in the harness; `resume` continues the agent's last session.
+ * `agent`: an agent's own TUI in the harness; `resume` continues the agent's last session. `hostAgent`: the Mac's
+ * install of the agent, unsandboxed, in the session folder of a session with no cage.
  */
 export type TerminalKind =
-  { type: "host" } | { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
+  | { type: "host" }
+  | { type: "shell" }
+  | { type: "agent"; agent: AgentKind; resume: boolean }
+  | { type: "hostAgent"; agent: AgentKind; resume: boolean };
 
 /** The split tree of a session's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
 export type PaneNode =

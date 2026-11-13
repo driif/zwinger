@@ -21,7 +21,9 @@ Hypervisor.framework). The VM is the unit of isolation.
 
 In **Settings** of a project, **Cage** selects the cage of the project. **Inherit from workspace** uses the default
 cage of its workspace. Set the default cage of a workspace with **Default cage…** in the menu of the workspace. A
-project that inherits, in a workspace with no default cage, has no cage: it opens Mac shells only.
+project that inherits, in a workspace with no default cage, has no cage: its Mac shells and its
+[agents](/agents/#agents-with-no-cage) run on your Mac, and nothing isolates them. Its tasks do not run, because tasks
+need a cage.
 
 A change of the cage applies at the next start. A VM that runs keeps running with its old cage until it stops. The
 project page then shows "The VM runs cage X; restart to use Y". If the project has no cage now, the page still shows
@@ -78,6 +80,12 @@ A VM shell (⌘⇧T) and an agent session (⌘P) run in the cage. A VM shell sta
 (`/workspace`, or `/workspace/<slug>` in a shared VM). An agent session starts in the harness folder of the project if
 it has one, else in that folder. A Mac shell (⌘T) runs on the Mac, not in
 the cage, and has no sandbox. A cage stop ends the VM shells and the agent sessions, but not the Mac shells.
+
+The effective cage sets where an agent opens: a project with a cage opens the agent in the cage, and a project with no
+cage opens the agent on your Mac. A VM that still runs with an old cage does not count. An agent with no cage has no
+bypass option, no credentials, no proxy or CA environment variables and no state-folder override. zwinger shows a
+warning before each open, and the terminal row shows a no-cage icon and no status glyph. It can read all your files,
+including the vault file. See [Agents with no cage](/agents/#agents-with-no-cage).
 
 ## Start and stop
 

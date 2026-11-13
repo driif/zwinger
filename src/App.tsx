@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
 import { Button, Card } from "@driif/motiv";
-import { Plus, RotateCw, TriangleAlert } from "lucide-react";
+import { Plus, RotateCw, ShieldOff, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
 import {
@@ -76,7 +76,7 @@ import { CommandBar } from "./shared/CommandBar";
 import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ProjectPage } from "./features/projects/ProjectPage";
 import { ProjectRail } from "./features/projects/ProjectRail";
-import { agentsOf, LaunchAction } from "./features/launcher/actions";
+import { agentsOf, LaunchAction, macAgent } from "./features/launcher/actions";
 import { launchCage, sessionCage } from "./features/cages/sessionCage";
 import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
@@ -272,6 +272,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
   const [detection, setDetection] = useState<Detection>();
+  /** The agent whose open with no cage waits for the warning's answer. */
+  const [noCage, setNoCage] = useState<AgentKind>();
+  const noCageAnswer = useRef<(ok: boolean) => void>(undefined);
   /** The tab of the app settings, which the main area shows instead of a session. */
   const [settingsTab, setSettingsTab] = useState<string>();
   const showSettings = settingsTab !== undefined;
@@ -571,26 +574,51 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }
 
   /**
-   * Opens a terminal, or the first agent of the cage: host agents come first. It shows in the focused pane, or in a new
-   * pane right of the pane `at` (`row`) or below it (`column`); no `at` splits the focused pane.
+   * The warning before each open of an agent with no cage. A second ask cancels the first. True: the user continues.
+   */
+  function confirmNoCage(agent: AgentKind) {
+    noCageAnswer.current?.(false);
+    return new Promise<boolean>((answer) => {
+      noCageAnswer.current = answer;
+      setNoCage(agent);
+    });
+  }
+
+  function answerNoCage(ok: boolean) {
+    const answer = noCageAnswer.current;
+    noCageAnswer.current = undefined;
+    setNoCage(undefined);
+    answer?.(ok);
+  }
+
+  /**
+   * Opens a terminal, or the first agent: with no effective cage, the first agent on this Mac; else the first agent of
+   * the cage, host agents first. It shows in the focused pane, or in a new pane right of the pane `at` (`row`) or below
+   * it (`column`); no `at` splits the focused pane.
    */
   async function newSession(kind: TerminalKind | "agent", target = selected, direction?: "row" | "column", at?: string) {
     if (!target) return;
     const { session } = target;
-    let cage = launchCage(target);
     if (direction && tooDeep(session.paneLayout, at ?? focusedOf(session)))
       throw new Error("This pane cannot split again. Close a pane first.");
-    // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
-    if (target.vmCage?.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
-      await vm.start(session.id);
-      const next = await listSessions();
-      const fresh = next.sessions.find((s) => s.id === session.id);
-      cage = (fresh && sessionCage(fresh, next.cages).vmCage) ?? cage;
+    let terminal: TerminalKind | undefined = macAgent(kind, !!session.effectiveCage, detection);
+    if (terminal) {
+      // The UI can show a stale cage: warn before each Mac agent. The backend checks the cage again.
+      if (!(await confirmNoCage(terminal.agent))) return;
+    } else {
+      let cage = launchCage(target);
+      // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
+      if (target.vmCage?.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
+        await vm.start(session.id);
+        const next = await listSessions();
+        const fresh = next.sessions.find((s) => s.id === session.id);
+        cage = (fresh && sessionCage(fresh, next.cages).vmCage) ?? cage;
+      }
+      const mounted = cage ? agentsOf(cage) : [];
+      terminal = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
+      if (terminal.type === "agent" && !mounted.includes(terminal.agent))
+        throw new Error(`${terminal.agent ? AGENT_NAMES[terminal.agent] : "No agent"} is not mounted in this cage.`);
     }
-    const mounted = cage ? agentsOf(cage) : [];
-    const terminal: TerminalKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
-    if (terminal.type === "agent" && !mounted.includes(terminal.agent))
-      throw new Error(`${terminal.agent ? AGENT_NAMES[terminal.agent] : "No agent"} is not mounted in this cage.`);
     const { rows, cols } = fittedSize();
     const processId = await openSession(session.id, terminal, rows, cols);
     const list = await refresh();
@@ -637,7 +665,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
     const target = joined.find((j) => j.session.id === pane.sessionId);
-    if (pane.kind.type !== "host" && target && target.vmCage?.status.state !== "running") await vm.start(pane.sessionId);
+    if (pane.kind.type === "hostAgent") {
+      // The UI can show a stale cage: warn before each Mac agent. The backend checks the cage again.
+      if (!(await confirmNoCage(pane.kind.agent))) return;
+    } else if (pane.kind.type !== "host" && target && target.vmCage?.status.state !== "running") await vm.start(pane.sessionId);
     const { rows, cols } = fittedSize();
     await reopenTerminal(pane.sessionId, pane.key, rows, cols);
     showPane(pane.key, (await refresh())?.find((s) => s.id === pane.sessionId));
@@ -800,7 +831,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     previous: () => cycle(-1),
     overview: () => setView({ kind: "overview" }),
     agents: () => {
-      const agents = sessionPanes.filter((p) => p.kind.type === "agent");
+      const agents = sessionPanes.filter((p) => p.kind.type === "agent" || p.kind.type === "hostAgent");
       if (agents.length > 0) showPane(agents[agents.length - 1].key);
       else run(() => newSession("agent"));
     },
@@ -846,6 +877,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         }}
         dropFolder={dropFolder}
         editors={editors}
+        detection={detection}
         home={home}
         onLaunch={(id, action) => {
           const target = joined.find((j) => j.session.id === id);
@@ -875,6 +907,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
           editors={editors}
+          detection={detection}
           onLaunch={(action) => selected && launch(selected, action, here)}
           run={run}
         />
@@ -895,6 +928,22 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
                 </Button>
                 <Button size="sm" variant="danger" onClick={() => ask.answer(true)}>
                   {ask.confirm}
+                </Button>
+              </div>
+            </Card>
+          )}
+          {noCage && (
+            <Card variant="outlined" padding="sm" className="stack" role="alertdialog" aria-label={`Open ${AGENT_NAMES[noCage]} with no cage`}>
+              <p className="row">
+                <ShieldOff size={14} className="warn" aria-hidden="true" />
+                {AGENT_NAMES[noCage]} runs on your Mac with your files and your logins. Nothing isolates it.
+              </p>
+              <div className="row end">
+                <Button size="sm" variant="ghost" autoFocus onClick={() => answerNoCage(false)}>
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={() => answerNoCage(true)}>
+                  Continue
                 </Button>
               </div>
             </Card>

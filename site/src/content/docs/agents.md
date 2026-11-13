@@ -1,6 +1,6 @@
 ---
 title: Agents
-description: Run Claude Code, Codex, pi or Gemini CLI in a cage.
+description: Run Claude Code, Codex, pi or Gemini CLI in a cage, or on your Mac with no cage.
 ---
 
 An **agent** is an AI coding CLI that runs in a [cage](/cages/): pi, Claude Code, Codex or Gemini CLI. zwinger has no
@@ -8,14 +8,49 @@ chat interface of its own. The agent runs as its own terminal interface, with al
 
 ## Agent sessions
 
-An agent session (⌘P) runs the agent in the cage, in `/workspace`. If the project has a harness folder
-(**Settings > Harness** of the project), the agent session starts there. It is different from a Mac shell (⌘T), which runs
-on the Mac with no sandbox. zwinger never starts an agent in a Mac shell.
+The [effective cage](/cages/#attach-or-inherit) of the project sets where an agent runs:
+
+- **A project with a cage** opens the agent in the cage. An agent session (⌘P) runs in `/workspace`. If the project has
+  a harness folder (**Settings > Harness** of the project), the agent session starts there.
+- **A project with no cage** opens the agent on your Mac. See [Agents with no cage](#agents-with-no-cage).
+
+A Mac shell (⌘T) runs on the Mac with no sandbox. zwinger never types an agent command into a Mac shell.
 
 In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi` and `gemini` are on the `PATH`.
 
 **Continue last session** starts the agent with its continue option (`claude -c`, `codex resume --last`, `pi -c`,
 `gemini --resume latest`).
+
+## Agents with no cage
+
+A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,
+**New Gemini CLI** and their **continue last session** actions. An agent that zwinger did not find on your Mac is
+disabled, with the reason "*agent* is not installed on this Mac". The agent starts in the project folder, through your
+login shell, so it gets the `PATH` and `node` of your profile. zwinger uses only an agent binary in an absolute
+folder of `PATH`, so a binary in the project folder never runs.
+
+An agent row from the time when the project had a cage also starts on your Mac: **Continue last session** continues
+the last session of the agent on your Mac, not the session in the VM.
+
+Nothing isolates this agent. It runs as your macOS user and can read all your files. This includes the
+[vault file](/network/#credentials) with the credential values of all cages. So zwinger shows a warning before each
+open, also before a reopen and **Continue last session**: "*agent* runs on your Mac with your files and your logins.
+Nothing isolates it." **Continue** opens the agent, and **Cancel** opens nothing. There is no option to stop the warning.
+
+An agent with no cage gets a guard:
+
+- No bypass option. **Agents run without permission prompts** does not apply, so the agent asks for its permissions.
+- No credentials and no placeholders. The agent uses its own config and login on your Mac.
+- No proxy and no CA environment variables from zwinger, and no override of the agent's state folder (`HOME`,
+  `CODEX_HOME` or `PI_CODING_AGENT_DIR`). Your shell profile can still set proxy variables.
+
+The terminal row shows a no-cage icon. Point to it to read "No cage: runs on this Mac". The row shows no
+[agent status](#agent-status) glyph. A cage stop does not end the agent; an app exit ends it, as it ends the Mac shells.
+
+zwinger checks the project again at each open. If the project gets a cage, the agent with no cage does not open again:
+its row says "the session has a cage". Open the agent in the cage instead.
+
+Tasks need a cage. A project with no cage cannot run a task.
 
 ## Agent status
 
@@ -30,7 +65,8 @@ A workspace uses the same rule across its sessions. The glyph disappears when th
 
 For interactive terminals, zwinger adds status hooks to Claude Code and pi. The hooks write status signals to the
 terminal; they do not change a read-only agent profile. Claude Code reports all three states. Pi reports active and
-done; it does not report blocked. Codex and Gemini CLI do not report status yet, so their rows show no glyph.
+done; it does not report blocked. Codex and Gemini CLI do not report status yet, so their rows show no glyph. An agent
+with no cage shows no glyph, because zwinger does not install its hooks on your Mac.
 
 ## Permission prompts
 

@@ -2,11 +2,12 @@ import { Button, Card } from "@driif/motiv";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import "./actionMenu.css";
 
-/** A menu action. `confirm` asks first. */
+/** A menu action. `confirm` asks first. `reason` shows why a disabled action cannot run. */
 export interface MenuAction {
   label: string;
   icon: ReactNode;
   disabled?: boolean;
+  reason?: string;
   run: () => void;
   confirm?: string;
 }
@@ -66,6 +67,7 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
               onClick={() => choose(action)}
             >
               {action.label}
+              {action.reason && <span className="muted"> · {action.reason}</span>}
             </Button>
           ))}
         </div>

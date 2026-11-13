@@ -32,7 +32,6 @@ import { TerminalTab } from "../terminal";
 import { Notice } from "../../shared/Notice";
 import { tildePath } from "../../shared/paths";
 import { LaunchAction, launchActions } from "../launcher/actions";
-import { launchCage } from "../cages/sessionCage";
 import { Editors } from "../launcher/api";
 import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
 
@@ -314,11 +313,12 @@ export function ProjectPage({
   const hostAgents = cage?.hostAgents ?? [];
   const noCage = (
     <Notice icon={<Info size={14} className="muted" />} actions={<Button size="sm" variant="outline" onClick={() => jump("settings")}>Pick a cage</Button>}>
-      This project has no cage. It opens Mac shells only. Pick a cage in Settings, or a default cage for its workspace.
+      This project has no cage. Its shells and agents run on this Mac, and nothing isolates them. Pick a cage in
+      Settings, or a default cage for its workspace.
     </Notice>
   );
   const task = view.kind === "task" ? session.tasks.find((t) => t.id === view.taskId) : undefined;
-  const actions = launchActions(launchCage({ session, cage, vmCage }), editors);
+  const actions = launchActions({ session, cage, vmCage }, detection, editors);
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
   const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
@@ -492,7 +492,7 @@ export function ProjectPage({
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
-                    <dd className="mono">{session.guestHarness ?? session.harness ?? "/workspace"}</dd>
+                    <dd className="mono">{session.effectiveCage ? (session.guestHarness ?? session.harness ?? "/workspace") : session.folder}</dd>
                   </div>
                   {cage && (
                     <div>

@@ -101,7 +101,7 @@ export function PaneLayout({
           pane &&
           !pane.processId && (
             <div key={terminal} className="pane-dormant" style={body(rect)}>
-              {status.state === "starting" && pane.kind.type !== "host" ? (
+              {status.state === "starting" && pane.kind.type !== "host" && pane.kind.type !== "hostAgent" ? (
                 <StartProgress phase={status.phase} />
               ) : (
                 <>

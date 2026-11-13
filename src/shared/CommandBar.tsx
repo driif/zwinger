@@ -9,9 +9,9 @@ import { removeMount, setMountReadonly } from "../features/settings/api";
 import { SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
-import { LaunchAction, launchActions } from "../features/launcher/actions";
-import { launchCage } from "../features/cages/sessionCage";
+import { LaunchAction, launchActions, launchCommand } from "../features/launcher/actions";
 import { Editors } from "../features/launcher/api";
+import type { Detection } from "../features/settings/api";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
 interface Props {
@@ -34,6 +34,7 @@ interface Props {
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
   editors?: Editors;
+  detection?: Detection;
   onLaunch: (action: LaunchAction) => void;
   run: Run;
 }
@@ -54,6 +55,7 @@ export function CommandBar({
   onIntent,
   onOpenRound,
   editors,
+  detection,
   onLaunch,
   run,
 }: Props) {
@@ -83,9 +85,9 @@ export function CommandBar({
       commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(session.id) });
     commands.push(action("newAgent", "New agent"));
     const herePane = panes.find((p) => p.key === here);
-    for (const launch of launchActions(launchCage(selected), editors)) {
+    for (const launch of launchActions(selected, detection, editors)) {
       const shortcut =
-        launch.type === "session" && launch.kind.type !== "agent"
+        launch.type === "session" && (launch.kind.type === "host" || launch.kind.type === "shell")
           ? shortcutLabel(launch.kind.type === "host" ? "newShell" : "newVmShell")
           : launch.type === "editor" && launch.editor.id === editors?.default
             ? shortcutLabel("openEditor")
@@ -96,7 +98,7 @@ export function CommandBar({
           : herePane
             ? `Open ${paneName(herePane, panes)}'s folder in ${launch.editor.name}`
             : `Open ${session.name} in ${launch.editor.name}`;
-      commands.push({ id: launch.id, label, shortcut, onSelect: () => onLaunch(launch) });
+      commands.push(launchCommand(launch, label, shortcut, onLaunch));
     }
     panes.forEach((pane) =>
       commands.push({

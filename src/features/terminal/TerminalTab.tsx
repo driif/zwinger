@@ -41,8 +41,10 @@ export function TerminalTab({ session, status, onNewSession, ...layout }: Props)
       {!session.paneLayout && status.state !== "starting" && (
         <div className="empty">
           <p className="muted">
-            No pane is open. A Mac shell starts in {session.folder} and needs no cage start. An agent starts in the cage,
-            in {session.harness ?? "/workspace"}.
+            No pane is open. A Mac shell starts in {session.folder} and needs no cage start.{" "}
+            {session.effectiveCage
+              ? `An agent starts in the cage, in ${session.harness ?? "/workspace"}.`
+              : `This session has no cage, so an agent runs on this Mac in ${session.folder}, and nothing isolates it.`}
           </p>
           <div className="row">
             <Button variant="outline" iconLeft={<Laptop size={14} />} onClick={() => onNewSession({ type: "host" })}>

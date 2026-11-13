@@ -11,7 +11,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::AgentKind;
 use crate::cage::lifecycle::mounted;
-use crate::cage::manager::{HostRun, Manager, State, Vm, in_guest_folder, lock, task_guest_folder};
+use crate::agent::launch;
+use crate::cage::manager::{HostRun, Manager, State, Vm, blocking, in_guest_folder, lock, task_guest_folder};
 use crate::cage::{Cage, Members};
 use crate::editor;
 use crate::error::{Error, Result};
@@ -115,14 +116,39 @@ impl<R: SandboxRuntime> Manager<R> {
         rows: u16,
         cols: u16,
     ) -> Result<String> {
-        if kind == TerminalKind::Host {
+        let host_argv = match kind {
+            TerminalKind::Host => Some(host::shell_argv()),
+            // Checked at each open, so a stale UI or a cage change after the
+            // confirm cannot start the agent on the Mac.
+            TerminalKind::HostAgent { agent, resume } => {
+                if lock(&self.state).effective_cage(session_id)?.is_some() {
+                    return Err(Error::HasCage);
+                }
+                let detection = self.host.clone();
+                let found = blocking(move || Ok(detection.last().agent(agent).cloned())).await?;
+                let argv = found
+                    .and_then(|found| launch::host_argv(&found, resume))
+                    .ok_or_else(|| Error::HostAgentMissing(agent.label().to_owned()))?;
+                Some(host::login_exec(argv))
+            }
+            TerminalKind::Shell | TerminalKind::Agent { .. } => None,
+        };
+        if let Some(argv) = host_argv {
             let folder = lock(&self.state).session(session_id)?.folder.clone();
             if !folder.is_dir() {
                 return Err(Error::MissingPath(folder.display().to_string()));
             }
-            let (pty, group) = host::open_host_pty(&folder, rows, cols)?;
-            return self.register(session_id, terminal_id, kind, pty, Some(group), |_| true);
+            // The last cage check and the spawn hold the state lock, which
+            // every cage change also takes: no cage can come in between.
+            return self.register(session_id, terminal_id, kind, |state| {
+                if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
+                    return Err(Error::HasCage);
+                }
+                let (pty, group) = host::open_host_pty(&folder, argv, rows, cols)?;
+                Ok((pty, Some(group)))
+            });
         }
+        let argv = kind.vm_argv().ok_or(Error::NotRunning)?;
         let (cage_id, vm, cwd) = {
             let state = lock(&self.state);
             state.session(session_id)?;
@@ -134,42 +160,41 @@ impl<R: SandboxRuntime> Manager<R> {
                             return Err(self.unmounted(agent, host));
                         }
                         TerminalKind::Agent { .. } => member.harness.as_deref(),
-                        TerminalKind::Shell | TerminalKind::Host => None,
+                        TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
                     };
                     (cage_id.to_owned(), vm.clone(), cwd.map_or(folder.clone(), |h| in_guest_folder(&folder, h)))
                 }
                 _ => return Err(Error::NotRunning),
             }
         };
-        let pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
+        let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
         // The cage may have stopped, or stopped and started again, while
         // the process opened. Its stop did not see this process, so kill it.
-        self.register(session_id, terminal_id, kind, pty, None, |state| {
-            matches!(
-                state.vms.get(&cage_id),
-                Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm)
-            )
+        self.register(session_id, terminal_id, kind, |state| match state.vms.get(&cage_id) {
+            Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
+            _ => {
+                let _ = pty.input.send(PtyInput::Kill);
+                Err(Error::NotRunning)
+            }
         })
     }
 
-    /// Adds the opened process. If `same_vm` is false, or a
-    /// close or a second open of the terminal ran while the process opened,
-    /// it kills the process.
+    /// Adds the process that `open` gives under the state lock. `open`
+    /// kills its process if it fails. If a close or a second open of the
+    /// terminal ran while the process opened, it kills the process.
     fn register(
         &self,
         session_id: &str,
         terminal_id: Option<&str>,
         kind: TerminalKind,
-        pty: Pty,
-        host_group: Option<host::HostGroup>,
-        same_vm: impl FnOnce(&State<R::Vm>) -> bool,
+        open: impl FnOnce(&State<R::Vm>) -> Result<(Pty, Option<host::HostGroup>)>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let output = Arc::new(Mutex::new(Output::default()));
-        {
+        let events = {
             let mut state = lock(&self.state);
+            let (pty, host_group) = open(&state)?;
             let terminal = match terminal_id {
-                _ if !same_vm(&state) => Err(Error::NotRunning),
                 None => self.add_terminal(&mut state, session_id, kind),
                 Some(tid) => match state.session(session_id).and_then(|s| s.terminal(tid).map(|_| ())) {
                     Err(e) => Err(e),
@@ -200,12 +225,13 @@ impl<R: SandboxRuntime> Manager<R> {
                 terminal_id: Some(terminal),
                 host_group,
             });
-        }
+            pty.events
+        };
         tokio::spawn(pump(
             self.state.clone(),
             id.clone(),
             output,
-            pty.events,
+            events,
             matches!(kind, TerminalKind::Agent { .. }),
             self.agent_sink.clone(),
         ));
@@ -283,13 +309,13 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Hangs up all host shells, and kills the ones that have not exited
+    /// Hangs up all host shells and agents, and kills the ones that have not exited
     /// after [`host::HANGUP_LIMIT`]. It blocks for at most that limit and
     /// needs no async runtime, so an app exit can call it.
     pub fn kill_host_sessions(&self) {
         let mut groups = Vec::new();
         lock(&self.state).terminals.retain(|t| {
-            let killed = t.kind == TerminalKind::Host;
+            let killed = t.kind.on_host();
             if killed && let Some(group) = &t.host_group {
                 group.hangup();
                 groups.push(group.clone());
@@ -331,7 +357,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     task_guest_folder(&applied.0, session_id).map(|(member, folder, _)| {
                         let start = match process.kind {
                             TerminalKind::Agent { .. } => member.harness.as_deref(),
-                            TerminalKind::Shell | TerminalKind::Host => None,
+                            TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
                         };
                         let start = start.map_or(folder.clone(), |h| in_guest_folder(&folder, h));
                         Cwd::Guest(process.output.clone(), start, applied.clone())
@@ -555,6 +581,65 @@ mod tests {
         manager.delete(&id).await.unwrap();
         assert!(lock(&manager.state).sessions.is_empty());
         while !matches!(next(&mut rx).await, PtyEvent::Exit(_)) {}
+    }
+
+    #[tokio::test]
+    async fn a_mac_agent_opens_only_with_no_cage_and_outlives_a_vm_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        host_sh();
+        let (manager, _, id) = manager_with_host();
+        let claude = TerminalKind::HostAgent { agent: AgentKind::Claude, resume: true };
+        // The attached cage, then the workspace default: the agent does not open.
+        assert!(matches!(manager.open_session(&id, claude, 24, 80).await, Err(Error::HasCage)));
+        manager.start(&id).await.unwrap();
+        manager.set_session_cage(&id, None).unwrap();
+        let workspace = lock(&manager.state).workspaces[0].id.clone();
+        manager.set_workspace_cage(&workspace, Some(&id)).unwrap();
+        assert!(matches!(manager.open_session(&id, claude, 24, 80).await, Err(Error::HasCage)));
+        assert!(manager.list().sessions[0].session.terminals.is_empty());
+
+        // No effective cage, while the old VM still runs: the agent opens on the Mac.
+        manager.set_workspace_cage(&workspace, None).unwrap();
+        let bin = manager.host.last().agent(AgentKind::Claude).unwrap().bin.clone().unwrap();
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho \"mac-claude $*\"\nexec sleep 1000\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let process = manager.open_session(&id, claude, 24, 80).await.unwrap();
+        let (_, mut rx) = attach(&manager, &process);
+        let mut out = String::new();
+        while !out.contains("mac-claude -c") {
+            match next(&mut rx).await {
+                PtyEvent::Output(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
+                PtyEvent::Exit(code) => panic!("exit {code}: {out}"),
+            }
+        }
+        let listed = manager.list();
+        assert_eq!(listed.sessions[0].session.terminals[0].kind, claude);
+        assert_eq!(listed.sessions[0].processes[0].agent, None, "no hooks, so no status");
+
+        // A VM stop does not end it; an app exit does.
+        manager.stop(&id, None).await.unwrap();
+        assert_eq!(manager.list().sessions[0].processes.len(), 1);
+        manager.kill_host_sessions();
+        assert!(manager.list().sessions[0].processes.is_empty());
+        while !matches!(next(&mut rx).await, PtyEvent::Exit(_)) {}
+
+        // A reopen checks the cage again.
+        manager.set_session_cage(&id, Some(&id)).unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        assert!(matches!(manager.reopen_terminal(&id, &terminal, 24, 80).await, Err(Error::HasCage)));
+    }
+
+    #[tokio::test]
+    async fn a_mac_agent_that_is_not_installed_does_not_open() {
+        let (manager, _, id) = manager();
+        manager.set_session_cage(&id, None).unwrap();
+        let pi = TerminalKind::HostAgent { agent: AgentKind::Pi, resume: false };
+        assert!(matches!(
+            manager.open_session(&id, pi, 24, 80).await,
+            Err(Error::HostAgentMissing(name)) if name == "pi"
+        ));
+        assert!(manager.list().sessions[0].session.terminals.is_empty());
     }
 
     #[tokio::test]

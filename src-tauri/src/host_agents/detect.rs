@@ -45,6 +45,10 @@ pub struct HostAgent {
     /// Gemini CLI's entry point, relative to its package dir.
     #[serde(skip)]
     pub entry: Option<String>,
+    /// The native binary whose `--version` detection ran (Claude Code,
+    /// Codex). A JS agent has none: it runs as `node <package>/<entry>`.
+    #[serde(skip)]
+    pub bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -108,10 +112,10 @@ fn npm(fs: &dyn HostFs, name: &str, entry: &str) -> Option<(PathBuf, String)> {
     npm_roots(fs).iter().find_map(|root| package(fs, &root.join(name), entry))
 }
 
-/// The npm package, and the version from `codex --version`: of the npm link
-/// next to the package (`<prefix>/bin/codex` for
-/// `<prefix>/lib/node_modules`), else of `codex` on `PATH`.
-fn codex(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
+/// The npm package, the binary whose `codex --version` ran, and its version:
+/// the npm link next to the package (`<prefix>/bin/codex` for
+/// `<prefix>/lib/node_modules`), else `codex` on `PATH`.
+fn codex(fs: &dyn HostFs) -> Option<(PathBuf, PathBuf, String)> {
     let (root, path) = npm_roots(fs).into_iter().find_map(|root| {
         let (path, _) = package(fs, &root.join("@openai/codex"), "")?;
         Some((root, path))
@@ -119,8 +123,17 @@ fn codex(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
     let mut bins: Vec<PathBuf> =
         root.parent().and_then(Path::parent).map(|p| p.join("bin/codex")).into_iter().collect();
     bins.extend(fs.path_dirs().into_iter().map(|d| d.join("codex")));
-    let version = bins.iter().filter(|bin| fs.is_file(bin)).find_map(|bin| version_in(&fs.version(bin)?))?;
-    Some((path, version))
+    let (bin, version) = runnable(fs, bins)?;
+    Some((path, bin, version))
+}
+
+/// The canonical path and the version of the first of `bins` whose
+/// `--version` runs. A Mac agent runs this path in the session folder, so it
+/// must not be relative.
+fn runnable(fs: &dyn HostFs, bins: Vec<PathBuf>) -> Option<(PathBuf, String)> {
+    bins.into_iter()
+        .filter(|bin| fs.is_file(bin))
+        .find_map(|bin| Some((fs.canonicalize(&bin)?, version_in(&fs.version(&bin)?)?)))
 }
 
 /// The native installer's link (`~/.local/bin/claude` → `versions/<v>`),
@@ -133,7 +146,7 @@ fn claude(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
         bins.push(target);
     }
     bins.extend(fs.path_dirs().into_iter().map(|d| d.join("claude")));
-    bins.into_iter().filter(|bin| fs.is_file(bin)).find_map(|bin| Some((bin.clone(), version_in(&fs.version(&bin)?)?)))
+    runnable(fs, bins)
 }
 
 /// Gemini CLI's entry points when `package.json` names none that exists:
@@ -186,14 +199,13 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
     let mut agents = Vec::new();
     for kind in super::KINDS {
         let found = match kind {
-            AgentKind::Claude => claude(fs).map(|(path, version)| (path, version, None)),
-            AgentKind::Codex => codex(fs).map(|(path, version)| (path, version, None)),
-            AgentKind::Pi => {
-                npm(fs, "@earendil-works/pi-coding-agent", pi::HOST_ENTRY).map(|(path, version)| (path, version, None))
-            }
-            AgentKind::Gemini => gemini(fs).map(|(path, version, entry)| (path, version, Some(entry))),
+            AgentKind::Claude => claude(fs).map(|(path, version)| (path.clone(), version, None, Some(path))),
+            AgentKind::Codex => codex(fs).map(|(path, bin, version)| (path, version, None, Some(bin))),
+            AgentKind::Pi => npm(fs, "@earendil-works/pi-coding-agent", pi::HOST_ENTRY)
+                .map(|(path, version)| (path, version, None, None)),
+            AgentKind::Gemini => gemini(fs).map(|(path, version, entry)| (path, version, Some(entry), None)),
         };
-        let Some((path, version, entry)) = found else {
+        let Some((path, version, entry, bin)) = found else {
             continue;
         };
         let native = matches!(kind, AgentKind::Claude | AgentKind::Codex);
@@ -211,6 +223,7 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
             login: login::state(logins, kind, now),
             package: (!native).then_some(path),
             entry,
+            bin,
             version,
         });
     }
@@ -280,6 +293,9 @@ mod tests {
         assert_eq!((claude.path.as_str(), claude.profile), ("/Users/me/.local/share/claude/versions/2.1.310", true));
         assert_eq!(claude.login, LoginState::SetupToken);
         assert_eq!(claude.package, None);
+        assert_eq!(claude.bin.as_deref(), Some(versions.as_path()));
+        assert_eq!(found.agent(AgentKind::Codex).unwrap().bin.as_deref(), Some(Path::new("/opt/homebrew/bin/codex")));
+        assert_eq!(found.agent(AgentKind::Pi).unwrap().bin, None);
         assert_eq!(found.agent(AgentKind::Pi).unwrap().package.as_deref(), Some(Path::new(pi)));
         assert_eq!(found.agent(AgentKind::Gemini).unwrap().entry.as_deref(), Some("bundle/gemini.js"));
         assert_eq!(found.agent(AgentKind::Codex).unwrap().login, LoginState::None);
@@ -312,7 +328,20 @@ mod tests {
         // Not next to the package: `codex` on PATH.
         fs.versions.insert("/usr/bin/codex".into(), "codex-cli 0.163.1".into());
         let found = detect(&fs, &FakeLogins::default(), 0, &data());
-        assert_eq!(found.agent(AgentKind::Codex).map(|a| a.version.as_str()), Some("0.163.1"));
+        let codex = found.agent(AgentKind::Codex).unwrap();
+        // The binary that ran, not the npm link that is not there.
+        assert_eq!((codex.version.as_str(), codex.bin.as_deref()), ("0.163.1", Some(Path::new("/usr/bin/codex"))));
+    }
+
+    #[test]
+    fn a_found_binary_is_its_canonical_path() {
+        let mut fs = home();
+        fs.file("/usr/local/lib/node_modules/@openai/codex/package.json", r#"{"version":"0.163.0"}"#);
+        fs.versions.insert("/usr/bin/codex".into(), "codex-cli 0.163.1".into());
+        let target = PathBuf::from("/usr/local/lib/node_modules/@openai/codex/bin/codex.js");
+        fs.links.insert("/usr/bin/codex".into(), target.clone());
+        let found = detect(&fs, &FakeLogins::default(), 0, &data());
+        assert_eq!(found.agent(AgentKind::Codex).unwrap().bin, Some(target));
     }
 
     #[test]

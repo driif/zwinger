@@ -563,7 +563,7 @@ pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
     let (session, cage) = (bound.session, bound.cage);
     let terminals = session.terminals.iter().filter_map(|t| match t.kind {
         TerminalKind::Agent { agent, .. } => Some(agent),
-        TerminalKind::Shell | TerminalKind::Host => None,
+        TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
     });
     let used: Vec<AgentKind> = cage
         .host_agents

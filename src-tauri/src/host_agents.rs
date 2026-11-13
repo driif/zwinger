@@ -61,6 +61,13 @@ impl Clock for SystemClock {
     }
 }
 
+/// The absolute dirs of a `PATH` value. An empty or relative entry (`.`,
+/// `node_modules/.bin`) resolves in the cwd, which for a Mac agent is the
+/// session folder: a project file must not run as a found binary.
+fn absolute_dirs(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path).filter(|dir| dir.is_absolute()).collect()
+}
+
 pub struct RealFs;
 
 impl HostFs for RealFs {
@@ -69,7 +76,7 @@ impl HostFs for RealFs {
     }
 
     fn path_dirs(&self) -> Vec<PathBuf> {
-        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default()
+        std::env::var_os("PATH").map(|p| absolute_dirs(&p)).unwrap_or_default()
     }
 
     fn is_file(&self, path: &Path) -> bool {
@@ -389,6 +396,12 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_dirs_drop_empty_and_relative_entries() {
+        let dirs = absolute_dirs(std::ffi::OsStr::new("/usr/bin::.:node_modules/.bin:/opt/homebrew/bin"));
+        assert_eq!(dirs, [PathBuf::from("/usr/bin"), PathBuf::from("/opt/homebrew/bin")]);
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-host-{}", uuid::Uuid::new_v4()));

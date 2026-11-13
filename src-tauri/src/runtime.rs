@@ -50,20 +50,29 @@ pub enum TerminalKind {
     /// The agent's own TUI, through its wrapper. `resume` continues the
     /// agent's last session.
     Agent { agent: AgentKind, resume: bool },
+    /// The Mac's install of the agent, unsandboxed, in the session folder of
+    /// a session with no cage (ADR 0008).
+    HostAgent { agent: AgentKind, resume: bool },
 }
 
 impl TerminalKind {
-    pub fn argv(self) -> Vec<String> {
+    /// The process runs on the Mac, not in the VM.
+    pub fn on_host(self) -> bool {
+        matches!(self, Self::Host | Self::HostAgent { .. })
+    }
+
+    /// The argv in the VM. `None` for a kind that runs on the Mac.
+    pub fn vm_argv(self) -> Option<Vec<String>> {
         match self {
-            Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
-            Self::Host => vec![crate::terminal::host::login_shell(), "-l".to_owned()],
+            Self::Shell => Some(vec!["/bin/bash".to_owned(), "-l".to_owned()]),
             Self::Agent { agent, resume } => {
                 let mut argv = vec![format!("{}/{}", launch::BIN_DIR, agent.name())];
                 if resume {
                     argv.extend(launch::continue_args(agent).iter().map(|a| (*a).to_owned()));
                 }
-                argv
+                Some(argv)
             }
+            Self::Host | Self::HostAgent { .. } => None,
         }
     }
 }
@@ -724,20 +733,28 @@ mod tests {
 
     #[test]
     fn sessions_run_a_login_shell_or_an_agent_wrapper() {
-        assert_eq!(TerminalKind::Shell.argv(), ["/bin/bash", "-l"]);
+        let argv = |kind: TerminalKind| kind.vm_argv().unwrap();
+        assert_eq!(argv(TerminalKind::Shell), ["/bin/bash", "-l"]);
         let claude = TerminalKind::Agent { agent: AgentKind::Claude, resume: false };
-        assert_eq!(claude.argv(), ["/opt/zwinger/bin/claude"]);
+        assert_eq!(argv(claude), ["/opt/zwinger/bin/claude"]);
         let codex = TerminalKind::Agent { agent: AgentKind::Codex, resume: true };
-        assert_eq!(codex.argv(), ["/opt/zwinger/bin/codex", "resume", "--last"]);
+        assert_eq!(argv(codex), ["/opt/zwinger/bin/codex", "resume", "--last"]);
         let gemini = TerminalKind::Agent { agent: AgentKind::Gemini, resume: true };
-        assert_eq!(gemini.argv(), ["/opt/zwinger/bin/gemini", "--resume", "latest"]);
+        assert_eq!(argv(gemini), ["/opt/zwinger/bin/gemini", "--resume", "latest"]);
         let pi = TerminalKind::Agent { agent: AgentKind::Pi, resume: true };
-        assert_eq!(pi.argv(), ["/opt/zwinger/bin/pi", "-c"]);
+        assert_eq!(argv(pi), ["/opt/zwinger/bin/pi", "-c"]);
         assert_eq!(serde_json::to_value(codex).unwrap(), json!({ "type": "agent", "agent": "codex", "resume": true }));
         assert_eq!(serde_json::from_value::<TerminalKind>(json!({ "type": "shell" })).unwrap(), TerminalKind::Shell);
         assert_eq!(serde_json::to_value(TerminalKind::Host).unwrap(), json!({ "type": "host" }));
         assert_eq!(serde_json::from_value::<TerminalKind>(json!({ "type": "host" })).unwrap(), TerminalKind::Host);
-        assert_eq!(TerminalKind::Host.argv()[1], "-l");
+        // A Mac kind has no VM argv; the Mac agent keeps its own kind.
+        let mac = TerminalKind::HostAgent { agent: AgentKind::Codex, resume: true };
+        let saved = json!({ "type": "hostAgent", "agent": "codex", "resume": true });
+        assert_eq!(serde_json::to_value(mac).unwrap(), saved);
+        assert_eq!(serde_json::from_value::<TerminalKind>(saved).unwrap(), mac);
+        assert_eq!((mac.vm_argv(), TerminalKind::Host.vm_argv()), (None, None));
+        assert!(mac.on_host() && TerminalKind::Host.on_host());
+        assert!(!codex.on_host() && !TerminalKind::Shell.on_host());
     }
 
     #[test]

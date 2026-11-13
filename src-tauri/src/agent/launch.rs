@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use super::{AgentKind, claude, codex, gemini, pi};
+use crate::host_agents::detect::HostAgent;
 use crate::terminal::output::AGENT_OSC;
 
 /// The guest dir of the wrappers, bound read-only.
@@ -26,7 +27,7 @@ pub const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const LOCAL_CA: &str = "/usr/local/share/ca-certificates/zwinger-ca.crt";
 /// The CA bundle vars of OpenSSL, Python requests, curl and git. They point
 /// at the system bundle, which [`trust_argv`] extends with the zwinger CA.
-const CA_ENV: [&str; 4] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"];
+pub(crate) const CA_ENV: [&str; 4] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"];
 /// Node reads the proxy vars only with `NODE_USE_ENV_PROXY`, and does not
 /// read the system trust store. With `NODE_USE_ENV_PROXY`, Node warns at each
 /// start that its proxy agent is experimental, which an agent TUI would show.
@@ -107,6 +108,31 @@ pub fn continue_args(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => &["resume", "--last"],
         AgentKind::Gemini => &["--resume", "latest"],
     }
+}
+
+/// The argv of the Mac's install of an agent in a session with no cage
+/// (ADR 0008): the binary that detection ran, or `node <package>/<entry>`.
+/// Nothing isolates it, so it gets no bypass flag, no zwinger wrapper and
+/// no env: the agent uses the Mac's own config and login. `None` if the
+/// detection has no runnable form, or a relative binary, which would resolve
+/// in the session folder or by `PATH`.
+pub fn host_argv(found: &HostAgent, resume: bool) -> Option<Vec<String>> {
+    let mut argv = match found.kind {
+        AgentKind::Claude | AgentKind::Codex => {
+            vec![found.bin.as_ref().filter(|bin| bin.is_absolute())?.to_string_lossy().into_owned()]
+        }
+        AgentKind::Pi | AgentKind::Gemini => {
+            let entry = match found.kind {
+                AgentKind::Pi => pi::HOST_ENTRY,
+                _ => found.entry.as_deref()?,
+            };
+            vec!["node".to_owned(), found.package.as_ref()?.join(entry).to_string_lossy().into_owned()]
+        }
+    };
+    if resume {
+        argv.extend(continue_args(found.kind).iter().map(|a| (*a).to_owned()));
+    }
+    Some(argv)
 }
 
 /// The flag that a wrapper adds, and the user arguments that keep it out.
@@ -396,6 +422,70 @@ pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_agent_runs_the_detected_install_with_no_bypass_flag_and_no_env() {
+        use crate::host_agents::detect::Source;
+        use crate::host_agents::login::LoginState;
+        use std::path::PathBuf;
+
+        let found = |kind, package: Option<&str>, entry: Option<&str>, bin: Option<&str>| HostAgent {
+            kind,
+            version: "1.0.0".into(),
+            path: String::new(),
+            source: Source::Host,
+            pinned: true,
+            profile: true,
+            login: LoginState::None,
+            package: package.map(PathBuf::from),
+            entry: entry.map(str::to_owned),
+            bin: bin.map(PathBuf::from),
+        };
+        let claude = found(AgentKind::Claude, None, None, Some("/Users/me/.local/share/claude/versions/2.1.310"));
+        let codex = found(AgentKind::Codex, Some("/opt/homebrew/lib/node_modules/@openai/codex"), None, Some("/usr/bin/codex"));
+        let pi = found(AgentKind::Pi, Some("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"), None, None);
+        let gemini = found(AgentKind::Gemini, Some("/opt/gemini"), Some("bundle/gemini.js"), None);
+        let cases: [(&HostAgent, bool, &[&str]); 8] = [
+            (&claude, false, &["/Users/me/.local/share/claude/versions/2.1.310"]),
+            (&claude, true, &["/Users/me/.local/share/claude/versions/2.1.310", "-c"]),
+            (&codex, false, &["/usr/bin/codex"]),
+            (&codex, true, &["/usr/bin/codex", "resume", "--last"]),
+            (&pi, false, &["node", "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"]),
+            (&pi, true, &["node", "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js", "-c"]),
+            (&gemini, false, &["node", "/opt/gemini/bundle/gemini.js"]),
+            (&gemini, true, &["node", "/opt/gemini/bundle/gemini.js", "--resume", "latest"]),
+        ];
+        let forbidden = [
+            "--dangerously-skip-permissions",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--yolo",
+            "-y",
+            "--full-auto",
+            "--sandbox",
+            "danger-full-access",
+            "--permission-mode",
+            "--approval-mode",
+        ];
+        for (agent, resume, expected) in cases {
+            let argv = host_argv(agent, resume).unwrap();
+            assert_eq!(argv, expected, "{:?} resume {resume}", agent.kind);
+            for arg in &argv {
+                assert!(!forbidden.iter().any(|f| arg.starts_with(f)), "{arg} in {argv:?}");
+                // No zwinger wrapper, placeholder, credential or state env.
+                assert!(!arg.starts_with(BIN_DIR) && !arg.contains('='), "{arg} in {argv:?}");
+                for name in ["IS_SANDBOX", "HOME", "CODEX_HOME", "PI_CODING_AGENT_DIR", "zwinger"] {
+                    assert!(!arg.contains(name), "{arg} in {argv:?}");
+                }
+            }
+        }
+        // A detection with no runnable form opens nothing.
+        assert_eq!(host_argv(&found(AgentKind::Codex, None, None, None), false), None);
+        assert_eq!(host_argv(&found(AgentKind::Gemini, Some("/opt/gemini"), None, None), false), None);
+        // A relative binary would run from the session folder or by PATH.
+        for bin in ["codex", "./codex", "node_modules/.bin/codex", ""] {
+            assert_eq!(host_argv(&found(AgentKind::Codex, None, None, Some(bin)), false), None, "{bin:?}");
+        }
+    }
 
     const PROXY: &str = "http://zw:t@host.microsandbox.internal:4000";
     const HOST: Found =

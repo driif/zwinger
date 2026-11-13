@@ -93,6 +93,8 @@ pub enum Error {
     StopShared { cage: String, members: Vec<Member>, generation: u64 },
     #[error("the sessions of the VM changed; look at them and try again")]
     StaleRestart,
+    #[error("this session has a cage, so an agent with no cage does not open in it; open the agent in the cage")]
+    HasCage,
     #[error("cage {0} is in use: {1}")]
     CageInUse(String, String),
     #[error("workspace not found")]
