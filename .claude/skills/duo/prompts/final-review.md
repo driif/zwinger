@@ -37,6 +37,8 @@ Do not report findings that `{{HISTORY}}` shows as fixed. Do not report style pr
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `ship` — `true` if you accept this change as complete.
 - `blocking` — array of `{what, why, where}`. If this array has an entry, `ship` is `false`.
 - `residual` — array of real, non-blocking items for the user to know.

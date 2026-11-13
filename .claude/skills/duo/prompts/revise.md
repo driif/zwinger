@@ -31,6 +31,8 @@ Run the gates again for the parts that you changed. Fix the errors that they fin
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `fixed` — array of `{finding, what_changed}`.
 - `rebuttals` — array of `{finding, why_not}`.
 - `files` — array of the paths that you wrote in this step.

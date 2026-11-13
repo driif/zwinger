@@ -35,6 +35,8 @@ You can read files and run read-only commands to check a claim.
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `message` — 3-8 sentences to your peer. Your peer reads them verbatim. Reply to their points; do not summarize your plan again.
 - `plan` — your current plan.
 - `implementer` — `opus` or `sol`, your current choice.

@@ -35,6 +35,8 @@ Do not report other items. Do not report style preferences: each one causes an u
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `verdict` — `accept` if no finding is blocking, `revise` if a finding is blocking.
 - `findings` — array of `{severity, file, line, what, why, fix}`. An empty array is a good result.
 - `plan_gaps` — array of plan items that are not in the diff. For each item, state if the omission looks intentional.

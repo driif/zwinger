@@ -37,6 +37,8 @@ Run the gates for the parts that you changed. Fix the errors that they find.
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `summary` — your changes, 3-6 sentences.
 - `files` — array of the paths that you wrote, relative to the repository root.
 - `gates` — object: each command that you ran → the verbatim end of its output.

@@ -23,6 +23,8 @@ Two models exchanged plans and did not agree on the implementer. Choose the impl
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `implementer` — `opus` or `sol`.
 - `why` — two or three sentences that name the deciding difference. "Argued better" is not a reason.
 - `plan` — the plan to build, from the transcript. Use the stronger plan as the base. Add the correct points of the other plan. The plan is the contract for the implementer, so it must be complete without other documents.

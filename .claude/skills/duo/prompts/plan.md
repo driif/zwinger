@@ -31,6 +31,8 @@ Be specific: name real files. A plan that you can write without reading the repo
 
 Return **only** a JSON object in a fenced ```json block:
 
+Inside a JSON string value, write no double quote: use backticks or single quotes.
+
 - `plan` — your solution, 4-8 sentences, with the names of the files that you change.
 - `touches` — array of the areas that the plan changes, e.g. `ui`, `state`, `tauri-command`, `rust`, `config`, `build`.
 - `risks` — array of possible problems. An empty array means that you found no risks.
