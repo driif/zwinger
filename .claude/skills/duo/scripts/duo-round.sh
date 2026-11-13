@@ -120,7 +120,7 @@ run_model() {  # run_model <opus|sol> <promptfile> <outfile> <name> <read|write>
 # same output and do not build in parallel.
 run_gates() {  # run_gates <outfile>
   local out="$1" cmd rc
-  local cmds=("pnpm build")
+  local cmds=("pnpm build" "pnpm test")
   if git -C "$ROOT" status --porcelain -- src-tauri | grep -q .; then
     cmds+=("cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings"
            "cargo test --manifest-path src-tauri/Cargo.toml")
