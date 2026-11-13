@@ -296,6 +296,14 @@ mod tests {
         (String::from_utf8_lossy(&out).into_owned(), code)
     }
 
+    /// The executable of the process `pid`, or "" if macOS does not tell it.
+    fn exe_path(pid: libc::pid_t) -> String {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: proc_pidpath writes at most `buf.len()` bytes to the buffer.
+        let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned()
+    }
+
     fn temp_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -346,6 +354,17 @@ mod tests {
         })
         .await
         .expect("no job pid");
+        // The shell prints the pid before its child execs `sleep`. Until the
+        // exec, the child keeps the shell's SIGHUP handler, which only marks
+        // the signal; the exec then drops the mark, and the job outlives the
+        // hangup. So hang up only a job that runs `sleep`.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !exe_path(job).ends_with("/sleep") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the job did not exec sleep");
         pty.input.send(PtyInput::Kill).unwrap();
         read_until_exit(&mut pty).await;
         assert_eq!(group.id(), None, "the reaped shell's group id is retired");
