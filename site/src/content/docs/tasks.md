@@ -15,7 +15,8 @@ A task has these fields:
 - Two agents of different kinds (pi, Claude Code, Codex), each with an optional model. The first agent decides a
   tiebreak. Gemini CLI is also available if the cage uses Gemini CLI from the Mac.
 - **Gates**: shell lines that check the result, for example `pnpm build`.
-- **Working dir**: `/workspace`, or a folder below it or below a mount.
+- **Working dir**: `/workspace`, or a folder below it or below a mount. In a VM with more projects, `/workspace` is the
+  project's folder `/workspace/<slug>`.
 
 A change to a task needs no restart.
 
@@ -44,7 +45,7 @@ pushes.
 The Git check and the change view cover the session folder, even when the Git root is above it. If the working dir is
 in a mount, they cover the working dir in its Git repository instead. They exclude the run's round copy. If the VM
 contains more than one session, the room shows a note when the run starts: the folder that the Git check covers, and
-that other sessions in the VM can see the task's files.
+that other sessions in the VM can see the task's files. The task form names those sessions.
 
 ## Room
 

@@ -47,8 +47,6 @@ import {
   renameSession,
   renameWorkspace,
   setWorkspaceCage,
-  startCage,
-  stopCage,
 } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
@@ -62,7 +60,7 @@ import {
   AgentState,
 } from "../../shared/api";
 import { errorCode } from "../../shared/errorMessage";
-import type { DroppedFolder, Pane, Run, View } from "../../App";
+import type { DroppedFolder, Pane, Run, View, VmControl } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import { tildePath, truncateMiddle } from "../../shared/paths";
@@ -267,6 +265,7 @@ interface Props {
   runs: Record<string, RunSummary[]>;
   panes: Pane[];
   run: Run;
+  vm: VmControl;
   onOpen: (sessionId: string, view: View) => void;
   onRunsChange: (sessionId: string) => void;
   onToggle: (target: SessionCage) => void;
@@ -302,6 +301,7 @@ export function ProjectRail({
   runs,
   panes,
   run,
+  vm,
   onOpen,
   onRunsChange,
   onToggle,
@@ -865,7 +865,7 @@ export function ProjectRail({
                 size="sm"
                 onClick={() => {
                   const { session, next, to } = moving;
-                  save(next, () => stopCage(session.id).then(() => (to === null ? undefined : startCage(session.id))));
+                  save(next, () => vm.stop(session.id).then(() => (to === null ? undefined : vm.start(session.id))));
                 }}
               >
                 Restart now
@@ -957,6 +957,7 @@ export function ProjectRail({
                           const launch = launchActions(launchCage(target), editors);
                           const running = status.state === "running";
                           const effective = session.effectiveCage;
+                          const shared = running && target.vmCage && target.vmCage.members.length > 1 ? target.vmCage : null;
                           return (
                             <TreeRow
                               key={session.id}
@@ -1009,10 +1010,17 @@ export function ProjectRail({
                                       )}
                                     </span>
                                   )}
-                                  {effective && (
-                                    <span className="muted" title={`${cageName(effective.id)}${effective.inherited ? " (inherited)" : ""}`}>
-                                      <Fence size={12} aria-label={`Cage ${cageName(effective.id)}`} />
+                                  {shared ? (
+                                    <span className="muted" title={`One VM of cage ${shared.name} runs ${shared.members.join(", ")}`}>
+                                      <Fence size={12} aria-label={`Shared VM of cage ${shared.name}`} />
+                                      {shared.members.length}
                                     </span>
+                                  ) : (
+                                    effective && (
+                                      <span className="muted" title={`${cageName(effective.id)}${effective.inherited ? " (inherited)" : ""}`}>
+                                        <Fence size={12} aria-label={`Cage ${cageName(effective.id)}`} />
+                                      </span>
+                                    )
                                   )}
                                   {blocked[session.id] > 0 && (
                                     <span className="rail-blocked" title="Blocked network events since you last saw them">

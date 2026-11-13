@@ -11,7 +11,7 @@ use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
 use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE};
-use crate::error::{Error, Result};
+use crate::error::{Error, Member, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
 use crate::network::{self, Action, RuleDraft, Target};
@@ -87,8 +87,8 @@ pub(crate) struct State<V> {
     pub(crate) cages: Vec<Cage>,
     /// Each session is in exactly one workspace, and there is at least one.
     pub(crate) workspaces: Vec<Workspace>,
-    /// Per cage id: one VM per cage. It runs for one session, which keeps
-    /// it after its cage changes, until it stops.
+    /// Per cage id: one VM per cage. The sessions of the cage share it as
+    /// its members. A member keeps it after its cage changes, until it stops.
     pub(crate) vms: HashMap<String, Vm<V>>,
     pub(crate) terminals: Vec<Terminal>,
     /// Per cage that starts or runs, the policy and the credential values
@@ -100,15 +100,15 @@ pub(crate) struct State<V> {
     /// The generation of the last VM that started. A stop names the
     /// generation it resolved, so a delayed stop cannot hit a later VM.
     pub(crate) generation: u64,
+    /// The sessions that a restart to add joins to a VM, from the first
+    /// check until the new start claims them. No other start takes them.
+    pub(crate) joining: HashSet<String>,
 }
 
 pub(crate) enum Vm<V> {
-    /// The phase that the start for `session` runs now.
-    Starting {
-        session: String,
-        phase: Phase,
-    },
-    /// `applied` is the session and the cage the VM booted with; they differ
+    /// The phase that the start for the `members` runs now.
+    Starting { members: Vec<String>, phase: Phase },
+    /// `applied` is the member sessions and the cage the VM booted with; they differ
     /// from the stored config after an edit, until the next start. `proxy`
     /// is the cage's proxy; a drop stops it. `net` follows the VM's network
     /// events. It is `None` if the runtime log could not be opened.
@@ -117,22 +117,17 @@ pub(crate) enum Vm<V> {
     Running {
         generation: u64,
         vm: Arc<V>,
-        applied: Box<(Session, Cage)>,
+        applied: Box<(Vec<Session>, Cage)>,
         proxy: Arc<Proxy>,
         net: Option<AbortHandle>,
         runtimes: Vec<&'static str>,
         host: Box<HostRun>,
     },
     /// Shutdown is in progress. If it fails, the VM goes back to `Running`.
-    /// It still belongs to `session` until the shutdown succeeds.
-    Stopping {
-        session: String,
-    },
+    /// It still belongs to the `members` until the shutdown succeeds.
+    Stopping { members: Vec<String> },
     /// The start for `session` failed with `message`.
-    Failed {
-        session: String,
-        message: String,
-    },
+    Failed { session: String, message: String },
 }
 
 /// What a start did for the cage's host agents.
@@ -183,6 +178,11 @@ pub struct SessionView {
     /// the session failed. It differs from the effective cage after a cage
     /// change, until that VM stops.
     pub vm_cage: Option<String>,
+    /// The session's folder in the running VM, if the session is a member.
+    pub guest_folder: Option<String>,
+    /// The folder where the session's agents start in the running VM, if
+    /// the session is a member.
+    pub guest_harness: Option<String>,
 }
 
 /// The cage that a session uses.
@@ -209,6 +209,8 @@ pub struct CageView {
     #[serde(flatten)]
     pub cage: Cage,
     pub status: Status,
+    /// The names of the member sessions of the VM that starts, runs or stops.
+    pub members: Vec<String>,
     pub pending_restart: bool,
     /// The agent runtimes that the running VM has mounted. A host Gemini CLI
     /// that loads counts as one.
@@ -282,8 +284,7 @@ impl<V> State<V> {
         let Some((_, vm @ Vm::Running { applied, .. })) = self.vm_of(id) else {
             return Err(Error::NotRunning);
         };
-        let (member, folder, shared) =
-            task_guest_folder(std::slice::from_ref(&applied.0), id).ok_or(Error::NotRunning)?;
+        let (member, folder, shared) = task_guest_folder(&applied.0, id).ok_or(Error::NotRunning)?;
         Ok((member, &applied.1, vm, folder, shared))
     }
 
@@ -308,16 +309,25 @@ impl<V> State<V> {
         self.sessions.iter().filter(uses).collect()
     }
 
-    /// The cage id and the VM that starts, runs or stops for the session.
+    /// The cage id and the VM that starts, runs or stops with the session as
+    /// a member. A session is a member of at most one VM: after a cage
+    /// change it stays a member of the VM of its old cage until that stops.
     pub(crate) fn vm_of(&self, session_id: &str) -> Option<(&str, &Vm<V>)> {
         self.vms
             .iter()
             .find(|(_, vm)| match vm {
-                Vm::Starting { session, .. } | Vm::Stopping { session } => session == session_id,
-                Vm::Running { applied, .. } => applied.0.id == session_id,
+                Vm::Starting { members, .. } | Vm::Stopping { members } => members.iter().any(|m| m == session_id),
+                Vm::Running { applied, .. } => applied.0.iter().any(|m| m.id == session_id),
                 Vm::Failed { .. } => false,
             })
             .map(|(id, vm)| (id.as_str(), vm))
+    }
+
+    /// Each member id with the current name of its session.
+    pub(crate) fn members(&self, ids: impl IntoIterator<Item = String>) -> Vec<Member> {
+        ids.into_iter()
+            .map(|id| Member { name: self.session(&id).map_or_else(|_| id.clone(), |s| s.name.clone()), id })
+            .collect()
     }
 
     /// Numbers the entry and adds it to the cage's ring.
@@ -332,14 +342,27 @@ impl<V> State<V> {
     }
 }
 
-fn task_guest_folder<'a>(members: &'a [Session], id: &str) -> Option<(&'a Session, String, bool)> {
+/// The guest folder of member `id` of a VM: `/workspace` for the only
+/// member, else `/workspace/<slug>` (ADR 0007). The flag is true when the VM
+/// has more members. Each guest path of a session folder comes from here.
+pub(crate) fn task_guest_folder<'a>(members: &'a [Session], id: &str) -> Option<(&'a Session, String, bool)> {
     let member = members.iter().find(|s| s.id == id)?;
     let shared = members.len() > 1;
     let folder = if shared { format!("{WORKSPACE}/{}", member.slug) } else { WORKSPACE.to_owned() };
     Some((member, folder, shared))
 }
 
-fn ids(sessions: &[Session]) -> Vec<String> {
+/// A stored guest path of a session, such as its harness or a task workdir,
+/// is relative to `/workspace`. This puts it below the session's guest
+/// `folder`. A path below a mount stays.
+pub(crate) fn in_guest_folder(folder: &str, stored: &str) -> String {
+    match stored.strip_prefix(WORKSPACE) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{folder}{rest}"),
+        _ => stored.to_owned(),
+    }
+}
+
+pub(crate) fn ids(sessions: &[Session]) -> Vec<String> {
     sessions.iter().map(|s| s.id.clone()).collect()
 }
 
@@ -399,6 +422,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 live: HashMap::new(),
                 net: HashMap::new(),
                 generation: 0,
+                joining: HashSet::new(),
             })),
             net_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
@@ -437,33 +461,46 @@ impl<R: SandboxRuntime> Manager<R> {
         let sessions = state
             .sessions
             .iter()
-            .map(|session| SessionView {
-                agent_needs: state.bound(&session.id).map_or_else(|_| Vec::new(), network::agent_needs),
-                effective_cage: effective(session, &state.workspaces),
-                vm_cage: state.vm_of(&session.id).map(|(id, _)| id.to_owned()).or_else(|| {
-                    // A failed start shows on the session that started it.
-                    state
-                        .vms
+            .map(|session| {
+                let guest = match state.vm_of(&session.id) {
+                    Some((_, Vm::Running { applied, .. })) => task_guest_folder(&applied.0, &session.id),
+                    _ => None,
+                };
+                let (guest_folder, guest_harness) = guest.map_or((None, None), |(member, folder, _)| {
+                    let harness =
+                        member.harness.as_deref().map_or_else(|| folder.clone(), |h| in_guest_folder(&folder, h));
+                    (Some(folder), Some(harness))
+                });
+                SessionView {
+                    guest_folder,
+                    guest_harness,
+                    agent_needs: state.bound(&session.id).map_or_else(|_| Vec::new(), network::agent_needs),
+                    effective_cage: effective(session, &state.workspaces),
+                    vm_cage: state.vm_of(&session.id).map(|(id, _)| id.to_owned()).or_else(|| {
+                        // A failed start shows on the session that started it.
+                        state
+                            .vms
+                            .iter()
+                            .find(|(_, vm)| matches!(vm, Vm::Failed { session: s, .. } if *s == session.id))
+                            .map(|(id, _)| id.clone())
+                    }),
+                    processes: state
+                        .terminals
                         .iter()
-                        .find(|(_, vm)| matches!(vm, Vm::Failed { session: s, .. } if *s == session.id))
-                        .map(|(id, _)| id.clone())
-                }),
-                processes: state
-                    .terminals
-                    .iter()
-                    .filter(|t| t.session_id == session.id)
-                    .map(|t| TerminalView {
-                        id: t.id.clone(),
-                        kind: t.kind,
-                        exit_code: t.exit_code,
-                        terminal_id: t.terminal_id.clone(),
-                        agent: lock(&t.output)
-                            .osc
-                            .agent
-                            .filter(|_| t.exit_code.is_none() && matches!(t.kind, TerminalKind::Agent { .. })),
-                    })
-                    .collect(),
-                session: session.clone(),
+                        .filter(|t| t.session_id == session.id)
+                        .map(|t| TerminalView {
+                            id: t.id.clone(),
+                            kind: t.kind,
+                            exit_code: t.exit_code,
+                            terminal_id: t.terminal_id.clone(),
+                            agent: lock(&t.output)
+                                .osc
+                                .agent
+                                .filter(|_| t.exit_code.is_none() && matches!(t.kind, TerminalKind::Agent { .. })),
+                        })
+                        .collect(),
+                    session: session.clone(),
+                }
             })
             .collect();
         let cages = state.cages.iter().map(|cage| cage_view(&state, cage, self.vault.as_ref())).collect();
@@ -895,9 +932,10 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Stops the VM that runs for the session and saves the sessions
     /// without it. The cage stays. Then it deletes the run records of the
-    /// session.
+    /// session. A VM with other members is not stopped: the delete fails
+    /// with [`Error::StopShared`], and the user stops that VM first.
     pub async fn delete(&self, session_id: &str) -> Result<()> {
-        self.stop(session_id).await.or_else(|e| match e {
+        self.stop(session_id, None).await.or_else(|e| match e {
             Error::NotRunning | Error::CageNotFound => Ok(()),
             e => Err(e),
         })?;
@@ -955,18 +993,25 @@ impl<R: SandboxRuntime> Manager<R> {
 
 /// The cage with the state of its VM.
 fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
-    let (status, pending_restart) = match state.vms.get(&cage.id) {
-        None => (Status::Stopped, false),
-        Some(Vm::Starting { phase, .. }) => (Status::Starting { phase: *phase }, false),
+    let (status, pending_restart, members) = match state.vms.get(&cage.id) {
+        None => (Status::Stopped, false, Vec::new()),
+        Some(Vm::Starting { phase, members }) => (Status::Starting { phase: *phase }, false, members.clone()),
         Some(Vm::Running { applied, .. }) => {
-            let session = state.session(&applied.0.id).ok();
-            // The session now uses a different cage: it moves at the next start.
-            let moved = session.is_some_and(|s| effective(s, &state.workspaces).is_none_or(|c| c.id != cage.id));
-            (Status::Running, moved || pending_restart(applied, session, cage))
+            let (old_members, old_cage) = applied.as_ref();
+            // A member that now uses a different cage, or was deleted, leaves at the next start.
+            let changed = old_members.iter().any(|old| match state.session(&old.id) {
+                Ok(session) => {
+                    effective(session, &state.workspaces).is_none_or(|c| c.id != cage.id)
+                        || session_changed(old, session)
+                }
+                Err(_) => true,
+            });
+            (Status::Running, changed || cage_changed(old_cage, cage), ids(old_members))
         }
-        Some(Vm::Stopping { .. }) => (Status::Stopping, false),
-        Some(Vm::Failed { message, .. }) => (Status::Error { message: message.clone() }, false),
+        Some(Vm::Stopping { members }) => (Status::Stopping, false, members.clone()),
+        Some(Vm::Failed { message, .. }) => (Status::Error { message: message.clone() }, false, Vec::new()),
     };
+    let members = state.members(members).into_iter().map(|m| m.name).collect();
     let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) = match state.vms.get(&cage.id) {
         Some(Vm::Running { runtimes, host, proxy, .. }) => (
             runtimes.clone(),
@@ -980,6 +1025,7 @@ fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
     CageView {
         cage: cage.clone(),
         status,
+        members,
         pending_restart,
         runtimes,
         login_expires_at,
@@ -1006,28 +1052,28 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
 
 /// A new name, layout, task, terminal list, unprompted setting or network
 /// rule is used at once, so it needs no restart. A change of the session's
-/// cage is not checked here. A new credential name
-/// needs its placeholder in the guest env.
-fn pending_restart(applied: &(Session, Cage), session: Option<&Session>, cage: &Cage) -> bool {
-    let (old_session, old_cage) = applied;
-    let session_changed = session.is_some_and(|session| {
-        Session {
-            name: session.name.clone(),
-            layout: session.layout.clone(),
-            tasks: session.tasks.clone(),
-            terminals: session.terminals.clone(),
-            pane_layout: session.pane_layout.clone(),
-            cage: session.cage.clone(),
-            ..old_session.clone()
-        } != *session
-    });
-    let cage_changed = Cage {
+/// cage is not checked here.
+fn session_changed(old: &Session, session: &Session) -> bool {
+    Session {
+        name: session.name.clone(),
+        layout: session.layout.clone(),
+        tasks: session.tasks.clone(),
+        terminals: session.terminals.clone(),
+        pane_layout: session.pane_layout.clone(),
+        cage: session.cage.clone(),
+        ..old.clone()
+    } != *session
+}
+
+/// As [`session_changed`]. A new credential name needs its placeholder in the guest env.
+fn cage_changed(old: &Cage, cage: &Cage) -> bool {
+    Cage {
         name: cage.name.clone(),
         agents_unprompted: cage.agents_unprompted,
         network: cage.network.clone(),
-        ..old_cage.clone()
-    } != *cage;
-    session_changed || cage_changed || placeholders(&old_cage.network) != placeholders(&cage.network)
+        ..old.clone()
+    } != *cage
+        || placeholders(&old.network) != placeholders(&cage.network)
 }
 
 pub(crate) fn bin_dir(data: &Path, id: &str) -> PathBuf {
@@ -1041,8 +1087,10 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 
 #[cfg(test)]
 mod tests {
-    use super::{EffectiveCage, Listing, reserved_dirs, task_guest_folder};
+    use super::{EffectiveCage, Listing, in_guest_folder, reserved_dirs, task_guest_folder};
+    use crate::cage::lifecycle::Confirmed;
     use crate::cage::testing::*;
+    use crate::error::Member;
     use crate::workspaces::{self, Arrangement};
 
     #[test]
@@ -1059,6 +1107,13 @@ mod tests {
             (other_folder.as_path(), format!("{WORKSPACE}/{}", member.slug), true)
         );
         assert!(task_guest_folder(&members[..1], &second).is_none());
+        // The stored paths of a session move with its guest folder; a mount path stays.
+        let shared = format!("{WORKSPACE}/{}", member.slug);
+        assert_eq!(in_guest_folder(WORKSPACE, "/workspace/src"), "/workspace/src");
+        assert_eq!(in_guest_folder(&shared, WORKSPACE), shared);
+        assert_eq!(in_guest_folder(&shared, "/workspace/src/app"), format!("{shared}/src/app"));
+        assert_eq!(in_guest_folder(&shared, "/workspaces"), "/workspaces");
+        assert_eq!(in_guest_folder(&shared, "/mnt/data"), "/mnt/data");
     }
 
     #[test]
@@ -1075,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn delete_refuses_a_session_that_is_starting() {
         let (manager, _runtime, id) = manager();
-        lock(&manager.state).vms.insert(id.clone(), Vm::Starting { session: id.clone(), phase: Phase::Vault });
+        lock(&manager.state).vms.insert(id.clone(), Vm::Starting { members: vec![id.clone()], phase: Phase::Vault });
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().sessions.len(), 1);
     }
@@ -1094,11 +1149,11 @@ mod tests {
         assert!(!manager.list().cages[0].pending_restart);
 
         // Stopped: the next start writes the stored setting.
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.set_agents_unprompted(&id, true).unwrap();
         manager.start(&id).await.unwrap();
         assert!(claude().contains("dangerously"));
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
         assert!(!manager.bin_dir(&id).exists());
@@ -1113,7 +1168,7 @@ mod tests {
         std::fs::write(sessions.join("a.jsonl"), "{\"type\":\"session\",\"timestamp\":\"t\"}\n").unwrap();
         let chats = manager.data.join("chats").join(&id).join("claude");
         std::fs::create_dir_all(&chats).unwrap();
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
 
         manager.delete(&id).await.unwrap();
         assert!(manager.state_dir(&id).exists(), "the cage stays");
@@ -1504,30 +1559,247 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cage_that_runs_for_one_session_refuses_a_second() {
+    async fn a_second_session_joins_the_running_vm_by_a_confirmed_restart() {
+        let (manager, runtime, a) = manager();
+        let (_, shared) = inherit(&manager, &a);
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        let session = |id: &str| manager.list().sessions.into_iter().find(|s| s.session.id == id).unwrap().session;
+        let (sa, sb) = (session(&a), session(&b));
+        std::fs::create_dir(sa.folder.join("src")).unwrap();
+        manager.set_harness(&a, Some("/workspace/src")).unwrap();
+        manager.start(&a).await.unwrap();
+        assert_eq!(*runtime.folders.lock().unwrap(), [(WORKSPACE.to_owned(), sa.folder.clone())]);
+        let guest = |id: &str| {
+            let view = manager.list().sessions.into_iter().find(|s| s.session.id == id).unwrap();
+            (view.guest_folder, view.guest_harness)
+        };
+        assert_eq!(guest(&a), (Some(WORKSPACE.to_owned()), Some(format!("{WORKSPACE}/src"))));
+        assert_eq!(guest(&b), (None, None));
+        let shell = manager.open_session(&a, TerminalKind::Shell, 24, 80).await.unwrap();
+
+        let Err(Error::RestartToAdd { members, generation, .. }) = manager.start(&b).await else {
+            panic!("a running VM without the session asks for a restart");
+        };
+        assert_eq!(members, [Member { id: a.clone(), name: sa.name.clone() }]);
+        let expected = [a.clone()];
+        let stale = manager.restart_to_add(&b, &expected, generation + 1).await;
+        assert!(matches!(stale, Err(Error::StaleRestart)), "{stale:?}");
+        let stale = manager.restart_to_add(&b, std::slice::from_ref(&b), generation).await;
+        assert!(matches!(stale, Err(Error::StaleRestart)), "{stale:?}");
+        assert!(matches!(manager.stop(&b, None).await, Err(Error::NotRunning)));
+
+        manager.restart_to_add(&b, &expected, generation).await.unwrap();
+        let folders = runtime.folders.lock().unwrap().clone();
+        assert_eq!(
+            folders,
+            [
+                (format!("{WORKSPACE}/{}", sa.slug), sa.folder.clone()),
+                (format!("{WORKSPACE}/{}", sb.slug), sb.folder.clone())
+            ]
+        );
+        let list = manager.list();
+        let vm_cage = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().vm_cage.clone();
+        assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(shared.clone()), Some(shared.clone())));
+        let view = list.cages.iter().find(|c| c.cage.id == shared).unwrap();
+        assert_eq!(view.members, [sa.name.clone(), sb.name.clone()]);
+        assert!(!view.pending_restart);
+        assert!(matches!(manager.start(&b).await, Err(Error::AlreadyStarted)));
+        assert!(lock(&manager.state).task_cage(&b).unwrap().4);
+        let (folder_a, folder_b) = (format!("{WORKSPACE}/{}", sa.slug), format!("{WORKSPACE}/{}", sb.slug));
+        assert_eq!(guest(&a), (Some(folder_a.clone()), Some(format!("{folder_a}/src"))));
+        assert_eq!(guest(&b), (Some(folder_b.clone()), Some(folder_b)));
+
+        // The VM shell of `a` opened again in the new VM, at its new folder.
+        let processes = &list.sessions.iter().find(|s| s.session.id == a).unwrap().processes;
+        assert_eq!(processes.len(), 1);
+        assert_ne!(processes[0].id, shell);
+        assert_eq!(processes[0].exit_code, None);
+        assert_eq!(runtime.cwds.lock().unwrap().last(), Some(&folder_a));
+        assert!(manager.take_app_notices().is_empty());
+
+        // Each terminal starts in its own session's guest folder.
+        manager.open_session(&b, TerminalKind::Shell, 24, 80).await.unwrap();
+        assert_eq!(runtime.cwds.lock().unwrap().last(), Some(&format!("{WORKSPACE}/{}", sb.slug)));
+
+        // A stop or a delete that also ends the other member asks first.
+        let Err(Error::StopShared { members, generation, .. }) = manager.stop(&a, None).await else {
+            panic!("a stop of a shared VM asks first");
+        };
+        assert_eq!(members, [Member { id: b.clone(), name: sb.name.clone() }]);
+        let Err(Error::StopShared { generation: deleted, .. }) = manager.delete(&b).await else {
+            panic!("a delete of a member of a shared VM asks first");
+        };
+        assert_eq!(deleted, generation);
+        manager.stop(&a, Some(&Confirmed { members: vec![b.clone()], generation })).await.unwrap();
+        let list = manager.list();
+        assert!(list.sessions.iter().all(|s| s.vm_cage.is_none()));
+        assert!(list.sessions.iter().all(|s| s.processes.is_empty()));
+
+        // A stopped VM starts with only the session that starts it, at `/workspace`.
+        manager.start(&b).await.unwrap();
+        assert_eq!(*runtime.folders.lock().unwrap(), [(WORKSPACE.to_owned(), sb.folder.clone())]);
+        assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count(), 3);
+    }
+
+    /// Two sessions of a cage in one VM. Returns the second session.
+    async fn two_members(manager: &Manager<FakeRuntime>, a: &str) -> String {
+        inherit(manager, a);
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.start(a).await.unwrap();
+        let Err(Error::RestartToAdd { generation, .. }) = manager.start(&b).await else { panic!("restart to add") };
+        manager.restart_to_add(&b, &[a.to_owned()], generation).await.unwrap();
+        b
+    }
+
+    fn running_generation(manager: &Manager<FakeRuntime>, session: &str) -> u64 {
+        match lock(&manager.state).vm_of(session) {
+            Some((_, Vm::Running { generation, .. })) => *generation,
+            _ => panic!("the VM of the session runs"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_confirmed_stop_is_refused() {
+        let (manager, _, a) = manager();
+        let b = two_members(&manager, &a).await;
+        let generation = running_generation(&manager, &b);
+        for stale in [
+            Confirmed { members: vec![b.clone()], generation: generation + 1 },
+            Confirmed { members: vec![], generation },
+            Confirmed { members: vec![a.clone(), b.clone()], generation },
+        ] {
+            let result = manager.stop(&a, Some(&stale)).await;
+            assert!(matches!(result, Err(Error::StaleRestart)), "{result:?}");
+        }
+        assert_eq!(running_generation(&manager, &a), generation);
+        // The order of the members does not matter.
+        manager.stop(&b, Some(&Confirmed { members: vec![a.clone()], generation })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_all_members_and_their_terminals() {
+        let (manager, runtime, a) = manager();
+        let b = two_members(&manager, &a).await;
+        manager.open_session(&b, TerminalKind::Shell, 24, 80).await.unwrap();
+        let before = runtime.folders.lock().unwrap().clone();
+        let Err(Error::StopShared { members, generation, .. }) = manager.restart(&a, None).await else {
+            panic!("a restart of a shared VM asks first");
+        };
+        assert_eq!(members.len(), 1);
+        manager.restart(&a, Some(&Confirmed { members: vec![b.clone()], generation })).await.unwrap();
+        assert_eq!(*runtime.folders.lock().unwrap(), before);
+        assert!(running_generation(&manager, &a) > generation);
+        let list = manager.list();
+        let view = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap();
+        assert_eq!(view(&a).vm_cage, view(&b).vm_cage);
+        assert!(view(&b).processes.iter().all(|p| p.exit_code.is_none()));
+        assert_eq!(view(&b).processes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reopen_after_a_second_stop_does_not_register_in_a_dead_vm() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let gate = Arc::new(PtyGate::default());
+        *runtime.pty_gate.lock().unwrap() = Some(gate.clone());
+
+        let manager = Arc::new(manager);
+        let restarting = tokio::spawn({
+            let (manager, id) = (manager.clone(), id.clone());
+            async move { manager.restart(&id, None).await }
+        });
+        // The new VM runs and the reopen waits in `open_pty`.
+        gate.entered.notified().await;
+        manager.stop(&id, None).await.unwrap();
+        *runtime.pty_gate.lock().unwrap() = None;
+        gate.release.notify_one();
+
+        restarting.await.unwrap().unwrap();
+        assert!(manager.list().sessions[0].processes.is_empty());
+        let notices = manager.take_app_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].starts_with("The VM shell of "), "{notices:?}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !runtime.log.lock().unwrap().contains(&"kill".to_owned()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reopened process was not killed");
+    }
+
+    #[tokio::test]
+    async fn a_restart_to_add_drops_members_that_left_the_cage() {
+        let (manager, runtime, a) = manager();
+        let (_, shared) = inherit(&manager, &a);
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        let c = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.start(&a).await.unwrap();
+        let Err(Error::RestartToAdd { generation, .. }) = manager.start(&b).await else { panic!("restart to add") };
+        manager.restart_to_add(&b, std::slice::from_ref(&a), generation).await.unwrap();
+
+        // `a` moves to its own cage: the VM waits for a restart, and the restart drops it.
+        manager.set_session_cage(&a, Some(&a)).unwrap();
+        let pending = |m: &Manager<FakeRuntime>| m.list().cages.into_iter().find(|v| v.cage.id == shared).unwrap();
+        assert!(pending(&manager).pending_restart);
+        let Err(Error::RestartToAdd { members, generation, .. }) = manager.start(&c).await else {
+            panic!("restart to add")
+        };
+        let members: Vec<String> = members.into_iter().map(|m| m.id).collect();
+        assert_eq!(members, [a.clone(), b.clone()]);
+        manager.restart_to_add(&c, &members, generation).await.unwrap();
+        let folders: Vec<String> = runtime.folders.lock().unwrap().iter().map(|(guest, _)| guest.clone()).collect();
+        let slug = |id: &str| manager.list().sessions.into_iter().find(|s| s.session.id == id).unwrap().session.slug;
+        assert_eq!(folders, [format!("{WORKSPACE}/{}", slug(&b)), format!("{WORKSPACE}/{}", slug(&c))]);
+        assert!(!pending(&manager).pending_restart);
+        assert_eq!(manager.list().sessions.iter().find(|s| s.session.id == a).unwrap().vm_cage, None);
+    }
+
+    #[tokio::test]
+    async fn a_restart_to_add_with_nested_folders_keeps_the_vm() {
+        let (manager, _, a) = manager();
+        inherit(&manager, &a);
+        let folder = manager.list().sessions[0].session.folder.join("inner");
+        std::fs::create_dir(&folder).unwrap();
+        let b = manager.create(folder.to_str().unwrap(), None).unwrap();
+        manager.start(&a).await.unwrap();
+        let Err(Error::RestartToAdd { generation, .. }) = manager.start(&b).await else { panic!("restart to add") };
+        let error = manager.restart_to_add(&b, std::slice::from_ref(&a), generation).await.unwrap_err();
+        assert!(matches!(error, Error::MountOverlap(..)), "{error}");
+        assert!(matches!(manager.start(&a).await, Err(Error::AlreadyStarted)), "the old VM still runs");
+    }
+
+    /// The joining session stays reserved while the old VM stops: it cannot
+    /// start in a different cage and then also join this VM.
+    #[tokio::test]
+    async fn a_restart_to_add_reserves_the_joining_session_during_the_stop() {
         let (manager, runtime, a) = manager();
         let (_, shared) = inherit(&manager, &a);
         let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
         manager.start(&a).await.unwrap();
-        let error = manager.start(&b).await.unwrap_err();
-        assert!(matches!(&error, Error::CageBusy { .. }), "{error}");
-        let name = manager.list().sessions[0].session.name.clone();
-        assert_eq!(error.to_string(), format!("cage shared runs for session {name}; stop it first"));
-        assert!(matches!(manager.stop(&b).await, Err(Error::NotRunning)));
+        let Err(Error::RestartToAdd { generation, .. }) = manager.start(&b).await else { panic!("restart to add") };
+
+        let gate = Arc::new(PtyGate::default());
+        *runtime.stop_gate.lock().unwrap() = Some(gate.clone());
+        let manager = Arc::new(manager);
+        let restart = tokio::spawn({
+            let (manager, a, b) = (manager.clone(), a.clone(), b.clone());
+            async move { manager.restart_to_add(&b, std::slice::from_ref(&a), generation).await }
+        });
+        gate.entered.notified().await;
+        let other = manager.create_cage("other").unwrap();
+        manager.set_session_cage(&b, Some(&other)).unwrap();
+        assert!(matches!(manager.start(&b).await, Err(Error::Starting)));
+        manager.set_session_cage(&b, None).unwrap();
+
+        *runtime.stop_gate.lock().unwrap() = None;
+        gate.release.notify_one();
+        restart.await.unwrap().unwrap();
         let list = manager.list();
         let vm_cage = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().vm_cage.clone();
-        assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(shared.clone()), None));
-
-        // A cage whose VM runs is in use, also with no session on it.
-        manager.set_session_cage(&a, Some(&a)).unwrap();
-        manager.set_session_cage(&b, Some(&a)).unwrap();
-        let workspace = manager.workspaces()[0].id.clone();
-        manager.set_workspace_cage(&workspace, None).unwrap();
-        assert!(matches!(manager.delete_cage(&shared), Err(Error::CageInUse(..))));
-
-        manager.stop(&a).await.unwrap();
-        manager.set_session_cage(&b, Some(&shared)).unwrap();
-        manager.start(&b).await.unwrap();
+        assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(shared.clone()), Some(shared)));
+        assert!(lock(&manager.state).joining.is_empty());
         assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count(), 2);
     }
 
@@ -1572,7 +1844,7 @@ mod tests {
         assert!(matches!(manager.start(&id).await, Err(Error::AlreadyStarted)));
 
         // Restart: the stop finds the old VM, the start uses the new cage.
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.start(&id).await.unwrap();
         let list = manager.list();
         assert_eq!(list.sessions[0].vm_cage.as_deref(), Some(shared.as_str()));

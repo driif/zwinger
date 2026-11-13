@@ -192,6 +192,10 @@ export interface SessionView {
    * the old cage until that VM stops.
    */
   vmCage: string | null;
+  /** The session's folder in the running VM: `/workspace`, or `/workspace/<slug>` in a shared VM. `null`: not a member. */
+  guestFolder: string | null;
+  /** The folder where the session's agents start in the running VM. `null`: not a member. */
+  guestHarness: string | null;
 }
 
 /** The sandbox config of a session and the state of its VM. */
@@ -205,6 +209,8 @@ export interface CageView {
   /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
   status: CageStatus;
+  /** The names of the sessions of the VM that starts, runs or stops. The sessions of a cage share its VM. */
+  members: string[];
   pendingRestart: boolean;
   /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
   runtimes: ("claude" | "codex" | "gemini")[];

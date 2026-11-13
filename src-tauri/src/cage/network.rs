@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(manager.list_net_events(&id).unwrap(), sent);
 
         // The ring stays after a stop; a restart continues the numbers.
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         net_closed(&runtime, 0).await;
         assert_eq!(manager.list_net_events(&id).unwrap().len(), 2);
         *runtime.net_script.lock().unwrap() = vec![dns_denied("2999-01-01T00:00:01Z", "google.com")];
@@ -437,7 +437,7 @@ mod tests {
         let (_, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
         assert_eq!(event.seq, 3);
 
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         net_closed(&runtime, 1).await;
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
@@ -449,7 +449,7 @@ mod tests {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
         *runtime.fail_stop.lock().unwrap() = true;
-        assert!(manager.stop(&id).await.is_err());
+        assert!(manager.stop(&id, None).await.is_err());
 
         net_sender(&runtime, 0).send(dns_denied("2999-01-01T00:00:00Z", "google.com")).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -461,7 +461,7 @@ mod tests {
         .expect("the event did not arrive");
 
         *runtime.fail_stop.lock().unwrap() = false;
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         net_closed(&runtime, 0).await;
     }
 
@@ -489,7 +489,7 @@ mod tests {
         manager.set_rule_credential(&id, &rule, "NPM_TOKEN", bearer(), Some(SecretValue::new("t"))).unwrap();
         assert!(manager.list().cages[0].pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["NPM_TOKEN"], SecretValue::new("t"));
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         assert!(lock(&manager.state).live.is_empty());
         manager.start(&id).await.unwrap();
         assert!(!manager.list().cages[0].pending_restart);

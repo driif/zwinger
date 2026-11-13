@@ -62,6 +62,10 @@ export function mapLayout(
   now: number,
 ) {
   const { harness } = session;
+  // In a running VM, the paths that the guest sees. `harness` stays the stored path, which the folders match.
+  const guestFolder = session.guestFolder ?? "/workspace";
+  const guestHarness = session.guestHarness ?? harness;
+  const inGuest = (path: string) => `${guestFolder}${path.slice("/workspace".length)}`;
   const { network } = cage;
   const runtimes = vm?.runtimes ?? [];
   const state = vm?.status.state ?? "stopped";
@@ -101,8 +105,8 @@ export function mapLayout(
   let y = TOP;
   inner("workspace", NODE_X, y, NODE_W, {
     icon: FolderOpen,
-    label: "/workspace",
-    title: "/workspace, read-write",
+    label: guestFolder,
+    title: `${guestFolder}, read-write`,
     badges: ["rw"],
     jump: "settings",
   });
@@ -121,7 +125,7 @@ export function mapLayout(
     inner(`folder:${path.slice("/workspace/".length)}`, FOLDER_X, y, FOLDER_W, {
       icon: isHarness ? Bot : Folder,
       label: path.slice("/workspace/".length),
-      title: isHarness ? `${path}, harness ${harness}` : path,
+      title: isHarness ? `${inGuest(path)}, harness ${guestHarness}` : inGuest(path),
       tone: isHarness ? "harness" : "muted",
       badges: harnessBadge(path),
       jump: "settings",
@@ -145,7 +149,7 @@ export function mapLayout(
     inner("harness", FOLDER_X, y, FOLDER_W, {
       icon: Bot,
       label: harness.slice("/workspace/".length),
-      title: `harness ${harness}`,
+      title: `harness ${guestHarness}`,
       tone: "harness",
       badges: ["harness"],
       jump: "settings",
@@ -159,7 +163,7 @@ export function mapLayout(
     inner(`mount:${mount.guest}`, NODE_X, y, NODE_W, {
       icon: isHarness ? Bot : FolderSymlink,
       label: mount.guest,
-      title: `${mount.guest}, ${mount.readonly ? "read-only" : "read-write"}${isHarness ? `, harness ${harness}` : ""}`,
+      title: `${mount.guest}, ${mount.readonly ? "read-only" : "read-write"}${isHarness ? `, harness ${guestHarness}` : ""}`,
       tone: isHarness ? "harness" : undefined,
       badges: [...harnessBadge(mount.guest), mount.readonly ? "ro" : "rw"],
       jump: "settings",

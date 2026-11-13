@@ -86,8 +86,8 @@ export function SettingsTab({ session, cages, defaultCage, folders, runtimes, ru
             </Button>
           </form>
           <p className="muted">
-            Folder <span className="mono">{session.folder}</span> is <span className="mono">{WORKSPACE}</span> in the
-            cage. It is read-write.
+            Folder <span className="mono">{session.folder}</span> is{" "}
+            <span className="mono">{session.guestFolder ?? WORKSPACE}</span> in the cage. It is read-write.
           </p>
           <Select
             label="Cage"

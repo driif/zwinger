@@ -41,11 +41,50 @@ export const resolveFolder = (path: string) =>
 export const renameSession = (sessionId: string, name: string) =>
   call<void>("rename_session", { sessionId, name });
 
-/** Starts the VM of the session's effective cage. */
+/** A member session of a running VM. */
+export interface Member {
+  id: string;
+  name: string;
+}
+
+/** The `detail` of `RestartToAdd`: the VM of the cage runs for other sessions. */
+export interface RestartToAdd {
+  cage: string;
+  members: Member[];
+  generation: number;
+}
+
+/** The `detail` of `StopShared`: the VM `generation` also runs for these other sessions. */
+export interface StopShared {
+  cage: string;
+  members: Member[];
+  generation: number;
+}
+
+/** The other members and the VM that the user saw when they confirmed a stop or restart. */
+const confirmedOf = (shared: StopShared | null) =>
+  shared && { members: shared.members.map((m) => m.id), generation: shared.generation };
+
+/**
+ * Starts the VM of the session's effective cage, with the session as its only member. Fails with `RestartToAdd` when
+ * that VM runs for other sessions.
+ */
 export const startCage = (sessionId: string) => call<void>("start_cage", { sessionId });
 
-/** Stops the VM that runs for the session. */
-export const stopCage = (sessionId: string) => call<void>("stop_cage", { sessionId });
+/** Restarts the VM with the session as one more member. Fails with `StaleRestart` if the VM or its members changed. */
+export const restartCageToAdd = (sessionId: string, add: RestartToAdd) =>
+  call<void>("restart_cage_to_add", { sessionId, members: add.members.map((m) => m.id), generation: add.generation });
+
+/**
+ * Stops the VM that runs for the session. Fails with `StopShared` when it has other members, unless `confirmed` is that
+ * error's detail. Fails with `StaleRestart` if the VM or its members changed since.
+ */
+export const stopCage = (sessionId: string, confirmed: StopShared | null) =>
+  call<void>("stop_cage", { sessionId, confirmed: confirmedOf(confirmed) });
+
+/** Restarts the VM that runs for the session, with all its members. `confirmed` works as for `stopCage`. */
+export const restartCage = (sessionId: string, confirmed: StopShared | null) =>
+  call<void>("restart_cage", { sessionId, confirmed: confirmedOf(confirmed) });
 
 /** `null`: the session inherits the default cage of its workspace. */
 export const setSessionCage = (sessionId: string, cageId: string | null) =>

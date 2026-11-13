@@ -296,6 +296,8 @@ pub fn run() {
             commands::network::list_net_events,
             commands::cages::start_cage,
             commands::cages::stop_cage,
+            commands::cages::restart_cage,
+            commands::cages::restart_cage_to_add,
             commands::cages::create_cage,
             commands::cages::rename_cage,
             commands::cages::delete_cage,

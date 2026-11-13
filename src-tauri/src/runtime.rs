@@ -10,7 +10,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
-use crate::cage::{Bound, WORKSPACE};
+use crate::cage::manager::task_guest_folder;
+use crate::cage::{Members, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::netlog;
 use crate::runtimes::Installed;
@@ -133,14 +134,15 @@ pub struct Pipe {
 pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
-    /// Boots the VM of the cage with the session folder at `/workspace`.
+    /// Boots the VM of the cage with each member folder at its guest folder
+    /// ([`task_guest_folder`]), with workdir `/workspace`.
     /// The VM reaches only `net.port` on the host. `state` is the host dir
     /// of the VM's agent state. Each runtime in `runtimes` is mounted
     /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
     /// its guest path.
     fn start(
         &self,
-        bound: Bound<'_>,
+        members: Members<'_>,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
@@ -239,14 +241,14 @@ impl SandboxRuntime for Microsandbox {
 
     async fn start(
         &self,
-        bound: Bound<'_>,
+        members: Members<'_>,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<Sandbox> {
         let policy = sandbox_policy(net.port)?;
-        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", bound.cage.id))
+        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", members.cage.id))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
             .deployment_profile(DeploymentProfile::SingleTenant)
@@ -254,9 +256,12 @@ impl SandboxRuntime for Microsandbox {
             .replace()
             // The network events are debug lines of the runtime log.
             .log_level(LogLevel::Debug)
-            .workdir(WORKSPACE)
-            .volume(WORKSPACE, |m| m.bind(&bound.session.folder));
-        for mount in &bound.cage.mounts {
+            .workdir(WORKSPACE);
+        for session in members.sessions {
+            let (_, guest, _) = task_guest_folder(members.sessions, &session.id).expect("a member");
+            builder = builder.volume(guest, |m| m.bind(&session.folder));
+        }
+        for mount in &members.cage.mounts {
             builder = builder.volume(&mount.guest, |m| {
                 let m = m.bind(&mount.host);
                 if mount.readonly { m.readonly() } else { m }
@@ -454,6 +459,8 @@ pub mod fake {
         pub runtimes: Arc<Mutex<Vec<String>>>,
         /// The read-only binds of the last start.
         pub binds: Arc<Mutex<Vec<Bind>>>,
+        /// The guest folder and host folder of each member of the last start.
+        pub folders: Arc<Mutex<Vec<(String, std::path::PathBuf)>>>,
         /// What `node --version` prints. `None` prints a supported version.
         pub node_version: Arc<Mutex<Option<String>>>,
         /// The scripts whose probe fails: `node <script> --version`, or the
@@ -512,7 +519,7 @@ pub mod fake {
 
         async fn start(
             &self,
-            bound: Bound<'_>,
+            members: Members<'_>,
             net: &GuestNet,
             _: &Path,
             runtimes: &[Installed],
@@ -525,9 +532,14 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.log.lock().unwrap().push(format!("start {}", bound.cage.id));
+            self.log.lock().unwrap().push(format!("start {}", members.cage.id));
             *self.net.lock().unwrap() = Some(net.clone());
-            Ok(FakeVm { cage_id: bound.cage.id.clone() })
+            *self.folders.lock().unwrap() = members
+                .sessions
+                .iter()
+                .map(|s| (task_guest_folder(members.sessions, &s.id).expect("a member").1, s.folder.clone()))
+                .collect();
+            Ok(FakeVm { cage_id: members.cage.id.clone() })
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {

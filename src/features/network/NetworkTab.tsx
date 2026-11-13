@@ -91,6 +91,8 @@ interface Props {
   active: boolean;
   /** Gets the last `seq` while the Activity section is in view. */
   onSeen: (seq: number) => void;
+  /** Starts the session's VM. */
+  onStart: () => void;
 }
 
 export function NetworkTab({
@@ -104,6 +106,7 @@ export function NetworkTab({
   onIntentDone,
   active,
   onSeen,
+  onStart,
 }: Props) {
   const catalog = useCatalog();
   const [testHost, setTestHost] = useState("example.com");
@@ -220,11 +223,11 @@ export function NetworkTab({
 
       <div ref={activity}>
         <NetworkActivity
-          sessionId={session.id}
           cage={cage}
           running={running}
           events={events}
           catalog={catalog}
+          onStart={onStart}
           run={run}
         />
       </div>

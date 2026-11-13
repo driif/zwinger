@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::agent::AgentKind;
 use crate::cage::Mount;
-use crate::cage::manager::{Manager, Vm, blocking, lock};
+use crate::cage::manager::{Manager, Vm, blocking, in_guest_folder, lock};
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
 use crate::session::{Task, TaskDraft};
@@ -60,8 +60,9 @@ impl<R: SandboxRuntime> Manager<R> {
         let (task, vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted) = {
             let state = lock(&self.state);
             let session = state.session(id)?;
-            let task = session.task(task_id)?.clone();
+            let mut task = session.task(task_id)?.clone();
             let (member, cage, running, folder, shared) = state.task_cage(id)?;
+            task.workdir = in_guest_folder(&folder, &task.workdir);
             let Vm::Running { vm, runtimes, host, .. } = running else {
                 unreachable!("task_cage returns a running VM")
             };
@@ -176,8 +177,9 @@ impl<R: SandboxRuntime> Manager<R> {
         let (task, vm, folder, scope) = {
             let state = lock(&self.state);
             let session = state.session(id)?;
-            let task = session.task(task_id)?.clone();
+            let mut task = session.task(task_id)?.clone();
             let (_, cage, running, folder, _) = state.task_cage(id)?;
+            task.workdir = in_guest_folder(&folder, &task.workdir);
             let Vm::Running { vm, .. } = running else { unreachable!("task_cage returns a running VM") };
             let scope = git_scope(&task, &folder, &cage.mounts)?;
             (task, vm.clone(), folder, scope)
@@ -309,7 +311,7 @@ mod tests {
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Again", kinds)).unwrap();
         assert!(!manager.list().cages[0].pending_restart);
 
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.set_mount_readonly(&id, "/mnt/ro", false).unwrap();
         manager.start(&id).await.unwrap();
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::RuntimeMissing(name)) if name == "claude"));

@@ -2,7 +2,7 @@ import { CSSProperties, lazy, ReactNode, Suspense, useEffect, useRef, useState }
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
-import { Button } from "@driif/motiv";
+import { Button, Card } from "@driif/motiv";
 import { Plus, RotateCw, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
@@ -27,8 +27,12 @@ import {
   onGuestLogin,
   onStartProgress,
   resolveFolder,
+  restartCage,
+  restartCageToAdd,
+  RestartToAdd,
   startCage,
   stopCage,
+  StopShared,
   takeAppNotices,
 } from "./features/projects/api";
 import {
@@ -81,7 +85,7 @@ import { Appearance, useAppearance } from "./features/appearance/themes";
 import { clampRail, RailHandle } from "./features/projects/RailHandle";
 import { Notice } from "./shared/Notice";
 import { ShortcutAction, useShortcuts } from "./shared/useShortcuts";
-import { errorCode, errorMessage, isBackendError } from "./shared/errorMessage";
+import { errorCode, errorDetail, errorMessage, isBackendError } from "./shared/errorMessage";
 import { LOST_TITLE, ReloadScreen, useBackendLost } from "./shared/Recover";
 import { CageMark } from "./shared/CageMark";
 import { CagesPage } from "./features/cages/CagesPage";
@@ -112,6 +116,22 @@ export interface Pane {
 }
 
 export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
+
+/** The start and stop of a session's VM. Each asks first when it restarts or stops the VM of other sessions. */
+export interface VmControl {
+  start: (sessionId: string) => Promise<void>;
+  stop: (sessionId: string) => Promise<void>;
+}
+
+/** The user cancelled a confirmation: `run` shows no error. */
+class Cancelled extends Error {}
+
+/** A question that a start or stop asks before it continues. */
+interface Ask {
+  text: string;
+  confirm: string;
+  answer: (ok: boolean) => void;
+}
 
 /** A ⌘K action that a tab completes, such as focusing a field. `at` makes a repeated action new. */
 export interface Intent {
@@ -233,6 +253,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [appNotices, setAppNotices] = useState<string[]>([]);
+  const [ask, setAsk] = useState<Ask>();
   const [intent, setIntent] = useState<Intent>();
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
@@ -299,7 +320,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const run: Run = (action) => {
     setError(undefined);
     const done = action().then(refresh, (e) => {
-      setError(errorMessage(e));
+      if (!(e instanceof Cancelled)) setError(errorMessage(e));
       return refresh();
     });
     refresh();
@@ -561,7 +582,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       throw new Error("This pane cannot split again. Close a pane first.");
     // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
     if (target.vmCage?.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
-      await startCage(session.id);
+      await vm.start(session.id);
       const next = await listSessions();
       const fresh = next.sessions.find((s) => s.id === session.id);
       cage = (fresh && sessionCage(fresh, next.cages).vmCage) ?? cage;
@@ -616,7 +637,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
     const target = joined.find((j) => j.session.id === pane.sessionId);
-    if (pane.kind.type !== "host" && target && target.vmCage?.status.state !== "running") await startCage(pane.sessionId);
+    if (pane.kind.type !== "host" && target && target.vmCage?.status.state !== "running") await vm.start(pane.sessionId);
     const { rows, cols } = fittedSize();
     await reopenTerminal(pane.sessionId, pane.key, rows, cols);
     showPane(pane.key, (await refresh())?.find((s) => s.id === pane.sessionId));
@@ -675,16 +696,96 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       return refresh();
     });
 
+  /** Resolves when the user confirms and `go` is done. A cancel rejects with `Cancelled`. */
+  const confirmFirst = (text: string, confirm: string, go: () => Promise<void>) =>
+    new Promise<void>((resolve, reject) =>
+      setAsk({
+        text,
+        confirm,
+        answer: (ok) => {
+          setAsk(undefined);
+          if (ok) go().then(resolve, reject);
+          else reject(new Cancelled());
+        },
+      }),
+    );
+
+  /** A restart adds a notice for each terminal that does not reopen. */
+  const pullNotices = () =>
+    takeAppNotices().then(
+      (notes) => notes.length > 0 && setAppNotices((all) => [...all, ...notes]),
+      (e) => setError(errorMessage(e)),
+    );
+
+  const vm: VmControl = {
+    async start(sessionId) {
+      try {
+        await startCage(sessionId);
+      } catch (e) {
+        const add = errorDetail<RestartToAdd>(e, "RestartToAdd");
+        if (!add) throw e;
+        const name = joined.find((j) => j.session.id === sessionId)?.session.name ?? "this project";
+        const others = add.members.map((m) => m.name).join(", ");
+        const first = add.members.length === 1 ? joined.find((j) => j.session.id === add.members[0].id)?.session : undefined;
+        const moves = first
+          ? ` ${first.name} moves from /workspace to /workspace/${first.slug}, so its agents do not find their history of the old path.`
+          : "";
+        await confirmFirst(
+          `Restart cage ${add.cage} to add ${name}? The terminals of ${others} reopen; their running tasks are cancelled.${moves}`,
+          "Restart",
+          () => restartCageToAdd(sessionId, add).finally(pullNotices),
+        );
+      }
+    },
+    stop: (sessionId) =>
+      confirmShared(
+        (others) => `Its VM also runs ${others}: their VM terminals and running tasks end.`,
+        "Stop",
+        (confirmed) => stopCage(sessionId, confirmed),
+      ),
+  };
+
+  /**
+   * Runs `act` on a session's VM. A VM with other members refuses with `StopShared`: the user confirms `say` of them,
+   * then `act` runs again with what the user saw.
+   */
+  async function confirmShared(
+    say: (others: string) => string,
+    verb: "Stop" | "Restart",
+    act: (confirmed: StopShared | null) => Promise<void>,
+  ) {
+    try {
+      await act(null);
+    } catch (e) {
+      const shared = errorDetail<StopShared>(e, "StopShared");
+      if (!shared) throw e;
+      const others = shared.members.map((m) => m.name).join(", ");
+      await confirmFirst(`${verb} cage ${shared.cage}? ${say(others)}`, verb, () => act(shared));
+    }
+  }
+
   const toggle = ({ session, vmCage }: SessionCage) =>
-    run(() => (vmCage?.status.state === "running" ? stopCage(session.id) : startCage(session.id)));
+    run(() => (vmCage?.status.state === "running" ? vm.stop(session.id) : vm.start(session.id)));
 
   function startIntent(kind: Intent["kind"]) {
     setView({ kind: kind === "addRule" ? "network" : "settings" });
     setIntent({ kind, at: Date.now() });
   }
 
-  /** Restarts the cage of the session. */
-  const restart = (sessionId: string) => run(() => stopCage(sessionId).then(() => startCage(sessionId)));
+  /**
+   * Restarts the VM of the selected session with all its members. After a cage change, it stops the old cage's VM and
+   * starts the new cage.
+   */
+  const restart = (sessionId: string) =>
+    run(() =>
+      cageChanged
+        ? vm.stop(sessionId).then(() => vm.start(sessionId))
+        : confirmShared(
+            (others) => `Its VM also runs ${others}: their terminals reopen; their running tasks are cancelled.`,
+            "Restart",
+            (confirmed) => restartCage(sessionId, confirmed).finally(pullNotices),
+          ),
+    );
 
   const actions: Record<ShortcutAction, () => void> = {
     // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
@@ -728,6 +829,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         runs={runs}
         panes={panes}
         run={run}
+        vm={vm}
         onOpen={openView}
         onRunsChange={reloadRuns}
         onToggle={toggle}
@@ -784,6 +886,19 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       />
       <main className="main">
         <div className="notices">
+          {ask && (
+            <Card variant="outlined" padding="sm" className="stack" role="alertdialog" aria-label={ask.confirm}>
+              <p>{ask.text}</p>
+              <div className="row end">
+                <Button size="sm" variant="ghost" onClick={() => ask.answer(false)}>
+                  Cancel
+                </Button>
+                <Button size="sm" variant="danger" onClick={() => ask.answer(true)}>
+                  {ask.confirm}
+                </Button>
+              </div>
+            </Card>
+          )}
           {appNotices.map((notice) => (
             <Notice
               key={notice}
@@ -803,7 +918,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
                     Restart
                   </Button>
                 ) : (
-                  <Button size="sm" variant="outline" onClick={() => run(() => stopCage(session.id))}>
+                  <Button size="sm" variant="outline" onClick={() => run(() => vm.stop(session.id))}>
                     Stop
                   </Button>
                 )

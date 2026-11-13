@@ -314,12 +314,12 @@ impl Registry {
         handle
     }
 
-    /// Cancels the live runs of a session and waits up to `limit` until each
+    /// Cancels the live runs of the sessions and waits up to `limit` until each
     /// one has written its manifest.
-    pub async fn cancel_session(&self, session_id: &str, reason: &str, limit: Duration) {
+    pub async fn cancel_sessions(&self, session_ids: &[String], reason: &str, limit: Duration) {
         let runs: Vec<Arc<RunHandle>> = lock(&self.runs)
             .iter()
-            .filter(|r| r.session_id == session_id && r.status().state.is_live())
+            .filter(|r| session_ids.contains(&r.session_id) && r.status().state.is_live())
             .cloned()
             .collect();
         for run in &runs {
@@ -2172,7 +2172,7 @@ mod tests {
         })
         .await
         .unwrap();
-        run.registry.cancel_session("s", "the cage stopped", Duration::from_secs(5)).await;
+        run.registry.cancel_sessions(&["s".to_owned()], "the cage stopped", Duration::from_secs(5)).await;
         assert_eq!(run.handle.status().state, RunState::Cancelled);
         let manifest = settled(&run).await;
         assert_eq!(manifest["stopped"], "the cage stopped");

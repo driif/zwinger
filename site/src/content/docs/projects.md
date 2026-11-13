@@ -5,12 +5,14 @@ description: A project is a folder on your Mac and its configuration.
 
 A **project** is one folder on your Mac and its configuration: the mounts, the network policy, the terminals, the
 tasks and the agents from your Mac. A project uses a [cage](/cages/): its own cage, or the default cage of its
-workspace. The project folder is mounted read-write at `/workspace` in the cage. A project with no cage opens Mac
-shells only.
+workspace. The project folder is mounted read-write at `/workspace` in the cage, or at `/workspace/<slug>` when other
+projects share the VM ([Projects in one VM](/cages/#projects-in-one-vm)). While the VM runs, **Settings**, the map and
+**Agent starts in** on the project page show the path that the VM uses. A project with no cage opens Mac shells only.
 
 You can create, rename and delete projects. Use ⌘N to create a project. If you rename a project to an empty name,
 it gets the name of its folder again. A rename does not rename the cage. A delete stops the VM of the project and keeps
-its cage: delete the cage in the [Cages](/cages/#the-cage-list) view.
+its cage: delete the cage in the [Cages](/cages/#the-cage-list) view. If the VM also runs other projects, stop it
+first.
 
 A new project in a workspace with a default cage uses that cage. In a workspace with no default cage, it gets a new
 cage with the name of the project.
@@ -70,8 +72,8 @@ A project has three kinds of terminal:
 | Kind | Where it runs | Folder |
 |---|---|---|
 | Mac shell | On the Mac, with no sandbox. It does not need a cage start. | The project folder |
-| VM shell | In the cage | `/workspace` |
-| Agent session | In the cage | The [harness folder](/agents/), else `/workspace` |
+| VM shell | In the cage | `/workspace`, or `/workspace/<slug>` in a shared VM |
+| Agent session | In the cage | The [harness folder](/agents/), else the VM shell's folder |
 
 The tree shows all terminals of a project in one Terminals group. Drag a terminal to change the order. zwinger saves
 the order.
@@ -98,7 +100,7 @@ zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/App
 `/Applications/Setapp`. Turn editors on and select a default in **Settings > Editors**.
 
 **Open in editor** (⌘⇧E) opens the project folder, or the current folder of the current terminal. In a VM shell, a
-folder below `/workspace` or below a mount opens as its folder on the Mac. Other folders open the project folder.
+folder below a project folder of the VM or below a mount opens as its folder on the Mac. Other folders open the project folder.
 
 ## Map
 

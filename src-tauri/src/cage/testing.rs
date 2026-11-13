@@ -133,7 +133,7 @@ pub(crate) async fn open_during(restart: bool) {
         async move { manager.open_session(&id, TerminalKind::Shell, 24, 80).await }
     });
     gate.entered.notified().await;
-    manager.stop(&id).await.unwrap();
+    manager.stop(&id, None).await.unwrap();
     if restart {
         *runtime.pty_gate.lock().unwrap() = None;
         manager.start(&id).await.unwrap();

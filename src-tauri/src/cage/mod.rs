@@ -388,6 +388,51 @@ impl Bound<'_> {
     }
 }
 
+/// The member sessions of one VM and their cage: the checks of a VM start.
+/// Each member is a [`Bound`] pair, and the guest can write each member
+/// folder, so no two of them may nest.
+#[derive(Clone, Copy)]
+pub struct Members<'a> {
+    pub sessions: &'a [Session],
+    pub cage: &'a Cage,
+}
+
+impl<'a> Members<'a> {
+    pub(crate) fn bounds(&self) -> impl Iterator<Item = Bound<'a>> {
+        let cage = self.cage;
+        self.sessions.iter().map(move |session| Bound { session, cage })
+    }
+
+    fn check_members_overlap(&self) -> Result<()> {
+        for (i, a) in self.sessions.iter().enumerate() {
+            for b in &self.sessions[i + 1..] {
+                if a.folder.starts_with(&b.folder) || b.folder.starts_with(&a.folder) {
+                    return Err(Error::MountOverlap(a.folder.display().to_string(), b.folder.display().to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.bounds().try_for_each(|b| b.check())?;
+        self.check_members_overlap()
+    }
+
+    pub fn verify_paths(&self) -> Result<()> {
+        self.bounds().try_for_each(|b| b.verify_paths())?;
+        self.check_members_overlap()
+    }
+
+    pub fn check_app_data(&self, reserved: &[PathBuf]) -> Result<()> {
+        self.bounds().try_for_each(|b| b.check_app_data(reserved))
+    }
+
+    pub fn check_overlap_with<'b>(&self, others: &[Bound<'b>]) -> Result<()> {
+        self.bounds().try_for_each(|b| b.check_overlap_with(others.iter().copied()))
+    }
+}
+
 /// Sets a missing `id` from the folder at `path` as it is now, if the path
 /// still resolves to itself. Returns true if it set it.
 pub(crate) fn fill_id(path: &Path, id: &mut Option<FileId>) -> bool {
@@ -757,6 +802,49 @@ mod tests {
         assert!(matches!(inner.bound().check_overlap_with([other.bound()]), Err(Error::MountOverlap(..))));
         let data = Pair::new(&path(&root, "data"));
         data.bound().check_overlap_with([other.bound()]).unwrap();
+    }
+
+    /// The project of `project_with_dirs` and a second session of its cage at `name`.
+    fn two_members(project: &Pair, root: &Path, name: &str) -> Vec<Session> {
+        let other = Session::new(&path(root, name), Some("c".into()), [project.session.slug.as_str()]).unwrap();
+        vec![project.session.clone(), other]
+    }
+
+    #[test]
+    fn nested_member_folders_are_rejected() {
+        let (project, root) = project_with_dirs(&["project/inner", "other"]);
+        let nested = two_members(&project, &root, "project/inner");
+        let members = Members { sessions: &nested, cage: &project.cage };
+        assert!(matches!(members.check(), Err(Error::MountOverlap(..))));
+        assert!(matches!(members.verify_paths(), Err(Error::MountOverlap(..))));
+        let apart = two_members(&project, &root, "other");
+        let members = Members { sessions: &apart, cage: &project.cage };
+        members.check().unwrap();
+        members.verify_paths().unwrap();
+    }
+
+    #[test]
+    fn a_mount_may_not_nest_with_any_member_folder() {
+        let (mut project, root) = project_with_dirs(&["project", "other/data"]);
+        project.add_mount(&path(&root, "other/data"), "/mnt/data", true).unwrap();
+        let sessions = two_members(&project, &root, "other");
+        let members = Members { sessions: &sessions, cage: &project.cage };
+        assert!(matches!(members.check(), Err(Error::MountOverlap(..))));
+        assert!(matches!(members.check_overlap_with(&[]), Ok(())));
+        let outside = Pair::new(&path(&root, "other/data"));
+        assert!(matches!(members.check_overlap_with(&[outside.bound()]), Err(Error::MountOverlap(..))));
+    }
+
+    #[test]
+    fn identity_and_app_data_are_checked_per_member() {
+        let (project, root) = project_with_dirs(&["project", "other"]);
+        let sessions = two_members(&project, &root, "other");
+        let members = Members { sessions: &sessions, cage: &project.cage };
+        members.verify_paths().unwrap();
+        assert!(matches!(members.check_app_data(&[root.join("other")]), Err(Error::AppDataOverlap(..))));
+        std::fs::rename(root.join("other"), root.join("was")).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        assert!(matches!(members.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("other")));
     }
 
     #[test]

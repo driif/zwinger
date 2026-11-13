@@ -33,6 +33,10 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const sameKind = agents[0].kind === agents[1].kind;
+  // Names need not be unique: drop only one entry for this session.
+  const own = cage.members.indexOf(session.name);
+  const others =
+    session.vmCage === cage.id && cage.status.state === "running" ? cage.members.filter((_, index) => index !== own) : [];
 
   const setAgent = (index: 0 | 1, change: Partial<TaskAgent>) =>
     setAgents((current) => {
@@ -90,6 +94,11 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
             </div>
           ))}
           {sameKind && <p className="danger">Choose two agents of different kinds.</p>}
+          {others.length > 0 && (
+            <p className="muted">
+              The VM also runs {others.join(", ")}. The agents of a run can read and write their folders too.
+            </p>
+          )}
           <Textarea
             label="Gates"
             hint="One shell line each, such as pnpm build. They run in the working dir after the implementation."

@@ -87,8 +87,12 @@ pub enum Error {
     MissingCage { owner: String, cage: String },
     #[error("this session has no cage; pick a cage for it or a default cage for its workspace")]
     NoCage,
-    #[error("cage {cage} runs for session {session}; stop it first")]
-    CageBusy { cage: String, session: String },
+    #[error("cage {cage} runs for {}; restart it to add this session", names(.members))]
+    RestartToAdd { cage: String, members: Vec<Member>, generation: u64 },
+    #[error("cage {cage} also runs for {}; a stop ends their VM terminals and task runs", names(.members))]
+    StopShared { cage: String, members: Vec<Member>, generation: u64 },
+    #[error("the sessions of the VM changed; look at them and try again")]
+    StaleRestart,
     #[error("cage {0} is in use: {1}")]
     CageInUse(String, String),
     #[error("workspace not found")]
@@ -183,6 +187,17 @@ pub enum Error {
     Sandbox(#[from] microsandbox::MicrosandboxError),
 }
 
+/// A member session of a running VM, as an error names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+}
+
+fn names(members: &[Member]) -> String {
+    members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")
+}
+
 impl Error {
     /// The variant name, for the UI to tell errors apart.
     pub fn code(&self) -> String {
@@ -235,11 +250,23 @@ fn sentence(text: &str) -> String {
 }
 
 /// `{code, message}`: the one place where an error becomes text for the user.
+/// An error that the UI confirms and retries also has `detail`.
 impl Serialize for Error {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("code", &self.code())?;
         map.serialize_entry("message", &self.message())?;
+        match self {
+            Error::RestartToAdd { cage, members, generation } => map.serialize_entry(
+                "detail",
+                &serde_json::json!({ "cage": cage, "members": members, "generation": generation }),
+            )?,
+            Error::StopShared { cage, members, generation } => map.serialize_entry(
+                "detail",
+                &serde_json::json!({ "cage": cage, "members": members, "generation": generation }),
+            )?,
+            _ => {}
+        }
         map.end()
     }
 }
@@ -261,6 +288,28 @@ mod tests {
         );
         assert_eq!(Error::SessionNotFound.message(), "Project not found.");
         assert_eq!(Error::RunState("paused").code(), "RunState");
+        let members = vec![Member { id: "a".into(), name: "A".into() }, Member { id: "b".into(), name: "B".into() }];
+        assert_eq!(
+            serde_json::to_value(Error::RestartToAdd { cage: "c".into(), members, generation: 3 }).unwrap(),
+            json!({
+                "code": "RestartToAdd",
+                "message": "Cage c runs for A, B; restart it to add this session.",
+                "detail": { "cage": "c", "members": [{ "id": "a", "name": "A" }, { "id": "b", "name": "B" }], "generation": 3 },
+            })
+        );
+    }
+
+    #[test]
+    fn a_shared_stop_has_the_members_and_the_generation() {
+        let members = vec![Member { id: "b".into(), name: "B".into() }];
+        assert_eq!(
+            serde_json::to_value(Error::StopShared { cage: "c".into(), members, generation: 4 }).unwrap(),
+            json!({
+                "code": "StopShared",
+                "message": "Cage c also runs for B; a stop ends their VM terminals and task runs.",
+                "detail": { "cage": "c", "members": [{ "id": "b", "name": "B" }], "generation": 4 },
+            })
+        );
     }
 
     #[test]

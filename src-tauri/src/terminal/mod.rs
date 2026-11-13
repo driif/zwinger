@@ -11,8 +11,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::AgentKind;
 use crate::cage::lifecycle::mounted;
-use crate::cage::manager::{HostRun, Manager, State, Vm, lock};
-use crate::cage::{Bound, Cage, WORKSPACE};
+use crate::cage::manager::{HostRun, Manager, State, Vm, in_guest_folder, lock, task_guest_folder};
+use crate::cage::{Cage, Members};
 use crate::editor;
 use crate::error::{Error, Result};
 use crate::runtime::{Pty, PtyEvent, PtyInput, SandboxRuntime, TerminalKind};
@@ -128,14 +128,15 @@ impl<R: SandboxRuntime> Manager<R> {
             state.session(session_id)?;
             match state.vm_of(session_id) {
                 Some((cage_id, Vm::Running { vm, applied, runtimes, host, .. })) => {
+                    let (member, folder, _) = task_guest_folder(&applied.0, session_id).ok_or(Error::NotRunning)?;
                     let cwd = match kind {
                         TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
                             return Err(self.unmounted(agent, host));
                         }
-                        TerminalKind::Agent { .. } => applied.0.harness.as_deref(),
+                        TerminalKind::Agent { .. } => member.harness.as_deref(),
                         TerminalKind::Shell | TerminalKind::Host => None,
                     };
-                    (cage_id.to_owned(), vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
+                    (cage_id.to_owned(), vm.clone(), cwd.map_or(folder.clone(), |h| in_guest_folder(&folder, h)))
                 }
                 _ => return Err(Error::NotRunning),
             }
@@ -313,7 +314,7 @@ impl<R: SandboxRuntime> Manager<R> {
         enum Cwd {
             Host(host::HostGroup),
             /// The output, its start folder and the applied config.
-            Guest(Arc<Mutex<Output>>, Option<String>, Box<(Session, Cage)>),
+            Guest(Arc<Mutex<Output>>, String, Box<(Vec<Session>, Cage)>),
         }
         let (folder, cwd) = {
             let state = lock(&self.state);
@@ -327,11 +328,14 @@ impl<R: SandboxRuntime> Manager<R> {
             let cwd = match (process, state.vm_of(session_id).map(|(_, vm)| vm)) {
                 (Some(Terminal { host_group: Some(group), .. }), _) => Some(Cwd::Host(group.clone())),
                 (Some(process), Some(Vm::Running { applied, .. })) => {
-                    let start = match process.kind {
-                        TerminalKind::Agent { .. } => applied.0.harness.clone(),
-                        TerminalKind::Shell | TerminalKind::Host => None,
-                    };
-                    Some(Cwd::Guest(process.output.clone(), start, applied.clone()))
+                    task_guest_folder(&applied.0, session_id).map(|(member, folder, _)| {
+                        let start = match process.kind {
+                            TerminalKind::Agent { .. } => member.harness.as_deref(),
+                            TerminalKind::Shell | TerminalKind::Host => None,
+                        };
+                        let start = start.map_or(folder.clone(), |h| in_guest_folder(&folder, h));
+                        Cwd::Guest(process.output.clone(), start, applied.clone())
+                    })
                 }
                 _ => None,
             };
@@ -343,11 +347,8 @@ impl<R: SandboxRuntime> Manager<R> {
         let found = match cwd {
             Some(Cwd::Host(group)) => group.cwd().filter(|path| path.is_dir()),
             Some(Cwd::Guest(output, start, applied)) => {
-                let guest = lock(&output).osc.cwd.clone().or(start);
-                editor::map_guest(
-                    guest.as_deref().unwrap_or(WORKSPACE),
-                    Bound { session: &applied.0, cage: &applied.1 },
-                )
+                let guest = lock(&output).osc.cwd.clone().unwrap_or(start);
+                editor::map_guest(&guest, Members { sessions: &applied.0, cage: &applied.1 })
             }
             None => None,
         };
@@ -411,7 +412,7 @@ mod tests {
         assert!(manager.list().sessions[0].session.terminals.is_empty());
         assert!(matches!(manager.write(&session, b"x".to_vec()), Err(Error::ProcessNotFound)));
 
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), "kill".into(), format!("stop {id}")]);
     }
@@ -468,7 +469,7 @@ mod tests {
             Err(Error::NotHostAgent(_))
         ));
 
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.start(&id).await.unwrap();
         assert_eq!(
             wrappers(&manager, &id),
@@ -546,7 +547,7 @@ mod tests {
 
         manager.start(&id).await.unwrap();
         manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         let sessions = &manager.list().sessions[0].processes;
         assert_eq!((sessions.len(), sessions[0].id.as_str()), (1, session.as_str()));
         assert_eq!(*runtime.argvs.lock().unwrap(), [["/bin/bash", "-l"]], "the host shell is not in the VM");
@@ -627,7 +628,7 @@ mod tests {
         assert!(manager.list().cages[0].pending_restart);
         manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
 
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         manager.start(&id).await.unwrap();
         manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
         manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
@@ -654,7 +655,7 @@ mod tests {
         assert_eq!(manager.list().sessions[0].processes.len(), 2);
 
         // A stop keeps the records as dormant rows.
-        manager.stop(&id).await.unwrap();
+        manager.stop(&id, None).await.unwrap();
         assert_eq!(terminal_ids(&manager), [ids[0].clone(), ids[2].clone()]);
 
         // After a process restart, the saved records come back with no session.

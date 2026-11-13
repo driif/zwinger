@@ -1,5 +1,6 @@
 use crate::agent::AgentKind;
 use crate::cage::HostAgentUse;
+use crate::cage::lifecycle::Confirmed;
 use crate::error::Result;
 use crate::secrets::SecretValue;
 
@@ -26,10 +27,32 @@ pub async fn start_cage(manager: Managed<'_>, session_id: String) -> Result<()> 
     manager.start(&session_id).await
 }
 
-/// Stops the VM that runs for the session.
+/// Restarts the running VM of the session's effective cage with the
+/// session as one more member. `members` and `generation` come from the
+/// `RestartToAdd` error that the user confirmed.
 #[tauri::command]
-pub async fn stop_cage(manager: Managed<'_>, session_id: String) -> Result<()> {
-    manager.stop(&session_id).await
+pub async fn restart_cage_to_add(
+    manager: Managed<'_>,
+    session_id: String,
+    members: Vec<String>,
+    generation: u64,
+) -> Result<()> {
+    manager.restart_to_add(&session_id, &members, generation).await
+}
+
+/// Stops the VM that runs with the session as a member. A VM with other
+/// members fails with `StopShared` unless `confirmed` has the members and
+/// the generation of that error.
+#[tauri::command]
+pub async fn stop_cage(manager: Managed<'_>, session_id: String, confirmed: Option<Confirmed>) -> Result<()> {
+    manager.stop(&session_id, confirmed.as_ref()).await
+}
+
+/// Restarts the VM that runs with the session as a member, with all its
+/// members. `confirmed` works as for `stop_cage`.
+#[tauri::command]
+pub async fn restart_cage(manager: Managed<'_>, session_id: String, confirmed: Option<Confirmed>) -> Result<()> {
+    manager.restart(&session_id, confirmed.as_ref()).await
 }
 
 #[tauri::command]

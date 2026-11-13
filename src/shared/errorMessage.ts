@@ -1,7 +1,11 @@
-/** The backend rejects with `{ code, message }`, where `message` is already written for the user. */
+/**
+ * The backend rejects with `{ code, message }`, where `message` is already written for the user. An error that the UI
+ * confirms and retries also has `detail`.
+ */
 interface BackendError {
   code: string;
   message: string;
+  detail?: unknown;
 }
 
 export const isBackendError = (e: unknown): e is BackendError =>
@@ -15,3 +19,7 @@ export function errorMessage(e: unknown): string {
 
 /** The backend's error variant, such as `CagesRunning`. */
 export const errorCode = (e: unknown) => (isBackendError(e) ? e.code : undefined);
+
+/** The `detail` of a backend error with this `code`. */
+export const errorDetail = <T>(e: unknown, code: string) =>
+  isBackendError(e) && e.code === code ? (e.detail as T) : undefined;

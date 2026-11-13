@@ -7,7 +7,7 @@ zwinger is a Mac app that runs AI coding agents in microVMs next to the user's o
 - **Session** is `Session` and `SessionView` in the code, `sessions.json` on disk, and "project" in the UI.
 - **Cage** is `Cage` and `CageView` in the code and `cages.json` on disk. The UI shows the cage settings of a session on the session's page, and all cages in the Cages view.
 - **Terminal** is `Terminal`, `TerminalView` and `TerminalKind` (the process) and `TerminalRecord` (the saved record in `terminals`). The process commands keep their names (`open_session`, `attach_session`, `write_session`, ...).
-- **Cage** and **VM** are both in the Rust `cage` module and its manager. VM state is `Status` in Rust and `CageStatus` in the frontend; `start_cage` and `stop_cage` take a session id and start the VM of its effective cage, or stop the VM that runs for it; the event `cage-start-progress` reports a start by cage id. Today a cage has one VM, and the VM runs for one session (until #120): a start for a second session of a running cage is refused (`CageBusy`). A session keeps the VM of its old cage after a cage change, until that VM stops. The sessions converted by #118 have their own cage with the same id.
+- **Cage** and **VM** are both in the Rust `cage` module and its manager. VM state is `Status` in Rust and `CageStatus` in the frontend; `start_cage` and `stop_cage` take a session id and start the VM of its effective cage, or stop the VM that runs for it; the event `cage-start-progress` reports a start by cage id. Today a cage has one VM, and the sessions of the cage share it as its **members** (`Vm` holds them; `applied` is the members and the cage). A start from a session boots a stopped VM with that session as its only member; a VM that runs without the session refuses with `RestartToAdd`, and `restart_cage_to_add` restarts it with the old members that still use the cage plus the session, if the member set and the VM generation are still the ones that the user confirmed (else `StaleRestart`). A stop of a VM with other members refuses with `StopShared` until the user confirms; it ends the VM for all members. There is no hot mount yet. A session keeps the VM of its old cage after a cage change, until that VM stops. `task_guest_folder` is the one resolver of a session's guest folder (ADR 0007). The sessions converted by #118 have their own cage with the same id.
 - `projects.json` is the store of older builds. The first start reads it once and converts it; the app never writes it.
 
 ## Organization
@@ -31,7 +31,7 @@ A saved config for a sandbox: mounts, network policy, credentials, host agents, 
 _Avoid_: shield, cage profile, sandbox
 
 **VM**:
-A running microVM of a cage, the unit of isolation. By default all sessions of a cage share one VM; the user can start more VMs from the same cage (ADR 0006). A **VM start** boots it with the session folders, the mounts and the network policy of its cage; a **VM stop** ends it. The VM name is `zwinger-<VM key>`: the VM key of the shared VM is the cage id, so it did not change with the renames.
+A running microVM of a cage, the unit of isolation. By default all sessions of a cage share one VM, and they can read and write each other's folders; the user can start more VMs from the same cage (ADR 0006). A **VM start** boots it with the session folders, the mounts and the network policy of its cage; a **VM stop** ends it. The VM name is `zwinger-<VM key>`: the VM key of the shared VM is the cage id, so it did not change with the renames.
 _Avoid_: shield, cage (for the process)
 
 **Mount**:

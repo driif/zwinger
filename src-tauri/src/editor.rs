@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::cage::{Bound, WORKSPACE};
+use crate::cage::Members;
+use crate::cage::manager::task_guest_folder;
 use crate::preferences::EditorPrefs;
 
 /// A known editor and the names of its app bundles, the stable one first.
@@ -121,14 +122,19 @@ pub fn view(prefs: &EditorPrefs, detected: Vec<Editor>) -> Editors {
     Editors { editors, default }
 }
 
-/// The host folder of a guest folder below `/workspace` or a mount of
-/// the session and its cage. `None` for any other path, a path that is gone on the host, or
-/// a path whose `..` or link leads out of its host folder.
-pub fn map_guest(guest: &str, bound: Bound<'_>) -> Option<PathBuf> {
+/// The host folder of a guest folder below the guest folder of a member
+/// ([`task_guest_folder`]) or a mount of the VM. `None` for any other path,
+/// a path that is gone on the host, or a path whose `..` or link leads out
+/// of its host folder.
+pub fn map_guest(guest: &str, members: Members<'_>) -> Option<PathBuf> {
     let below = |root: &str| guest.strip_prefix(root).filter(|rest| rest.is_empty() || rest.starts_with('/'));
-    let (host, rest) = std::iter::once((bound.session.folder.as_path(), WORKSPACE))
-        .chain(bound.cage.mounts.iter().map(|m| (m.host.as_path(), m.guest.as_str())))
-        .filter_map(|(host, root)| Some((host, root.len(), below(root)?)))
+    let folders = members.sessions.iter().filter_map(|s| {
+        let (_, root, _) = task_guest_folder(members.sessions, &s.id)?;
+        Some((s.folder.as_path(), root))
+    });
+    let (host, rest) = folders
+        .chain(members.cage.mounts.iter().map(|m| (m.host.as_path(), m.guest.clone())))
+        .filter_map(|(host, root)| Some((host, root.len(), below(&root)?)))
         .max_by_key(|(_, len, _)| *len)
         .map(|(host, _, rest)| (host, rest))?;
     let base = host.canonicalize().ok()?;
@@ -242,7 +248,8 @@ mod tests {
         let mut cage = Cage::new("c".into(), session.name.clone());
         cage.mounts.push(Mount { host: data.clone(), id: None, guest: "/data".into(), readonly: true });
 
-        let map = |guest: &str| map_guest(guest, Bound { session: &session, cage: &cage });
+        let sessions = [session];
+        let map = |guest: &str| map_guest(guest, Members { sessions: &sessions, cage: &cage });
         assert_eq!(map("/workspace"), Some(folder.clone()));
         assert_eq!(map("/workspace/"), Some(folder.clone()));
         assert_eq!(map("/workspace/src/deep"), Some(folder.join("src/deep")));
@@ -255,6 +262,25 @@ mod tests {
             assert_eq!(map(guest), None, "{guest}");
         }
         for guest in ["/workspace/file", "/workspaces", "/tmp", "/", "", "workspace/src", "/datax"] {
+            assert_eq!(map(guest), None, "{guest}");
+        }
+    }
+
+    #[test]
+    fn with_two_members_each_maps_below_its_slug() {
+        let root = temp();
+        let (a, b) = (root.join("alpha"), root.join("beta"));
+        std::fs::create_dir_all(a.join("src")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let first = Session::new(a.to_str().unwrap(), Some("c".into()), []).unwrap();
+        let second = Session::new(b.to_str().unwrap(), Some("c".into()), [first.slug.as_str()]).unwrap();
+        let cage = Cage::new("c".into(), "c".into());
+        let sessions = [first, second];
+        let map = |guest: &str| map_guest(guest, Members { sessions: &sessions, cage: &cage });
+        assert_eq!(map("/workspace/alpha/src"), Some(a.join("src")));
+        assert_eq!(map("/workspace/beta"), Some(b.clone()));
+        // `/workspace` itself is no session folder in a shared VM.
+        for guest in ["/workspace", "/workspace/src", "/workspace/alphax"] {
             assert_eq!(map(guest), None, "{guest}");
         }
     }

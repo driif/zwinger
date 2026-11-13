@@ -492,7 +492,7 @@ export function ProjectPage({
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
-                    <dd className="mono">{session.harness ?? "/workspace"}</dd>
+                    <dd className="mono">{session.guestHarness ?? session.harness ?? "/workspace"}</dd>
                   </div>
                   {cage && (
                     <div>
@@ -550,6 +550,7 @@ export function ProjectPage({
                 onIntentDone={onIntentDone}
                 active={isTab && tab === "network"}
                 onSeen={onNetSeen}
+                onStart={onToggle}
               />
             ),
             settings: (

@@ -2,7 +2,6 @@ import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
 import { Ban, Check, KeyRound, Play } from "lucide-react";
 import { useEffect, useState } from "react";
 import { NetEvent, putRule, Service, wildcardFor } from "./api";
-import { startCage } from "../projects/api";
 import { Action, CageView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
@@ -35,17 +34,18 @@ interface Group {
 }
 
 interface Props {
-  sessionId: string;
   /** The effective cage: a rule that the view adds goes to it. `null`: the view adds no rules. */
   cage: CageView | null;
   /** The session's VM runs. */
   running: boolean;
   events: NetEvent[];
   catalog: Service[];
+  /** Starts the session's VM; it asks first when the VM runs for other sessions. */
+  onStart: () => void;
   run: Run;
 }
 
-export function NetworkActivity({ sessionId, cage, running, events, catalog, run }: Props) {
+export function NetworkActivity({ cage, running, events, catalog, onStart, run }: Props) {
   const [filter, setFilter] = useState("all");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
@@ -166,7 +166,7 @@ export function NetworkActivity({ sessionId, cage, running, events, catalog, run
                 size="sm"
                 variant="outline"
                 iconLeft={<Play size={14} />}
-                onClick={() => run(() => startCage(sessionId))}
+                onClick={onStart}
               >
                 Start
               </Button>
