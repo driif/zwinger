@@ -74,9 +74,6 @@ A named set of overrides for motiv tokens (colors, radius, fonts, density) and a
 The map positions that the user dragged, per session, by stable node id (`folder:<name>`, `mount:<guest>`, `host:<domain>`, ...). A node with no saved position takes its place from the auto layout. Reset layout clears the positions. Positions of nodes that no longer exist are dropped on the next save. A layout change needs no restart.
 _Avoid_: pane layout (that is the split tree)
 
-**App**:
-A saved, named, long-running command of a session, such as a dev server: `name`, `command` (one shell line), `cwd` (`/workspace` or a folder below it or below a mount; the default is the harness) and `autostart`. It has a stable id. Start runs `/bin/sh -lc <command>` in the VM as a terminal that the app owns, not a view; its output stays like the output of a terminal (1 MiB), so its view can attach later. It is running, exited (with a code) or stopped. Stop and a VM stop end it. An autostart app starts after each VM start; a bad command shows only as an exit code. No port of an app is published to the host. An app edit applies at once, with no restart.
-
 ## Agents
 
 **Agent**:

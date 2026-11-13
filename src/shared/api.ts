@@ -97,7 +97,7 @@ export interface HostLogin {
 
 /** A phase of a cage start. */
 export type StartPhase =
-  | { step: "vault" | "prepare" | "proxy" | "boot" | "guest" | "node" | "tui" | "gemini" | "setup" | "trust" | "wrappers" | "apps" }
+  | { step: "vault" | "prepare" | "proxy" | "boot" | "guest" | "node" | "tui" | "gemini" | "setup" | "trust" | "wrappers" }
   | { step: "profile"; agent: AgentKind };
 
 /** The duration of each phase of a start, in the order they ended. Some phases run at the same time. */
@@ -117,7 +117,7 @@ export interface SessionView {
   id: string;
   kind: SessionKind;
   exitCode: number | null;
-  /** Set for a shell or agent terminal. An app run has none. */
+  /** Set for a shell or agent terminal. */
   terminalId: string | null;
 }
 
@@ -130,23 +130,6 @@ export interface Terminal {
 export interface Pos {
   x: number;
   y: number;
-}
-
-/** A saved, named, long-running command of a project. */
-export interface App {
-  id: string;
-  name: string;
-  command: string;
-  /** The guest folder where the command starts. */
-  cwd: string;
-  autostart: boolean;
-}
-
-/** An app that runs or has exited. An app with no run is stopped. */
-export interface AppRun {
-  appId: string;
-  sessionId: string;
-  exitCode: number | null;
 }
 
 export interface TaskAgent {
@@ -186,7 +169,6 @@ export interface ProjectView {
   logins: HostLogin[];
   /** The map positions that the user dragged, by node id. */
   layout: Record<string, Pos>;
-  apps: App[];
   tasks: Task[];
   /** In tree order. */
   terminals: Terminal[];
@@ -195,7 +177,6 @@ export interface ProjectView {
   status: CageStatus;
   pendingRestart: boolean;
   sessions: SessionView[];
-  appRuns: AppRun[];
   /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
   runtimes: ("claude" | "codex" | "gemini")[];
   hostAgents: HostAgentUse[];

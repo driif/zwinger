@@ -30,8 +30,6 @@ export function phaseText(phase: StartPhase) {
       return "Trusting the network proxy…";
     case "wrappers":
       return "Writing the agent commands…";
-    case "apps":
-      return "Starting the apps…";
   }
 }
 

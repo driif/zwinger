@@ -1,6 +1,5 @@
 import { CommandMenu, CommandMenuItem } from "@driif/motiv";
 import { Ref } from "react";
-import { startApp, stopApp } from "../features/apps/api";
 import {
   removeRule,
   setNetworkDefault,
@@ -122,17 +121,6 @@ export function CommandBar({
       intent("delete", "Delete project…"),
     );
     const { id, network } = project;
-    for (const app of project.apps) {
-      const running = project.appRuns.some((r) => r.appId === app.id && r.exitCode === null);
-      commands.push({ id: `app-${app.id}`, label: `Show app ${app.name}`, onSelect: () => onView({ kind: "app", appId: app.id }) });
-      if (state === "running")
-        commands.push({
-          id: `app-run-${app.id}`,
-          label: running ? `Stop app ${app.name}` : `Start app ${app.name}`,
-          onSelect: () => run(() => (running ? stopApp(id, app.id) : startApp(id, app.id))),
-        });
-    }
-    commands.push(intent("app", "Add app…"));
     commands.push({ id: "new-task", label: "New task…", onSelect: () => onView({ kind: "taskEdit" }) });
     for (const task of project.tasks)
       commands.push({ id: `task-${task.id}`, label: `Show task ${task.title}`, onSelect: () => onView({ kind: "task", taskId: task.id }) });

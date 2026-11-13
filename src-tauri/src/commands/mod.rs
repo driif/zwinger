@@ -1,5 +1,4 @@
 pub(crate) mod appearance;
-pub(crate) mod apps;
 pub(crate) mod editors;
 pub(crate) mod network;
 pub(crate) mod projects;

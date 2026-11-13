@@ -1,4 +1,3 @@
-pub(crate) mod apps;
 pub(crate) mod lifecycle;
 pub(crate) mod manager;
 pub(crate) mod network;
@@ -60,8 +59,6 @@ pub struct Project {
     #[serde(default)]
     pub layout: BTreeMap<String, Pos>,
     #[serde(default)]
-    pub apps: Vec<App>,
-    #[serde(default)]
     pub tasks: Vec<Task>,
     /// The terminals of the project, in tree order. A terminal with no live
     /// session is dormant: it opens again under the same id.
@@ -96,17 +93,6 @@ pub struct HostAgentUse {
 pub struct Pos {
     pub x: f64,
     pub y: f64,
-}
-
-/// A saved, named, long-running command of a project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct App {
-    pub id: String,
-    pub name: String,
-    pub command: String,
-    pub cwd: String,
-    pub autostart: bool,
 }
 
 /// A shell or agent terminal of a project. It stays when its process ends.
@@ -176,17 +162,6 @@ impl PaneNode {
             }
         }
     }
-}
-
-/// An app as the UI sends it. No `id` adds a new app.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppDraft {
-    pub id: Option<String>,
-    pub name: String,
-    pub command: String,
-    pub cwd: String,
-    pub autostart: bool,
 }
 
 /// A request that two agents of a project plan, build and review together.
@@ -269,7 +244,6 @@ impl Project {
             harness: None,
             logins: Vec::new(),
             layout: BTreeMap::new(),
-            apps: Vec::new(),
             tasks: Vec::new(),
             terminals: Vec::new(),
             pane_layout: None,
@@ -291,46 +265,6 @@ impl Project {
             .filter(|(_, p)| p.x.is_finite() && p.y.is_finite())
             .take(LAYOUT_LIMIT)
             .collect();
-    }
-
-    /// Adds the app, or replaces the app with the draft's id. Returns its id.
-    pub fn put_app(&mut self, draft: AppDraft) -> Result<String> {
-        let name = display_name(&draft.name)?;
-        let command = draft.command.trim();
-        if command.is_empty() {
-            return Err(Error::InvalidApp(name, "the command is empty".into()));
-        }
-        if command.chars().count() > COMMAND_LIMIT || command.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(Error::InvalidApp(
-                name,
-                format!("the command must be one line of at most {COMMAND_LIMIT} characters"),
-            ));
-        }
-        let cwd = self.guest_dir(&draft.cwd)?;
-        let app = App {
-            id: draft.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            name,
-            command: command.to_owned(),
-            cwd,
-            autostart: draft.autostart,
-        };
-        let id = app.id.clone();
-        match draft.id {
-            Some(existing) => *self.app_mut(&existing)? = app,
-            None => self.apps.push(app),
-        }
-        Ok(id)
-    }
-
-    pub fn remove_app(&mut self, id: &str) -> Result<()> {
-        self.app_mut(id)?;
-        self.apps.retain(|a| a.id != id);
-        Ok(())
-    }
-
-    /// `ids` must name each app once.
-    pub fn reorder_apps(&mut self, ids: &[String]) -> Result<()> {
-        reorder(&mut self.apps, ids, |a| &a.id)
     }
 
     /// Adds a terminal at the end and returns its id.
@@ -364,14 +298,6 @@ impl Project {
 
     pub fn terminal(&self, id: &str) -> Result<&Terminal> {
         self.terminals.iter().find(|t| t.id == id).ok_or(Error::TerminalNotFound)
-    }
-
-    pub fn app(&self, id: &str) -> Result<&App> {
-        self.apps.iter().find(|a| a.id == id).ok_or(Error::AppNotFound)
-    }
-
-    fn app_mut(&mut self, id: &str) -> Result<&mut App> {
-        self.apps.iter_mut().find(|a| a.id == id).ok_or(Error::AppNotFound)
     }
 
     /// Adds the task, or replaces the task with the draft's id. Returns its id.
@@ -560,9 +486,6 @@ impl Project {
                     format!("the credentials of {}", rule.label()),
                 ));
             }
-        }
-        if let Some(app) = self.apps.iter().find(|a| !self.guest_target_exists(Path::new(&a.cwd))) {
-            return Err(Error::AppCwd(app.name.clone(), app.cwd.clone()));
         }
         if let Some(task) = self.tasks.iter().find(|t| !self.guest_target_exists(Path::new(&t.workdir))) {
             return Err(Error::TaskWorkdir(task.title.clone(), task.workdir.clone()));
@@ -1140,61 +1063,6 @@ mod tests {
             Err(Error::HarnessMount(..))
         ));
         assert_eq!(project.mounts.len(), 1);
-    }
-
-    fn draft(name: &str, command: &str, cwd: &str) -> AppDraft {
-        AppDraft { id: None, name: name.into(), command: command.into(), cwd: cwd.into(), autostart: false }
-    }
-
-    #[test]
-    fn put_app_validates_name_command_and_cwd() {
-        let (mut project, root) = project_with_dirs(&["project/web", "data"]);
-        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        for cwd in ["/workspace", "//workspace/web/", "/mnt/data", "/mnt/data/sub"] {
-            project.put_app(draft(" web ", " pnpm dev ", cwd)).unwrap();
-        }
-        assert_eq!(project.apps[0].name, "web");
-        assert_eq!(project.apps[0].command, "pnpm dev");
-        assert_eq!(project.apps[1].cwd, "/workspace/web");
-
-        assert!(matches!(project.put_app(draft("", "x", "/workspace")), Err(Error::InvalidName(_))));
-        for command in ["", "   ", "a\nb", &"x".repeat(COMMAND_LIMIT + 1)] {
-            assert!(
-                matches!(project.put_app(draft("a", command, "/workspace")), Err(Error::InvalidApp(..))),
-                "{command:?}"
-            );
-        }
-        assert!(matches!(project.put_app(draft("a", "x", "workspace")), Err(Error::InvalidGuestPath(_))));
-        assert!(matches!(project.put_app(draft("a", "x", "/workspace/missing")), Err(Error::MissingPath(_))));
-        assert!(matches!(project.put_app(draft("a", "x", "/etc")), Err(Error::GuestDirTarget(_))));
-        assert_eq!(project.apps.len(), 4);
-    }
-
-    #[test]
-    fn put_app_with_id_replaces_and_unknown_id_fails() {
-        let (mut project, _) = project_with_dirs(&["project"]);
-        let id = project.put_app(draft("web", "pnpm dev", "/workspace")).unwrap();
-        project
-            .put_app(AppDraft { id: Some(id.clone()), autostart: true, ..draft("api", "cargo run", "/workspace") })
-            .unwrap();
-        assert_eq!(project.apps.len(), 1);
-        assert_eq!((project.apps[0].id.as_str(), project.apps[0].name.as_str()), (id.as_str(), "api"));
-        assert!(project.apps[0].autostart);
-        assert!(matches!(
-            project.put_app(AppDraft { id: Some("nope".into()), ..draft("a", "x", "/workspace") }),
-            Err(Error::AppNotFound)
-        ));
-        project.remove_app(&id).unwrap();
-        assert!(matches!(project.remove_app(&id), Err(Error::AppNotFound)));
-    }
-
-    #[test]
-    fn check_refuses_an_app_without_its_mount() {
-        let (mut project, root) = project_with_dirs(&["project", "data"]);
-        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        project.put_app(draft("web", "x", "/mnt/data")).unwrap();
-        project.remove_mount("/mnt/data").unwrap();
-        assert!(matches!(project.check(), Err(Error::AppCwd(n, c)) if n == "web" && c == "/mnt/data"));
     }
 
     #[test]

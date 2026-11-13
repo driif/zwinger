@@ -16,7 +16,6 @@ import {
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
-  AppWindow,
   Box,
   ChevronDown,
   ChevronRight,
@@ -27,20 +26,12 @@ import {
   Pencil,
   Play,
   Plus,
-  RotateCw,
   Settings,
   Square,
   Trash2,
   X,
 } from "lucide-react";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import {
-  removeApp,
-  reorderApps,
-  restartApp,
-  startApp,
-  stopApp,
-} from "../apps/api";
 import { reorderProjects } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
@@ -48,7 +39,7 @@ import {
   SessionKind,
   ProjectView,
 } from "../../shared/api";
-import type { DroppedFolder, Intent, Pane, Run, View } from "../../App";
+import type { DroppedFolder, Pane, Run, View } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import { tildePath, truncateMiddle } from "../../shared/paths";
@@ -61,10 +52,9 @@ import "./rail.css";
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
 const FORBIDDEN = "Not allowed: each project has its own cage. Items stay in their project.";
 
-type Group = "terminals" | "apps" | "tasks";
+type Group = "terminals" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
   { group: "terminals", label: "Terminals" },
-  { group: "apps", label: "Apps" },
   { group: "tasks", label: "Tasks" },
 ];
 
@@ -178,7 +168,6 @@ interface Props {
   run: Run;
   onSelect: (id: string) => void;
   onOpen: (projectId: string, view: View) => void;
-  onIntent: (projectId: string, kind: Intent["kind"], appId?: string) => void;
   onRunsChange: (projectId: string) => void;
   onToggle: (project: ProjectView) => void;
   onNewSession: (projectId: string, kind: SessionKind) => void;
@@ -200,7 +189,7 @@ interface Props {
   children: ReactNode;
 }
 
-/** The projects as a tree: project → Terminals / Apps / Tasks → items. */
+/** The projects as a tree: project → Terminals / Tasks → items. */
 export function ProjectRail({
   projects,
   selectedId,
@@ -211,7 +200,6 @@ export function ProjectRail({
   run,
   onSelect,
   onOpen,
-  onIntent,
   onRunsChange,
   onToggle,
   onNewSession,
@@ -296,82 +284,42 @@ export function ProjectRail({
           };
         });
     const cageRunning = project.status.state === "running";
-    if (group === "tasks")
-      return project.tasks.map((task) => {
-        const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
-        const latest = taskRuns[taskRuns.length - 1];
-        const live = taskRuns.some((r) => isLive(r.state));
-        const badge = runBadge(latest);
-        return {
-          entity: task.id,
-          label: (
-            <>
-              <span className="grow">{task.title}</span>
-              {badge && <span className={latest?.state === "done" && !latest.ship ? "danger tree-state" : "muted tree-state"}>{badge}</span>}
-            </>
-          ),
-          name: task.title,
-          title: task.request,
-          icon: <ListChecks size={14} className={live ? "ok" : undefined} />,
-          view: { kind: "task", taskId: task.id },
-          menu: [
-            {
-              label: "Start run",
-              icon: <Play size={14} />,
-              disabled: !cageRunning || live,
-              run: () =>
-                run(async () => {
-                  const next = await startTaskRun(sid, task.id);
-                  onOpen(sid, { kind: "task", taskId: task.id, run: next });
-                  onRunsChange(sid);
-                }),
-            },
-            { label: "Edit", icon: <Pencil size={14} />, run: () => onOpen(sid, { kind: "taskEdit", taskId: task.id }) },
-            {
-              label: "Delete",
-              icon: <Trash2 size={14} />,
-              disabled: live,
-              confirm: `Delete the task ${task.title} and its runs?`,
-              run: () => run(() => removeTask(sid, task.id).then(() => onRunsChange(sid))),
-            },
-          ],
-        };
-      });
-    return project.apps.map((app) => {
-      const appRun = project.appRuns.find((r) => r.appId === app.id);
-      const state = !appRun ? "stopped" : appRun.exitCode === null ? "running" : `exited ${appRun.exitCode}`;
-      const running = state === "running";
+    return project.tasks.map((task) => {
+      const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
+      const latest = taskRuns[taskRuns.length - 1];
+      const live = taskRuns.some((r) => isLive(r.state));
+      const badge = runBadge(latest);
       return {
-        entity: app.id,
+        entity: task.id,
         label: (
           <>
-            <span className="grow">{app.name}</span>
-            <span className="muted tree-state">{state}</span>
+            <span className="grow">{task.title}</span>
+            {badge && <span className={latest?.state === "done" && !latest.ship ? "danger tree-state" : "muted tree-state"}>{badge}</span>}
           </>
         ),
-        name: app.name,
-        title: app.command,
-        icon: <AppWindow size={14} className={running ? "ok" : undefined} />,
-        view: { kind: "app", appId: app.id },
+        name: task.title,
+        title: task.request,
+        icon: <ListChecks size={14} className={live ? "ok" : undefined} />,
+        view: { kind: "task", taskId: task.id },
         menu: [
           {
-            label: running ? "Stop" : "Start",
-            icon: running ? <Square size={14} /> : <Play size={14} />,
-            disabled: !cageRunning,
-            run: () => run(() => (running ? stopApp(sid, app.id) : startApp(sid, app.id))),
+            label: "Start run",
+            icon: <Play size={14} />,
+            disabled: !cageRunning || live,
+            run: () =>
+              run(async () => {
+                const next = await startTaskRun(sid, task.id);
+                onOpen(sid, { kind: "task", taskId: task.id, run: next });
+                onRunsChange(sid);
+              }),
           },
-          {
-            label: "Restart",
-            icon: <RotateCw size={14} />,
-            disabled: !cageRunning,
-            run: () => run(() => restartApp(sid, app.id)),
-          },
-          { label: "Edit", icon: <Pencil size={14} />, run: () => onIntent(sid, "app", app.id) },
+          { label: "Edit", icon: <Pencil size={14} />, run: () => onOpen(sid, { kind: "taskEdit", taskId: task.id }) },
           {
             label: "Delete",
             icon: <Trash2 size={14} />,
-            confirm: `Delete the app ${app.name}? It stops.`,
-            run: () => run(() => removeApp(sid, app.id)),
+            disabled: live,
+            confirm: `Delete the task ${task.title} and its runs?`,
+            run: () => run(() => removeTask(sid, task.id).then(() => onRunsChange(sid))),
           },
         ],
       };
@@ -411,11 +359,9 @@ export function ProjectRail({
   const selectedRow =
     view.kind === "terminal"
       ? `i|${selectedId}|terminals|${view.key}`
-      : view.kind === "app"
-          ? `i|${selectedId}|apps|${view.appId}`
-          : view.kind === "task" || (view.kind === "taskEdit" && view.taskId)
-            ? `i|${selectedId}|tasks|${view.taskId}`
-            : `s|${selectedId}`;
+      : view.kind === "task" || (view.kind === "taskEdit" && view.taskId)
+        ? `i|${selectedId}|tasks|${view.taskId}`
+        : `s|${selectedId}`;
 
   function focus(id: string | undefined, event: KeyboardEvent) {
     if (!id) return;
@@ -508,7 +454,6 @@ export function ProjectRail({
     const list = lists[container];
     const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
     if (container === "projects") run(() => reorderProjects(next));
-    else if (container.endsWith("|apps")) run(() => reorderApps(projectId, next));
     else onMoveTerminals(projectId, next);
   }
 
@@ -524,9 +469,7 @@ export function ProjectRail({
     const [label, action] =
       group === "terminals"
         ? ["New Mac shell", () => onNewSession(project.id, { type: "host" })]
-        : group === "apps"
-          ? ["Add app", () => onIntent(project.id, "app")]
-          : ["New task", () => onOpen(project.id, { kind: "taskEdit" })];
+        : ["New task", () => onOpen(project.id, { kind: "taskEdit" })];
     return (
       <>
         <IconButton

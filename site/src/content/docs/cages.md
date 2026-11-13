@@ -26,7 +26,7 @@ the cage, and has no sandbox. A cage stop ends the VM shells and the agent sessi
 
 ## Start and stop
 
-You start and stop the cage. A start shows its phases: vault, prepare, proxy, boot, guest, wrappers and apps. The
+You start and stop the cage. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
 status of a starting cage names the current phase. **Settings > Last start** of the project shows the time of each
 phase.
 

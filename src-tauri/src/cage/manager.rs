@@ -6,7 +6,6 @@ use serde::Serialize;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, launch};
-use crate::cage::apps::AppRunView;
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
@@ -81,9 +80,6 @@ pub(crate) struct State<V> {
     /// Per project, the last network log entries. They stay after a stop, so
     /// the user can still allow a blocked host.
     pub(crate) net: HashMap<String, VecDeque<Entry>>,
-    /// Per project and app, counts the app stops. A start that saw an older
-    /// count was stopped while its process opened.
-    pub(crate) app_stops: HashMap<(String, String), u64>,
 }
 
 pub(crate) enum Vm<V> {
@@ -142,8 +138,6 @@ pub struct ProjectView {
     pub status: Status,
     pub pending_restart: bool,
     pub sessions: Vec<SessionView>,
-    /// The apps that run or have exited. An app with no entry is stopped.
-    pub app_runs: Vec<AppRunView>,
     /// The agent runtimes that the running VM has mounted. A host Gemini CLI
     /// that loads counts as one.
     pub runtimes: Vec<&'static str>,
@@ -246,7 +240,6 @@ impl<R: SandboxRuntime> Manager<R> {
                 sessions: Vec::new(),
                 live: HashMap::new(),
                 net: HashMap::new(),
-                app_stops: HashMap::new(),
             })),
             net_sink: Arc::new(OnceLock::new()),
             runs: Arc::default(),
@@ -283,7 +276,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 let (status, pending_restart) = match state.vms.get(&project.id) {
                     None => (Status::Stopped, false),
                     Some(Vm::Starting(phase)) => (Status::Starting { phase: *phase }, false),
-                    // A new name, layout, app list, terminal list or network
+                    // A new name, layout, terminal list or network
                     // rule is used at once, so it needs no restart. A new
                     // credential name needs its placeholder in the guest env.
                     Some(Vm::Running { applied, .. }) => (
@@ -291,7 +284,6 @@ impl<R: SandboxRuntime> Manager<R> {
                         Project {
                             name: project.name.clone(),
                             layout: project.layout.clone(),
-                            apps: project.apps.clone(),
                             tasks: project.tasks.clone(),
                             terminals: project.terminals.clone(),
                             pane_layout: project.pane_layout.clone(),
@@ -322,22 +314,11 @@ impl<R: SandboxRuntime> Manager<R> {
                     status,
                     pending_restart,
                     sessions: sessions
-                        .clone()
-                        .filter(|s| s.app.is_none())
                         .map(|s| SessionView {
                             id: s.id.clone(),
                             kind: s.kind,
                             exit_code: s.exit_code,
                             terminal_id: s.terminal_id.clone(),
-                        })
-                        .collect(),
-                    app_runs: sessions
-                        .filter_map(|s| {
-                            s.app.as_ref().map(|run| AppRunView {
-                                app_id: run.app_id.clone(),
-                                session_id: s.id.clone(),
-                                exit_code: s.exit_code,
-                            })
                         })
                         .collect(),
                     runtimes,
@@ -698,20 +679,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn layout_app_and_order_edits_need_no_restart() {
+    async fn layout_and_order_edits_need_no_restart() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
         manager.set_layout(&id, Some([("harness".to_owned(), Pos { x: 1.0, y: 2.0 })].into())).unwrap();
-        let web = app(&manager, &id, "pnpm dev", false);
-        app(&manager, &id, "cargo run", true);
-        let mut ids: Vec<String> = manager.list()[0].project.apps.iter().map(|a| a.id.clone()).collect();
-        ids.reverse();
-        manager.reorder_apps(&id, &ids).unwrap();
-        manager.remove_app(&id, &web).unwrap();
         manager.reorder_projects(std::slice::from_ref(&id)).unwrap();
         let view = &manager.list()[0];
         assert!(!view.pending_restart);
-        assert_eq!(view.project.apps.len(), 1);
         assert_eq!(view.project.layout.len(), 1);
     }
 

@@ -4,7 +4,7 @@ description: A project is a folder on your Mac and its configuration.
 ---
 
 A **project** is one folder on your Mac and its configuration: the mounts, the network policy, the terminals, the
-apps, the tasks and the agents from your Mac. Each project has one [cage](/cages/). The project folder is mounted
+tasks and the agents from your Mac. Each project has one [cage](/cages/). The project folder is mounted
 read-write at `/workspace` in the cage.
 
 You can create, rename and delete projects. Use ⌘N to create a project.
@@ -58,16 +58,6 @@ zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/App
 
 **Open in editor** (⌘⇧E) opens the project folder, or the current folder of the current terminal. In a VM shell, a
 folder below `/workspace` or below a mount opens as its folder on the Mac. Other folders open the project folder.
-
-## Apps
-
-An app is a saved, long-running command of a project, for example a dev server. It has a name, a command (one shell
-line), a folder (`/workspace` or a folder below it or below a mount) and an autostart setting.
-
-- **Start** runs the command in the cage. **Stop** or a cage stop ends it.
-- An autostart app starts after each cage start.
-- zwinger does not publish a port of an app to the Mac.
-- A change to an app applies immediately.
 
 ## Map
 

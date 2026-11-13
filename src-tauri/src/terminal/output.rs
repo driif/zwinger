@@ -315,9 +315,8 @@ mod tests {
     #[tokio::test]
     async fn a_stale_detach_keeps_the_new_sink() {
         let (manager, _, id) = manager();
-        let web = app(&manager, &id, "pnpm dev", false);
         manager.start(&id).await.unwrap();
-        let session = manager.start_app(&id, &web).await.unwrap();
+        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
         let (old, _old_rx) = attach(&manager, &session);
         let (new, mut rx) = attach(&manager, &session);
         assert_ne!(old, new);
@@ -329,7 +328,7 @@ mod tests {
         manager.detach_session(&session, new);
         manager.write(&session, b"y".to_vec()).unwrap();
         manager.send(&session, PtyInput::Kill).unwrap();
-        until(|| runs(&manager) == [(web.clone(), Some(137))]).await;
+        until(|| manager.list()[0].sessions[0].exit_code == Some(137)).await;
         assert!(rx.try_recv().is_err());
         manager.detach_session("gone", new);
     }

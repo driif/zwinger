@@ -10,7 +10,6 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::AgentKind;
-use crate::cage::apps::AppRun;
 use crate::cage::lifecycle::mounted;
 use crate::cage::manager::{HostRun, Manager, State, Vm, lock};
 use crate::cage::{PaneNode, Project, WORKSPACE};
@@ -31,8 +30,6 @@ pub(crate) struct Session {
     pub(crate) output: Arc<Mutex<Output>>,
     /// Set for a shell or agent terminal.
     pub(crate) terminal_id: Option<String>,
-    /// Set for an app run.
-    pub(crate) app: Option<AppRun>,
     /// Set for a host shell: its process group, which an app exit kills.
     pub(crate) host_group: Option<host::HostGroup>,
 }
@@ -181,7 +178,6 @@ impl<R: SandboxRuntime> Manager<R> {
                 exit_code: None,
                 output: output.clone(),
                 terminal_id: Some(terminal),
-                app: None,
                 host_group,
             });
         }

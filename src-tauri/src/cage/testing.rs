@@ -12,7 +12,7 @@ pub(crate) use crate::agent::{AgentKind, launch};
 pub(crate) use crate::cage::manager::*;
 pub(crate) use crate::cage::network::*;
 pub(crate) use crate::cage::progress::Phase;
-pub(crate) use crate::cage::{self, AppDraft, HostAgentUse, Pos, TaskDraft, WORKSPACE};
+pub(crate) use crate::cage::{self, HostAgentUse, Pos, TaskDraft, WORKSPACE};
 pub(crate) use crate::error::{Error, Result};
 pub(crate) use crate::host_agents::HostAgents;
 pub(crate) use crate::host_agents::fake::{FakeClock, FakeFs};
@@ -195,19 +195,6 @@ pub(crate) fn task_draft(id: Option<String>, title: &str, kinds: [AgentKind; 2])
     }
 }
 
-pub(crate) fn app(manager: &Manager<FakeRuntime>, id: &str, command: &str, autostart: bool) -> String {
-    manager
-        .put_app(
-            id,
-            AppDraft { id: None, name: command.into(), command: command.into(), cwd: WORKSPACE.into(), autostart },
-        )
-        .unwrap()
-}
-
-pub(crate) fn runs(manager: &Manager<FakeRuntime>) -> Vec<(String, Option<i32>)> {
-    manager.list()[0].app_runs.iter().map(|r| (r.app_id.clone(), r.exit_code)).collect()
-}
-
 pub(crate) async fn until(mut done: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while !done() {
@@ -220,36 +207,6 @@ pub(crate) async fn until(mut done: impl FnMut() -> bool) {
 
 pub(crate) fn terminal_ids(manager: &Manager<FakeRuntime>) -> Vec<String> {
     manager.list()[0].project.terminals.iter().map(|t| t.id.clone()).collect()
-}
-
-pub(crate) async fn app_start_during(remove: bool) {
-    let (manager, runtime, id) = manager();
-    let web = app(&manager, &id, "pnpm dev", false);
-    manager.start(&id).await.unwrap();
-    let gate = Arc::new(PtyGate::default());
-    *runtime.pty_gate.lock().unwrap() = Some(gate.clone());
-
-    let manager = Arc::new(manager);
-    let starting = tokio::spawn({
-        let (manager, id, web) = (manager.clone(), id.clone(), web.clone());
-        async move { manager.start_app(&id, &web).await }
-    });
-    gate.entered.notified().await;
-    if remove {
-        manager.remove_app(&id, &web).unwrap();
-    } else {
-        manager.stop_app(&id, &web).unwrap();
-    }
-    gate.release.notify_one();
-
-    let result = starting.await.unwrap();
-    if remove {
-        assert!(matches!(result, Err(Error::AppNotFound)), "{result:?}");
-    } else {
-        assert!(matches!(result, Err(Error::AppStopped)), "{result:?}");
-    }
-    assert!(runs(&manager).is_empty());
-    until(|| runtime.log.lock().unwrap().contains(&"kill".to_owned())).await;
 }
 
 pub(crate) fn value(text: &str) -> Option<SecretValue> {

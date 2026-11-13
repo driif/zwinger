@@ -89,7 +89,6 @@ export type View =
   | { kind: TabView }
   /** `key` is the focused pane. No `key`: no pane is focused. */
   | { kind: "terminal"; key?: string }
-  | { kind: "app"; appId: string }
   /** No `run` shows the latest run. */
   | { kind: "task"; taskId: string; run?: string }
   /** No `taskId` adds a task. */
@@ -107,14 +106,12 @@ export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
 
 /** A ⌘K action that a tab completes, such as focusing a field. `at` makes a repeated action new. */
 export interface Intent {
-  kind: "rename" | "mount" | "harness" | "delete" | "addRule" | "app";
+  kind: "rename" | "mount" | "harness" | "delete" | "addRule";
   at: number;
   /** For `mount`: the canonical folder that was dropped on the map. */
   host?: string;
   /** For `mount`: the dropped path, which can be a link to `host`. */
   dropped?: string;
-  /** For `app`: the app to edit. No `appId` adds an app. */
-  appId?: string;
 }
 
 /** A dropped folder: the dropped path and its canonical folder. */
@@ -394,14 +391,6 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
     return () => clearInterval(timer);
   }, [liveRunProjects]);
 
-  // An app can exit while no view is attached, so the list polls while one runs.
-  const appsRunning = projects.some((s) => s.appRuns.some((r) => r.exitCode === null));
-  useEffect(() => {
-    if (!appsRunning) return;
-    const timer = setInterval(refresh, 2000);
-    return () => clearInterval(timer);
-  }, [appsRunning]);
-
   const panes: Pane[] = projects.flatMap((s) =>
     s.terminals.map((t) => ({
       key: t.id,
@@ -422,9 +411,8 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   const here = view.kind === "terminal" && !showSettings ? focused : undefined;
   const events = (project && net[project.id]) ?? [];
 
-  // A deleted app or task has no view.
+  // A deleted task has no view.
   useEffect(() => {
-    if (view.kind === "app" && project && !project.apps.some((a) => a.id === view.appId)) setView({ kind: "overview" });
     if (view.kind === "task" && project && !project.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
   }, [view, project]);
 
@@ -621,9 +609,9 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   const toggle = (project: ProjectView) =>
     run(() => (project.status.state === "running" ? stopCage(project.id) : startCage(project.id)));
 
-  function startIntent(kind: Intent["kind"], appId?: string) {
+  function startIntent(kind: Intent["kind"]) {
     setView({ kind: kind === "addRule" ? "network" : "settings" });
-    setIntent({ kind, appId, at: Date.now() });
+    setIntent({ kind, at: Date.now() });
   }
 
   const restart = (id: string) => run(() => stopCage(id).then(() => startCage(id)));
@@ -670,10 +658,6 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         run={run}
         onSelect={select}
         onOpen={openView}
-        onIntent={(id, kind, appId) => {
-          setSelectedId(id);
-          startIntent(kind, appId);
-        }}
         onRunsChange={reloadRuns}
         onToggle={toggle}
         onNewSession={(id, kind) => run(() => newSession(kind, projects.find((s) => s.id === id)))}

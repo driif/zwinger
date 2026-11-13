@@ -37,8 +37,6 @@ pub enum Phase {
     Trust,
     /// The network log and the agent commands.
     Wrappers,
-    /// The autostart apps, after the cage runs.
-    Apps,
 }
 
 impl Phase {
@@ -56,7 +54,6 @@ impl Phase {
             Phase::Setup => "setup".into(),
             Phase::Trust => "trust".into(),
             Phase::Wrappers => "wrappers".into(),
-            Phase::Apps => "apps".into(),
         }
     }
 }

@@ -22,7 +22,6 @@ import { deleteProject, renameProject } from "../projects/api";
 import { AGENT_NAMES, ProjectView } from "../../shared/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
-import { AppsSection } from "../apps/AppsSection";
 import { errorMessage } from "../../shared/errorMessage";
 import { phaseName } from "../projects/StartProgress";
 
@@ -86,7 +85,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
   }
 
   useEffect(() => {
-    if (!intent || intent.kind === "app") return;
+    if (!intent) return;
     onIntentDone();
     switch (intent.kind) {
       case "rename":
@@ -313,13 +312,6 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
           </CardBody>
         </Card>
       )}
-
-      <AppsSection
-        project={project}
-        run={run}
-        intent={intent?.kind === "app" ? intent : undefined}
-        onIntentDone={onIntentDone}
-      />
 
       <Card variant="outlined" padding="md">
         <CardHeader title="Delete project" titleAs="h2" description="Stops the cage. Your folders stay on disk." />

@@ -35,18 +35,6 @@ pub enum Error {
     HarnessMount(String, String),
     #[error("{0} is not below /workspace or a mount")]
     GuestDirTarget(String),
-    #[error("app {0} starts in {1}, which is not below /workspace or a mount")]
-    AppCwd(String, String),
-    #[error("invalid app {0}: {1}")]
-    InvalidApp(String, String),
-    #[error("app not found")]
-    AppNotFound,
-    #[error("app is already running")]
-    AppRunning,
-    #[error("the app was stopped while it started")]
-    AppStopped,
-    #[error("the old run of the app did not exit")]
-    AppStillRunning,
     #[error("task {0} runs in {1}, which is not below /workspace or a mount")]
     TaskWorkdir(String, String),
     #[error("invalid task {0}: {1}")]

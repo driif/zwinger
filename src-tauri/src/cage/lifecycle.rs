@@ -9,7 +9,6 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
-use crate::cage::apps::APP_SIZE;
 use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, Vm, bin_dir, blocking, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
@@ -40,6 +39,9 @@ pub(crate) const PROBE_LIMIT: Duration = Duration::from_secs(15);
 
 /// The host pi's TUI that still runs after this long has loaded.
 pub(crate) const TUI_PROBE: Duration = Duration::from_secs(4);
+
+/// The terminal size of the TUI probe.
+const TUI_PROBE_SIZE: (u16, u16) = (24, 80);
 
 /// The bytes of a probe's stderr that a notice shows.
 pub(crate) const PROBE_ERR: usize = 512;
@@ -181,7 +183,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Err(_) => None,
         };
 
-        let autostart: Vec<String> = {
+        {
             let mut state = lock(&self.state);
             match result {
                 Ok(vm) => {
@@ -204,8 +206,6 @@ impl<R: SandboxRuntime> Manager<R> {
                             host: Box::new(run),
                         },
                     );
-                    let apps = state.project_mut(id).map(|s| s.apps.clone()).unwrap_or_default();
-                    apps.into_iter().filter(|a| a.autostart).map(|a| a.id).collect()
                 }
                 Err(e) => {
                     timings.finish(started);
@@ -216,16 +216,6 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             }
         };
-        // An app that cannot start, or a stop that ran meanwhile, does not
-        // fail the start. A bad command shows as an exit code.
-        let at = Instant::now();
-        for app_id in autostart {
-            if let Err(e) = self.start_app(id, &app_id).await {
-                eprintln!("autostart of app {app_id} in {id} failed: {e}");
-            }
-        }
-        timings.add(Phase::Apps, at.elapsed());
-        // After the apps, so the total includes them.
         timings.finish(started);
         eprintln!("{}", timings.line(id));
         if let Some(Vm::Running { host, .. }) = lock(&self.state).vms.get_mut(id) {
@@ -514,7 +504,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let found = launch::Found { pi_host: true, gemini: None, proxy };
         let mut argv = launch::command(AgentKind::Pi, found).expect("pi has a program");
         argv.push("--no-session".to_owned());
-        let (rows, cols) = APP_SIZE;
+        let (rows, cols) = TUI_PROBE_SIZE;
         let mut pty = self.runtime.open_pty(vm, &argv, WORKSPACE, rows, cols).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         let read = async {
@@ -1239,8 +1229,7 @@ mod tests {
                 Phase::Setup,
                 Phase::Trust,
                 Phase::Guest,
-                Phase::Wrappers,
-                Phase::Apps
+                Phase::Wrappers
             ]
         );
     }

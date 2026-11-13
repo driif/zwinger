@@ -123,7 +123,7 @@ fn migrate_secrets(project: &mut Project) {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
-    use crate::cage::{App, FileId, HostAgentUse, Mount, PaneNode, Pos, SplitDirection, Task, TaskAgent, Terminal};
+    use crate::cage::{FileId, HostAgentUse, Mount, PaneNode, Pos, SplitDirection, Task, TaskAgent, Terminal};
     use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, Rule, Target};
     use crate::runtime::SessionKind;
     use crate::secrets::{Origin, Places, Secret};
@@ -168,13 +168,6 @@ mod tests {
                 origin: Origin::HostLogin { agent: AgentKind::Claude },
             }],
             layout: [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into(),
-            apps: vec![App {
-                id: "app-1".into(),
-                name: "web".into(),
-                command: "pnpm dev".into(),
-                cwd: "/workspace".into(),
-                autostart: true,
-            }],
             tasks: vec![Task {
                 id: "task-1".into(),
                 slug: "fix-it".into(),
@@ -245,6 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn loads_config_with_removed_apps() {
+        let dir = data_dir();
+        let path = dir.join(FILE);
+        std::fs::write(
+            &path,
+            r#"[{"id":"a","name":"proj","folder":"/tmp/proj","mounts":[],
+                "network":{"allowAll":false,"domains":[]},
+                "apps":[{"id":"app-1","name":"web","command":"pnpm dev","cwd":"/workspace","autostart":true}]}]"#,
+        )
+        .unwrap();
+        let store = Store::new(path.clone());
+        let projects = store.load().unwrap();
+        assert_eq!(projects[0].name, "proj");
+        store.save(&projects).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("apps"));
+    }
+
+    #[test]
     fn loads_config_without_newer_fields() {
         let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -259,7 +270,6 @@ mod tests {
         assert_eq!(project.harness, None);
         assert!(project.logins.is_empty());
         assert!(project.layout.is_empty());
-        assert!(project.apps.is_empty());
         assert!(project.tasks.is_empty());
         assert_eq!(project.pane_layout, None);
         assert!(project.terminals.is_empty());

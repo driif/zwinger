@@ -22,7 +22,6 @@ import {
 import { time } from "../settings/HostAgentsSettings";
 import { decide, useCatalog } from "../network/network";
 import type { Intent, Pane, Run, Runtimes, TabView, View } from "../../App";
-import { AppView } from "../apps/AppView";
 import { NetworkTab } from "../network/NetworkTab";
 import { SettingsTab } from "../settings/SettingsTab";
 import { TaskDialog } from "../tasks/TaskDialog";
@@ -209,7 +208,7 @@ export function ProjectPage({
   if (dismissed?.project === project.id && status.state !== "running") setDismissed(undefined);
   const hidden = dismissed?.project === project.id ? dismissed.notices : [];
   const folders = listed?.id === project.id ? listed.folders : undefined;
-  // The tab that shows again after a terminal, app or task view. The tabs stay
+  // The tab that shows again after a terminal or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
   const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
@@ -243,7 +242,6 @@ export function ProjectPage({
   const sessions = project.sessions.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
   const unverified = [...(project.folderId ? [] : [project.folder]), ...project.mounts.filter((m) => !m.id).map((m) => m.host)];
-  const app = view.kind === "app" ? project.apps.find((a) => a.id === view.appId) : undefined;
   const task = view.kind === "task" ? project.tasks.find((t) => t.id === view.taskId) : undefined;
   const actions = launchActions(project, editors);
   const newTerminals = actions.filter((a) => a.type === "session");
@@ -414,10 +412,6 @@ export function ProjectPage({
                     <dt>Sessions</dt>
                     <dd>{sessions}</dd>
                   </div>
-                  <div>
-                    <dt>Apps running</dt>
-                    <dd>{project.appRuns.filter((r) => r.exitCode === null).length}</dd>
-                  </div>
                   {project.hostAgents.length > 0 && (
                     <div>
                       <dt>From this Mac</dt>
@@ -456,18 +450,6 @@ export function ProjectPage({
             ),
           }}
         />
-      {app && (
-        <div className="view">
-          <AppView
-            key={app.id}
-            project={project}
-            app={app}
-            run={run}
-            onExit={terminal.onPaneExit}
-            onError={(e) => run(() => Promise.reject(e))}
-          />
-        </div>
-      )}
       {task && view.kind === "task" && (
         <div className="view task-view">
           <Suspense>
