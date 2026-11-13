@@ -967,6 +967,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 | "resumed"
                 | "mirror_failed"
                 | "decision"
+                | "shared_vm"
         );
         if shown {
             let body = format!("**{}** — {}", event.kind.replace('_', " "), event.detail);

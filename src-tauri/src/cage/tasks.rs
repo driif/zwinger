@@ -1,14 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use crate::agent::AgentKind;
+use crate::cage::Mount;
 use crate::cage::manager::{Manager, Vm, blocking, lock};
-use crate::cage::{Bound, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
-use crate::session::TaskDraft;
+use crate::session::{Task, TaskDraft};
 use crate::task_agents::Exec;
 use crate::task_artifacts::{self, Mirror, RoundWriter};
 use crate::task_runs::{self, Control, RunHandle, RunState};
@@ -53,46 +53,44 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Starts a run of the task in the running VM. Returns the run name.
-    /// The round goes to host app data; the harness gets a mirror, which
+    /// The round goes to host app data; the session folder gets a copy, which
     /// must be writable before the run starts.
     pub fn start_task_run(&self, id: &str, task_id: &str) -> Result<String> {
         let _start = lock(&self.run_start);
-        let (task, vm, applied, pi_host, gemini, proxy, unmounted) = {
+        let (task, vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted) = {
             let state = lock(&self.state);
             let session = state.session(id)?;
             let task = session.task(task_id)?.clone();
-            match state.vms.get(&session.cage) {
-                Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
-                    let unmounted = task
-                        .agents
-                        .iter()
-                        .find(|a| a.kind != AgentKind::Pi && !runtimes.contains(&a.kind.name()))
-                        .map(|a| self.unmounted(a.kind, host));
-                    let (pi_host, gemini, proxy) = (host.pi_host, host.gemini.clone(), host.proxy.clone());
-                    (task, vm.clone(), applied.clone(), pi_host, gemini, proxy, unmounted)
-                }
-                _ => return Err(Error::NotRunning),
-            }
+            let (member, cage, running, folder, shared) = state.task_cage(id)?;
+            let Vm::Running { vm, runtimes, host, .. } = running else {
+                unreachable!("task_cage returns a running VM")
+            };
+            let scope = git_scope(&task, &folder, &cage.mounts)?;
+            let unmounted = task
+                .agents
+                .iter()
+                .find(|a| a.kind != AgentKind::Pi && !runtimes.contains(&a.kind.name()))
+                .map(|a| self.unmounted(a.kind, host));
+            (
+                task,
+                vm.clone(),
+                folder,
+                scope,
+                member.folder.clone(),
+                shared,
+                host.pi_host,
+                host.gemini.clone(),
+                host.proxy.clone(),
+                unmounted,
+            )
         };
         if self.runs.is_running(id, task_id) {
             return Err(Error::TaskRunning);
         }
-        // The VM has the mounts of its start, so the paths are checked there.
-        let applied = Bound { session: &applied.0, cage: &applied.1 };
-        if applied.host_of(&task.workdir).is_none() {
-            return Err(Error::TaskWorkdir(task.title.clone(), task.workdir.clone()));
-        }
         let dir = self.task_dir(id, &task.slug);
         let run = format!("{:02}", run_names(&dir).iter().filter_map(|r| r.parse::<u32>().ok()).max().unwrap_or(0) + 1);
-        let harness = applied.session.harness.as_deref().unwrap_or(WORKSPACE);
-        let mirror = match applied.host_of(harness) {
-            Some((root, rel, true)) => {
-                let mut parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-                parts.extend([".zwinger", "tasks", &task.slug, &run].map(str::to_owned));
-                Mirror { root, parts }
-            }
-            _ => return Err(Error::MirrorUnwritable(harness.to_owned(), "the folder is read-only".to_owned())),
-        };
+        let mirror =
+            Mirror { root: host_folder, parts: [".zwinger", "tasks", &task.slug, &run].map(str::to_owned).to_vec() };
         if let Some(e) = unmounted {
             return Err(e);
         }
@@ -102,7 +100,8 @@ impl<R: SandboxRuntime> Manager<R> {
             runtime: self.runtime.clone(),
             vm,
             cwd: task.workdir.clone(),
-            artifacts: Some(guest_artifacts(harness, &task.slug, &run)),
+            scope,
+            artifacts: Some(guest_artifacts(&folder, &task.slug, &run)),
             pi_host,
             gemini,
             proxy,
@@ -114,6 +113,7 @@ impl<R: SandboxRuntime> Manager<R> {
             exec,
             writer,
             config: self.run_config,
+            shared_vm: shared,
         });
         Ok(run)
     }
@@ -173,20 +173,21 @@ impl<R: SandboxRuntime> Manager<R> {
             Some(handle) => handle.status().base,
             None => blocking(move || Ok(task_artifacts::read_room(&dir).outcome.and_then(|o| o.base))).await?,
         };
-        let (task, vm, harness) = {
+        let (task, vm, folder, scope) = {
             let state = lock(&self.state);
             let session = state.session(id)?;
             let task = session.task(task_id)?.clone();
-            match state.vms.get(&session.cage) {
-                Some(Vm::Running { vm, applied, .. }) => (task, vm.clone(), applied.0.harness.clone()),
-                _ => return Err(Error::NotRunning),
-            }
+            let (_, cage, running, folder, _) = state.task_cage(id)?;
+            let Vm::Running { vm, .. } = running else { unreachable!("task_cage returns a running VM") };
+            let scope = git_scope(&task, &folder, &cage.mounts)?;
+            (task, vm.clone(), folder, scope)
         };
         let exec = Exec {
             runtime: self.runtime.clone(),
             vm,
             cwd: task.workdir,
-            artifacts: Some(guest_artifacts(harness.as_deref().unwrap_or(WORKSPACE), &task.slug, run)),
+            scope,
+            artifacts: Some(guest_artifacts(&folder, &task.slug, run)),
             // The diff runs git only.
             pi_host: false,
             gemini: None,
@@ -200,9 +201,9 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 }
 
-/// The guest path of a run's artifact mirror in the harness.
-pub(crate) fn guest_artifacts(harness: &str, slug: &str, run: &str) -> String {
-    format!("{}/.zwinger/tasks/{slug}/{run}", harness.trim_end_matches('/'))
+/// The guest path of a run's copy in the session folder.
+pub(crate) fn guest_artifacts(folder: &str, slug: &str, run: &str) -> String {
+    format!("{}/.zwinger/tasks/{slug}/{run}", folder.trim_end_matches('/'))
 }
 
 /// A run of a task, for the tree and the room.
@@ -233,12 +234,52 @@ pub(crate) fn run_names(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// The guest folder that the git check and the diff of a task cover: the
+/// session guest folder when the working dir is in it, else the working dir
+/// in its mount. A working dir in neither is an error.
+fn git_scope(task: &Task, folder: &str, mounts: &[Mount]) -> Result<String> {
+    let workdir = Path::new(&task.workdir);
+    if workdir.starts_with(folder) {
+        Ok(folder.to_owned())
+    } else if mounts.iter().any(|mount| workdir.starts_with(&mount.guest)) {
+        Ok(task.workdir.clone())
+    } else {
+        Err(Error::TaskWorkdir(task.title.clone(), task.workdir.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::cage::Mount;
     use crate::cage::testing::*;
+    use crate::session::{Task, TaskAgent};
+    use crate::task_runs::RunState;
+
+    fn task_in(workdir: &str) -> Task {
+        Task {
+            id: "t".into(),
+            slug: "t".into(),
+            title: "T".into(),
+            request: "Do it.".into(),
+            agents: [AgentKind::Pi, AgentKind::Claude].map(|kind| TaskAgent { kind, model: None }),
+            gates: Vec::new(),
+            workdir: workdir.into(),
+        }
+    }
+
+    #[test]
+    fn git_scope_is_the_session_folder_or_the_mount_workdir() {
+        let mounts = [Mount { host: PathBuf::from("/h"), id: None, guest: "/mnt/repo".into(), readonly: false }];
+        let scope = |workdir| super::git_scope(&task_in(workdir), "/workspace/a", &mounts);
+        assert_eq!(scope("/workspace/a").unwrap(), "/workspace/a");
+        assert_eq!(scope("/workspace/a/src").unwrap(), "/workspace/a");
+        assert_eq!(scope("/mnt/repo/app").unwrap(), "/mnt/repo/app");
+        assert!(matches!(scope("/workspace/ab"), Err(Error::TaskWorkdir(..))));
+        assert!(matches!(scope("/workspace/b"), Err(Error::TaskWorkdir(..))));
+    }
 
     #[tokio::test]
-    async fn tasks_are_saved_and_a_run_needs_a_writable_mirror() {
+    async fn tasks_are_saved_and_a_run_needs_a_mounted_agent() {
         let (manager, _runtime, id) = manager();
         let kinds = [AgentKind::Pi, AgentKind::Claude];
         assert!(matches!(
@@ -258,12 +299,12 @@ mod tests {
         assert_eq!(manager.list().sessions[0].session.tasks[0].slug, "fix-the-map");
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::NotRunning)));
 
-        // The harness is in a read-only mount: the run cannot write its mirror.
+        // The harness does not control where the run copy goes.
         let mount = temp_dir();
         manager.add_mount(&id, mount.to_str().unwrap(), "/mnt/ro", true).unwrap();
         manager.set_harness(&id, Some("/mnt/ro")).unwrap();
         manager.start(&id).await.unwrap();
-        assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::MirrorUnwritable(..))));
+        assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::RuntimeMissing(name)) if name == "claude"));
         // A task edit needs no restart.
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Again", kinds)).unwrap();
         assert!(!manager.list().cages[0].pending_restart);
@@ -278,5 +319,30 @@ mod tests {
 
         manager.remove_task(&id, &task_id).unwrap();
         assert_eq!(manager.list().sessions[0].session.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn converted_project_keeps_its_old_run_records() {
+        let data = temp_dir();
+        let folder = temp_dir();
+        let project = serde_json::json!([{
+            "id": "legacy", "name": "Old project", "folder": folder,
+            "mounts": [], "network": { "default": "block", "offline": false, "rules": [] },
+            "tasks": [{ "id": "old-task", "slug": "fix", "title": "Fix", "request": "Fix it",
+                "agents": [{ "kind": "pi", "model": null }, { "kind": "claude", "model": null }],
+                "gates": [], "workdir": "/workspace" }]
+        }]);
+        std::fs::write(data.join("projects.json"), project.to_string()).unwrap();
+        let round = data.join("tasks/legacy/fix/01");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("events.jsonl"), "{\"at\":\"t\",\"kind\":\"stage\",\"detail\":\"plan\"}\n{\"at\":\"t\",\"kind\":\"done\",\"detail\":\"ship=false\"}\n").unwrap();
+        let manager =
+            Manager::new(FakeRuntime::default(), Store::new(data.clone()), vault(), data.clone(), host()).unwrap();
+
+        let runs = manager.list_task_runs("legacy").await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].task_id.as_str(), runs[0].run.as_str(), runs[0].state), ("old-task", "01", RunState::Done));
+        assert_eq!(manager.round_dir("legacy", "old-task", "01").unwrap(), round);
+        assert!(data.join("projects.json").exists());
     }
 }

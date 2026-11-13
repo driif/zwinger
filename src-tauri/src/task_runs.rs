@@ -249,6 +249,7 @@ pub struct Spec<R: SandboxRuntime> {
     pub exec: Exec<R>,
     pub writer: RoundWriter,
     pub config: Config,
+    pub shared_vm: bool,
 }
 
 impl Registry {
@@ -304,6 +305,7 @@ impl Registry {
             },
             control: control_rx,
             run: Default::default(),
+            shared_vm: spec.shared_vm,
         };
         tokio::spawn(actor.run());
         let mut runs = lock(&self.runs);
@@ -397,6 +399,12 @@ struct Actor<R: SandboxRuntime> {
     book: Book,
     control: mpsc::UnboundedReceiver<Control>,
     run: Round,
+    shared_vm: bool,
+}
+
+/// The run note when the VM contains more than one session.
+fn shared_vm_note(scope: &str) -> String {
+    format!("The git-state check covers only {scope}. Other sessions in the same VM can see this task's files.")
 }
 
 /// The run ends early.
@@ -792,6 +800,10 @@ impl<R: SandboxRuntime> Actor<R> {
 
         // 1. Blind plans, in parallel.
         self.stage("plan", "plan")?;
+        if self.shared_vm {
+            let note = shared_vm_note(&self.io.exec.scope);
+            self.book.writer.event("shared_vm", &note);
+        }
         let prompts = [0, 1].map(|i| {
             fit(
                 PLAN,
@@ -1621,6 +1633,15 @@ mod tests {
         sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
         script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
     ) -> Started {
+        start_full_mode(idle, sh, script, false)
+    }
+
+    fn start_full_mode(
+        idle: Duration,
+        sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+        shared_vm: bool,
+    ) -> Started {
         let runtime = FakeRuntime::default();
         let (calls, shells) = serve(&runtime, Arc::new(sh), Arc::new(script));
         let dir = temp_dir().join("01");
@@ -1649,6 +1670,7 @@ mod tests {
                 runtime,
                 vm: Arc::new(FakeVm { cage_id: "s".into() }),
                 cwd: "/workspace".into(),
+                scope: "/workspace".into(),
                 artifacts: Some("/workspace/.zwinger/tasks/fix/01".into()),
                 pi_host: false,
                 gemini: None,
@@ -1656,6 +1678,7 @@ mod tests {
             },
             writer: RoundWriter::create(dir.clone(), Some(mirror)).unwrap(),
             config: Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } },
+            shared_vm,
         });
         Started { registry, handle, dir, mirror: root.join(".zwinger/tasks/fix/01"), calls, shells }
     }
@@ -1687,6 +1710,20 @@ mod tests {
 
     fn states(dir: &std::path::Path) -> Vec<(String, &'static str)> {
         read_room(dir).stages.into_iter().map(|s| (s.id, s.state)).collect()
+    }
+
+    #[tokio::test]
+    async fn shared_vm_note_appears_only_for_multiple_members() {
+        let single = start(happy);
+        settled(&single).await;
+        assert!(!events(&single).iter().any(|(kind, _)| kind == "shared_vm"));
+
+        let shared = start_full_mode(Duration::from_secs(5), no_git, happy, true);
+        settled(&shared).await;
+        let note =
+            "The git-state check covers only /workspace. Other sessions in the same VM can see this task's files.";
+        assert!(events(&shared).iter().any(|(kind, detail)| kind == "shared_vm" && detail == note));
+        assert!(read_room(&shared.dir).messages.iter().any(|message| message.body.ends_with(note)));
     }
 
     #[tokio::test]
@@ -2003,9 +2040,9 @@ mod tests {
         assert!(!events(&run).iter().any(|(k, _)| k == "no_detection"));
         // The check states what it saw: it names no agent.
         assert!(read_room(&run.dir).violations.iter().all(|v| v.agent.is_none()));
-        // Only the run's own artifact folder is skipped.
+        // Only the session folder is checked; its run copy is skipped.
         let shell = run.shells.lock().unwrap()[0].clone();
-        assert_eq!(shell[4], "/workspace/.zwinger/tasks/fix/01");
+        assert_eq!((shell[4].as_str(), shell[5].as_str()), ("/workspace", "/workspace/.zwinger/tasks/fix/01"));
         assert!(!shell[2].contains("**/.zwinger/**"));
     }
 
@@ -2062,7 +2099,7 @@ mod tests {
             assert!(prompt.contains(&format!("The run started at commit `{BASE}`.")), "{stage:?}");
         }
         let diff = run.shells.lock().unwrap().iter().find(|a| a[2].contains("Commits since")).cloned().unwrap();
-        assert_eq!(diff[5], BASE);
+        assert_eq!(diff[6], BASE);
         assert_eq!(read_room(&run.dir).outcome.unwrap().base.as_deref(), Some(BASE));
     }
 

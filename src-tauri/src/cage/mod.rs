@@ -278,19 +278,6 @@ impl Bound<'_> {
             .chain(self.cage.mounts.iter().map(|m| (m.host.as_path(), !m.readonly)))
     }
 
-    /// The host folder that holds a guest path (`/workspace` or a mount),
-    /// the path below it, and if the guest can write it. The deepest mount
-    /// that holds the path wins.
-    pub fn host_of(&self, guest: &str) -> Option<(PathBuf, PathBuf, bool)> {
-        let path = Path::new(guest);
-        if let Ok(rel) = path.strip_prefix(WORKSPACE) {
-            return Some((self.session.folder.clone(), rel.to_owned(), true));
-        }
-        let mount = self.cage.mounts.iter().filter(|m| path.starts_with(&m.guest)).max_by_key(|m| m.guest.len())?;
-        let rel = path.strip_prefix(&mount.guest).ok()?;
-        Some((mount.host.clone(), rel.to_owned(), !mount.readonly))
-    }
-
     /// A guest folder that a process can start in: `/workspace` or a
     /// sub-path whose host folder exists, or a path below a mount.
     pub(crate) fn guest_dir(&self, input: &str) -> Result<String> {

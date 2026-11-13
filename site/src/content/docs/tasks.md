@@ -3,7 +3,7 @@ title: Tasks
 description: Two agents plan, build and review a task together.
 ---
 
-A **task** is a request that two agents of a project plan, build and review together. The agents run headless in the
+A **task** is a request that two agents of a session plan, build and review together. The agents run headless in the
 [cage](/cages/), not in a terminal. They do not use a Mac shell (⌘T), which runs on the Mac with no sandbox, or a
 VM shell (⌘⇧T).
 
@@ -13,7 +13,7 @@ A task has these fields:
 
 - **Title** and **Request**.
 - Two agents of different kinds (pi, Claude Code, Codex), each with an optional model. The first agent decides a
-  tiebreak. Gemini CLI is also available if the project uses Gemini CLI from the Mac.
+  tiebreak. Gemini CLI is also available if the cage uses Gemini CLI from the Mac.
 - **Gates**: shell lines that check the result, for example `pnpm build`.
 - **Working dir**: `/workspace`, or a folder below it or below a mount.
 
@@ -35,9 +35,16 @@ A run is one execution of a task. It has these stages:
 If an agent fails, the run continues in a degraded mode, and the room shows it. A degraded result is never shown as an
 agreement.
 
-In the stages that must not change files, the run compares the git state of the working dir before and after. A change
-is a violation. Outside a git work tree, this check is not possible, and the run tells you. A run never commits or
+A task needs a cage. A session with no cage cannot start a task: attach a cage first.
+
+In the stages that must not change files, the run compares the Git state of its folder before and after. A change
+is a violation. Outside a Git work tree, this check is not possible, and the run tells you. A run never commits or
 pushes.
+
+The Git check and the change view cover the session folder, even when the Git root is above it. If the working dir is
+in a mount, they cover the working dir in its Git repository instead. They exclude the run's round copy. If the VM
+contains more than one session, the room shows a note when the run starts: the folder that the Git check covers, and
+that other sessions in the VM can see the task's files.
 
 ## Room
 
@@ -56,6 +63,7 @@ A cage stop cancels its runs. A run does not continue after an app restart.
 
 ## Records
 
-zwinger writes the files of each run to its app data on the Mac. The cage cannot write there, so an agent cannot
-change a verdict. zwinger also writes a copy to `.zwinger/tasks/<task>/<run>/` in the harness folder of the project (else in
-`/workspace`) at each stage. A run starts only if zwinger can write this copy.
+zwinger writes the files of each run to its app data on the Mac, under the session ID. The cage cannot write there,
+so an agent cannot change a verdict. At each stage, zwinger also writes a copy to
+`.zwinger/tasks/<task>/<run>/` in the session folder. The harness setting does not move this copy. A run starts only
+if zwinger can write it.

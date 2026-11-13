@@ -32,15 +32,21 @@ const PARSE_LIMIT: Duration = Duration::from_secs(5);
 const PI_READ_TOOLS: &str = "read,grep,find,ls";
 /// The tree of a repository with no commit: the base of a run that started there.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-/// The start of each git script. `$1` is the guest path of the run's own
-/// artifact folder, the only path that the scripts skip, and `$2` the base
-/// commit. The scripts see the whole repository, not only the working dir.
-const GIT_PRELUDE: &str = r#"art=$1 base=$2
+/// The start of each git script. `$1` is the folder that the check covers, `$2` is
+/// the run copy to skip, and `$3` is the base commit.
+const GIT_PRELUDE: &str = r#"scope=$1 art=$2 base=$3
+[ -d "$scope" ] || exit 3
+scope=$(cd "$scope" && pwd -P) || exit 3
+cd "$scope" || exit 3
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 3
 top=$(git rev-parse --show-toplevel) && cd "$top" || exit 4
 [ -n "$art" ] && art=$(cd "$art" 2>/dev/null && pwd -P)
-set -- .
-case "$art" in "$top"/?*) set -- . ":(exclude,literal)${art#"$top"/}" ;; esac
+case "$scope" in
+  "$top") set -- . ;;
+  "$top"/*) set -- ":(literal)${scope#"$top"/}" ;;
+  *) exit 3 ;;
+esac
+case "$art" in "$top"/?*) set -- "$@" ":(exclude,literal)${art#"$top"/}" ;; esac
 "#;
 const RETRY: &str = "\n\n---\n\nYour last reply had no valid JSON object. Do not do the work again. \
 Return only the JSON object that the Output section asks for, in a fenced ```json block.";
@@ -299,6 +305,9 @@ pub struct Exec<R: SandboxRuntime> {
     pub runtime: R,
     pub vm: Arc<R::Vm>,
     pub cwd: String,
+    /// The folder that the git check and the diff cover: the session's guest
+    /// folder when `cwd` is in it, else `cwd` in its mount.
+    pub scope: String,
     /// The guest path of the run's artifact folder, which git checks skip.
     pub artifacts: Option<String>,
     /// pi runs from the host install that the cage mounts.
@@ -511,18 +520,19 @@ impl<R: SandboxRuntime> Exec<R> {
         }
     }
 
-    fn git_argv(&self, script: String, base: Option<&str>) -> [String; 6] {
+    fn git_argv(&self, script: String, base: Option<&str>) -> [String; 7] {
         [
             "/bin/sh".to_owned(),
             "-c".to_owned(),
             format!("{GIT_PRELUDE}{script}"),
             "zwinger".to_owned(),
+            self.scope.clone(),
             self.artifacts.clone().unwrap_or_default(),
             base.unwrap_or_default().to_owned(),
         ]
     }
 
-    /// The git state of the repository of the working dir.
+    /// The git state of the session folder.
     pub async fn snapshot(&self, cancel: &mut watch::Receiver<bool>) -> Result<Snapshot, SnapshotError> {
         let script = format!(
             "printf 'HEAD %s\\n' \"$(git rev-parse -q --verify HEAD || echo {EMPTY_TREE})\"\n\
@@ -530,7 +540,8 @@ impl<R: SandboxRuntime> Exec<R> {
              printf '\\0'\n\
              git diff --binary -- \"$@\" || exit 4\n\
              git diff --cached --binary -- \"$@\" || exit 4\n\
-             git ls-files -o --exclude-standard -z -- \"$@\" | xargs -0 -r cat --"
+             git ls-files -o --exclude-standard -z -- \"$@\" | xargs -0 -r cat --\n\
+             git ls-files -s -- \"$@\" || exit 4"
         );
         let (mut status, mut hash, mut in_status) = (Vec::new(), Sha256::new(), true);
         let ran = self
@@ -554,7 +565,9 @@ impl<R: SandboxRuntime> Exec<R> {
         match ran {
             Ok((3, _)) => Err(SnapshotError::NotGit),
             Ok((0, _)) if !in_status => {
-                hash.update(&status);
+                if let Some(line) = status.iter().position(|&b| b == b'\n') {
+                    hash.update(&status[line + 1..]);
+                }
                 status.truncate(STATUS_LIMIT);
                 let status = String::from_utf8_lossy(&status).into_owned();
                 let head = status.lines().next().and_then(|l| l.strip_prefix("HEAD ")).filter(|h| is_commit(h));
@@ -577,7 +590,7 @@ impl<R: SandboxRuntime> Exec<R> {
             "q='-c core.quotepath=off'\n\
              if [ -n \"$base\" ]; then\n\
                echo 'Commits since the start of the run:'\n\
-               if [ \"$base\" = {EMPTY_TREE} ]; then git $q log --oneline HEAD 2>/dev/null; else git $q log --oneline \"$base..HEAD\"; fi\n\
+               if [ \"$base\" = {EMPTY_TREE} ]; then git $q log --oneline HEAD -- \"$@\" 2>/dev/null; else git $q log --oneline \"$base..HEAD\" -- \"$@\"; fi\n\
                echo\n\
              fi\n\
              git $q status --short -uall -- \"$@\"\n\
@@ -701,6 +714,32 @@ mod tests {
     }
 
     const GEMINI: Option<&str> = Some("/opt/zwinger/host/gemini/bundle/gemini.js");
+
+    #[test]
+    fn git_scope_excludes_other_sessions_and_the_round_copy() {
+        let root = std::env::temp_dir().join(format!("zwinger-git-scope-{}", uuid::Uuid::new_v4()));
+        let session = root.join("session");
+        let copy = session.join(".zwinger/tasks/fix/01");
+        let workdir = std::env::temp_dir().join(format!("zwinger-other-workdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(root.join("outside.txt"), "outside").unwrap();
+        std::fs::write(session.join("code.txt"), "code").unwrap();
+        std::fs::write(copy.join("events.jsonl"), "round").unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&root).status().unwrap().success());
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{GIT_PRELUDE}git status --porcelain=v1 -uall -- \"$@\""))
+            .arg("zwinger")
+            .arg(&session)
+            .arg(&copy)
+            .arg("")
+            .current_dir(&workdir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "?? session/code.txt\n");
+    }
 
     fn found(pi_host: bool, gemini: Option<&str>) -> launch::Found<'_> {
         launch::Found { pi_host, gemini, proxy: None }

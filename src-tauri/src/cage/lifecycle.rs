@@ -199,7 +199,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         id.to_owned(),
                         Vm::Running {
                             vm,
-                            applied: Box::new((session, cage)),
+                            applied: Box::new((vec![session], cage)),
                             proxy,
                             net,
                             runtimes: names,

@@ -116,7 +116,9 @@ impl<R: SandboxRuntime> Manager<R> {
                     TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
                         return Err(self.unmounted(agent, host));
                     }
-                    TerminalKind::Agent { .. } => applied.0.harness.as_deref(),
+                    TerminalKind::Agent { .. } => {
+                        applied.0.iter().find(|s| s.id == session_id).and_then(|s| s.harness.as_deref())
+                    }
                     TerminalKind::Shell | TerminalKind::Host => None,
                 };
                 (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
@@ -303,11 +305,13 @@ impl<R: SandboxRuntime> Manager<R> {
             let cwd = match (process, state.vms.get(&session.cage)) {
                 (Some(Terminal { host_group: Some(group), .. }), _) => Some(Cwd::Host(group.clone())),
                 (Some(process), Some(Vm::Running { applied, .. })) => {
-                    let start = match process.kind {
-                        TerminalKind::Agent { .. } => applied.0.harness.clone(),
-                        TerminalKind::Shell | TerminalKind::Host => None,
-                    };
-                    Some(Cwd::Guest(process.output.clone(), start, applied.clone()))
+                    applied.0.iter().find(|s| s.id == session_id).map(|member| {
+                        let start = match process.kind {
+                            TerminalKind::Agent { .. } => member.harness.clone(),
+                            TerminalKind::Shell | TerminalKind::Host => None,
+                        };
+                        Cwd::Guest(process.output.clone(), start, Box::new((member.clone(), applied.1.clone())))
+                    })
                 }
                 _ => None,
             };

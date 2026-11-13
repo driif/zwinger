@@ -10,7 +10,7 @@ use crate::agent::{AgentKind, launch};
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
-use crate::cage::{self, Bound, Cage, HostAgentUse};
+use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
@@ -97,14 +97,14 @@ pub(crate) struct State<V> {
 pub(crate) enum Vm<V> {
     /// The phase that the start runs now.
     Starting(Phase),
-    /// `applied` is the session and the cage the VM booted with; they differ
+    /// `applied` is the sessions and the cage the VM booted with; they differ
     /// from the stored config after an edit, until the next start. `proxy`
     /// is the cage's proxy; a drop stops it. `net` follows the VM's network
     /// events. It is `None` if the runtime log could not be opened.
     /// `runtimes` are the agent runtimes that the start mounted.
     Running {
         vm: Arc<V>,
-        applied: Box<(Session, Cage)>,
+        applied: Box<(Vec<Session>, Cage)>,
         proxy: Arc<Proxy>,
         net: Option<AbortHandle>,
         runtimes: Vec<&'static str>,
@@ -232,6 +232,21 @@ impl<V> State<V> {
         self.sessions.iter().find(|s| s.id == id).ok_or(Error::SessionNotFound)
     }
 
+    /// The session as mounted in its running VM, its cage, and its guest folder.
+    pub(crate) fn task_cage(&self, id: &str) -> Result<(&Session, &Cage, &Vm<V>, String, bool)> {
+        let session = self.session(id)?;
+        if session.cage.is_empty() {
+            return Err(Error::NoCage);
+        }
+        self.cage(&session.cage)?;
+        let vm = self.vms.get(&session.cage).ok_or(Error::NotRunning)?;
+        let Vm::Running { applied, .. } = vm else {
+            return Err(Error::NotRunning);
+        };
+        let (member, folder, shared) = task_guest_folder(&applied.0, id).ok_or(Error::NotRunning)?;
+        Ok((member, &applied.1, vm, folder, shared))
+    }
+
     pub(crate) fn cage(&self, id: &str) -> Result<&Cage> {
         self.cages.iter().find(|c| c.id == id).ok_or(Error::CageNotFound)
     }
@@ -258,6 +273,13 @@ impl<V> State<V> {
         ring.push_back(event.clone());
         event
     }
+}
+
+fn task_guest_folder<'a>(members: &'a [Session], id: &str) -> Option<(&'a Session, String, bool)> {
+    let member = members.iter().find(|s| s.id == id)?;
+    let shared = members.len() > 1;
+    let folder = if shared { format!("{WORKSPACE}/{}", member.slug) } else { WORKSPACE.to_owned() };
+    Some((member, folder, shared))
 }
 
 fn ids(sessions: &[Session]) -> Vec<String> {
@@ -825,9 +847,12 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
 /// A new name, layout, task, terminal list, unprompted setting or network
 /// rule is used at once, so it needs no restart. A new credential name
 /// needs its placeholder in the guest env.
-fn pending_restart(applied: &(Session, Cage), session: Option<&Session>, cage: &Cage) -> bool {
-    let (old_session, old_cage) = applied;
+fn pending_restart(applied: &(Vec<Session>, Cage), session: Option<&Session>, cage: &Cage) -> bool {
+    let (sessions, old_cage) = applied;
     let session_changed = session.is_some_and(|session| {
+        let Some(old_session) = sessions.iter().find(|s| s.id == session.id) else {
+            return true;
+        };
         Session {
             name: session.name.clone(),
             layout: session.layout.clone(),
@@ -857,9 +882,32 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 
 #[cfg(test)]
 mod tests {
-    use super::reserved_dirs;
+    use super::{reserved_dirs, task_guest_folder};
     use crate::cage::testing::*;
     use crate::workspaces::{self, Arrangement};
+
+    #[test]
+    fn task_guest_folder_uses_the_applied_members() {
+        let (manager, _, first) = manager();
+        let other_folder = temp_dir();
+        let second = manager.create(other_folder.to_str().unwrap(), None).unwrap();
+        let members: Vec<_> = manager.list().sessions.into_iter().map(|view| view.session).collect();
+        let (only, folder, shared) = task_guest_folder(&members[..1], &first).unwrap();
+        assert_eq!((only.id.as_str(), folder.as_str(), shared), (first.as_str(), WORKSPACE, false));
+        let (member, folder, shared) = task_guest_folder(&members, &second).unwrap();
+        assert_eq!(
+            (member.folder.as_path(), folder, shared),
+            (other_folder.as_path(), format!("{WORKSPACE}/{}", member.slug), true)
+        );
+        assert!(task_guest_folder(&members[..1], &second).is_none());
+    }
+
+    #[test]
+    fn task_cage_refuses_a_session_without_a_cage() {
+        let (manager, _, id) = manager();
+        lock(&manager.state).sessions[0].cage.clear();
+        assert!(matches!(lock(&manager.state).task_cage(&id), Err(Error::NoCage)));
+    }
 
     #[tokio::test]
     async fn delete_refuses_a_project_that_is_starting() {
