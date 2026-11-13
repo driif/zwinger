@@ -464,6 +464,8 @@ pub mod fake {
         pub trust_fail: Arc<Mutex<bool>>,
         /// The VM names that `reap` removes.
         pub reaped: Arc<Mutex<Vec<String>>>,
+        /// Each `reap` fails.
+        pub reap_fail: Arc<Mutex<bool>>,
         /// How long each stop takes.
         pub stop_delay: Arc<Mutex<Duration>>,
         /// The stops that run now, and the most that ran at once.
@@ -542,6 +544,9 @@ pub mod fake {
 
         async fn reap(&self) -> Result<Vec<String>> {
             self.log.lock().unwrap().push("reap".into());
+            if *self.reap_fail.lock().unwrap() {
+                return Err(Error::Io(std::io::Error::other("reap failed")));
+            }
             Ok(self.reaped.lock().unwrap().clone())
         }
 

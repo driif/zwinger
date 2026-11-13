@@ -1043,7 +1043,6 @@ mod tests {
     use super::*;
     use crate::host_agents::login::{self as host_login};
     use crate::network::{Action, DefaultAction, Inject, Rule, Target};
-    use crate::secrets::fake::MemoryVault;
     use dial::fake::FakeResolver;
     use inject::TokenSource;
 
@@ -1104,9 +1103,7 @@ mod tests {
     }
 
     async fn fixture(policy: NetworkPolicy, logins: Vec<Arc<Login>>, refresh: Vec<&'static str>) -> Fixture {
-        let ca = Arc::new(
-            Ca::load(&MemoryVault::default(), &std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap(),
-        );
+        let ca = Arc::new(Ca::load(&std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap());
         let resolver = FakeResolver { loopback: true, ..FakeResolver::default() };
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         resolver.names.lock().unwrap().insert("api.test".into(), vec![ip("127.0.0.1")]);

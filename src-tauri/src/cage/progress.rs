@@ -20,7 +20,7 @@ pub enum Phase {
     Prepare,
     /// The copy of an agent profile.
     Profile(AgentKind),
-    /// The CA load and the proxy start.
+    /// The proxy start.
     Proxy,
     Boot,
     /// The checks and the setup in the guest after the boot. They run at

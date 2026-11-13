@@ -1,6 +1,6 @@
-//! The zwinger CA of this app install: an ECDSA P-256 key in the vault (the
-//! macOS Keychain), and a self-signed certificate that each app run makes
-//! again from the key and writes for the guests. The proxy signs one leaf
+//! The zwinger CA of this app run: a new ECDSA P-256 key that stays only in
+//! memory, and its self-signed certificate, which is written for the guests.
+//! The proxy signs one leaf
 //! certificate per host and keeps the newest in a bounded cache. It signs
 //! with no lock held, and once for concurrent requests of one host.
 
@@ -19,11 +19,10 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::OnceCell;
 
-use crate::error::{Error, Result};
-use crate::secrets::{SecretValue, Vault};
+use sha2::{Digest, Sha256};
 
-/// The vault entry of the CA key, as `(project id, name)`. No project has this id.
-pub const KEY_ENTRY: (&str, &str) = ("zwinger", "PROXY_CA_KEY");
+use crate::error::{Error, Result};
+
 /// The file of the CA certificate in [`Ca::dir`], bound read-only into each guest.
 pub const CERT_FILE: &str = "zwinger-ca.pem";
 /// The leaf certificates that stay cached.
@@ -50,8 +49,7 @@ fn ca_error(e: impl std::fmt::Display) -> Error {
     Error::Proxy(format!("the zwinger CA: {e}"))
 }
 
-/// The same name and constraints at each run, so the leaves of one key
-/// chain to each certificate that the key signed.
+/// The name and constraints of the CA certificate.
 fn params() -> CertificateParams {
     let mut params = CertificateParams::default();
     let mut name = DistinguishedName::new();
@@ -68,22 +66,14 @@ pub fn provider() -> Arc<CryptoProvider> {
 }
 
 impl Ca {
-    /// Reads the key from the vault, or makes and stores a new one when the
-    /// vault has none. A vault that fails or does not answer fails the load,
-    /// so no cage starts without its CA.
-    pub fn load(vault: &dyn Vault, dir: &Path) -> Result<Self> {
-        let (project, name) = KEY_ENTRY;
-        let key = match vault.get(project, name)? {
-            Some(pem) => KeyPair::from_pem(pem.expose()).map_err(ca_error)?,
-            None => {
-                let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(ca_error)?;
-                vault.set(project, name, &SecretValue::new(key.serialize_pem()))?;
-                key
-            }
-        };
+    /// Makes a new key and writes its certificate to `dir`. The key is never written.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(ca_error)?;
         let cert = params().self_signed(&key).map_err(ca_error)?;
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(dir.join(CERT_FILE), cert.pem())?;
+        let file = dir.join(CERT_FILE);
+        std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&file, cert.pem()))
+            .map_err(|e| ca_error(format!("cannot write the certificate to {}: {e}", file.display())))?;
         Ok(Self {
             der: cert.der().clone(),
             issuer: Issuer::new(params(), key),
@@ -93,6 +83,11 @@ impl Ca {
             #[cfg(test)]
             signed: Default::default(),
         })
+    }
+
+    /// The SHA-256 of the certificate DER, as colon hex.
+    pub fn fingerprint(&self) -> String {
+        Sha256::digest(&self.der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
     }
 
     /// The folder of [`CERT_FILE`] below the app data.
@@ -158,51 +153,46 @@ impl Ca {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::fake::MemoryVault;
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("zwinger-ca-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
-    fn the_key_stays_in_the_vault_and_the_cert_is_written() {
-        let vault = MemoryVault::default();
+    fn each_load_makes_a_new_key_and_writes_only_the_cert() {
         let dir = temp_dir();
-        let first = Ca::load(&vault, &dir).unwrap();
-        let key = vault.get(KEY_ENTRY.0, KEY_ENTRY.1).unwrap().unwrap();
-        assert!(key.expose().contains("PRIVATE KEY"));
+        let first = Ca::load(&dir).unwrap();
         let written = std::fs::read_to_string(dir.join(CERT_FILE)).unwrap();
         assert!(written.starts_with("-----BEGIN CERTIFICATE-----"), "{written}");
         assert!(!written.contains("PRIVATE"));
-        assert!(!first.der().is_empty());
-        // A second load keeps the key.
-        Ca::load(&vault, &dir).unwrap();
-        assert_eq!(vault.get(KEY_ENTRY.0, KEY_ENTRY.1).unwrap().unwrap(), key);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let second = Ca::load(&dir).unwrap();
+        assert_ne!(first.der(), second.der());
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        assert_ne!(std::fs::read_to_string(dir.join(CERT_FILE)).unwrap(), written);
     }
 
     #[test]
-    fn a_vault_that_fails_fails_the_load() {
-        struct Broken;
-        impl Vault for Broken {
-            fn set(&self, _: &str, _: &str, _: &SecretValue) -> Result<()> {
-                Err(Error::KeychainTimeout)
-            }
-            fn get(&self, _: &str, _: &str) -> Result<Option<SecretValue>> {
-                Err(Error::KeychainTimeout)
-            }
-            fn delete(&self, _: &str, _: &str) -> Result<()> {
-                Ok(())
-            }
-            fn accounts(&self) -> Result<Vec<String>> {
-                Ok(Vec::new())
-            }
-        }
-        assert!(matches!(Ca::load(&Broken, &temp_dir()), Err(Error::KeychainTimeout)));
+    fn the_fingerprint_is_the_sha256_of_the_der_in_colon_hex() {
+        let ca = Ca::load(&temp_dir()).unwrap();
+        let fp = ca.fingerprint();
+        assert_eq!(fp.len(), 32 * 3 - 1, "{fp}");
+        let hex: String = Sha256::digest(ca.der()).iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(fp.replace(':', ""), hex);
+    }
+
+    #[test]
+    fn a_cert_that_cannot_be_written_fails_the_load_with_its_path() {
+        let file = temp_dir();
+        std::fs::write(&file, "not a dir").unwrap();
+        let e = Ca::load(&file).unwrap_err().to_string();
+        assert!(e.contains("cannot write the certificate to"), "{e}");
+        assert!(e.contains(CERT_FILE), "{e}");
     }
 
     #[tokio::test]
     async fn leaves_are_cached_per_host_and_bounded() {
-        let ca = Ca::load(&MemoryVault::default(), &temp_dir()).unwrap();
+        let ca = Ca::load(&temp_dir()).unwrap();
         let a = ca.server_config("a.example").await.unwrap();
         assert!(Arc::ptr_eq(&a, &ca.server_config("a.example").await.unwrap()));
         assert_eq!(a.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
@@ -216,7 +206,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_requests_for_a_host_share_one_signature() {
-        let ca = Arc::new(Ca::load(&MemoryVault::default(), &temp_dir()).unwrap());
+        let ca = Arc::new(Ca::load(&temp_dir()).unwrap());
         let tasks: Vec<_> = (0..16)
             .map(|i| {
                 let ca = ca.clone();

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -92,14 +93,15 @@ impl<R: SandboxRuntime> Manager<R> {
                 Err(e) => return fail(e, &mut timings),
             }
         };
+        if let Err(e) = self.reap_leftovers().await {
+            return fail(e, &mut timings);
+        }
         progress.begin(Phase::Prepare);
-        // The CA load reads the Keychain, as the host logins of `prepare` do, so the two wait at once.
-        let prepared = {
+        let (prepared, prepare_took) = {
             let (host, data, project, progress) =
                 (self.host.clone(), self.data.clone(), project.clone(), progress.clone());
-            timed(blocking(move || prepare(&host, &data, &project, &|phase| progress.begin(phase))))
+            timed(blocking(move || prepare(&host, &data, &project, &|phase| progress.begin(phase)))).await
         };
-        let ((prepared, prepare_took), (ca, ca_took)) = tokio::join!(prepared, timed(self.ca()));
         let Prepared { mut binds, wanted, mut run, tokens, profiles, tui_probe } = match prepared {
             Ok(prepared) => prepared,
             Err(e) => return fail(e, &mut timings),
@@ -108,12 +110,9 @@ impl<R: SandboxRuntime> Manager<R> {
             timings.add(Phase::Profile(kind), took);
         }
         timings.add(Phase::Prepare, prepare_took);
-        if let Err(e) = ca {
-            return fail(e, &mut timings);
-        }
         progress.begin(Phase::Proxy);
         let (proxy, proxy_took) = timed(self.start_proxy(id, &project, live, tokens)).await;
-        timings.add(Phase::Proxy, ca_took + proxy_took);
+        timings.add(Phase::Proxy, proxy_took);
         let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
             Err(e) => return fail(e, &mut timings),
@@ -304,16 +303,23 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// The zwinger CA, loaded once. The Keychain read runs off the async workers.
-    pub(crate) async fn ca(&self) -> Result<Arc<Ca>> {
-        let ca = self
-            .ca
-            .get_or_try_init(|| {
-                let (vault, dir) = (self.vault.clone(), Ca::dir(&self.data));
-                blocking(move || Ok(Arc::new(Ca::load(vault.as_ref(), &dir)?)))
-            })
-            .await?;
-        Ok(ca.clone())
+    /// Reaps the VMs of the last run if the boot reap failed: they trust a
+    /// CA whose key is gone. Concurrent starts reap once. While the reap
+    /// fails, each start fails.
+    async fn reap_leftovers(&self) -> Result<()> {
+        let _gate = self.reap_gate.lock().await;
+        if !self.reap_pending.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let why = match tokio::time::timeout(crate::REAP_LIMIT, self.runtime.reap()).await {
+            Ok(Ok(_)) => {
+                self.reap_pending.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "the reap timed out".to_owned(),
+        };
+        Err(Error::Io(std::io::Error::other(format!("the VMs of the last app run are not stopped: {why}"))))
     }
 
     /// Starts the cage's proxy. Its log entries go to the project's ring and the sink.
@@ -324,7 +330,7 @@ impl<R: SandboxRuntime> Manager<R> {
         live: Arc<Live>,
         tokens: Vec<HostToken>,
     ) -> Result<Proxy> {
-        let ca = self.ca().await?;
+        let ca = self.ca.clone();
         let logins = project
             .logins
             .iter()
@@ -927,8 +933,7 @@ mod tests {
         ));
 
         manager.start(&id).await.unwrap();
-        let accounts: Vec<String> = vault.values.lock().unwrap().keys().cloned().collect();
-        assert_eq!(accounts, [secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1)], "only the CA key");
+        assert!(vault.values.lock().unwrap().is_empty(), "the vault holds no CA key and no login");
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "$MSB_CLAUDE_CODE_OAUTH_TOKEN$".to_owned())));
         assert!(!format!("{net:?}").contains("sk-ant-oat-real"));

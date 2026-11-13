@@ -53,4 +53,10 @@ Do not give a credential to a host that sends requests back, for example `httpbi
 `echo.*` host. The app shows a warning.
 :::
 
-The proxy uses its own certificate authority for HTTPS. Each cage start adds it to the trust store of the cage.
+The proxy uses its own certificate authority (CA) for HTTPS. Each app start makes a new CA. Its private key stays
+only in the memory of the app: no file and no Keychain item holds it. The app writes only the CA certificate to disk,
+and logs its SHA-256 fingerprint once (`proxy CA sha256 …`). Each cage start puts the current CA in the trust store
+of the cage and removes the CA of an earlier app start.
+
+At each app start, the app stops the VMs that the last run left running. If this stop fails, the first cage start
+stops them again. While it fails, no cage starts.

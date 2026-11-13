@@ -95,7 +95,8 @@ fn report_panics(app: AppHandle) {
 
 /// Removes the VMs of an earlier run, loads the projects and makes the
 /// manager. The manager starts with no VMs, so every cage shows as
-/// stopped; a notice names the removed VMs.
+/// stopped; a notice names the removed VMs. If the reap fails, the first
+/// cage start reaps again.
 fn boot<R: SandboxRuntime>(
     runtime: R,
     vault: Arc<dyn Vault>,
@@ -106,18 +107,22 @@ fn boot<R: SandboxRuntime>(
     // The timer must be made inside the runtime, so it is in the future.
     let reaped = tauri::async_runtime::block_on(async { tokio::time::timeout(REAP_LIMIT, runtime.reap()).await });
     let reaped = match reaped {
-        Ok(Ok(reaped)) => reaped,
+        Ok(Ok(reaped)) => Some(reaped),
         Ok(Err(e)) => {
             eprintln!("reap failed: {e}");
-            Vec::new()
+            None
         }
         Err(_) => {
             eprintln!("reap timed out");
-            Vec::new()
+            None
         }
     };
     let store = store::Store::new(data.join(store::FILE));
     let manager = Manager::new(runtime, store, vault, data.to_owned(), host)?;
+    let Some(reaped) = reaped else {
+        manager.reap_pending.store(true, Ordering::SeqCst);
+        return Ok(manager);
+    };
     if !reaped.is_empty() {
         let projects = manager.list();
         let names: Vec<String> = reaped
@@ -393,6 +398,84 @@ mod tests {
             ["zwinger stopped the VMs that the last run left running: proj, zwinger-gone."]
         );
         assert!(manager.take_app_notices().is_empty());
+    }
+
+    fn host_agents(dir: &Path) -> Arc<HostAgents> {
+        Arc::new(HostAgents::new(
+            Arc::new(FakeFs::default()),
+            Arc::new(FakeLogins::default()),
+            Arc::new(FakeClock(0.into())),
+            dir.to_owned(),
+        ))
+    }
+
+    /// Boots with two stored projects whose folders are outside the app data.
+    fn boot_two(runtime: &FakeRuntime) -> (Manager<FakeRuntime>, [String; 2]) {
+        let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let root = root.canonicalize().unwrap();
+        let projects = ["a", "b"].map(|name| {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            cage::Project::new(root.join(name).to_str().unwrap()).unwrap()
+        });
+        store::Store::new(root.join("data/projects.json")).save(&projects).unwrap();
+        let data = root.join("data");
+        let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host_agents(&root)).unwrap();
+        (manager, projects.map(|p| p.id))
+    }
+
+    fn reaps(runtime: &FakeRuntime) -> usize {
+        runtime.log.lock().unwrap().iter().filter(|l| *l == "reap").count()
+    }
+
+    #[test]
+    fn a_failed_boot_reap_reaps_at_the_first_start() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        let (manager, [a, b]) = boot_two(&runtime);
+        assert_eq!(reaps(&runtime), 1);
+        *runtime.reap_fail.lock().unwrap() = false;
+        tauri::async_runtime::block_on(async {
+            manager.start(&a).await.unwrap();
+            manager.start(&b).await.unwrap();
+        });
+        let log = runtime.log.lock().unwrap().clone();
+        assert_eq!(log, ["reap".to_owned(), "reap".into(), format!("start {a}"), format!("start {b}")]);
+    }
+
+    #[test]
+    fn a_reap_that_still_fails_blocks_each_start() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        let (manager, [a, _]) = boot_two(&runtime);
+        for _ in 0..2 {
+            let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+            assert!(e.to_string().contains("the VMs of the last app run are not stopped: reap failed"), "{e}");
+        }
+        assert_eq!(*runtime.log.lock().unwrap(), ["reap", "reap", "reap"]);
+        assert_eq!(manager.list()[0].status, cage::manager::Status::Stopped);
+    }
+
+    #[test]
+    fn concurrent_starts_reap_once() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        let (manager, [a, b]) = boot_two(&runtime);
+        *runtime.reap_fail.lock().unwrap() = false;
+        let (ra, rb) = tauri::async_runtime::block_on(async { tokio::join!(manager.start(&a), manager.start(&b)) });
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(reaps(&runtime), 2);
+        assert_eq!(runtime.log.lock().unwrap()[..2], ["reap", "reap"]);
+    }
+
+    #[test]
+    fn a_successful_boot_reap_gives_no_second_reap() {
+        let runtime = FakeRuntime::default();
+        let (manager, [a, _]) = boot_two(&runtime);
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        assert_eq!(*runtime.log.lock().unwrap(), ["reap".to_owned(), format!("start {a}")]);
     }
 
     #[test]

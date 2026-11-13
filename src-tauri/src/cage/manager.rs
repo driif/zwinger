@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use serde::Serialize;
@@ -14,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
 use crate::network::{self, Action, RuleDraft, Target};
-use crate::proxy::ca::{self, Ca};
+use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, SessionKind};
@@ -48,8 +49,12 @@ pub struct Manager<R: SandboxRuntime> {
     /// the app data dir and `~/.zwinger`.
     pub(crate) reserved: Vec<PathBuf>,
     pub(crate) vault: Arc<dyn Vault>,
-    /// The zwinger CA, loaded at the first start.
-    pub(crate) ca: tokio::sync::OnceCell<Arc<Ca>>,
+    /// The zwinger CA of this app run.
+    pub(crate) ca: Arc<Ca>,
+    /// The boot reap failed, so the VMs of the last run can still run. The
+    /// next cage start reaps them first, under `reap_gate`.
+    pub(crate) reap_pending: AtomicBool,
+    pub(crate) reap_gate: tokio::sync::Mutex<()>,
     /// Serializes the secret edits, so that a rollback cannot undo a later edit.
     /// The state lock is not held during vault calls.
     pub(crate) secret_edit: Mutex<()>,
@@ -166,6 +171,9 @@ pub enum Status {
     Error { message: String },
 }
 
+/// The vault account of the CA key of older versions. The prune keeps it and never reads it.
+const LEGACY_CA_KEY: &str = "zwinger/PROXY_CA_KEY";
+
 /// Deletes the values that no configured secret uses, such as the values of a
 /// project whose delete failed. A failure does not stop the app load.
 pub(crate) fn prune_vault(vault: &dyn Vault, projects: &[Project]) {
@@ -174,12 +182,11 @@ pub(crate) fn prune_vault(vault: &dyn Vault, projects: &[Project]) {
         Err(e) => return eprintln!("secret prune: cannot list the vault: {e}"),
     };
     // A host login has no value in the vault, so its account is not kept.
-    let mut configured: HashSet<String> = projects
+    let configured: HashSet<String> = projects
         .iter()
         .flat_map(|project| project.network.credentials().into_iter().map(|c| secrets::account(&project.id, &c.name)))
         .collect();
-    configured.insert(secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1));
-    for account in accounts.iter().filter(|a| !configured.contains(*a)) {
+    for account in accounts.iter().filter(|a| *a != LEGACY_CA_KEY && !configured.contains(*a)) {
         let Some((project_id, name)) = account.split_once('/') else {
             continue;
         };
@@ -225,13 +232,17 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf, host: Arc<HostAgents>) -> Result<Self> {
         let projects = store.load()?;
         prune_vault(vault.as_ref(), &projects);
+        let ca = Ca::load(&Ca::dir(&data))?;
+        eprintln!("proxy CA sha256 {}", ca.fingerprint());
         Ok(Self {
             runtime,
             store,
             reserved: reserved_dirs(&data, dirs::home_dir()),
             data,
             vault,
-            ca: tokio::sync::OnceCell::new(),
+            ca: Arc::new(ca),
+            reap_pending: AtomicBool::new(false),
+            reap_gate: tokio::sync::Mutex::new(()),
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
             state: Arc::new(Mutex::new(State {
@@ -767,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn load_prunes_values_with_no_credential_and_keeps_the_ca_key() {
+    fn load_prunes_values_with_no_credential_and_keeps_the_legacy_ca_key() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("projects.json"));
         let vault = vault();
@@ -776,15 +787,17 @@ mod tests {
         credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.set("deleted-project", "KEY", &SecretValue::new("y")).unwrap();
-        vault.set(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1, &SecretValue::new("ca")).unwrap();
+        vault.set("zwinger", "PROXY_CA_KEY", &SecretValue::new("ca")).unwrap();
+        vault.set("zwinger", "OTHER", &SecretValue::new("z")).unwrap();
 
         Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let mut accounts = vault.accounts().unwrap();
         accounts.sort();
-        let mut kept = [secrets::account(&id, "KEY"), secrets::account(ca::KEY_ENTRY.0, ca::KEY_ENTRY.1)];
+        let mut kept = [secrets::account(&id, "KEY"), "zwinger/PROXY_CA_KEY".to_owned()];
         kept.sort();
         assert_eq!(accounts, kept);
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("keep"));
+        assert_eq!(stored(&vault, "zwinger", "PROXY_CA_KEY").as_deref(), Some("ca"));
     }
 
     #[test]

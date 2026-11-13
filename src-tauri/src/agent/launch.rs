@@ -224,25 +224,52 @@ pub fn profile_argv() -> Vec<String> {
     ["/bin/sh", "-c", &script, "sh", &profile()].map(str::to_owned).into()
 }
 
-/// The root exec that adds the zwinger CA to the system trust. With no
-/// system bundle, the bundle holds only this CA.
+/// The lines around the zwinger CA in [`CA_BUNDLE`].
+const BEGIN: &str = "# BEGIN zwinger proxy CA";
+const END: &str = "# END zwinger proxy CA";
+
+/// Drops the marked block, and each PEM outside it that is equal to the
+/// previous CA (`ARGV[1]`) or the new CA (`ARGV[2]`), from the bundle
+/// (`ARGV[3]`). An updater can copy the previous CA outside the block.
+const STRIP: &str = r#"FILENAME == ARGV[1] { prev = prev $0 "\n"; next }
+FILENAME == ARGV[2] { next_ca = next_ca $0 "\n"; next }
+$0 == "BEGIN_MARK" { skip = 1 }
+skip { if ($0 == "END_MARK") skip = 0; next }
+pem != "" || $0 == "-----BEGIN CERTIFICATE-----" {
+  pem = pem $0 "\n"
+  if ($0 == "-----END CERTIFICATE-----") { if (pem != prev && pem != next_ca) printf "%s", pem; pem = "" }
+  next
+}
+{ print }
+END { printf "%s", pem }"#;
+
+/// The root exec that adds the zwinger CA to the system trust. Each app run
+/// has a new CA, so the previous CA is removed from the whole bundle and the
+/// marked block holds only the new CA. With no system bundle, the bundle
+/// holds only this CA.
 pub fn trust_argv() -> Vec<String> {
     let dir = LOCAL_CA.rsplit_once('/').expect("a dir").0;
+    let strip = STRIP.replace("BEGIN_MARK", BEGIN).replace("END_MARK", END);
     let script = [
         "set -e".to_owned(),
+        "prev=$(mktemp)".to_owned(),
+        "tmp=$(mktemp)".to_owned(),
+        "trap 'rm -f \"$prev\" \"$tmp\"' EXIT".to_owned(),
+        // The local copy of the last run is the previous CA.
+        format!("[ ! -f {LOCAL_CA} ] || cat {LOCAL_CA} > \"$prev\""),
         format!("mkdir -p {dir}"),
         format!("cp {CA_CERT} {LOCAL_CA}"),
         "if command -v update-ca-certificates >/dev/null 2>&1; then".to_owned(),
         "  update-ca-certificates >/dev/null".to_owned(),
-        format!("elif [ -f {CA_BUNDLE} ]; then"),
-        // The second line of the PEM is unique to the CA, so a second run appends nothing.
-        format!("  grep -qF \"$(sed -n 2p {CA_CERT})\" {CA_BUNDLE} || cat {CA_CERT} >> {CA_BUNDLE}"),
-        "else".to_owned(),
+        format!("elif [ ! -f {CA_BUNDLE} ]; then"),
         // All TLS of the cage goes through the proxy, so a bundle with only
         // the zwinger CA is complete.
         format!("  mkdir -p \"$(dirname {CA_BUNDLE})\""),
-        format!("  cp {CA_CERT} {CA_BUNDLE}"),
+        format!("  : > {CA_BUNDLE}"),
         "fi".to_owned(),
+        format!("awk '{strip}' \"$prev\" {CA_CERT} {CA_BUNDLE} > \"$tmp\""),
+        // `cat >` writes through a symlinked bundle.
+        format!("{{ cat \"$tmp\"; echo '{BEGIN}'; cat {CA_CERT}; echo '{END}'; }} > {CA_BUNDLE}"),
     ]
     .join("\n");
     ["/bin/sh", "-c", &script].map(str::to_owned).into()
@@ -517,48 +544,72 @@ mod tests {
     fn trust_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("zwinger-trust-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("tools")).unwrap();
-        std::fs::write(root.join("ca.pem"), "-----BEGIN CERTIFICATE-----\nZWINGERCA\n-----END CERTIFICATE-----\n")
-            .unwrap();
         root
     }
 
-    #[test]
-    fn trust_appends_the_ca_to_the_bundle_once() {
-        let root = trust_root();
-        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
-        for _ in 0..2 {
-            let out = trust(&root, &root.join("tools"));
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        }
-        let bundle = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
-        assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
-        assert_eq!(bundle.matches("ZWINGERCA").count(), 1, "{bundle}");
-        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-ca.crt")).unwrap();
-        assert!(local.contains("ZWINGERCA"));
+    /// Writes the CA of a run with the key `key`, and runs the trust script.
+    fn trust_with(root: &Path, key: &str) -> String {
+        std::fs::write(root.join("ca.pem"), format!("-----BEGIN CERTIFICATE-----\n{key}\n-----END CERTIFICATE-----\n"))
+            .unwrap();
+        let out = trust(root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read_to_string(root.join("bundle.crt")).unwrap()
+    }
+
+    /// The bundle has one marked block, with the newest key, and has the
+    /// newest key once and the old key nowhere.
+    fn assert_one_block(bundle: &str, key: &str, old: &str) {
+        assert!(!bundle.contains(old), "{bundle}");
+        assert_eq!(bundle.matches(key).count(), 1, "{bundle}");
+        assert_eq!(bundle.matches(BEGIN).count(), 1, "{bundle}");
+        assert_eq!(bundle.matches(END).count(), 1, "{bundle}");
+        let block = &bundle[bundle.find(BEGIN).unwrap()..];
+        assert!(block.contains(key), "{bundle}");
+        assert!(!block.contains(old), "{bundle}");
+        assert!(block.ends_with(&format!("{END}\n")), "{bundle}");
     }
 
     #[test]
-    fn trust_prefers_update_ca_certificates() {
+    fn trust_replaces_the_block_in_the_bundle() {
+        let root = trust_root();
+        // A symlinked bundle, as Debian has in some images: it stays a link.
+        std::fs::write(root.join("roots.crt"), "SYSTEM ROOTS").unwrap();
+        std::os::unix::fs::symlink(root.join("roots.crt"), root.join("bundle.crt")).unwrap();
+        trust_with(&root, "KEY1");
+        let bundle = trust_with(&root, "KEY2");
+        assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
+        assert!(!bundle.contains("KEY1"), "{bundle}");
+        assert_one_block(&bundle, "KEY2", "KEY1");
+        assert!(std::fs::symlink_metadata(root.join("bundle.crt")).unwrap().file_type().is_symlink());
+        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-ca.crt")).unwrap();
+        assert!(local.contains("KEY2"));
+    }
+
+    #[test]
+    fn trust_runs_update_ca_certificates_and_replaces_the_block() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = trust_root();
         let tool = root.join("tools/update-ca-certificates");
-        std::fs::write(&tool, format!("#!/bin/sh\necho ran > {}\n", root.join("ran").display())).unwrap();
+        let local = root.join("local/ca-certificates/zwinger-ca.crt");
+        let bundle = root.join("bundle.crt");
+        std::fs::write(&tool, format!("#!/bin/sh\ncat {} >> {}\n", local.display(), bundle.display())).unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
-        let out = trust(&root, &root.join("tools"));
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(root.join("ran").exists());
-        assert_eq!(std::fs::read_to_string(root.join("bundle.crt")).unwrap(), "SYSTEM ROOTS\n");
+        std::fs::write(&bundle, "SYSTEM ROOTS\n").unwrap();
+        trust_with(&root, "KEY1");
+        let text = trust_with(&root, "KEY2");
+        assert!(text.starts_with("SYSTEM ROOTS\n"), "{text}");
+        assert_one_block(&text, "KEY2", "KEY1");
     }
 
     #[test]
     fn trust_makes_a_bundle_with_only_the_ca() {
         let root = trust_root();
-        let out = trust(&root, &root.join("tools"));
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let bundle = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
-        assert_eq!(bundle.matches("ZWINGERCA").count(), 1, "{bundle}");
+        trust_with(&root, "KEY1");
+        let bundle = trust_with(&root, "KEY2");
+        assert!(bundle.starts_with(BEGIN), "{bundle}");
+        assert!(!bundle.contains("KEY1"), "{bundle}");
+        assert_one_block(&bundle, "KEY2", "KEY1");
         // A later install of ca-certificates picks it up.
         assert!(root.join("local/ca-certificates/zwinger-ca.crt").exists());
     }
