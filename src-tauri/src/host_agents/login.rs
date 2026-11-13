@@ -1,6 +1,6 @@
-//! The host login of an agent (ADR 0002). zwinger reads the subscription
-//! token on the Mac at each cage start and never writes the host Keychain
-//! or the host login files. The guest gets a login with placeholders only:
+//! The file host login of an agent (ADR 0002). zwinger reads the subscription
+//! token on the Mac at each cage start and never writes the host login files.
+//! The guest gets a login with placeholders only:
 //! the proxy puts the real access token into the `authorization` header of
 //! requests to the provider's exact hosts. The refresh token in the guest is
 //! an inert literal that no secret replaces, and the proxy blocks the refresh
@@ -9,24 +9,15 @@
 //! with no restart. Gemini CLI checks its cached token at the tokeninfo
 //! endpoint of `oauth2.googleapis.com`: the proxy answers that one request.
 
-use std::fmt;
-use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::sync::LazyLock;
-#[cfg(target_os = "macos")]
-use std::sync::mpsc::{self, Sender};
-#[cfg(target_os = "macos")]
-use std::time::Duration;
-
 use base64::Engine;
 use serde_json::{Map, Value};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{AgentKind, cli};
 use crate::error::{Error, Result};
 use crate::secrets::{Origin, Places, Secret, SecretValue};
 
-/// The Keychain item of Claude Code's login.
-const CLAUDE_SERVICE: &str = "Claude Code-credentials";
 /// A login file over this size is refused.
 const FILE_LIMIT: u64 = 1 << 20;
 /// The refresh token in the guest. No secret replaces it.
@@ -104,7 +95,9 @@ fn copilot_endpoint(access: &str) -> Option<(String, usize)> {
 /// providers of the cage's host logins.
 pub fn denied_hosts(secrets: &[Secret]) -> Vec<&'static str> {
     let mut denied = Vec::new();
-    for secret in secrets.iter().filter(|s| matches!(s.origin, Origin::HostLogin { .. })) {
+    for secret in
+        secrets.iter().filter(|s| matches!(s.origin, Origin::HostLogin { agent } if agent != AgentKind::Claude))
+    {
         for provider in secret.hosts.iter().filter_map(|h| provider_of(h)) {
             for host in provider.refresh {
                 if !denied.contains(host) {
@@ -129,41 +122,29 @@ pub fn secret_name(kind: AgentKind) -> &'static str {
 
 /// The login of an agent on the Mac.
 pub trait LoginSource: Send + Sync {
-    /// The login document, `None` if there is none. The Keychain read has a
-    /// timeout.
+    /// The login document, `None` if there is none.
     fn read(&self, kind: AgentKind) -> Result<Option<String>>;
-    /// If a login exists. It reads no secret, so macOS shows no prompt.
-    fn exists(&self, kind: AgentKind) -> bool;
 }
 
-/// The real logins: the Keychain for Claude Code, files for the others.
+/// The file logins of Codex, pi and Gemini.
 pub struct HostLogins {
     pub home: PathBuf,
 }
 
 impl HostLogins {
-    fn file(&self, kind: AgentKind) -> PathBuf {
+    fn file(&self, kind: AgentKind) -> Option<PathBuf> {
         match kind {
-            AgentKind::Codex => self.home.join(".codex/auth.json"),
-            AgentKind::Pi => self.home.join(".pi/agent/auth.json"),
-            _ => self.home.join(".gemini/oauth_creds.json"),
+            AgentKind::Codex => Some(self.home.join(".codex/auth.json")),
+            AgentKind::Pi => Some(self.home.join(".pi/agent/auth.json")),
+            AgentKind::Gemini => Some(self.home.join(".gemini/oauth_creds.json")),
+            AgentKind::Claude => None,
         }
     }
 }
 
 impl LoginSource for HostLogins {
     fn read(&self, kind: AgentKind) -> Result<Option<String>> {
-        if kind == AgentKind::Claude {
-            return read_keychain();
-        }
-        read_file(&self.file(kind))
-    }
-
-    fn exists(&self, kind: AgentKind) -> bool {
-        if kind == AgentKind::Claude {
-            return keychain_exists();
-        }
-        self.file(kind).is_file()
+        self.file(kind).map_or(Ok(None), |file| read_file(&file))
     }
 }
 
@@ -177,110 +158,6 @@ fn read_file(path: &Path) -> Result<Option<String>> {
     let mut text = String::new();
     file.take(FILE_LIMIT).read_to_string(&mut text)?;
     Ok(Some(text))
-}
-
-/// The longest wait for a Keychain call, which can show the macOS access prompt.
-#[cfg(target_os = "macos")]
-const KEYCHAIN_LIMIT: Duration = Duration::from_secs(60);
-
-#[cfg(target_os = "macos")]
-type Job = Box<dyn FnOnce() + Send>;
-
-/// One thread that runs its jobs one after another, in submit order.
-#[cfg(target_os = "macos")]
-struct Worker(Sender<Job>);
-
-#[cfg(target_os = "macos")]
-impl Worker {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("zwinger-keychain".into())
-            .spawn(move || {
-                for job in rx {
-                    job();
-                }
-            })
-            .expect("spawn the Keychain worker");
-        Self(tx)
-    }
-
-    /// Runs `f` after the jobs before it. `None` if it does not end in
-    /// `limit`: it then still runs, and the jobs after it wait for it.
-    fn run<T: Send + 'static>(&self, limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (tx, rx) = mpsc::channel();
-        // The thread never ends, so the send cannot fail.
-        let _ = self.0.send(Box::new(move || {
-            let _ = tx.send(f());
-        }));
-        rx.recv_timeout(limit).ok()
-    }
-}
-
-/// The worker of all Keychain calls, so they run in submit order.
-#[cfg(target_os = "macos")]
-static KEYCHAIN: LazyLock<Worker> = LazyLock::new(Worker::new);
-
-/// Runs a Keychain call on the Keychain worker. `None` if it does not end in
-/// `limit`, such as when nobody answers the macOS prompt.
-#[cfg(target_os = "macos")]
-fn bounded<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    KEYCHAIN.run(limit, f)
-}
-
-/// On the Keychain worker, so a macOS access prompt that nobody answers ends
-/// the wait after `KEYCHAIN_LIMIT`.
-#[cfg(target_os = "macos")]
-fn read_keychain() -> Result<Option<String>> {
-    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-    let found = bounded(KEYCHAIN_LIMIT, || {
-        let mut query = security_framework::item::ItemSearchOptions::new();
-        query
-            .class(security_framework::item::ItemClass::generic_password())
-            .service(CLAUDE_SERVICE)
-            .load_data(true)
-            .limit(1);
-        match query.search() {
-            Ok(mut items) => match items.pop() {
-                Some(security_framework::item::SearchResult::Data(data)) => Ok(Some(data)),
-                _ => Ok(None),
-            },
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-            Err(e) => Err(Error::Keychain(e.to_string())),
-        }
-    });
-    match found {
-        Some(found) => Ok(found?.map(|data| String::from_utf8_lossy(&data).into_owned())),
-        None => Err(Error::Keychain(
-            "no answer from the Keychain; allow access to \"Claude Code-credentials\" in the macOS prompt".into(),
-        )),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn read_keychain() -> Result<Option<String>> {
-    Ok(None)
-}
-
-/// No answer in time counts as no login.
-#[cfg(target_os = "macos")]
-fn keychain_exists() -> bool {
-    bounded(KEYCHAIN_LIMIT, || {
-        let mut query = security_framework::item::ItemSearchOptions::new();
-        query
-            .class(security_framework::item::ItemClass::generic_password())
-            .service(CLAUDE_SERVICE)
-            .load_attributes(true)
-            .load_data(false)
-            .limit(1);
-        query.search().is_ok_and(|items| !items.is_empty())
-    })
-    .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_exists() -> bool {
-    false
 }
 
 /// A host login, read at a cage start.
@@ -347,10 +224,7 @@ pub fn parse(kind: AgentKind, text: &str) -> Result<HostToken> {
     let access = |value: &Value| value.as_str().filter(|s| !s.is_empty()).map(SecretValue::new);
     let mut prefix = String::new();
     let (access, expires, host, pi) = match kind {
-        AgentKind::Claude => {
-            let oauth = &doc["claudeAiOauth"];
-            (access(&oauth["accessToken"]), oauth["expiresAt"].as_i64(), ANTHROPIC.host.to_owned(), None)
-        }
+        AgentKind::Claude => return Err(bad(kind, "use claude setup-token")),
         AgentKind::Codex => {
             let token = access(&doc["tokens"]["access_token"]);
             let expires = token.as_ref().and_then(|t| jwt_expiry(t.expose()));
@@ -389,24 +263,28 @@ pub fn token(source: &dyn LoginSource, kind: AgentKind, now: i64) -> Result<Host
     let text = source.read(kind)?.ok_or_else(|| Error::HostLoginMissing(kind.name().to_owned()))?;
     let token = parse(kind, &text)?;
     if token.expires.is_some_and(|e| e <= now) {
-        return Err(Error::HostLoginExpired(kind.name().to_owned()));
+        return Err(Error::HostLoginExpired(format!(
+            "the {} login on this Mac has expired; open {} on the Mac once to renew it, then start the cage again",
+            kind.name(),
+            kind.name()
+        )));
     }
     Ok(token)
 }
 
-/// What detection shows of a login. A Claude Code login is not read, so
-/// that no macOS prompt shows at app start; its expiry shows at a start.
+/// What detection shows of a login.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum LoginState {
     Found { expires: Option<i64> },
+    SetupToken,
     Expired,
     None,
 }
 
 pub fn state(source: &dyn LoginSource, kind: AgentKind, now: i64) -> LoginState {
     if kind == AgentKind::Claude {
-        return if source.exists(kind) { LoginState::Found { expires: None } } else { LoginState::None };
+        return LoginState::SetupToken;
     }
     match token(source, kind, now) {
         Ok(token) => LoginState::Found { expires: token.expires },
@@ -512,8 +390,6 @@ pub mod fake {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use serde_json::json;
-
     use super::*;
 
     /// Logins from a map; a missing kind has no login.
@@ -526,14 +402,6 @@ pub mod fake {
         fn read(&self, kind: AgentKind) -> Result<Option<String>> {
             Ok(self.docs.lock().unwrap().get(&kind).cloned())
         }
-
-        fn exists(&self, kind: AgentKind) -> bool {
-            self.docs.lock().unwrap().contains_key(&kind)
-        }
-    }
-
-    pub fn claude_doc(token: &str, expires: i64) -> String {
-        json!({ "claudeAiOauth": { "accessToken": token, "refreshToken": "rt-secret", "expiresAt": expires, "scopes": ["user:inference"], "subscriptionType": "max" } }).to_string()
     }
 }
 
@@ -559,20 +427,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_uses_the_keychain_token_and_needs_no_file() {
-        let token = parse(AgentKind::Claude, &claude_doc("sk-ant-oat-1", NOW + 1000)).unwrap();
-        assert_eq!(
-            (token.access.expose(), token.expires, token.host.as_str()),
-            ("sk-ant-oat-1", Some(NOW + 1000), "api.anthropic.com")
-        );
-        assert!(guest_files(&token, "$MSB_X$", NOW).is_empty());
-        let secret = secret(token.kind, api_host(AgentKind::Claude).unwrap());
-        assert_eq!(secret.name, "CLAUDE_CODE_OAUTH_TOKEN");
-        assert_eq!(
-            (secret.hosts, secret.places.header_fields),
-            (vec!["api.anthropic.com".to_owned()], vec!["authorization".to_owned()])
-        );
-        assert!(!secret.places.query && !secret.places.body);
+    fn claude_detection_asks_for_a_setup_token() {
+        let logins = FakeLogins::default();
+        assert_eq!(state(&logins, AgentKind::Claude, NOW), LoginState::SetupToken);
+        assert!(matches!(parse(AgentKind::Claude, "{}"), Err(Error::HostLogin(..))));
     }
 
     #[test]
@@ -701,12 +559,9 @@ mod tests {
     #[test]
     fn a_missing_or_expired_login_fails_and_detection_shows_it() {
         let logins = FakeLogins::default();
-        assert!(matches!(token(&logins, AgentKind::Claude, NOW), Err(Error::HostLoginMissing(_))));
+        assert!(matches!(token(&logins, AgentKind::Pi, NOW), Err(Error::HostLoginMissing(_))));
         assert_eq!(state(&logins, AgentKind::Pi, NOW), LoginState::None);
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t", NOW - 1));
-        assert!(matches!(token(&logins, AgentKind::Claude, NOW), Err(Error::HostLoginExpired(_))));
-        // The Keychain is not read for detection.
-        assert_eq!(state(&logins, AgentKind::Claude, NOW), LoginState::Found { expires: None });
+        assert_eq!(state(&logins, AgentKind::Claude, NOW), LoginState::SetupToken);
         let pi = |expires: i64| {
             json!({ "github-copilot": { "type": "oauth", "access": "a", "expires": expires } }).to_string()
         };
@@ -732,6 +587,6 @@ mod tests {
         let mut user = claude.clone();
         user.origin = Origin::User;
         assert!(denied_hosts(&[user]).is_empty());
-        assert_eq!(denied_hosts(&[claude.clone(), claude]), ["console.anthropic.com", "platform.claude.com"]);
+        assert!(denied_hosts(&[claude.clone(), claude]).is_empty());
     }
 }

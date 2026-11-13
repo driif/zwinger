@@ -19,7 +19,7 @@ use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::SandboxRuntime;
-use crate::secrets::{self, SecretValue, Vault};
+use crate::secrets::{self, Vault, VaultEntry};
 use crate::session::{Pos, Session};
 use crate::store::Store;
 use crate::task_runs;
@@ -64,7 +64,7 @@ pub struct Manager<R: SandboxRuntime> {
     /// Per account, the value that the saved config expects (`None`: no
     /// value) after a restore that did not end. Until the vault is seen to
     /// hold it, starts and edits that use the account fail.
-    pub(crate) unsettled: Mutex<HashMap<String, Option<SecretValue>>>,
+    pub(crate) unsettled: Mutex<HashMap<String, Option<VaultEntry>>>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
     pub(crate) runs: Arc<task_runs::Registry>,
@@ -173,6 +173,7 @@ pub struct CageView {
     /// The earliest expiry of the host logins that the proxy of the running
     /// VM has now, in ms. The proxy reads a newer login when it is due.
     pub login_expires_at: Option<i64>,
+    pub claude_token: Option<ClaudeTokenView>,
     /// What the start of the running VM did differently for the host
     /// agents, such as a fallback.
     pub host_notices: Vec<String>,
@@ -181,6 +182,13 @@ pub struct CageView {
     pub guest_logins: Vec<AgentKind>,
     /// The phase durations of the start of the running VM.
     pub start_timings: Option<Timings>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeTokenView {
+    pub stored: bool,
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -356,7 +364,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 session: session.clone(),
             })
             .collect();
-        let cages = state.cages.iter().map(|cage| cage_view(&state, cage)).collect();
+        let cages = state.cages.iter().map(|cage| cage_view(&state, cage, self.vault.as_ref())).collect();
         Listing { sessions, cages }
     }
 
@@ -594,6 +602,7 @@ impl<R: SandboxRuntime> Manager<R> {
             return Err(Error::HostAgentMissing(kind.label().to_owned()));
         }
         let login = match (used.login, login::api_host(kind)) {
+            (true, _) if kind == AgentKind::Claude => None,
             (false, _) => None,
             (true, Some(api)) => Some(login::secret(kind, api)),
             // pi's host depends on the provider of its login.
@@ -619,18 +628,27 @@ impl<R: SandboxRuntime> Manager<R> {
             c.put_host_agent(used, login);
             Ok(())
         })?;
-        drop(_edit);
         self.publish(cage_id, None);
+        if kind == AgentKind::Claude {
+            // The login off removed the token credential; its value goes too.
+            self.drop_unused(cage_id, std::iter::once(cage::CLAUDE_TOKEN))?;
+        }
         Ok(())
     }
 
-    /// Also removes its host-login secret. Applies on the next start.
+    /// Also removes its host-login secret, and for Claude its token
+    /// credential and value. Applies on the next start.
     pub fn remove_host_agent(&self, cage_id: &str, kind: AgentKind) -> Result<()> {
         let _edit = lock(&self.secret_edit);
         self.edit_cage(cage_id, |c, _| {
             c.remove_host_agent(kind);
             Ok(())
-        })
+        })?;
+        self.publish(cage_id, None);
+        if kind == AgentKind::Claude {
+            self.drop_unused(cage_id, std::iter::once(cage::CLAUDE_TOKEN))?;
+        }
+        Ok(())
     }
 
     /// Needs no restart: a running VM gets new wrappers at once.
@@ -758,7 +776,7 @@ impl<R: SandboxRuntime> Manager<R> {
 }
 
 /// The cage with the state of its VM.
-fn cage_view<V>(state: &State<V>, cage: &Cage) -> CageView {
+fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
     let session = state.sessions.iter().find(|s| s.cage == cage.id);
     let (status, pending_restart) = match state.vms.get(&cage.id) {
         None => (Status::Stopped, false),
@@ -783,10 +801,25 @@ fn cage_view<V>(state: &State<V>, cage: &Cage) -> CageView {
         pending_restart,
         runtimes,
         login_expires_at,
+        claude_token: claude_token(cage, vault),
         host_notices,
         guest_logins,
         start_timings,
     }
+}
+
+/// Shown when the Claude host login is on or a credential has the token name.
+fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
+    let login = cage.host_agent(AgentKind::Claude).is_some_and(|agent| agent.login);
+    if !login && !cage.network.credentials().iter().any(|c| c.name == cage::CLAUDE_TOKEN) {
+        return None;
+    }
+    let entry = vault.entry(&cage.id, cage::CLAUDE_TOKEN).ok().flatten();
+    Some(ClaudeTokenView {
+        stored: (!login || cage.claude_token_binding().unwrap_or(false))
+            && entry.as_ref().is_some_and(|entry| entry.saved_at.is_some()),
+        expires_at: entry.and_then(|entry| entry.saved_at.map(|at| at.saturating_add(365 * 24 * 60 * 60 * 1000))),
+    })
 }
 
 /// A new name, layout, task, terminal list, unprompted setting or network

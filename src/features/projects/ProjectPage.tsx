@@ -1,4 +1,4 @@
-import { Button, Card, CardBody, CardHeader, CopyField, ElasticTabs, SpringCheckbox } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, CopyField, ElasticTabs, FloatingField, SpringCheckbox } from "@driif/motiv";
 import { Bot, Code, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
@@ -9,7 +9,9 @@ import {
   removeGuestLogin,
   removeHostAgent,
 } from "../settings/api";
-import { confirmPaths } from "./api";
+import { confirmPaths, setClaudeToken } from "./api";
+import { expiresSoon } from "./tokenExpiry";
+import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
 import { RunSummary } from "../tasks/api";
 import {
@@ -21,7 +23,7 @@ import {
   TerminalKind,
 } from "../../shared/api";
 import { time } from "../settings/HostAgentsSettings";
-import { decide, useCatalog } from "../network/network";
+import { decide, ruleMatches, useCatalog } from "../network/network";
 import type { Intent, Pane, Run, Runtimes, TabView, View } from "../../App";
 import { NetworkTab } from "../network/NetworkTab";
 import { SettingsTab } from "../settings/SettingsTab";
@@ -45,26 +47,47 @@ const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
 };
 
 /** The step that adds a host agent to the cage, or changes or removes it. */
-function AddAgent({ cage, detection, kind, run, onDone }: {
+function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   cage: CageView;
   detection: Detection;
   kind: AgentKind;
   run: Run;
   onDone: () => void;
+  onRefresh: () => Promise<unknown>;
 }) {
   const agent = detection.agents.find((a) => a.kind === kind);
   const current = cage.hostAgents.find((a) => a.kind === kind);
   const catalog = useCatalog();
-  const canLogin = agent?.login.state === "found";
+  const canLogin = agent?.login.state === "found" || agent?.login.state === "setupToken";
   const [profile, setProfile] = useState(current?.profile ?? agent?.profile === true);
   const [login, setLogin] = useState(current?.login ?? canLogin);
   const host = LOGIN_HOSTS[kind];
   const blocked = host === undefined || !decide(cage.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
+  const [token, setToken] = useState("");
+  const claude = kind === "claude";
+  const tokenReady =
+    !!cage.claudeToken?.stored && !!cage.claudeToken.expiresAt && cage.claudeToken.expiresAt > Date.now();
+  const allowRule = cage.network.rules.some(
+    (rule) => rule.action === "allow" && ruleMatches(rule, "api.anthropic.com", catalog),
+  );
+  const exactAllow = cage.network.rules.some(
+    (rule) => rule.action === "allow" && rule.target.kind === "host" && rule.target.host === "api.anthropic.com",
+  );
+  const exactBlock = cage.network.rules.some(
+    (rule) => rule.action === "block" && rule.target.kind === "host" && rule.target.host === "api.anthropic.com",
+  );
+  const needsAllow = claude && !exactAllow && (cage.network.default === "block" || exactBlock);
+  const blockedOverride = claude && allowRule && !decide(cage.network, "api.anthropic.com", catalog).allowed;
   if (!agent) return null;
   const name = AGENT_NAMES[kind];
   const save = () =>
-    run(() => putHostAgent(cage.id, { kind, profile, login }, login && blocked && allow).then(onDone));
+    run(() => {
+      if (claude && login && token.trim()) {
+        return setClaudeToken(cage.id, token.trim(), false, profile).then(onDone);
+      }
+      return putHostAgent(cage.id, { kind, profile, login }, !claude && login && blocked && allow).then(onDone);
+    });
 
   return (
     <Card variant="outlined" padding="md">
@@ -90,15 +113,41 @@ function AddAgent({ cage, detection, kind, run, onDone }: {
           disabled={!canLogin && !current?.login}
           onChange={(e) => setLogin(e.target.checked)}
         />
-        {login && blocked && (
+        {login && blocked && !claude && (
           <SpringCheckbox
             label={host ? `Allow ${host}, the provider host` : "Allow the provider host of the pi login"}
             checked={allow}
             onChange={(e) => setAllow(e.target.checked)}
           />
         )}
-        {login && kind === "claude" && (
-          <span className="muted">When the cage starts, macOS asks once to allow access to the login: select Allow.</span>
+        {login && claude && (
+          <>
+            <span className="muted">Run this on your Mac and paste the token below.</span>
+            <CopyField className="mono" value="claude setup-token" />
+            <FloatingField label="Setup token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+            {cage.claudeToken?.expiresAt && (
+              <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"}>
+                expires {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
+                {expiresSoon(cage.claudeToken.expiresAt) && " · run claude setup-token again"}
+              </span>
+            )}
+            {needsAllow && (
+              <Button
+                variant="outline"
+                onClick={() =>
+                  run(() =>
+                    putRule(cage.id, {
+                      target: { kind: "host", host: "api.anthropic.com" },
+                      action: "allow",
+                    }).then(onRefresh),
+                  )
+                }
+              >
+                Allow api.anthropic.com
+              </Button>
+            )}
+            {blockedOverride && <span className="warn">A Block rule overrides the Allow rule for api.anthropic.com.</span>}
+          </>
         )}
         <div className="row end">
           {current && (
@@ -109,7 +158,9 @@ function AddAgent({ cage, detection, kind, run, onDone }: {
           <Button variant="ghost" onClick={onDone}>
             Cancel
           </Button>
-          <Button onClick={save}>{current ? "Save" : "Add"}</Button>
+          <Button onClick={save} disabled={login && claude && (needsAllow || (!token.trim() && !tokenReady))}>
+            {current ? "Save" : "Add"}
+          </Button>
         </div>
       </CardBody>
     </Card>
@@ -308,7 +359,15 @@ export function ProjectPage({
         </Button>
       </header>
       {adding && detection && (
-        <AddAgent key={adding} cage={cage} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
+        <AddAgent
+          key={adding}
+          cage={cage}
+          detection={detection}
+          kind={adding}
+          run={run}
+          onRefresh={onRefresh}
+          onDone={() => onAdding(undefined)}
+        />
       )}
       <div className="notices">
         {unverified.length > 0 && (
@@ -421,7 +480,21 @@ export function ProjectPage({
                       <dt>From this Mac</dt>
                       <dd>
                         {cage.hostAgents
-                          .map((a) => [AGENT_NAMES[a.kind], a.profile && "profile", a.login && "login"].filter(Boolean).join(" + "))
+                          .map((a) =>
+                            [
+                              AGENT_NAMES[a.kind],
+                              a.profile && "profile",
+                              a.login &&
+                                (a.kind === "claude" &&
+                                (!cage.claudeToken?.stored ||
+                                  !cage.claudeToken.expiresAt ||
+                                  cage.claudeToken.expiresAt <= Date.now())
+                                  ? "needs token"
+                                  : "login"),
+                            ]
+                              .filter(Boolean)
+                              .join(" + "),
+                          )
                           .join(", ")}
                       </dd>
                     </div>

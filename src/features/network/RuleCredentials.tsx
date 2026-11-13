@@ -12,6 +12,7 @@ import type { Run } from "../../App";
 import { echoHost } from "./echoHost";
 import { errorMessage } from "../../shared/errorMessage";
 import { credentialHosts, serviceOf } from "./network";
+import { expiresSoon } from "../projects/tokenExpiry";
 
 const NAME = /^[A-Z_][A-Z0-9_]*$/;
 
@@ -195,6 +196,11 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
                 >
                   <TriangleAlert size={14} />
                   Not set
+                </span>
+              )}
+              {credential.name === "CLAUDE_CODE_OAUTH_TOKEN" && cage.claudeToken?.expiresAt && (
+                <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"}>
+                  expires {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
                 </span>
               )}
               {removing === credential.name ? (

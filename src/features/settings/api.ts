@@ -61,6 +61,7 @@ export type RuntimeSource = "host" | "cached" | "pinned";
 
 export type LoginState =
   | { state: "found"; expires: number | null }
+  | { state: "setupToken" }
   | { state: "expired" }
   | { state: "none" };
 

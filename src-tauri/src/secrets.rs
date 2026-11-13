@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -231,12 +232,29 @@ pub fn account(cage_id: &str, name: &str) -> String {
 
 /// Stores secret values per project.
 pub trait Vault: Send + Sync {
-    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()>;
-    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>>;
+    fn put(&self, cage_id: &str, name: &str, entry: &VaultEntry) -> Result<()>;
+    fn entry(&self, cage_id: &str, name: &str) -> Result<Option<VaultEntry>>;
+    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        self.put(cage_id, name, &VaultEntry { value: value.clone(), saved_at: Some(now_ms()) })
+    }
+    #[cfg(test)]
+    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        Ok(self.entry(cage_id, name)?.map(|entry| entry.value))
+    }
     /// Deleting an absent value is not an error.
     fn delete(&self, cage_id: &str, name: &str) -> Result<()>;
     /// The [`account`]s of all stored values. Returns no values.
     fn accounts(&self) -> Result<Vec<String>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultEntry {
+    pub value: SecretValue,
+    pub saved_at: Option<i64>,
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
 /// The folder of the vault file, in the app data folder.
@@ -245,12 +263,19 @@ const VAULT_FILE: &str = "credentials.json";
 /// The temp files of a write. A file with this prefix is from a write that
 /// did not end, and the next write removes it.
 const TEMP_PREFIX: &str = ".credentials.json.tmp-";
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredValue {
+    Legacy(String),
+    Dated { value: String, saved_at: i64 },
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Stored {
     version: u32,
-    values: BTreeMap<String, String>,
+    values: BTreeMap<String, StoredValue>,
 }
 
 /// The values in one JSON file that only the user can read and write
@@ -285,7 +310,7 @@ impl FileVault {
         })
     }
 
-    fn load(&self) -> Result<BTreeMap<String, String>> {
+    fn load(&self) -> Result<BTreeMap<String, StoredValue>> {
         if !private(&self.dir, 0o700)? {
             return Ok(BTreeMap::new());
         }
@@ -307,13 +332,13 @@ impl FileVault {
         let stored: Stored = serde_json::from_slice(&text).map_err(|e| {
             Error::Vault(format!("{} is not valid at line {}, column {}", self.file.display(), e.line(), e.column()))
         })?;
-        if stored.version != FORMAT {
+        if stored.version != FORMAT && stored.version != 1 {
             return Err(Error::Vault(format!("{} has unknown version {}", self.file.display(), stored.version)));
         }
         Ok(stored.values)
     }
 
-    fn save(&self, values: BTreeMap<String, String>) -> Result<()> {
+    fn save(&self, values: BTreeMap<String, StoredValue>) -> Result<()> {
         remove_temps(&self.dir)?;
         let temp = self.dir.join(format!("{TEMP_PREFIX}{}", std::process::id()));
         let json = serde_json::to_vec_pretty(&Stored { version: FORMAT, values })?;
@@ -376,16 +401,25 @@ fn vault_io(path: &Path, e: io::Error) -> Error {
 }
 
 impl Vault for FileVault {
-    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+    fn put(&self, cage_id: &str, name: &str, entry: &VaultEntry) -> Result<()> {
         let _lock = self.locked();
         let mut values = self.load()?;
-        values.insert(account(cage_id, name), value.expose().to_owned());
+        let stored = match entry.saved_at {
+            Some(saved_at) => StoredValue::Dated { value: entry.value.expose().to_owned(), saved_at },
+            None => StoredValue::Legacy(entry.value.expose().to_owned()),
+        };
+        values.insert(account(cage_id, name), stored);
         self.save(values)
     }
 
-    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
+    fn entry(&self, cage_id: &str, name: &str) -> Result<Option<VaultEntry>> {
         let _lock = self.locked();
-        Ok(self.load()?.remove(&account(cage_id, name)).map(SecretValue::new))
+        Ok(self.load()?.remove(&account(cage_id, name)).map(|stored| match stored {
+            StoredValue::Legacy(value) => VaultEntry { value: SecretValue::new(value), saved_at: None },
+            StoredValue::Dated { value, saved_at } => {
+                VaultEntry { value: SecretValue::new(value), saved_at: Some(saved_at) }
+            }
+        }))
     }
 
     fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
@@ -413,6 +447,7 @@ pub mod fake {
     #[derive(Default)]
     pub struct MemoryVault {
         pub values: Mutex<HashMap<String, SecretValue>>,
+        pub dates: Mutex<HashMap<String, Option<i64>>>,
         /// When set, this many more writes succeed, and the writes after
         /// them fail and keep the values.
         pub writes_left: Mutex<Option<usize>>,
@@ -435,23 +470,30 @@ pub mod fake {
     }
 
     impl Vault for MemoryVault {
-        fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        fn put(&self, cage_id: &str, name: &str, entry: &VaultEntry) -> Result<()> {
             self.write()?;
-            self.values.lock().unwrap().insert(account(cage_id, name), value.clone());
+            let account = account(cage_id, name);
+            self.values.lock().unwrap().insert(account.clone(), entry.value.clone());
+            self.dates.lock().unwrap().insert(account, entry.saved_at);
             if self.fail_after_write.swap(false, Ordering::SeqCst) {
                 return Err(Error::Vault("folder sync failed".into()));
             }
             Ok(())
         }
 
-        fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        fn entry(&self, cage_id: &str, name: &str) -> Result<Option<VaultEntry>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            Ok(self.values.lock().unwrap().get(&account(cage_id, name)).cloned())
+            let account = account(cage_id, name);
+            Ok(self.values.lock().unwrap().get(&account).cloned().map(|value| VaultEntry {
+                value,
+                saved_at: self.dates.lock().unwrap().get(&account).copied().flatten(),
+            }))
         }
 
         fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
             self.write()?;
             self.values.lock().unwrap().remove(&account(cage_id, name));
+            self.dates.lock().unwrap().remove(&account(cage_id, name));
             Ok(())
         }
 
@@ -494,8 +536,22 @@ pub mod tests {
         assert_eq!(again.get("p/1", "KEY").unwrap().unwrap().expose(), pem);
         assert_eq!(again.accounts().unwrap(), ["p/1/KEY", "p/1/OTHER"]);
         let json: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(VAULT_FILE)).unwrap()).unwrap();
-        assert_eq!(json["version"], 1);
-        assert_eq!(json["values"]["p/1/KEY"], pem);
+        assert_eq!(json["version"], 2);
+        assert_eq!(json["values"]["p/1/KEY"]["value"], pem);
+        assert!(json["values"]["p/1/KEY"]["saved_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn the_file_vault_reads_old_plain_string_entries_without_a_date() {
+        let (vault, dir) = file_vault();
+        let file = dir.join(VAULT_FILE);
+        fs::write(&file, r#"{"version":1,"values":{"p/KEY":"old"}}"#).unwrap();
+        chmod(&file, 0o600);
+        let old = vault.entry("p", "KEY").unwrap().unwrap();
+        assert_eq!(old.value.expose(), "old");
+        assert_eq!(old.saved_at, None);
+        vault.set("p", "OTHER", &SecretValue::new("new")).unwrap();
+        assert_eq!(vault.entry("p", "KEY").unwrap(), Some(old));
     }
 
     #[test]
@@ -549,8 +605,8 @@ pub mod tests {
             fs::write(&file, text).unwrap();
             chmod(&file, 0o600);
         };
-        write(r#"{"version":2,"values":{}}"#);
-        assert!(matches!(vault.get("p", "KEY"), Err(Error::Vault(m)) if m.contains("unknown version 2")));
+        write(r#"{"version":3,"values":{}}"#);
+        assert!(matches!(vault.get("p", "KEY"), Err(Error::Vault(m)) if m.contains("unknown version 3")));
         write(r#"{"version":1,"values":{"p/KEY":"sk-hidden" "#);
         let error = vault.get("p", "KEY").unwrap_err();
         assert!(matches!(error, Error::Vault(_)) && !error.to_string().contains("sk-hidden"), "{error}");

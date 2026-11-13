@@ -223,7 +223,7 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
 #[cfg(test)]
 mod tests {
     use super::super::fake::FakeFs;
-    use super::super::login::fake::{FakeLogins, claude_doc};
+    use super::super::login::fake::FakeLogins;
     use super::*;
 
     fn home() -> FakeFs {
@@ -264,7 +264,6 @@ mod tests {
         fs.dirs.insert("/Applications/Antigravity.app".into());
 
         let logins = FakeLogins::default();
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t", 5));
         let data = data();
         let found = detect(&fs, &logins, 10, &data);
         let summary: Vec<_> = found.agents.iter().map(|a| (a.kind, a.version.as_str(), a.source, a.pinned)).collect();
@@ -279,7 +278,7 @@ mod tests {
         );
         let claude = found.agent(AgentKind::Claude).unwrap();
         assert_eq!((claude.path.as_str(), claude.profile), ("/Users/me/.local/share/claude/versions/2.1.310", true));
-        assert_eq!(claude.login, LoginState::Found { expires: None });
+        assert_eq!(claude.login, LoginState::SetupToken);
         assert_eq!(claude.package, None);
         assert_eq!(found.agent(AgentKind::Pi).unwrap().package.as_deref(), Some(Path::new(pi)));
         assert_eq!(found.agent(AgentKind::Gemini).unwrap().entry.as_deref(), Some("bundle/gemini.js"));

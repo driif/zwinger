@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::agent::AgentKind;
 use crate::cage::Cage;
 use crate::error::{Error, Result};
 use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, Rule, Target};
-use crate::secrets::Secret;
+use crate::secrets::{Origin, Secret};
 use crate::session::Session;
 
 /// The store files in the app data dir.
@@ -63,9 +64,16 @@ impl Store {
             if let Some(s) = sessions.iter().find(|s| !cages.iter().any(|c| c.id == s.cage)) {
                 return Err(Error::MissingCage { session: format!("{} ({})", s.name, s.id), cage: s.cage.clone() });
             }
+            let mut cages = cages;
+            if drop_claude_logins(&mut cages)
+                && let Err(e) = self.save_cages(&cages)
+            {
+                eprintln!("the migrated cages could not be saved: {e}");
+            }
             return Ok((sessions, cages));
         }
-        let (sessions, cages) = self.convert()?;
+        let (sessions, mut cages) = self.convert()?;
+        drop_claude_logins(&mut cages);
         self.save_cages(&cages)?;
         self.save_sessions(&sessions)?;
         Ok((sessions, cages))
@@ -99,6 +107,17 @@ impl Store {
     pub fn save_cages(&self, cages: &[Cage]) -> Result<()> {
         write(&self.dir.join(CAGES), cages)
     }
+}
+
+/// Claude Code uses a setup token in the vault now, not a host login.
+/// Removes the old Claude host logins. Returns true if it removed one.
+fn drop_claude_logins(cages: &mut [Cage]) -> bool {
+    let claude = Origin::HostLogin { agent: AgentKind::Claude };
+    cages.iter_mut().fold(false, |dropped, cage| {
+        let before = cage.logins.len();
+        cage.logins.retain(|secret| secret.origin != claude);
+        dropped | (before != cage.logins.len())
+    })
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
@@ -294,17 +313,35 @@ mod tests {
                 },
             ],
             network: serde_json::from_value(project_json()[0]["network"].clone()).unwrap(),
-            logins: vec![Secret {
-                name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
-                hosts: vec!["api.anthropic.com".into()],
-                places: Places { header_fields: vec!["authorization".into()], query: false, body: false },
-                origin: Origin::HostLogin { agent: AgentKind::Claude },
-            }],
+            // The Claude host login is dropped: Claude Code uses a setup token now.
+            logins: Vec::new(),
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             agents_unprompted: false,
         };
         assert_eq!(cage.network.credentials().len(), 2);
         assert_eq!((sessions, cages), (vec![session], vec![cage]));
+    }
+
+    #[test]
+    fn a_stored_claude_host_login_is_dropped_and_saved() {
+        let dir = data_dir();
+        let store = Store::new(dir.clone());
+        let session = Session::new(data_dir().to_str().unwrap(), "c", []).unwrap();
+        let mut cage = Cage::new("c".into(), "proj".into());
+        cage.host_agents.push(HostAgentUse { kind: AgentKind::Claude, profile: false, login: true });
+        cage.logins.push(Secret {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            hosts: vec!["api.anthropic.com".into()],
+            places: Places { header_fields: vec!["authorization".into()], query: false, body: false },
+            origin: Origin::HostLogin { agent: AgentKind::Claude },
+        });
+        store.save_cages(&[cage]).unwrap();
+        store.save_sessions(&[session]).unwrap();
+        let (_, cages) = store.load().unwrap();
+        assert!(cages[0].logins.is_empty());
+        assert!(cages[0].host_agents[0].login);
+        let saved: Vec<Cage> = read(&dir.join(CAGES)).unwrap();
+        assert_eq!(saved, cages);
     }
 
     #[test]
@@ -424,7 +461,7 @@ mod tests {
                   "origin": { "kind": "hostLogin", "agent": "claude" } },
             ] }]));
         let cage = cages.remove(0);
-        assert_eq!(cage.logins.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["CLAUDE_CODE_OAUTH_TOKEN"]);
+        assert!(cage.logins.is_empty());
         let rule = |host: &str| {
             cage.network.rules.iter().find(|r| r.target == Target::Host { host: host.into() }).unwrap().clone()
         };

@@ -218,7 +218,7 @@ impl Login {
         if !due {
             return token;
         }
-        // The Keychain read can wait for the macOS prompt.
+        // A file login read can block.
         let (source, kind) = (self.source.clone(), self.kind);
         match tokio::task::spawn_blocking(move || source.token(kind)).await {
             // A changed token for the same host replaces the old one; a token
@@ -342,6 +342,7 @@ mod tests {
     use http_body_util::{BodyExt, Full};
 
     use super::*;
+    use crate::network::{Action, Rule, Target};
     use crate::secrets::Places;
 
     /// A body of the given chunks.
@@ -373,6 +374,21 @@ mod tests {
 
     fn replace(name: &str, places: Places) -> Credential {
         Credential { name: name.into(), inject: Inject::Replace { places } }
+    }
+
+    #[test]
+    fn claude_setup_token_is_set_for_its_exact_api_host() {
+        let credential = set("CLAUDE_CODE_OAUTH_TOKEN", "authorization", "Bearer {secret}");
+        let mut rule = Rule::new(Target::Host { host: "api.anthropic.com".into() }, Action::Allow);
+        rule.credentials.push(credential.clone());
+        assert!(rule.sends_credentials_to("api.anthropic.com"));
+        assert!(!rule.sends_credentials_to("other.anthropic.com"));
+        let placeholder = credential.placeholder();
+        let mut head =
+            parts("https://api.anthropic.com/v1/messages", &[("authorization", &format!("Bearer {placeholder}"))]);
+        let injected = apply(&mut head, &[(credential, SecretValue::new("real-token"))]);
+        assert_eq!(head.headers["authorization"], "Bearer real-token");
+        assert_eq!(injected.names, ["CLAUDE_CODE_OAUTH_TOKEN"]);
     }
 
     #[test]
@@ -434,20 +450,20 @@ mod tests {
 
     #[tokio::test]
     async fn the_mac_login_is_read_again_and_a_newer_token_applies_at_once() {
-        use crate::host_agents::login::fake::claude_doc;
         const NOW: i64 = 1_800_000_000_000;
-        let doc = claude_doc("old", NOW + 5 * 60_000);
-        let token = crate::host_agents::login::parse(AgentKind::Claude, &doc).unwrap();
+        let doc = serde_json::json!({ "access_token": "old", "expiry_date": NOW + 5 * 60_000 }).to_string();
+        let token = crate::host_agents::login::parse(AgentKind::Gemini, &doc).unwrap();
         let source = Arc::new(Source { doc: std::sync::Mutex::new(doc), reads: Default::default() });
         let login =
-            Login::new("CLAUDE_CODE_OAUTH_TOKEN".into(), vec!["api.anthropic.com".into()], token, source.clone());
+            Login::new("GEMINI_HOST_LOGIN".into(), vec!["cloudcode-pa.googleapis.com".into()], token, source.clone());
 
         // The Mac has the same login: it stays, and the next read waits a minute.
         assert_eq!(login.current().await.access.expose(), "old");
         assert_eq!(login.current().await.access.expose(), "old");
         assert_eq!(source.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        *source.doc.lock().unwrap() = claude_doc("new", NOW + 3_600_000);
+        *source.doc.lock().unwrap() =
+            serde_json::json!({ "access_token": "new", "expiry_date": NOW + 3_600_000 }).to_string();
         login.state.lock().unwrap().checked = None;
         let token = login.current().await;
         assert_eq!((token.access.expose(), login.expires()), ("new", Some(NOW + 3_600_000)));
@@ -456,7 +472,7 @@ mod tests {
         assert_eq!(source.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer $MSB_CLAUDE_CODE_OAUTH_TOKEN$"));
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer $MSB_GEMINI_HOST_LOGIN$"));
         assert!(login.apply(&mut headers, &token));
         assert_eq!(headers[AUTHORIZATION], "Bearer new");
         let mut other = HeaderMap::new();

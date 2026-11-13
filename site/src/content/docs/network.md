@@ -47,6 +47,8 @@ a placeholder. The proxy puts the real value into the request.
 - A credential on a Block rule is inactive. The proxy does not use it until the rule allows the host again.
 - A wildcard host rule (`*.a.io`) cannot have a credential.
 - A change of the value applies to the next request.
+- A Claude Code setup token is stored as `CLAUDE_CODE_OAUTH_TOKEN` with its save date. Its estimated expiry is 365 days after save. The proxy uses it only for `api.anthropic.com` through an exact-host Allow rule. Under default Block, the project offers an **Allow api.anthropic.com** action. Block rules take priority over Allow rules.
+- Claude setup tokens have no refresh host. Claude cages no longer block `console.anthropic.com` or `platform.claude.com` for this login.
 
 The vault file is `~/Library/Application Support/com.driif.zwinger/vault/credentials.json`. It holds the values of all
 cages. The file has mode 0600 and its folder has mode 0700. The app replaces the file in one atomic step at each

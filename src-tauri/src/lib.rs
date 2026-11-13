@@ -303,6 +303,7 @@ pub fn run() {
             commands::settings::host_agents,
             commands::settings::detect_host_agents,
             commands::cages::put_host_agent,
+            commands::cages::set_claude_token,
             commands::cages::remove_host_agent,
             commands::cages::set_agents_unprompted,
             commands::tasks::put_task,

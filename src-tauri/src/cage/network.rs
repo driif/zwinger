@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentKind;
 use crate::cage::manager::{Manager, Vm, lock};
-use crate::cage::{self, WORKSPACE};
+use crate::cage::{self, Cage, HostAgentUse, WORKSPACE};
 use crate::error::{Error, Result};
-use crate::network::{Credential, DefaultAction, Inject, NetworkPolicy, RuleDraft};
+use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, RuleDraft, Target};
 use crate::proxy::log::Entry;
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::secrets::{self, SecretValue};
@@ -167,7 +168,7 @@ impl<R: SandboxRuntime> Manager<R> {
             cage.check()?;
             is_new
         };
-        let prior = self.vault.get(id, &name)?;
+        let prior = self.vault.entry(id, &name)?;
         let Some(value) = value else {
             if is_new || prior.is_none() {
                 return Err(Error::SecretValueRequired(name));
@@ -187,6 +188,72 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         // A request must not see the new rule with the old value.
         self.publish(id, Some((&name, value)));
+        Ok(())
+    }
+
+    pub fn set_claude_token(&self, id: &str, value: SecretValue, allow: bool, profile: bool) -> Result<()> {
+        const NAME: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+        const HOST: &str = "api.anthropic.com";
+        if self.host.last().agent(AgentKind::Claude).is_none() {
+            return Err(Error::HostAgentMissing("Claude Code".into()));
+        }
+        let value = SecretValue::new(value.expose().trim());
+        if value.expose().is_empty() {
+            return Err(Error::SecretValueRequired(NAME.into()));
+        }
+        let _edit = lock(&self.secret_edit);
+        self.settle(id, NAME)?;
+        let put = |cage: &mut Cage| -> Result<()> {
+            let network = &mut cage.network;
+            let exact = network
+                .rules
+                .iter()
+                .position(|r| r.action == Action::Allow && matches!(&r.target, Target::Host { host } if host == HOST));
+            let index = match exact {
+                Some(index) => index,
+                None => {
+                    let exact_block = network.rules.iter().any(|rule| {
+                        rule.action == Action::Block && matches!(&rule.target, Target::Host { host } if host == HOST)
+                    });
+                    if (network.default == DefaultAction::Block || exact_block) && !allow {
+                        return Err(Error::InvalidRule("allow api.anthropic.com first".into()));
+                    }
+                    let id = network.put_rule(RuleDraft {
+                        id: None,
+                        target: Target::Host { host: HOST.into() },
+                        action: Action::Allow,
+                    })?;
+                    network.rules.iter().position(|r| r.id == id).expect("new rule")
+                }
+            };
+            let credential = Credential {
+                name: NAME.into(),
+                inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            };
+            let credentials = &mut network.rules[index].credentials;
+            match credentials.iter_mut().find(|c| c.name == NAME) {
+                Some(current) => *current = credential,
+                None => credentials.push(credential),
+            }
+            cage.put_host_agent(HostAgentUse { kind: AgentKind::Claude, profile, login: true }, None);
+            Ok(())
+        };
+        {
+            let state = lock(&self.state);
+            let mut cage = state.cage(id)?.clone();
+            put(&mut cage)?;
+            cage.check()?;
+        }
+        let prior = self.vault.entry(id, NAME)?;
+        if let Err(e) = self.vault.set(id, NAME, &value) {
+            self.restore_value(id, NAME, prior.as_ref());
+            return Err(e);
+        }
+        if let Err(e) = self.edit_cage(id, |c, _| put(c)) {
+            self.restore_value(id, NAME, prior.as_ref());
+            return Err(e);
+        }
+        self.publish(id, Some((NAME, value)));
         Ok(())
     }
 
@@ -237,9 +304,9 @@ impl<R: SandboxRuntime> Manager<R> {
     /// never get the new value: if the old value cannot come back, the value
     /// is removed, and the secret is then missing. If both fail, the account
     /// stays unsettled until [`Self::settle`] sees the prior value.
-    pub(crate) fn restore_value(&self, id: &str, name: &str, prior: Option<&SecretValue>) {
+    pub(crate) fn restore_value(&self, id: &str, name: &str, prior: Option<&secrets::VaultEntry>) {
         let restored = match prior {
-            Some(prior) => self.vault.set(id, name, prior),
+            Some(prior) => self.vault.put(id, name, prior),
             None => self.vault.delete(id, name),
         }
         .or_else(|_| self.vault.delete(id, name));
@@ -255,10 +322,10 @@ impl<R: SandboxRuntime> Manager<R> {
         let Some(prior) = lock(&self.unsettled).get(&account).cloned() else {
             return Ok(());
         };
-        let held = self.vault.get(id, name)?;
-        if held.as_ref().map(SecretValue::expose) != prior.as_ref().map(SecretValue::expose) {
+        let held = self.vault.entry(id, name)?;
+        if held != prior {
             match &prior {
-                Some(prior) => self.vault.set(id, name, prior),
+                Some(prior) => self.vault.put(id, name, prior),
                 None => self.vault.delete(id, name),
             }
             .or_else(|_| self.vault.delete(id, name))?;
@@ -687,5 +754,82 @@ mod tests {
         ));
         manager.set_rule_credential(&id, &b, "B", bearer(), value("new")).unwrap();
         assert_eq!(manager.stored_credentials(&id).unwrap(), ["A", "B"]);
+    }
+
+    #[test]
+    fn claude_token_needs_explicit_allow_under_default_block() {
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        assert!(matches!(
+            manager.set_claude_token(&id, SecretValue::new("token"), false, false),
+            Err(Error::InvalidRule(message)) if message == "allow api.anthropic.com first"
+        ));
+        assert!(vault.get(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
+        manager.set_claude_token(&id, SecretValue::new("token"), true, false).unwrap();
+        let view = manager.list().cages.remove(0);
+        assert!(view.claude_token.unwrap().stored);
+        assert!(view.cage.host_agent(AgentKind::Claude).unwrap().login);
+        let rule = &view.cage.network.rules[0];
+        assert_eq!(rule.target, Target::Host { host: "api.anthropic.com".into() });
+        assert_eq!(rule.action, Action::Allow);
+        assert_eq!(
+            rule.credentials[0].inject,
+            Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() }
+        );
+    }
+
+    #[test]
+    fn claude_token_creates_an_exact_allow_rule_under_default_allow() {
+        let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.set_network_default(&id, DefaultAction::Allow).unwrap();
+        manager.set_claude_token(&id, SecretValue::new("token"), false, false).unwrap();
+        assert_eq!(manager.list().cages[0].cage.network.rules[0].label(), "api.anthropic.com");
+    }
+
+    #[test]
+    fn claude_token_does_not_silently_replace_an_exact_block() {
+        let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.set_network_default(&id, DefaultAction::Allow).unwrap();
+        manager.put_rule(&id, host_rule("api.anthropic.com", Action::Block)).unwrap();
+        assert!(matches!(
+            manager.set_claude_token(&id, SecretValue::new("token"), false, false),
+            Err(Error::InvalidRule(..))
+        ));
+        manager.set_claude_token(&id, SecretValue::new("token"), true, false).unwrap();
+        assert_eq!(manager.list().cages[0].cage.network.rules[0].action, Action::Allow);
+    }
+
+    #[tokio::test]
+    async fn claude_login_off_or_agent_removed_drops_the_token() {
+        let off = HostAgentUse { kind: AgentKind::Claude, profile: false, login: false };
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        manager.set_claude_token(&id, SecretValue::new("token"), true, false).unwrap();
+        manager.put_host_agent(&id, off, false).await.unwrap();
+        assert!(manager.list().cages[0].cage.network.credentials().is_empty());
+        assert!(vault.entry(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
+
+        manager.set_claude_token(&id, SecretValue::new("token"), true, false).unwrap();
+        manager.remove_host_agent(&id, AgentKind::Claude).unwrap();
+        assert!(manager.list().cages[0].cage.network.credentials().is_empty());
+        assert!(vault.entry(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_token_binding_is_checked_with_the_login_off() {
+        let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
+        let rule = allow(&manager, &id, "other.example.com");
+        assert!(matches!(
+            manager.set_rule_credential(&id, &rule, "CLAUDE_CODE_OAUTH_TOKEN", bearer(), value("t")),
+            Err(Error::InvalidSecret(..))
+        ));
+    }
+
+    #[test]
+    fn claude_token_rollback_preserves_the_prior_date() {
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        manager.set_claude_token(&id, SecretValue::new("old"), true, false).unwrap();
+        let prior = vault.entry(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap();
+        break_store(&manager);
+        assert!(manager.set_claude_token(&id, SecretValue::new("new"), false, false).is_err());
+        assert_eq!(vault.entry(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap(), prior);
     }
 }

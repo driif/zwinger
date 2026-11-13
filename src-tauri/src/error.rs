@@ -71,8 +71,8 @@ pub enum Error {
     Proxy(String),
     #[error("secret {0} has no stored value; set it again")]
     SecretMissing(String),
-    #[error("Keychain: {0}")]
-    Keychain(String),
+    #[error("Claude Code needs a token; run claude setup-token and save it in this cage")]
+    ClaudeTokenNeeded,
     #[error("credential vault: {0}")]
     Vault(String),
     #[error(
@@ -145,7 +145,7 @@ pub enum Error {
     HostLogin(String, String),
     #[error("{0} has no login on this Mac; log in with {0} on the Mac first")]
     HostLoginMissing(String),
-    #[error("the {0} login on this Mac has expired; open {0} on the Mac once to renew it, then start the cage again")]
+    #[error("{0}")]
     HostLoginExpired(String),
     #[error(
         "{0} is blocked in this cage: a host login of an agent is refreshed there, so {1} cannot reach it; remove {1} or turn that login off"

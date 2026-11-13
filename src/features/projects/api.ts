@@ -48,6 +48,9 @@ export const stopCage = (cageId: string) => call<void>("stop_cage", { cageId });
 /** The user confirms the folders that are not verified since the update. */
 export const confirmPaths = (sessionId: string) => call<void>("confirm_paths", { sessionId });
 
+export const setClaudeToken = (cageId: string, value: string, allow: boolean, profile: boolean) =>
+  call<void>("set_claude_token", { cageId, value, allow, profile });
+
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (cageId: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));

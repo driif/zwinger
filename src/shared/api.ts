@@ -199,6 +199,7 @@ export interface CageView {
   runtimes: ("claude" | "codex" | "gemini")[];
   /** The earliest expiry of the host logins that the proxy has now, in ms since the epoch. The proxy reads a newer login when it is due. */
   loginExpiresAt: number | null;
+  claudeToken: { stored: boolean; expiresAt: number | null } | null;
   /** What the start did differently for the host agents, such as a fallback. */
   hostNotices: string[];
   /** The agents of the running VM with a login made in the guest: the agent can read its real token. */

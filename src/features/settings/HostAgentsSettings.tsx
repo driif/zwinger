@@ -22,10 +22,9 @@ function source(agent: HostAgent) {
 }
 
 function login(agent: HostAgent) {
+  if (agent.login.state === "setupToken") return "Run claude setup-token, then save the token in each cage that uses this login.";
   if (agent.login.state === "expired") return `The login has expired. Open ${AGENT_NAMES[agent.kind]} on this Mac once to renew it.`;
   if (agent.login.state === "none") return "No subscription login on this Mac.";
-  if (agent.kind === "claude")
-    return "Login found in the Keychain. When a cage starts, macOS asks once to allow access: select Allow.";
   return agent.login.expires ? `Login found, valid until ${time(agent.login.expires)}.` : "Login found.";
 }
 

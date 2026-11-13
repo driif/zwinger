@@ -171,8 +171,7 @@ impl HostAgents {
     }
 
     /// The host login of the agent. Fails if there is none or it has expired.
-    /// The Keychain read can wait for the macOS access prompt, so call it on
-    /// a blocking thread.
+    /// A file read can block, so call it on a blocking thread.
     pub fn token(&self, kind: AgentKind) -> Result<HostToken> {
         login::token(self.logins.as_ref(), kind, self.clock.now_ms())
     }

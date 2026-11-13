@@ -13,7 +13,7 @@ use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
 use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, Vm, bin_dir, blocking, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
-use crate::cage::{Bound, Cage, WORKSPACE};
+use crate::cage::{Bound, CLAUDE_TOKEN, Cage, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
@@ -58,7 +58,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The config snapshot, the vault reads and the registration of the
     /// proxy's live values hold `secret_edit`, so a credential edit during
     /// the start reaches the proxy. The lock is released before the host
-    /// logins are read (the Keychain can wait for the macOS prompt) and
+    /// logins are read and
     /// before the runtime start. The proxy starts before the VM: if it
     /// cannot start, the cage does not start. `id` is the cage id.
     pub async fn start(&self, id: &str) -> Result<()> {
@@ -437,6 +437,7 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         let bound = Bound { session: &session, cage: &cage };
         bound.verify_paths()?;
+        bound.check()?;
         cage.network.check()?;
         bound.check_app_data(&self.reserved)?;
         // A session with no known cage cannot start, so it is not checked.
@@ -472,13 +473,28 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// The vault value of each credential. An account whose restore failed
-    /// is restored first; if that fails again, the start fails.
+    /// is restored first; if that fails again, the start fails. The Claude
+    /// token's date is checked on the entry that is loaded, after that restore.
     pub(crate) fn vault_values(&self, cage: &Cage) -> Result<HashMap<String, SecretValue>> {
+        let login = cage.host_agent(AgentKind::Claude).is_some_and(|agent| agent.login);
+        let bound = cage.claude_token_binding()?;
+        if login && !bound {
+            return Err(Error::ClaudeTokenNeeded);
+        }
         let mut values = HashMap::new();
         for credential in cage.network.credentials() {
             self.settle(&cage.id, &credential.name)?;
-            match self.vault.get(&cage.id, &credential.name)? {
-                Some(value) => values.insert(credential.name.clone(), value),
+            let entry = self.vault.entry(&cage.id, &credential.name)?;
+            if bound && credential.name == CLAUDE_TOKEN {
+                let saved_at = entry.as_ref().and_then(|entry| entry.saved_at).ok_or(Error::ClaudeTokenNeeded)?;
+                if saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms() {
+                    return Err(Error::HostLoginExpired(
+                        "the Claude Code token has expired; run claude setup-token again".into(),
+                    ));
+                }
+            }
+            match entry {
+                Some(entry) => values.insert(credential.name.clone(), entry.value),
                 None => return Err(Error::SecretMissing(credential.name.clone())),
             };
         }
@@ -639,7 +655,7 @@ pub(crate) struct Prepared {
 
 /// Copies the profiles and links them into the agents' state, reads the
 /// host logins and writes the guest logins, and picks the host packages and
-/// runtime versions. It reads the Keychain and copies files, so it runs on a
+/// runtime versions. It copies files, so it runs on a
 /// blocking thread. The state dir is guest-writable: each write there
 /// follows no link. `begin` gets the phase of each profile copy.
 pub(crate) fn prepare(host: &HostAgents, data: &Path, cage: &Cage, begin: &dyn Fn(Phase)) -> Result<Prepared> {
@@ -931,24 +947,17 @@ mod tests {
     #[tokio::test]
     async fn a_host_agent_gets_its_login_and_profile_at_start() {
         let logins = FakeLogins::default();
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("sk-ant-oat-real", NOW + 3_600_000));
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
-        manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), true).await.unwrap();
+        manager.set_claude_token(&id, SecretValue::new("sk-ant-oat-real"), true, true).unwrap();
 
-        let project = manager.list().cages.remove(0).cage;
-        let rules: Vec<_> = project.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
+        let cage = manager.list().cages.remove(0).cage;
+        let rules: Vec<_> = cage.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
         assert_eq!(rules, [(Target::Host { host: "api.anthropic.com".into() }, Action::Allow)]);
-        assert_eq!(project.logins[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
-        assert_eq!(project.logins[0].origin, crate::secrets::Origin::HostLogin { agent: AgentKind::Claude });
-        // A credential cannot take its name, and the vault never holds it.
-        let rule = project.network.rules[0].id.clone();
-        assert!(matches!(
-            manager.set_rule_credential(&id, &rule, "CLAUDE_CODE_OAUTH_TOKEN", bearer(), value("x")),
-            Err(Error::DuplicateSecret(_))
-        ));
+        assert!(cage.logins.is_empty());
+        assert_eq!(cage.network.rules[0].credentials[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
 
         manager.start(&id).await.unwrap();
-        assert!(vault.values.lock().unwrap().is_empty(), "the vault holds no CA key and no login");
+        assert_eq!(vault.get(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap().expose(), "sk-ant-oat-real");
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "$MSB_CLAUDE_CODE_OAUTH_TOKEN$".to_owned())));
         assert!(!format!("{net:?}").contains("sk-ant-oat-real"));
@@ -964,7 +973,8 @@ mod tests {
         assert_eq!(std::fs::read_link(skills).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
 
         let view = manager.list().cages.remove(0);
-        assert_eq!(view.login_expires_at, Some(NOW + 3_600_000));
+        assert_eq!(view.login_expires_at, None);
+        assert!(view.claude_token.unwrap().stored);
         // Neither the host version nor the pinned Claude Code is downloaded.
         assert!(
             view.host_notices.iter().any(|n| n.contains("Claude Code 2.1.310 is not downloaded")),
@@ -1029,9 +1039,20 @@ mod tests {
     #[tokio::test]
     async fn an_expired_or_missing_host_login_fails_the_start() {
         let logins = FakeLogins::default();
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, claude_doc("t", NOW - 1));
-        let (manager, runtime, id, _) = host_manager(logins, NOW);
+        let (manager, runtime, id, vault) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        assert!(matches!(manager.start(&id).await, Err(Error::ClaudeTokenNeeded)));
+        manager.set_claude_token(&id, SecretValue::new("t"), true, false).unwrap();
+        vault
+            .put(
+                &id,
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                &secrets::VaultEntry {
+                    value: SecretValue::new("t"),
+                    saved_at: Some(secrets::now_ms() - 365 * 24 * 60 * 60 * 1000),
+                },
+            )
+            .unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
         assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
@@ -1046,6 +1067,35 @@ mod tests {
             empty.put_host_agent(&empty_id, uses(AgentKind::Codex, false, false), false).await,
             Err(Error::HostAgentMissing(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_restored_by_settle_fails_the_start() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        manager.set_claude_token(&id, SecretValue::new("fresh"), true, false).unwrap();
+        // A failed rollback left the prior, expired entry to restore.
+        let expired = secrets::VaultEntry {
+            value: SecretValue::new("old"),
+            saved_at: Some(secrets::now_ms() - 365 * 24 * 60 * 60 * 1000),
+        };
+        lock(&manager.unsettled).insert(secrets::account(&id, "CLAUDE_CODE_OAUTH_TOKEN"), Some(expired));
+        assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
+        assert!(runtime.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migrated_claude_host_login_needs_a_setup_token() {
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        let mut cage = manager.list().cages.remove(0).cage;
+        cage.logins.push(login::secret(AgentKind::Claude, "api.anthropic.com"));
+        let dir = manager.store.dir().to_owned();
+        manager.store.save_cages(&[cage]).unwrap();
+        let reloaded =
+            Manager::new(FakeRuntime::default(), Store::new(dir), vault, manager.data.clone(), manager.host.clone())
+                .unwrap();
+        assert!(reloaded.list().cages[0].cage.logins.is_empty());
+        assert!(matches!(reloaded.start(&id).await, Err(Error::ClaudeTokenNeeded)));
     }
 
     #[tokio::test]
@@ -1090,10 +1140,10 @@ mod tests {
     #[tokio::test]
     async fn a_login_with_no_expiry_is_not_read_again() {
         let logins = FakeLogins::default();
-        let doc = serde_json::json!({ "claudeAiOauth": { "accessToken": "t" } }).to_string();
-        logins.docs.lock().unwrap().insert(AgentKind::Claude, doc);
+        let doc = serde_json::json!({ "tokens": { "access_token": "t" } }).to_string();
+        logins.docs.lock().unwrap().insert(AgentKind::Codex, doc);
         let (manager, _, id, _) = host_manager(logins, NOW);
-        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Codex, false, true), false).await.unwrap();
         manager.start(&id).await.unwrap();
         let view = manager.list().cages.remove(0);
         assert_eq!(view.login_expires_at, None);

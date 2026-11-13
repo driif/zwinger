@@ -18,6 +18,8 @@ use crate::secrets::{self, Origin, Secret};
 use crate::session::Session;
 
 pub const WORKSPACE: &str = "/workspace";
+/// The credential that holds the Claude Code setup token.
+pub(crate) const CLAUDE_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const FOLDER_LIMIT: usize = 50;
 
 /// A saved config for a sandbox: mounts, network policy, credentials and
@@ -95,18 +97,27 @@ impl Cage {
 
     /// Adds or replaces the host agent of its kind. `login` is the agent's
     /// host-login secret if the use has a login; it replaces the old one.
+    /// The Claude login off also removes its token credential from the rules.
     pub fn put_host_agent(&mut self, used: HostAgentUse, login: Option<Secret>) {
         let kind = used.kind;
+        if kind == AgentKind::Claude && !used.login {
+            self.remove_claude_token();
+        }
         self.logins.retain(|s| s.origin != Origin::HostLogin { agent: kind });
-        self.logins.extend(login);
+        if kind != AgentKind::Claude {
+            self.logins.extend(login);
+        }
         match self.host_agents.iter_mut().find(|a| a.kind == kind) {
             Some(current) => *current = used,
             None => self.host_agents.push(used),
         }
     }
 
-    /// Also removes its host-login secret.
+    /// Also removes its host-login secret, and for Claude its token credential.
     pub fn remove_host_agent(&mut self, kind: AgentKind) {
+        if kind == AgentKind::Claude {
+            self.remove_claude_token();
+        }
         self.host_agents.retain(|a| a.kind != kind);
         self.logins.retain(|s| s.origin != Origin::HostLogin { agent: kind });
     }
@@ -119,6 +130,7 @@ impl Cage {
     /// [`Bound::check`] adds the rules that need a session.
     pub fn check(&self) -> Result<()> {
         self.network.check()?;
+        self.claude_token_binding()?;
         secrets::check_unique(&self.logins)?;
         for (i, used) in self.host_agents.iter().enumerate() {
             if self.host_agents[..i].iter().any(|a| a.kind == used.kind) {
@@ -127,6 +139,12 @@ impl Cage {
         }
         // A host login belongs to a host agent with a login.
         for secret in &self.logins {
+            if secret.origin == (Origin::HostLogin { agent: AgentKind::Claude }) {
+                return Err(Error::InvalidSecret(
+                    secret.name.clone(),
+                    "Claude Code uses a setup token in the vault".into(),
+                ));
+            }
             if !matches!(secret.origin, Origin::HostLogin { agent } if self.host_agent(agent).is_some_and(|a| a.login))
             {
                 return Err(Error::InvalidSecret(secret.name.clone(), "it is not the login of a host agent".into()));
@@ -154,6 +172,35 @@ impl Cage {
             }
         }
         Ok(())
+    }
+
+    fn remove_claude_token(&mut self) {
+        for rule in &mut self.network.rules {
+            rule.credentials.retain(|c| c.name != CLAUDE_TOKEN);
+        }
+    }
+
+    /// Whether an Allow rule injects the Claude token. Fails if one injects
+    /// it other than to exact host api.anthropic.com as a Bearer token. The
+    /// check runs whether the Claude login is on or off.
+    pub fn claude_token_binding(&self) -> Result<bool> {
+        let mut found = false;
+        for rule in &self.network.rules {
+            for credential in &rule.credentials {
+                if credential.name != CLAUDE_TOKEN || rule.action != crate::network::Action::Allow {
+                    continue;
+                }
+                let valid = matches!(&rule.target, crate::network::Target::Host { host } if host == "api.anthropic.com")
+                    && matches!(&credential.inject, crate::network::Inject::Set { header, template }
+                        if header == "authorization" && template == "Bearer {secret}");
+                if !valid {
+                    return Err(Error::InvalidSecret(credential.name.clone(),
+                        "Claude Code requires an Allow rule for exact host api.anthropic.com with authorization: Bearer {secret}".into()));
+                }
+                found = true;
+            }
+        }
+        Ok(found)
     }
 
     fn guest_target_exists(&self, path: &Path) -> bool {
@@ -960,7 +1007,7 @@ mod tests {
         project.cage.put_host_agent(claude(true, true), Some(login(AgentKind::Claude)));
         project.cage.put_host_agent(claude(false, true), Some(login(AgentKind::Claude)));
         project.check().unwrap();
-        assert_eq!((project.cage.host_agents.len(), project.cage.logins.len()), (1, 1));
+        assert_eq!((project.cage.host_agents.len(), project.cage.logins.len()), (1, 0));
         assert!(!project.cage.host_agents[0].profile);
 
         // The login off removes its secret.
@@ -1005,10 +1052,45 @@ mod tests {
         // Without the login, the GitHub API is open again.
         project.cage.remove_host_agent(AgentKind::Pi);
         project.check().unwrap();
-        // A credential may not take the name of a host login.
+        // The Claude token may only bind to its exact API host.
         let claude = HostAgentUse { kind: AgentKind::Claude, profile: false, login: true };
         project.cage.put_host_agent(claude, Some(login::secret(AgentKind::Claude, "api.anthropic.com")));
         project.cage.network.rule_mut(&rule).unwrap().credentials[0].name = "CLAUDE_CODE_OAUTH_TOKEN".into();
-        assert!(matches!(project.check(), Err(Error::DuplicateSecret(_))));
+        assert!(matches!(project.check(), Err(Error::InvalidSecret(..))));
+    }
+
+    #[test]
+    fn claude_binding_refuses_other_hosts_and_templates() {
+        use crate::network::{Action, Credential, Inject, RuleDraft, Target};
+
+        let mut cage = Cage::new("c".into(), "proj".into());
+        cage.put_host_agent(HostAgentUse { kind: AgentKind::Claude, profile: false, login: true }, None);
+        let rule = cage
+            .network
+            .put_rule(RuleDraft {
+                id: None,
+                target: Target::Host { host: "other.example.com".into() },
+                action: Action::Allow,
+            })
+            .unwrap();
+        cage.network.rule_mut(&rule).unwrap().credentials.push(Credential {
+            name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+        });
+        assert!(matches!(cage.check(), Err(Error::InvalidSecret(..))));
+        let rule = cage
+            .network
+            .put_rule(RuleDraft {
+                id: Some(rule),
+                target: Target::Host { host: "api.anthropic.com".into() },
+                action: Action::Allow,
+            })
+            .unwrap();
+        cage.network.rule_mut(&rule).unwrap().credentials[0].inject =
+            Inject::Set { header: "x-api-key".into(), template: "{secret}".into() };
+        assert!(matches!(cage.check(), Err(Error::InvalidSecret(..))));
+        cage.network.rule_mut(&rule).unwrap().credentials[0].inject =
+            Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() };
+        assert!(cage.check().is_ok());
     }
 }

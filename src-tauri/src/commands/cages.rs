@@ -1,6 +1,7 @@
 use crate::agent::AgentKind;
 use crate::cage::HostAgentUse;
 use crate::error::Result;
+use crate::secrets::SecretValue;
 
 use super::Managed;
 
@@ -37,6 +38,17 @@ pub async fn put_host_agent(
     allow_hosts: bool,
 ) -> Result<()> {
     manager.put_host_agent(&cage_id, agent, allow_hosts).await
+}
+
+#[tauri::command]
+pub fn set_claude_token(
+    manager: Managed<'_>,
+    cage_id: String,
+    value: String,
+    allow: bool,
+    profile: bool,
+) -> Result<()> {
+    manager.set_claude_token(&cage_id, SecretValue::new(value), allow, profile)
 }
 
 #[tauri::command]

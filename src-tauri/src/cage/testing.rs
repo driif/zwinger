@@ -17,7 +17,7 @@ pub(crate) use crate::error::{Error, Result};
 pub(crate) use crate::host_agents::HostAgents;
 pub(crate) use crate::host_agents::fake::{FakeClock, FakeFs};
 pub(crate) use crate::host_agents::login;
-pub(crate) use crate::host_agents::login::fake::{FakeLogins, claude_doc};
+pub(crate) use crate::host_agents::login::fake::FakeLogins;
 pub(crate) use crate::network::{Action, DefaultAction, Inject, RuleDraft, Target};
 pub(crate) use crate::proxy::ca::Ca;
 pub(crate) use crate::proxy::log::Entry;
@@ -231,16 +231,16 @@ pub(crate) struct GatedVault {
 }
 
 impl Vault for GatedVault {
-    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+    fn put(&self, cage_id: &str, name: &str, entry: &crate::secrets::VaultEntry) -> Result<()> {
         if let Some((entered, release)) = self.gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv().unwrap();
         }
-        self.inner.set(cage_id, name, value)
+        self.inner.put(cage_id, name, entry)
     }
 
-    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        self.inner.get(cage_id, name)
+    fn entry(&self, cage_id: &str, name: &str) -> Result<Option<crate::secrets::VaultEntry>> {
+        self.inner.entry(cage_id, name)
     }
 
     fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
