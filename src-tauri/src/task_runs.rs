@@ -657,6 +657,10 @@ impl<R: SandboxRuntime> Actor<R> {
         if let Some(why) = self.book.writer.failure() {
             return Err(Stop::Failed(why));
         }
+        // A control can wait in the queue when the stage ends; the run accepted it, so it applies here.
+        while let Ok(control) = self.control.try_recv() {
+            self.book.handle(control, &self.io.names);
+        }
         if self.book.cancelled() {
             return Err(Stop::Cancelled);
         }
