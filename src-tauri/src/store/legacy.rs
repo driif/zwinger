@@ -77,7 +77,7 @@ impl Project {
             folder: self.folder,
             folder_id: self.folder_id,
             slug,
-            cage: self.id.clone(),
+            cage: Some(self.id.clone()),
             harness: self.harness,
             terminals: self.terminals,
             pane_layout: self.pane_layout,

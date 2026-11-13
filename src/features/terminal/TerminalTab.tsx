@@ -1,13 +1,14 @@
 import { Button } from "@driif/motiv";
 import { Bot, Laptop } from "lucide-react";
-import { CageView, PaneNode, SessionView, TerminalKind } from "../../shared/api";
+import { CageStatus, PaneNode, SessionView, TerminalKind } from "../../shared/api";
 import type { Pane } from "../../App";
 import { PaneLayout } from "./PaneLayout";
 import { StartProgress } from "../projects/StartProgress";
 
 interface Props {
   session: SessionView;
-  cage: CageView;
+  /** The status of the session's cage. */
+  status: CageStatus;
   /** The terminals of all projects. */
   panes: Pane[];
   /** The focused pane of the shown project. */
@@ -29,15 +30,15 @@ interface Props {
 }
 
 /** The pane layout of the shown project. The terminals of every project stay attached. */
-export function TerminalTab({ session, cage, onNewSession, ...layout }: Props) {
+export function TerminalTab({ session, status, onNewSession, ...layout }: Props) {
   return (
     <div className="terminal-tab">
-      {!session.paneLayout && cage.status.state === "starting" && (
+      {!session.paneLayout && status.state === "starting" && (
         <div className="empty">
-          <StartProgress phase={cage.status.phase} />
+          <StartProgress phase={status.phase} />
         </div>
       )}
-      {!session.paneLayout && cage.status.state !== "starting" && (
+      {!session.paneLayout && status.state !== "starting" && (
         <div className="empty">
           <p className="muted">
             No pane is open. A Mac shell starts in {session.folder} and needs no cage start. An agent starts in the cage,
@@ -53,7 +54,7 @@ export function TerminalTab({ session, cage, onNewSession, ...layout }: Props) {
           </div>
         </div>
       )}
-      <PaneLayout layout={session.paneLayout} status={cage.status} {...layout} />
+      <PaneLayout layout={session.paneLayout} status={status} {...layout} />
     </div>
   );
 }

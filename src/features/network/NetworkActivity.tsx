@@ -35,14 +35,17 @@ interface Group {
 }
 
 interface Props {
-  cage: CageView;
+  sessionId: string;
+  /** The effective cage: a rule that the view adds goes to it. `null`: the view adds no rules. */
+  cage: CageView | null;
+  /** The session's VM runs. */
+  running: boolean;
   events: NetEvent[];
   catalog: Service[];
   run: Run;
 }
 
-export function NetworkActivity({ cage, events, catalog, run }: Props) {
-  const { id, network } = cage;
+export function NetworkActivity({ sessionId, cage, running, events, catalog, run }: Props) {
   const [filter, setFilter] = useState("all");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
@@ -80,10 +83,8 @@ export function NetworkActivity({ cage, events, catalog, run }: Props) {
     );
   }, [missing]);
 
-  const set = (target: Target, action: Action) =>
-    run(() => putRule(id, { target, action }));
-
   function actions({ host, last }: Group) {
+    if (!cage) return null;
     // A rule does not open the floor, and a tool that ignores the proxy stays blocked.
     if (
       last.reason === "always-blocked" ||
@@ -91,7 +92,9 @@ export function NetworkActivity({ cage, events, catalog, run }: Props) {
       last.reason === "tokeninfo"
     )
       return null;
-    const action: Action = decide(network, host, catalog).allowed
+    const set = (target: Target, action: Action) =>
+      run(() => putRule(cage.id, { target, action }));
+    const action: Action = decide(cage.network, host, catalog).allowed
       ? "block"
       : "allow";
     const verb = action === "allow" ? "Allow" : "Block";
@@ -133,7 +136,7 @@ export function NetworkActivity({ cage, events, catalog, run }: Props) {
       <CardHeader
         title="Activity"
         titleAs="h2"
-        description="The requests of the cage, by host. The newest host is first."
+        description="The requests of the session's VM, by host. The newest host is first."
       />
       <CardBody className="stack">
         <FilterChips
@@ -148,12 +151,12 @@ export function NetworkActivity({ cage, events, catalog, run }: Props) {
         {shown.length === 0 &&
           (events.length > 0 ? (
             <p className="muted">No {filter} activity.</p>
-          ) : cage.status.state === "running" ? (
+          ) : running ? (
             <p className="muted">
               No network activity yet. The hosts show here when the agent
               reaches out.
             </p>
-          ) : (
+          ) : cage ? (
             <div className="row">
               <p className="muted grow">
                 No network activity. Start the cage to see the hosts that the
@@ -163,11 +166,13 @@ export function NetworkActivity({ cage, events, catalog, run }: Props) {
                 size="sm"
                 variant="outline"
                 iconLeft={<Play size={14} />}
-                onClick={() => run(() => startCage(id))}
+                onClick={() => run(() => startCage(sessionId))}
               >
                 Start
               </Button>
             </div>
+          ) : (
+            <p className="muted">No network activity.</p>
           ))}
         <ul className="list">
           {shown.map((group) => {

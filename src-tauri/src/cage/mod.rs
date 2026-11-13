@@ -550,7 +550,7 @@ mod tests {
 
     impl Pair {
         fn new(folder: &str) -> Self {
-            let session = Session::new(folder, "c", []).unwrap();
+            let session = Session::new(folder, Some("c".into()), []).unwrap();
             let cage = Cage::new("c".into(), session.name.clone());
             Self { session, cage }
         }

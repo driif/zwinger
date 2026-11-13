@@ -48,13 +48,23 @@ const under = (path: string, base: string) => path === base || path.startsWith(`
 
 /**
  * The map of a session and its cage: host paths on the left, the microVM boundary with its
- * folders in the middle, egress on the right. The auto layout uses fixed
+ * folders in the middle, egress on the right. `vm` is the cage of the session's VM: its state and runtimes. The auto layout uses fixed
  * columns; a position in `session.layout` replaces it. Child positions are
  * relative to the boundary.
  */
-export function mapLayout(session: SessionView, cage: CageView, folders: string[], events: NetEvent[], catalog: Service[], now: number) {
+export function mapLayout(
+  session: SessionView,
+  cage: CageView,
+  vm: CageView | null,
+  folders: string[],
+  events: NetEvent[],
+  catalog: Service[],
+  now: number,
+) {
   const { harness } = session;
   const { network } = cage;
+  const runtimes = vm?.runtimes ?? [];
+  const state = vm?.status.state ?? "stopped";
   const nodes: MapNode[] = [];
   const edges: Edge[] = [];
   const at = (id: string, x: number, y: number) => session.layout[id] ?? { x, y };
@@ -168,7 +178,7 @@ export function mapLayout(session: SessionView, cage: CageView, folders: string[
   const fromMac = (kind: AgentKind) => cage.hostAgents.some((a) => a.kind === kind);
   for (const [name, origin] of [
     ["pi", fromMac("pi") ? "from this Mac, or bundled with zwinger if it does not load" : "bundled with zwinger"],
-    ...cage.runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
+    ...runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
   ] as const) {
     y += ROW;
     // pi has no permission prompts; the setting applies to the other agents.
@@ -223,8 +233,8 @@ export function mapLayout(session: SessionView, cage: CageView, folders: string[
     position: at("boundary", BOX_X, BOX_Y),
     width: BOX_W,
     height: y + H + 20 - BOX_Y,
-    ariaLabel: `Cage of ${session.name}, ${cage.status.state}`,
-    data: { name: session.name, state: cage.status.state },
+    ariaLabel: `Cage of ${session.name}, ${state}`,
+    data: { name: session.name, state },
   });
 
   let ny = TOP;

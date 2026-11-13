@@ -4,11 +4,16 @@ description: A project is a folder on your Mac and its configuration.
 ---
 
 A **project** is one folder on your Mac and its configuration: the mounts, the network policy, the terminals, the
-tasks and the agents from your Mac. Each project has one [cage](/cages/). The project folder is mounted
-read-write at `/workspace` in the cage.
+tasks and the agents from your Mac. A project uses a [cage](/cages/): its own cage, or the default cage of its
+workspace. The project folder is mounted read-write at `/workspace` in the cage. A project with no cage opens Mac
+shells only.
 
 You can create, rename and delete projects. Use ⌘N to create a project. If you rename a project to an empty name,
-it gets the name of its folder again.
+it gets the name of its folder again. A rename does not rename the cage. A delete stops the VM of the project and keeps
+its cage: delete the cage in the [Cages](/cages/#the-cage-list) view.
+
+A new project in a workspace with a default cage uses that cage. In a workspace with no default cage, it gets a new
+cage with the name of the project.
 
 ## Workspaces
 
@@ -21,8 +26,15 @@ workspace. The tree is workspace → session → Terminals and Tasks.
   button). The name becomes a field in the row. Press Enter or click outside the field to save the name. Press Escape
   to cancel. An empty name gives a workspace the name "Workspace" again.
 - You can delete only an empty workspace. The last workspace cannot be deleted.
+- **Default cage…** in the menu of a workspace sets the cage of the sessions in it that inherit their cage. A session
+  row shows a cage icon when the session has a cage. Its tooltip names the cage, with "(inherited)" if the cage comes
+  from the workspace.
 - Drag a workspace to change the order of the workspaces. Drag a session to change its place or to move it to a
   different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
+- A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,
+  the rail asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,
+  and **Cancel** puts the session back. Until the restart, the project page edits the new cage and shows the state of
+  the old VM.
 - With the keyboard, press Space to pick up a row, the Up and Down arrow keys to move it, and Space to drop it. Escape
   cancels the move. Each arrow key moves a session one row. At the border of its workspace, the session goes to the
   end of the workspace above or to the start of the workspace below. A collapsed workspace expands. A workspace moves

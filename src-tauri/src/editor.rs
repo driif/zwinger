@@ -238,7 +238,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("secret"), folder.join("link")).unwrap();
         std::os::unix::fs::symlink(folder.join("src"), folder.join("inside")).unwrap();
         std::fs::write(folder.join("file"), "").unwrap();
-        let session = Session::new(folder.to_str().unwrap(), "c", []).unwrap();
+        let session = Session::new(folder.to_str().unwrap(), Some("c".into()), []).unwrap();
         let mut cage = Cage::new("c".into(), session.name.clone());
         cage.mounts.push(Mount { host: data.clone(), id: None, guest: "/data".into(), readonly: true });
 

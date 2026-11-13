@@ -132,7 +132,7 @@ export function Onboarding({
   async function create(folder: string) {
     const session = await createSession(await resolveFolder(folder));
     const { sessions } = await listSessions();
-    setCreated({ session, cage: sessions.find((s) => s.id === session)!.cage });
+    setCreated({ session, cage: sessions.find((s) => s.id === session)!.effectiveCage!.id });
     setStep(2);
   }
 

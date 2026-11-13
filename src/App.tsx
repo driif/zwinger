@@ -71,6 +71,7 @@ import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ProjectPage } from "./features/projects/ProjectPage";
 import { ProjectRail } from "./features/projects/ProjectRail";
 import { agentsOf, LaunchAction } from "./features/launcher/actions";
+import { launchCage, sessionCage } from "./features/cages/sessionCage";
 import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
@@ -81,6 +82,7 @@ import { ShortcutAction, useShortcuts } from "./shared/useShortcuts";
 import { errorCode, errorMessage, isBackendError } from "./shared/errorMessage";
 import { LOST_TITLE, ReloadScreen, useBackendLost } from "./shared/Recover";
 import { CageMark } from "./shared/CageMark";
+import { CagesPage } from "./features/cages/CagesPage";
 
 const TaskRoom = lazy(() => import("./features/tasks/TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
@@ -248,6 +250,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** The tab of the app settings, which the main area shows instead of a session. */
   const [settingsTab, setSettingsTab] = useState<string>();
   const showSettings = settingsTab !== undefined;
+  /** The list of cages, which the main area shows instead of a session. */
+  const [showCages, setShowCages] = useState(false);
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
   const [home, setHome] = useState<string>();
@@ -403,11 +407,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     return () => clearInterval(timer);
   }, [liveRunSessions]);
 
-  // A session whose cage is not in the list is not shown.
-  const joined: SessionCage[] = sessions.flatMap((session) => {
-    const cage = cages.find((c) => c.id === session.cage);
-    return cage ? [{ session, cage }] : [];
-  });
+  const joined: SessionCage[] = sessions.map((session) => sessionCage(session, cages));
   const panes: Pane[] = joined.flatMap(({ session }) =>
     session.terminals.map((t) => ({
       key: t.id,
@@ -418,7 +418,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   );
   const selected = joined.find((j) => j.session.id === selectedId) ?? joined[0];
   const session = selected?.session;
-  const cage = selected?.cage;
+  const vmCage = selected?.vmCage;
+  // With no effective cage there is nothing to restart into: the banner offers Stop.
+  const cageChanged = vmCage?.status.state === "running" && !!selected.cage && selected.cage.id !== vmCage.id;
   const sessionPanes = panes.filter((p) => p.sessionId === session?.id);
   /** The focused pane of a session; a stale one gives way to the first pane. */
   const focusedOf = (target: SessionView) => {
@@ -428,7 +430,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const focused = session && focusedOf(session);
   /** The pane whose folder ⌘⇧E and the command menu open. */
   const here = view.kind === "terminal" && !showSettings ? focused : undefined;
-  const events = (cage && net[cage.id]) ?? [];
+  const events = (vmCage && net[vmCage.id]) ?? [];
+  const defaultCage = cages.find((c) => c.id === workspaces.find((w) => w.sessions.includes(session?.id ?? ""))?.defaultCage);
 
   // A deleted task has no view.
   useEffect(() => {
@@ -436,9 +439,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }, [view, session]);
 
   const blocked = Object.fromEntries(
-    joined.map(({ session, cage }) => [
+    joined.map(({ session, vmCage }) => [
       session.id,
-      (net[cage.id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[cage.id] ?? 0)).length,
+      vmCage ? (net[vmCage.id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[vmCage.id] ?? 0)).length : 0,
     ]),
   );
 
@@ -483,6 +486,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   function select(id: string) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
+    setShowCages(false);
     setSelectedId(id);
     if (id === session?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
@@ -490,6 +494,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   function openView(sessionId: string, next: View) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
+    setShowCages(false);
     setSelectedId(sessionId);
     const target = sessions.find((s) => s.id === sessionId);
     // A session click opens the terminal view with its focused pane.
@@ -519,16 +524,17 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   async function newSession(kind: TerminalKind | "agent", target = selected, direction?: "row" | "column", at?: string) {
     if (!target) return;
     const { session } = target;
-    let { cage } = target;
+    let cage = launchCage(target);
     if (direction && tooDeep(session.paneLayout, at ?? focusedOf(session)))
       throw new Error("This pane cannot split again. Close a pane first.");
     // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
-    if (cage.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
-      const id = cage.id;
-      await startCage(id);
-      cage = (await listSessions()).cages.find((c) => c.id === id) ?? cage;
+    if (target.vmCage?.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
+      await startCage(session.id);
+      const next = await listSessions();
+      const fresh = next.sessions.find((s) => s.id === session.id);
+      cage = (fresh && sessionCage(fresh, next.cages).vmCage) ?? cage;
     }
-    const mounted = agentsOf(cage);
+    const mounted = cage ? agentsOf(cage) : [];
     const terminal: TerminalKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
     if (terminal.type === "agent" && !mounted.includes(terminal.agent))
       throw new Error(`${terminal.agent ? AGENT_NAMES[terminal.agent] : "No agent"} is not mounted in this cage.`);
@@ -578,7 +584,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
     const target = joined.find((j) => j.session.id === pane.sessionId);
-    if (pane.kind.type !== "host" && target && target.cage.status.state !== "running") await startCage(target.cage.id);
+    if (pane.kind.type !== "host" && target && target.vmCage?.status.state !== "running") await startCage(pane.sessionId);
     const { rows, cols } = fittedSize();
     await reopenTerminal(pane.sessionId, pane.key, rows, cols);
     showPane(pane.key, (await refresh())?.find((s) => s.id === pane.sessionId));
@@ -637,15 +643,16 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       return refresh();
     });
 
-  const toggle = (target: CageView) =>
-    run(() => (target.status.state === "running" ? stopCage(target.id) : startCage(target.id)));
+  const toggle = ({ session, vmCage }: SessionCage) =>
+    run(() => (vmCage?.status.state === "running" ? stopCage(session.id) : startCage(session.id)));
 
   function startIntent(kind: Intent["kind"]) {
     setView({ kind: kind === "addRule" ? "network" : "settings" });
     setIntent({ kind, at: Date.now() });
   }
 
-  const restart = (id: string) => run(() => stopCage(id).then(() => startCage(id)));
+  /** Restarts the cage of the session. */
+  const restart = (sessionId: string) => run(() => stopCage(sessionId).then(() => startCage(sessionId)));
 
   const actions: Record<ShortcutAction, () => void> = {
     // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
@@ -681,6 +688,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
       <ProjectRail
         sessions={joined}
+        cages={cages}
         workspaces={workspaces}
         selectedId={session?.id}
         view={view}
@@ -697,6 +705,11 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         onMoveTerminals={moveTerminals}
         onNew={actions.newProject}
         onSettings={actions.appSettings}
+        onCages={() => {
+          setRoundFolder(undefined);
+          setSettingsTab(undefined);
+          setShowCages(true);
+        }}
         dropFolder={dropFolder}
         editors={editors}
         home={home}
@@ -749,16 +762,26 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             </Notice>
           ))}
           {banner}
-          {!showSettings && !roundFolder && cage?.pendingRestart && (
+          {!showSettings && !showCages && !roundFolder && session && (vmCage?.pendingRestart || cageChanged) && (
             <Notice
               icon={<RotateCw size={14} className="warn" />}
               actions={
-                <Button size="sm" variant="outline" onClick={() => restart(cage.id)}>
-                  Restart
-                </Button>
+                selected.cage ? (
+                  <Button size="sm" variant="outline" onClick={() => restart(session.id)}>
+                    Restart
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={() => run(() => stopCage(session.id))}>
+                    Stop
+                  </Button>
+                )
               }
             >
-              The running cage uses an older config. Restart it to apply the changes.
+              {!selected.cage
+                ? `The VM runs cage ${vmCage?.name}, but the project has no cage now. Stop the VM.`
+                : cageChanged
+                  ? `The VM runs cage ${vmCage.name}; restart to use ${selected.cage.name}.`
+                  : "The running cage uses an older config. Restart it to apply the changes."}
             </Notice>
           )}
         </div>
@@ -783,6 +806,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             onUpdate={onUpdate}
             appearance={appearance}
           />
+        ) : showCages ? (
+          <CagesPage cages={cages} sessions={sessions} workspaces={workspaces} runtimes={runtimes} run={run} />
         ) : roundFolder ? (
           <section className="page">
             <div className="view task-view">
@@ -795,12 +820,15 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           <ProjectPage
             session={selected.session}
             cage={selected.cage}
+            vmCage={selected.vmCage}
+            cages={cages}
+            defaultCage={defaultCage}
             events={events}
             view={view}
             onView={setView}
             intent={intent}
             onIntentDone={() => setIntent(undefined)}
-            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [selected.cage.id]: seq }))}
+            onNetSeen={(seq) => vmCage && setLastSeen((current) => ({ ...current, [vmCage.id]: seq }))}
             onDropFolder={dropMount}
             runtimes={runtimes}
             detection={detection}
@@ -820,7 +848,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             panes={panes}
             focused={focused}
             run={run}
-            onToggle={() => toggle(selected.cage)}
+            onToggle={() => toggle(selected)}
             onNewSession={(kind) => run(() => newSession(kind))}
             onReopen={(pane) => run(() => reopen(pane))}
             onFocus={(key) => focusPane(key)}

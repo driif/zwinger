@@ -17,7 +17,7 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn put_task(&self, id: &str, draft: TaskDraft) -> Result<String> {
         let mut task_id = String::new();
         self.edit_session(id, |s, c| {
-            task_id = s.put_task(c, draft)?;
+            task_id = s.put_task(c.ok_or(Error::NoCage)?, draft)?;
             Ok(())
         })?;
         Ok(task_id)

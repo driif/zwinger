@@ -437,8 +437,10 @@ mod tests {
         let (_, event) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
         assert_eq!(event.seq, 3);
 
-        manager.delete(&id).await.unwrap();
+        manager.stop(&id).await.unwrap();
         net_closed(&runtime, 1).await;
+        manager.delete(&id).await.unwrap();
+        manager.delete_cage(&id).unwrap();
         assert!(lock(&manager.state).net.is_empty());
     }
 

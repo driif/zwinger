@@ -5,9 +5,9 @@ zwinger is a Mac app that runs AI coding agents in microVMs next to the user's o
 ## Code names
 
 - **Session** is `Session` and `SessionView` in the code, `sessions.json` on disk, and "project" in the UI.
-- **Cage** is `Cage` and `CageView` in the code and `cages.json` on disk. The UI shows the cage settings of a session on the session's page.
+- **Cage** is `Cage` and `CageView` in the code and `cages.json` on disk. The UI shows the cage settings of a session on the session's page, and all cages in the Cages view.
 - **Terminal** is `Terminal`, `TerminalView` and `TerminalKind` (the process) and `TerminalRecord` (the saved record in `terminals`). The process commands keep their names (`open_session`, `attach_session`, `write_session`, ...).
-- **Cage** and **VM** are both in the Rust `cage` module and its manager. VM state is `Status` in Rust and `CageStatus` in the frontend; `start_cage`, `stop_cage` and the event `cage-start-progress` start and stop a VM. Today each session has its own cage, with the same id, and one VM.
+- **Cage** and **VM** are both in the Rust `cage` module and its manager. VM state is `Status` in Rust and `CageStatus` in the frontend; `start_cage` and `stop_cage` take a session id and start the VM of its effective cage, or stop the VM that runs for it; the event `cage-start-progress` reports a start by cage id. Today a cage has one VM, and the VM runs for one session (until #120): a start for a second session of a running cage is refused (`CageBusy`). A session keeps the VM of its old cage after a cage change, until that VM stops. The sessions converted by #118 have their own cage with the same id.
 - `projects.json` is the store of older builds. The first start reads it once and converts it; the app never writes it.
 
 ## Organization
@@ -17,7 +17,7 @@ A named group of sessions in the sidebar. It is for organization only: it has no
 _Avoid_: group, folder. The guest path `/workspace` is a different thing.
 
 **Session**:
-One host folder on the Mac with its terminals, its pane layout and its tasks. Its default name is the basename of the folder. A session uses its own cage, the cage of its workspace, or no cage. The user creates, renames and deletes sessions; the config is in `sessions.json` in the app data folder, and the config of its cage in `cages.json`. Builds before #118 stored both in `projects.json`. When `sessions.json` or `cages.json` is missing, the start converts each project to one session and one cage with the project's id, writes `cages.json`, then `sessions.json`, and keeps `projects.json` unchanged. Builds before ADR 0005 stored the projects in `shields.json`: the conversion first copies that file to `projects.json` once, when `projects.json` is missing, and keeps the old file.
+One host folder on the Mac with its terminals, its pane layout and its tasks. Its default name is the basename of the folder. A session **attaches** a cage (`cage` is its id) or **inherits** (`cage` is `null`) the default cage of its workspace. Its **effective cage** is the attached cage, else that default; with neither it has no cage and opens Mac shells only. A new session in a workspace with a default cage inherits it; else it gets a new cage with its own id and name. A session rename does not rename its cage, and a session delete keeps its cage. The user creates, renames and deletes sessions; the config is in `sessions.json` in the app data folder, and the config of its cage in `cages.json`. Builds before #118 stored both in `projects.json`. When `sessions.json` or `cages.json` is missing, the start converts each project to one session and one cage with the project's id, writes `cages.json`, then `sessions.json`, and keeps `projects.json` unchanged. Builds before ADR 0005 stored the projects in `shields.json`: the conversion first copies that file to `projects.json` once, when `projects.json` is missing, and keeps the old file.
 _Avoid_: project, shield
 
 **Session folder**:

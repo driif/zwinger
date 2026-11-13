@@ -14,15 +14,19 @@ pub const DEFAULT_NAME: &str = "Workspace";
 /// A named group of sessions in the rail. Each session is in exactly one
 /// workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: String,
     pub name: String,
     pub sessions: Vec<String>,
+    /// The cage of each session of the workspace that inherits its cage.
+    #[serde(default)]
+    pub default_cage: Option<String>,
 }
 
 impl Workspace {
     pub fn new(sessions: Vec<String>) -> Self {
-        Self { id: uuid::Uuid::new_v4().to_string(), name: DEFAULT_NAME.to_owned(), sessions }
+        Self { id: uuid::Uuid::new_v4().to_string(), name: DEFAULT_NAME.to_owned(), sessions, default_cage: None }
     }
 }
 
@@ -121,8 +125,10 @@ pub fn arrange(workspaces: &[Workspace], wanted: Vec<Arrangement>, session_ids: 
     Ok(wanted
         .into_iter()
         .map(|a| {
-            let name = workspaces.iter().find(|w| w.id == a.id).map(|w| w.name.clone()).unwrap_or_default();
-            Workspace { id: a.id, name, sessions: a.sessions }
+            let old = workspaces.iter().find(|w| w.id == a.id);
+            let name = old.map(|w| w.name.clone()).unwrap_or_default();
+            let default_cage = old.and_then(|w| w.default_cage.clone());
+            Workspace { id: a.id, name, sessions: a.sessions, default_cage }
         })
         .collect())
 }
@@ -141,7 +147,7 @@ mod tests {
     }
 
     fn workspace(id: &str, sessions: &[&str]) -> Workspace {
-        Workspace { id: id.to_owned(), name: id.to_owned(), sessions: ids(sessions) }
+        Workspace { id: id.to_owned(), name: id.to_owned(), sessions: ids(sessions), default_cage: None }
     }
 
     fn arrangement(id: &str, sessions: &[&str]) -> Arrangement {

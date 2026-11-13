@@ -292,6 +292,11 @@ pub fn run() {
             commands::network::list_net_events,
             commands::cages::start_cage,
             commands::cages::stop_cage,
+            commands::cages::create_cage,
+            commands::cages::rename_cage,
+            commands::cages::delete_cage,
+            commands::cages::set_session_cage,
+            commands::cages::set_workspace_cage,
             commands::terminal::open_session,
             commands::terminal::reopen_terminal,
             commands::terminal::write_session,
@@ -420,9 +425,9 @@ mod tests {
     /// conversion does. Returns their ids.
     fn stored<const N: usize>(data: &Path, folders: [PathBuf; N]) -> [String; N] {
         let pairs = folders.map(|folder| {
-            let session = session::Session::new(folder.to_str().unwrap(), "", []).unwrap();
+            let session = session::Session::new(folder.to_str().unwrap(), None, []).unwrap();
             let cage = cage::Cage::new(session.id.clone(), session.name.clone());
-            (session::Session { cage: cage.id.clone(), ..session }, cage)
+            (session::Session { cage: Some(cage.id.clone()), ..session }, cage)
         });
         let store = store::Store::new(data.to_owned());
         store.save_cages(&pairs.iter().map(|p| p.1.clone()).collect::<Vec<_>>()).unwrap();

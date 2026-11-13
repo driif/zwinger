@@ -31,8 +31,10 @@ pub struct Session {
     /// The guest folder name below `/workspace` in a VM with more sessions
     /// (ADR 0007). It is set once and does not change with a rename.
     pub slug: String,
-    /// The id of the cage of the session.
-    pub cage: String,
+    /// The id of the attached cage. `None`: the session inherits the
+    /// default cage of its workspace, if it has one.
+    #[serde(default)]
+    pub cage: Option<String>,
     /// The guest folder where agent terminals start: below `/workspace` or a mount.
     #[serde(default)]
     pub harness: Option<String>,
@@ -163,9 +165,13 @@ pub struct TaskDraft {
 }
 
 impl Session {
-    /// A new session of `folder` in the cage `cage`. `taken` are the slugs
+    /// A new session of `folder` with the cage `cage`. `taken` are the slugs
     /// of all other sessions.
-    pub fn new<'a>(folder: &str, cage: &str, taken: impl IntoIterator<Item = &'a str> + Clone) -> Result<Self> {
+    pub fn new<'a>(
+        folder: &str,
+        cage: Option<String>,
+        taken: impl IntoIterator<Item = &'a str> + Clone,
+    ) -> Result<Self> {
         let (folder, folder_id) = cage::host_dir_with_id(folder)?;
         let name = cage::folder_name(&folder);
         Ok(Self {
@@ -174,7 +180,7 @@ impl Session {
             name,
             folder,
             folder_id: Some(folder_id),
-            cage: cage.to_owned(),
+            cage,
             harness: None,
             terminals: Vec::new(),
             pane_layout: None,
@@ -354,7 +360,7 @@ mod tests {
     fn set_layout_keeps_finite_positions() {
         let dir = std::env::temp_dir().join(format!("zwinger-layout-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut session = Session::new(dir.to_str().unwrap(), "c", []).unwrap();
+        let mut session = Session::new(dir.to_str().unwrap(), Some("c".into()), []).unwrap();
         session.set_layout(Some(
             [
                 ("harness".to_owned(), Pos { x: 1.0, y: 2.0 }),

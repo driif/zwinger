@@ -10,7 +10,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
-use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, Vm, bin_dir, blocking, lock};
+use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, State, Vm, bin_dir, blocking, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
 use crate::cage::{Bound, CLAUDE_TOKEN, Cage, WORKSPACE};
@@ -60,10 +60,33 @@ impl<R: SandboxRuntime> Manager<R> {
     /// the start reaches the proxy. The lock is released before the host
     /// logins are read and
     /// before the runtime start. The proxy starts before the VM: if it
-    /// cannot start, the cage does not start. `id` is the cage id.
-    pub async fn start(&self, id: &str) -> Result<()> {
+    /// cannot start, the cage does not start. It starts the VM of the
+    /// effective cage of the session.
+    pub async fn start(&self, session_id: &str) -> Result<()> {
         let started = Instant::now();
         let mut timings = Timings::default();
+        let (session, cage, progress, live) = {
+            let _edit = lock(&self.secret_edit);
+            let (session, cage) = self.claim_start(session_id)?;
+            let progress = Arc::new(Progress {
+                id: cage.id.clone(),
+                started,
+                state: self.state.clone(),
+                sink: self.progress_sink.clone(),
+            });
+            // After the claim: only a cage that is starting reports a phase.
+            progress.begin(Phase::Vault);
+            let values = self.vault_values(&cage);
+            timings.add(Phase::Vault, started.elapsed());
+            let live = values.map(|values| {
+                let live = Live::new(cage.network.clone(), values);
+                lock(&self.state).live.insert(cage.id.clone(), live.clone());
+                live
+            });
+            (session, cage, progress, live)
+        };
+        let cage_id = cage.id.clone();
+        let id = cage_id.as_str();
         let fail = |e: Error, timings: &mut Timings| {
             timings.finish(started);
             eprintln!("{} (failed: {e})", timings.line(id));
@@ -72,27 +95,9 @@ impl<R: SandboxRuntime> Manager<R> {
             state.live.remove(id);
             Err(e)
         };
-        let progress = Arc::new(Progress {
-            id: id.to_owned(),
-            started,
-            state: self.state.clone(),
-            sink: self.progress_sink.clone(),
-        });
-        let ((session, cage), live) = {
-            let _edit = lock(&self.secret_edit);
-            let claimed = self.claim_start(id)?;
-            // After the claim: only a cage that is starting reports a phase.
-            progress.begin(Phase::Vault);
-            let values = self.vault_values(&claimed.1);
-            timings.add(Phase::Vault, started.elapsed());
-            match values {
-                Ok(values) => {
-                    let live = Live::new(claimed.1.network.clone(), values);
-                    lock(&self.state).live.insert(id.to_owned(), live.clone());
-                    (claimed, live)
-                }
-                Err(e) => return fail(e, &mut timings),
-            }
+        let live = match live {
+            Ok(live) => live,
+            Err(e) => return fail(e, &mut timings),
         };
         if let Err(e) = self.reap_leftovers().await {
             return fail(e, &mut timings);
@@ -195,11 +200,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     timings.add(Phase::Wrappers, at.elapsed());
                     let vm = Arc::new(vm);
                     run.guest_watch = Some(self.watch_guest_logins(id, &vm));
+                    state.generation += 1;
+                    let generation = state.generation;
                     state.vms.insert(
                         id.to_owned(),
                         Vm::Running {
+                            generation,
                             vm,
-                            applied: Box::new((vec![session], cage)),
+                            applied: Box::new((session, cage)),
                             proxy,
                             net,
                             runtimes: names,
@@ -210,7 +218,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 Err(e) => {
                     timings.finish(started);
                     eprintln!("{} (failed: {e})", timings.line(id));
-                    state.vms.insert(id.to_owned(), Vm::Failed(e.message()));
+                    state.vms.insert(id.to_owned(), Vm::Failed { session: session_id.to_owned(), message: e.message() });
                     state.live.remove(id);
                     return Err(e);
                 }
@@ -423,17 +431,31 @@ impl<R: SandboxRuntime> Manager<R> {
         .abort_handle()
     }
 
-    /// Checks the cage and its session, marks the cage as starting and
-    /// returns both.
-    pub(crate) fn claim_start(&self, id: &str) -> Result<(Session, Cage)> {
+    /// Checks the session and its effective cage, marks the cage as
+    /// starting for the session and returns both. One VM runs one session:
+    /// a cage whose VM runs for a different session is busy.
+    pub(crate) fn claim_start(&self, session_id: &str) -> Result<(Session, Cage)> {
         let mut state = lock(&self.state);
-        let cage = state.cage(id)?.clone();
-        let session = state.session_of(id)?.clone();
+        let session = state.session(session_id)?.clone();
+        let cage = state.bound(session_id)?.cage.clone();
+        let id = cage.id.as_str();
+        // The VM of the session's old cage still runs or stops.
+        match state.vm_of(session_id) {
+            Some((vm_cage, Vm::Stopping { .. })) if vm_cage != id => return Err(Error::Stopping),
+            Some((vm_cage, _)) if vm_cage != id => return Err(Error::AlreadyStarted),
+            _ => {}
+        }
+        let busy = |other: &str| Error::CageBusy {
+            cage: cage.name.clone(),
+            session: state.session(other).map_or_else(|_| other.to_owned(), |s| s.name.clone()),
+        };
         match state.vms.get(id) {
-            Some(Vm::Starting(_)) => return Err(Error::Starting),
+            Some(Vm::Starting { session: other, .. }) if other != session_id => return Err(busy(other)),
+            Some(Vm::Running { applied, .. }) if applied.0.id != session_id => return Err(busy(&applied.0.id)),
+            Some(Vm::Starting { .. }) => return Err(Error::Starting),
             Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
-            Some(Vm::Stopping) => return Err(Error::Stopping),
-            None | Some(Vm::Failed(_)) => {}
+            Some(Vm::Stopping { .. }) => return Err(Error::Stopping),
+            None | Some(Vm::Failed { .. }) => {}
         }
         let bound = Bound { session: &session, cage: &cage };
         bound.verify_paths()?;
@@ -442,9 +464,10 @@ impl<R: SandboxRuntime> Manager<R> {
         bound.check_app_data(&self.reserved)?;
         // A session with no known cage cannot start, so it is not checked.
         let others: Vec<Bound> =
-            state.sessions.iter().filter(|s| s.cage != id).filter_map(|s| state.bound(&s.id).ok()).collect();
+            state.sessions.iter().filter_map(|s| state.bound(&s.id).ok()).filter(|other| other.cage.id != id).collect();
         bound.check_overlap_with(others)?;
-        state.vms.insert(id.to_owned(), Vm::Starting(Phase::Vault));
+        let starting = Vm::Starting { session: session_id.to_owned(), phase: Phase::Vault };
+        state.vms.insert(id.to_owned(), starting);
         Ok((session, cage))
     }
 
@@ -555,35 +578,55 @@ impl<R: SandboxRuntime> Manager<R> {
         }
     }
 
-    /// The VM stays tracked until the runtime confirms shutdown, so a failed
-    /// stop leaves the cage running and the user can retry.
-    pub async fn stop(&self, id: &str) -> Result<()> {
-        // First, so each run settles its manifest before its processes die with the VM.
-        let sessions: Vec<String> = {
+    /// Stops the VM that runs for the session. A VM that failed has no
+    /// session: the session's effective cage reports its state.
+    pub async fn stop(&self, session_id: &str) -> Result<()> {
+        let (cage_id, generation) = {
             let state = lock(&self.state);
-            state.cage(id)?;
-            state.sessions.iter().filter(|s| s.cage == id).map(|s| s.id.clone()).collect()
+            let (id, vm) = match state.vm_of(session_id) {
+                Some(found) => found,
+                None => {
+                    let cage = state.effective_cage(session_id)?.ok_or(Error::NotRunning)?;
+                    state.cage(&cage.id)?;
+                    return Err(match state.vms.get(&cage.id) {
+                        Some(Vm::Stopping { .. }) => Error::Stopping,
+                        _ => Error::NotRunning,
+                    });
+                }
+            };
+            match vm {
+                Vm::Running { generation, .. } => (id.to_owned(), *generation),
+                Vm::Starting { .. } => return Err(Error::Starting),
+                Vm::Stopping { .. } => return Err(Error::Stopping),
+                Vm::Failed { .. } => return Err(Error::NotRunning),
+            }
         };
-        for session in &sessions {
-            self.runs.cancel_session(session, "the cage stopped", RUN_STOP_LIMIT).await;
-        }
+        self.stop_vm(&cage_id, generation).await
+    }
+
+    /// Stops the VM of cage `id` if it is the start `generation`. The VM
+    /// stays tracked until the runtime confirms shutdown, so a failed stop
+    /// leaves the cage running and the user can retry.
+    pub(crate) async fn stop_vm(&self, id: &str, generation: u64) -> Result<()> {
+        let session_of = |state: &State<R::Vm>| match state.vms.get(id) {
+            Some(Vm::Running { generation: g, applied, .. }) if *g == generation => Ok(applied.0.id.clone()),
+            _ => Err(Error::NotRunning),
+        };
+        // First, so the run settles its manifest before its processes die with the VM.
+        let session = session_of(&lock(&self.state))?;
+        self.runs.cancel_session(&session, "the cage stopped", RUN_STOP_LIMIT).await;
         let (vm, applied, proxy, net, runtimes, host) = {
             let mut state = lock(&self.state);
-            state.cage(id)?;
-            match state.vms.get(id) {
-                Some(Vm::Running { .. }) => {}
-                Some(Vm::Starting(_)) => return Err(Error::Starting),
-                Some(Vm::Stopping) => return Err(Error::Stopping),
-                Some(Vm::Failed(_)) | None => return Err(Error::NotRunning),
-            }
-            let Some(Vm::Running { vm, applied, proxy, net, runtimes, host }) =
-                state.vms.insert(id.to_owned(), Vm::Stopping)
+            let session = session_of(&state)?;
+            let stopping = Vm::Stopping { session: session.clone() };
+            let Some(Vm::Running { vm, applied, proxy, net, runtimes, host, .. }) =
+                state.vms.insert(id.to_owned(), stopping)
             else {
                 unreachable!("checked above");
             };
             // A host shell runs on the Mac, so it outlives the VM.
             state.terminals.retain(|t| {
-                let ends = sessions.contains(&t.session_id) && t.kind != TerminalKind::Host;
+                let ends = t.session_id == session && t.kind != TerminalKind::Host;
                 if ends {
                     let _ = t.input.send(PtyInput::Kill);
                 }
@@ -606,7 +649,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             // The follower and the proxy stay with the VM that still runs.
             Err(_) => {
-                state.vms.insert(id.to_owned(), Vm::Running { vm, applied, proxy, net, runtimes, host });
+                state.vms.insert(id.to_owned(), Vm::Running { generation, vm, applied, proxy, net, runtimes, host });
             }
         }
         result
@@ -615,19 +658,21 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Stops the running cages, `STOP_PARALLEL` at a time. `limit` bounds
     /// the total time, so app exit cannot hang on a stuck VM.
     pub async fn stop_all(&self, limit: Duration) {
-        let running: Vec<String> = lock(&self.state)
+        let running: Vec<(String, u64)> = lock(&self.state)
             .vms
             .iter()
-            .filter(|(_, vm)| matches!(vm, Vm::Running { .. }))
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, vm)| match vm {
+                Vm::Running { generation, .. } => Some((id.clone(), *generation)),
+                _ => None,
+            })
             .collect();
         let permits = Semaphore::new(STOP_PARALLEL);
         let mut stops: Vec<_> = running
             .iter()
-            .map(|id| {
+            .map(|(id, generation)| {
                 Box::pin(async {
                     let _permit = permits.acquire().await;
-                    let _ = self.stop(id).await;
+                    let _ = self.stop_vm(id, *generation).await;
                 })
             })
             .collect();
@@ -890,6 +935,43 @@ mod tests {
         assert!(crate::updates::restart_guard(manager.live()).is_ok());
     }
 
+    fn generation(manager: &Manager<FakeRuntime>, cage: &str) -> u64 {
+        match lock(&manager.state).vms.get(cage) {
+            Some(Vm::Running { generation, .. }) => *generation,
+            _ => panic!("the cage does not run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_of_an_old_vm_does_not_stop_the_vm_of_another_session() {
+        let (manager, _, a) = manager();
+        let shared = manager.create_cage("shared").unwrap();
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.set_session_cage(&a, Some(&shared)).unwrap();
+        manager.set_session_cage(&b, Some(&shared)).unwrap();
+        manager.start(&a).await.unwrap();
+        let old = generation(&manager, &shared);
+        manager.stop(&a).await.unwrap();
+        manager.start(&b).await.unwrap();
+
+        assert!(matches!(manager.stop_vm(&shared, old).await, Err(Error::NotRunning)));
+        let vm_of_b = lock(&manager.state).vm_of(&b).map(|(id, vm)| (id.to_owned(), matches!(vm, Vm::Running { .. })));
+        assert_eq!(vm_of_b, Some((shared, true)));
+    }
+
+    #[tokio::test]
+    async fn a_stop_of_an_old_vm_does_not_stop_the_restarted_vm() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        let old = generation(&manager, &id);
+        manager.stop(&id).await.unwrap();
+        manager.start(&id).await.unwrap();
+
+        assert!(matches!(manager.stop_vm(&id, old).await, Err(Error::NotRunning)));
+        assert_eq!(manager.list().cages[0].status, Status::Running);
+        assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("stop")).count(), 1);
+    }
+
     #[tokio::test]
     async fn stop_kills_sessions() {
         let (manager, _, id) = manager();
@@ -917,6 +999,36 @@ mod tests {
         *runtime.fail_stop.lock().unwrap() = false;
         manager.stop(&id).await.unwrap();
         assert_eq!(manager.list().cages[0].status, Status::Stopped);
+    }
+
+    /// The old VM keeps its session while it stops: a start of the
+    /// session's new cage must wait, or a failed stop leaves two VMs.
+    #[tokio::test]
+    async fn a_start_waits_for_the_stop_of_the_old_cage() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        let other = manager.create_cage("other").unwrap();
+        manager.set_session_cage(&id, Some(&other)).unwrap();
+
+        let gate = Arc::new(PtyGate::default());
+        *runtime.stop_gate.lock().unwrap() = Some(gate.clone());
+        let manager = Arc::new(manager);
+        let stop = tokio::spawn({
+            let (manager, id) = (manager.clone(), id.clone());
+            async move { manager.stop(&id).await }
+        });
+        gate.entered.notified().await;
+        assert_eq!(manager.list().sessions[0].vm_cage.as_deref(), Some(id.as_str()));
+        assert!(matches!(manager.start(&id).await, Err(Error::Stopping)));
+        assert!(matches!(manager.stop(&id).await, Err(Error::Stopping)));
+
+        *runtime.fail_stop.lock().unwrap() = true;
+        *runtime.stop_gate.lock().unwrap() = None;
+        gate.release.notify_one();
+        assert!(stop.await.unwrap().is_err());
+        assert!(matches!(manager.start(&id).await, Err(Error::AlreadyStarted)));
+        let starts = runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count();
+        assert_eq!(starts, 1);
     }
 
     #[tokio::test]
@@ -992,6 +1104,7 @@ mod tests {
         assert!(!snapshot.exists());
         manager.stop(&id).await.unwrap();
         manager.delete(&id).await.unwrap();
+        manager.delete_cage(&id).unwrap();
         assert!(!manager.profile_dir(&id).exists());
     }
 

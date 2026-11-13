@@ -17,13 +17,14 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
   NetEvent,
   NetStage,
   NetTest,
   putRule,
   removeRule,
+  Service,
   setNetworkDefault,
   setOffline,
   testNetwork,
@@ -75,7 +76,13 @@ function domainError(input: string) {
 
 interface Props {
   session: SessionView;
-  cage: CageView;
+  /** The effective cage: the rules that the tab edits. `null`: the session has no cage. */
+  cage: CageView | null;
+  /** The cage of the session's VM: the test and the activity apply to it. */
+  vmCage: CageView | null;
+  /** Shows in place of the rules when `cage` is null. */
+  noCage: ReactNode;
+  /** The network events of the session's VM. */
   events: NetEvent[];
   run: Run;
   intent?: Intent;
@@ -89,6 +96,8 @@ interface Props {
 export function NetworkTab({
   session,
   cage,
+  vmCage,
+  noCage,
   events,
   run,
   intent,
@@ -96,30 +105,17 @@ export function NetworkTab({
   active,
   onSeen,
 }: Props) {
-  const { id, network } = cage;
   const catalog = useCatalog();
-  const [adding, setAdding] = useState<"service" | "host">();
-  const [host, setHost] = useState("");
-  const [problem, setProblem] = useState<string>();
-  const [expanded, setExpanded] = useState<string>();
-  const [credentialsOf, setCredentialsOf] = useState<string>();
   const [testHost, setTestHost] = useState("example.com");
   const [test, setTest] = useState<NetTest | "running">();
-  const hostField = useRef<HTMLInputElement>(null);
   const activity = useRef<HTMLDivElement>(null);
   const [activityVisible, setActivityVisible] = useState(false);
   const latestSeq = events[events.length - 1]?.seq ?? 0;
-  const running = cage.status.state === "running";
+  const running = vmCage?.status.state === "running";
 
   useEffect(() => {
-    if (intent?.kind !== "addRule") return;
-    onIntentDone();
-    setAdding("host");
-  }, [intent]);
-
-  useEffect(() => {
-    if (adding === "host") hostField.current?.focus();
-  }, [adding]);
+    if (!cage && intent) onIntentDone();
+  }, [intent, cage]);
 
   useEffect(() => {
     const observer = new IntersectionObserver(([entry]) =>
@@ -133,27 +129,11 @@ export function NetworkTab({
     if (active && activityVisible) onSeen(latestSeq);
   }, [active, activityVisible, latestSeq]);
 
-  const add = (target: Target, action: Action) =>
-    run(() => putRule(id, { target, action }));
-
-  function submitHost(action: Action) {
-    const error = domainError(host);
-    if (error) return setProblem(error);
-    run(() =>
-      putRule(id, { target: { kind: "host", host }, action }).then(
-        () => {
-          setHost("");
-          setAdding(undefined);
-        },
-        (e) => setProblem(errorMessage(e)),
-      ),
-    );
-  }
-
   function runTest(event: FormEvent) {
     event.preventDefault();
+    if (!running) return;
     setTest("running");
-    testNetwork(id, testHost.trim()).then(setTest, (e) =>
+    testNetwork(vmCage.id, testHost.trim()).then(setTest, (e) =>
       setTest({ proxy: { ok: false, detail: errorMessage(e) }, target: null }),
     );
   }
@@ -166,16 +146,33 @@ export function NetworkTab({
     </li>
   );
 
-  const loginsOf = (rule: Rule) =>
-    cage.logins.filter((l) =>
-      l.hosts.some((h) => ruleDomains(rule, catalog).some((d) => covers(d, h))),
-    );
-  const blockedNeeds = session.agentNeeds.filter((need) => !need.allowed);
-  const unused = catalog.filter(
-    (s) =>
-      !network.rules.some(
-        (r) => r.target.kind === "service" && r.target.id === s.id,
-      ),
+  const testForm = (
+    <>
+          <form className="row" onSubmit={runTest}>
+            <FloatingField
+              label="Host to test"
+              className="grow mono"
+              value={testHost}
+              onChange={(e) => setTestHost(e.target.value)}
+            />
+            <Button
+              type="submit"
+              variant="outline"
+              disabled={
+                !running || test === "running" || testHost.trim() === ""
+              }
+              title={running ? undefined : "Start the cage to test"}
+            >
+              {test === "running" ? "Testing…" : "Test"}
+            </Button>
+          </form>
+          {test && test !== "running" && (
+            <ul className="list">
+              {stage("Proxy", test.proxy)}
+              {test.target && stage("Host", test.target)}
+            </ul>
+          )}
+    </>
   );
 
   return (
@@ -201,6 +198,121 @@ export function NetworkTab({
         </CardBody>
       </Card>
 
+      {cage ? (
+        <CageRules
+          session={session}
+          cage={cage}
+          catalog={catalog}
+          run={run}
+          intent={intent}
+          onIntentDone={onIntentDone}
+          test={testForm}
+        />
+      ) : (
+        <>
+          {noCage}
+          <Card variant="outlined" padding="md">
+            <CardHeader title="Test" titleAs="h2" />
+            <CardBody className="stack">{testForm}</CardBody>
+          </Card>
+        </>
+      )}
+
+      <div ref={activity}>
+        <NetworkActivity
+          sessionId={session.id}
+          cage={cage}
+          running={running}
+          events={events}
+          catalog={catalog}
+          run={run}
+        />
+      </div>
+
+      <Card variant="subtle" padding="md">
+        <CardHeader
+          title="Always blocked"
+          titleAs="h2"
+          description="No rule and no default opens these. You cannot change this."
+        />
+        <CardBody>
+          <ul className="list">
+            {ALWAYS_BLOCKED.map((group) => (
+              <li key={group.label} className="row">
+                <Ban size={14} className="danger" />
+                <span className="grow">{group.label}</span>
+                <span className="muted mono">{group.hint}</span>
+              </li>
+            ))}
+          </ul>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+interface RulesProps {
+  session: SessionView;
+  cage: CageView;
+  catalog: Service[];
+  run: Run;
+  intent?: Intent;
+  onIntentDone: () => void;
+  /** The network test, at the end of the Internet access card. */
+  test: ReactNode;
+}
+
+/** The rules of the effective cage. */
+function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: RulesProps) {
+  const { id, network } = cage;
+  const [adding, setAdding] = useState<"service" | "host">();
+  const [host, setHost] = useState("");
+  const [problem, setProblem] = useState<string>();
+  const [expanded, setExpanded] = useState<string>();
+  const [credentialsOf, setCredentialsOf] = useState<string>();
+  const hostField = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (intent?.kind !== "addRule") return;
+    onIntentDone();
+    setAdding("host");
+  }, [intent]);
+
+  useEffect(() => {
+    if (adding === "host") hostField.current?.focus();
+  }, [adding]);
+
+  const add = (target: Target, action: Action) =>
+    run(() => putRule(id, { target, action }));
+
+  function submitHost(action: Action) {
+    const error = domainError(host);
+    if (error) return setProblem(error);
+    run(() =>
+      putRule(id, { target: { kind: "host", host }, action }).then(
+        () => {
+          setHost("");
+          setAdding(undefined);
+        },
+        (e) => setProblem(errorMessage(e)),
+      ),
+    );
+  }
+
+  const loginsOf = (rule: Rule) =>
+    cage.logins.filter((l) =>
+      l.hosts.some((h) => ruleDomains(rule, catalog).some((d) => covers(d, h))),
+    );
+  const blockedNeeds = session.agentNeeds.filter((need) => !need.allowed);
+  const unused = catalog.filter(
+    (s) =>
+      !network.rules.some(
+        (r) => r.target.kind === "service" && r.target.id === s.id,
+      ),
+  );
+
+  return (
+    <>
       <Card variant="outlined" padding="md">
         <CardHeader title="Internet access" titleAs="h2" />
         <CardBody className="stack">
@@ -228,30 +340,7 @@ export function NetworkTab({
             checked={network.offline}
             onChange={(on) => run(() => setOffline(id, on))}
           />
-          <form className="row" onSubmit={runTest}>
-            <FloatingField
-              label="Host to test"
-              className="grow mono"
-              value={testHost}
-              onChange={(e) => setTestHost(e.target.value)}
-            />
-            <Button
-              type="submit"
-              variant="outline"
-              disabled={
-                !running || test === "running" || testHost.trim() === ""
-              }
-              title={running ? undefined : "Start the cage to test"}
-            >
-              {test === "running" ? "Testing…" : "Test"}
-            </Button>
-          </form>
-          {test && test !== "running" && (
-            <ul className="list">
-              {stage("Proxy", test.proxy)}
-              {test.target && stage("Host", test.target)}
-            </ul>
-          )}
+          {test}
         </CardBody>
       </Card>
 
@@ -479,33 +568,6 @@ export function NetworkTab({
         </CardBody>
       </Card>
 
-      <div ref={activity}>
-        <NetworkActivity
-          cage={cage}
-          events={events}
-          catalog={catalog}
-          run={run}
-        />
-      </div>
-
-      <Card variant="subtle" padding="md">
-        <CardHeader
-          title="Always blocked"
-          titleAs="h2"
-          description="No rule and no default opens these. You cannot change this."
-        />
-        <CardBody>
-          <ul className="list">
-            {ALWAYS_BLOCKED.map((group) => (
-              <li key={group.label} className="row">
-                <Ban size={14} className="danger" />
-                <span className="grow">{group.label}</span>
-                <span className="muted mono">{group.hint}</span>
-              </li>
-            ))}
-          </ul>
-        </CardBody>
-      </Card>
-    </div>
+    </>
   );
 }

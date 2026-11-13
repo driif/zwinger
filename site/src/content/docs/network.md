@@ -8,7 +8,7 @@ the outside into the cage are always blocked.
 
 ## Network policy
 
-Each project has one network policy. Open it with ⌘4.
+The network policy belongs to the cage of a project: the projects of one cage share it. Open it with ⌘4.
 
 - **Default**: Block or Allow all hosts that no rule names.
 - **Rules**: each rule names a service of the catalog (for example GitHub or npm, with its domains) or a host, and says
@@ -24,6 +24,9 @@ The proxy checks each request in this sequence:
 5. The default.
 
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
+
+The rules that the network page edits are the rules of the project's current cage. **Test** and **Activity** apply to
+the VM that runs for the project. After a cage change, that VM uses its old cage until a restart.
 
 ## Activity
 

@@ -106,7 +106,7 @@ impl<V> Progress<V> {
     pub(crate) fn begin(&self, phase: Phase) {
         // Only a start that still runs: a failed start already set its status.
         match lock(&self.state).vms.get_mut(&self.id) {
-            Some(Vm::Starting(current)) => *current = phase,
+            Some(Vm::Starting { phase: current, .. }) => *current = phase,
             _ => return,
         }
         if let Some(sink) = self.sink.get() {

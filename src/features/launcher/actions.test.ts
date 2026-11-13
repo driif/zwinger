@@ -54,3 +54,8 @@ test("no editors, or all editors off, give no editor actions", () => {
   for (const list of [undefined, { editors: editors.editors.map((e) => ({ ...e, enabled: false })), default: null }])
     assert.equal(launchActions(cage("running"), list).filter((a) => a.type === "editor").length, 0);
 });
+
+test("with no cage, only the Mac shell runs", () => {
+  const sessions = launchActions(null, undefined).filter((a) => a.type === "session");
+  assert.deepEqual(sessions.map((a) => a.label), ["New Mac shell"]);
+});

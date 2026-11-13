@@ -83,10 +83,14 @@ pub enum Error {
     SessionNotFound,
     #[error("the cage of this project is missing")]
     CageNotFound,
-    #[error(
-        "session {session} uses cage {cage}, which is not in cages.json; restore cages.json, then open zwinger again"
-    )]
-    MissingCage { session: String, cage: String },
+    #[error("{owner} uses cage {cage}, which is not in cages.json; restore cages.json, then open zwinger again")]
+    MissingCage { owner: String, cage: String },
+    #[error("this session has no cage; pick a cage for it or a default cage for its workspace")]
+    NoCage,
+    #[error("cage {cage} runs for session {session}; stop it first")]
+    CageBusy { cage: String, session: String },
+    #[error("cage {0} is in use: {1}")]
+    CageInUse(String, String),
     #[error("workspace not found")]
     WorkspaceNotFound,
     #[error("the workspace has sessions; move them to a different workspace first")]
@@ -107,8 +111,6 @@ pub enum Error {
     TerminalOpen,
     #[error("invalid pane layout: {0}")]
     InvalidPaneLayout(String),
-    #[error("this session has no cage; attach a cage to run a task")]
-    NoCage,
     #[error("cage is not running")]
     NotRunning,
     #[error("cage is already started")]

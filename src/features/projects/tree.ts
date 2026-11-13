@@ -1,4 +1,4 @@
-import type { Workspace } from "../../shared/api";
+import type { SessionView, Workspace } from "../../shared/api";
 
 /** The workspaces with `session` moved to workspace `to`: before `before`, else at the end. */
 export function moveSession(workspaces: Workspace[], session: string, to: string, before?: string): Workspace[] {
@@ -40,4 +40,16 @@ export function stepWorkspace(workspaces: Workspace[], workspace: string, dir: 1
   const next = [...workspaces];
   [next[index], next[to]] = [next[to], next[index]];
   return next;
+}
+
+/**
+ * The cage of `session` after its move to the workspaces `next`, when the move changes its effective cage: the new cage
+ * id, or `null` for no cage. `undefined`: the cage stays.
+ */
+export function cageAfterMove(
+  session: Pick<SessionView, "id" | "cage" | "effectiveCage">,
+  next: Workspace[],
+): string | null | undefined {
+  const cage = session.cage ?? next.find((w) => w.sessions.includes(session.id))?.defaultCage ?? null;
+  return cage === (session.effectiveCage?.id ?? null) ? undefined : cage;
 }

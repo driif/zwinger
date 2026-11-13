@@ -109,11 +109,17 @@ export function HostAgentsSettings({ detection, sessions, runtimes, run, onRefre
                   className="model-picker"
                   menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a cage`}
                   placeholder="Use in projects"
-                  commands={sessions.map(({ session, cage }) => ({
-                    id: session.id,
-                    label: cage.hostAgents.some((a) => a.kind === agent.kind) ? `${session.name} (in use)` : session.name,
-                    onSelect: () => run(async () => onUse(session.id, agent)),
-                  }))}
+                  commands={sessions.flatMap(({ session, cage }) =>
+                    cage
+                      ? [
+                          {
+                            id: session.id,
+                            label: cage.hostAgents.some((a) => a.kind === agent.kind) ? `${session.name} (in use)` : session.name,
+                            onSelect: () => run(async () => onUse(session.id, agent)),
+                          },
+                        ]
+                      : [],
+                  )}
                 />
               </div>
             </CardBody>

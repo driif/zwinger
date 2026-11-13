@@ -109,21 +109,22 @@ impl<R: SandboxRuntime> Manager<R> {
             let (pty, group) = host::open_host_pty(&folder, rows, cols)?;
             return self.register(session_id, terminal_id, kind, pty, Some(group), |_| true);
         }
-        let cage_id = lock(&self.state).session(session_id)?.cage.clone();
-        let (vm, cwd) = match lock(&self.state).vms.get(&cage_id) {
-            Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
-                let cwd = match kind {
-                    TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
-                        return Err(self.unmounted(agent, host));
-                    }
-                    TerminalKind::Agent { .. } => {
-                        applied.0.iter().find(|s| s.id == session_id).and_then(|s| s.harness.as_deref())
-                    }
-                    TerminalKind::Shell | TerminalKind::Host => None,
-                };
-                (vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
+        let (cage_id, vm, cwd) = {
+            let state = lock(&self.state);
+            state.session(session_id)?;
+            match state.vm_of(session_id) {
+                Some((cage_id, Vm::Running { vm, applied, runtimes, host, .. })) => {
+                    let cwd = match kind {
+                        TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
+                            return Err(self.unmounted(agent, host));
+                        }
+                        TerminalKind::Agent { .. } => applied.0.harness.as_deref(),
+                        TerminalKind::Shell | TerminalKind::Host => None,
+                    };
+                    (cage_id.to_owned(), vm.clone(), cwd.unwrap_or(WORKSPACE).to_owned())
+                }
+                _ => return Err(Error::NotRunning),
             }
-            _ => return Err(Error::NotRunning),
         };
         let pty = self.runtime.open_pty(&vm, &kind.argv(), &cwd, rows, cols).await?;
         // The cage may have stopped, or stopped and started again, while
@@ -302,16 +303,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     t.session_id == session_id && t.terminal_id.as_deref() == Some(tid) && t.exit_code.is_none()
                 })
             });
-            let cwd = match (process, state.vms.get(&session.cage)) {
+            let cwd = match (process, state.vm_of(session_id).map(|(_, vm)| vm)) {
                 (Some(Terminal { host_group: Some(group), .. }), _) => Some(Cwd::Host(group.clone())),
                 (Some(process), Some(Vm::Running { applied, .. })) => {
-                    applied.0.iter().find(|s| s.id == session_id).map(|member| {
-                        let start = match process.kind {
-                            TerminalKind::Agent { .. } => member.harness.clone(),
-                            TerminalKind::Shell | TerminalKind::Host => None,
-                        };
-                        Cwd::Guest(process.output.clone(), start, Box::new((member.clone(), applied.1.clone())))
-                    })
+                    let start = match process.kind {
+                        TerminalKind::Agent { .. } => applied.0.harness.clone(),
+                        TerminalKind::Shell | TerminalKind::Host => None,
+                    };
+                    Some(Cwd::Guest(process.output.clone(), start, applied.clone()))
                 }
                 _ => None,
             };

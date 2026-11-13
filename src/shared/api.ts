@@ -167,8 +167,8 @@ export interface SessionView {
   folderId: FileId | null;
   /** The guest folder name of the session, fixed when the session is made. */
   slug: string;
-  /** The id of its cage. */
-  cage: string;
+  /** The id of its attached cage. `null`: it inherits the default cage of its workspace. */
+  cage: string | null;
   harness: string | null;
   /** In tree order. */
   terminals: TerminalRecord[];
@@ -181,6 +181,13 @@ export interface SessionView {
   processes: TerminalView[];
   /** The hosts that the session's agents need, with the proxy's decision on each. */
   agentNeeds: AgentNeed[];
+  /** The cage that the session uses. `inherited`: the default cage of its workspace. */
+  effectiveCage: { id: string; inherited: boolean } | null;
+  /**
+   * The cage whose VM starts or runs for the session, or whose start for the session failed. After a cage change it is
+   * the old cage until that VM stops.
+   */
+  vmCage: string | null;
 }
 
 /** The sandbox config of a session and the state of its VM. */
@@ -208,10 +215,17 @@ export interface CageView {
   startTimings: StartTimings | null;
 }
 
-/** A session with its cage, as the UI shows them: one row per session. */
+/** A session with its cages, as the UI shows them: one row per session. */
 export interface SessionCage {
   session: SessionView;
-  cage: CageView;
+  /** The effective cage: each config edit goes to it. `null`: the session has no cage. */
+  cage: CageView | null;
+  /**
+   * The cage of the VM that starts, runs or stops for the session, or whose start for the session failed: the VM
+   * state, Start/Stop, the network test and the network events read it. `null`: no VM for the session. It differs from
+   * `cage` after a cage change, until the VM restarts.
+   */
+  vmCage: CageView | null;
 }
 
 /** A group of sessions in the rail. Each session is in exactly one workspace. */
@@ -220,6 +234,8 @@ export interface Workspace {
   name: string;
   /** Session ids, in rail order. */
   sessions: string[];
+  /** The cage of each session of the workspace that inherits its cage. */
+  defaultCage: string | null;
 }
 
 export interface AgentNeed {

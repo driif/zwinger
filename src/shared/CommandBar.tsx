@@ -6,10 +6,11 @@ import {
   setOffline,
 } from "../features/network/api";
 import { removeMount, setMountReadonly } from "../features/settings/api";
-import { CageView, SessionCage, SessionView } from "./api";
+import { SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
 import { LaunchAction, launchActions } from "../features/launcher/actions";
+import { launchCage } from "../features/cages/sessionCage";
 import { Editors } from "../features/launcher/api";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
@@ -27,8 +28,9 @@ interface Props {
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
   onView: (view: View) => void;
-  onToggle: (cage: CageView) => void;
-  onRestart: (id: string) => void;
+  onToggle: (target: SessionCage) => void;
+  /** Restarts the cage of the session. */
+  onRestart: (sessionId: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
   editors?: Editors;
@@ -69,19 +71,19 @@ export function CommandBar({
 
   const commands: CommandMenuItem[] = [];
   if (selected) {
-    const { session, cage } = selected;
-    const { state } = cage.status;
+    const { session, cage, vmCage } = selected;
+    const state = vmCage?.status.state ?? (cage ? "stopped" : undefined);
     if (state === "running" || state === "stopped" || state === "error")
       commands.push({
         id: "toggle",
         label: state === "running" ? `Stop ${session.name} cage` : `Start ${session.name} cage`,
-        onSelect: () => onToggle(cage),
+        onSelect: () => onToggle(selected),
       });
-    if (cage.pendingRestart)
-      commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(cage.id) });
+    if (cage && (vmCage?.pendingRestart || (state === "running" && cage.id !== vmCage?.id)))
+      commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(session.id) });
     commands.push(action("newAgent", "New agent"));
     const herePane = panes.find((p) => p.key === here);
-    for (const launch of launchActions(cage, editors)) {
+    for (const launch of launchActions(launchCage(selected), editors)) {
       const shortcut =
         launch.type === "session" && launch.kind.type !== "agent"
           ? shortcutLabel(launch.kind.type === "host" ? "newShell" : "newVmShell")
@@ -122,10 +124,12 @@ export function CommandBar({
       intent("harness", "Set harness…"),
       intent("delete", "Delete project…"),
     );
-    const { id, network } = cage;
     commands.push({ id: "new-task", label: "New task…", onSelect: () => onView({ kind: "taskEdit" }) });
     for (const task of session.tasks)
       commands.push({ id: `task-${task.id}`, label: `Show task ${task.title}`, onSelect: () => onView({ kind: "task", taskId: task.id }) });
+  }
+  if (selected?.cage) {
+    const { id, network, mounts } = selected.cage;
     const other = network.default === "allow" ? "block" : "allow";
     commands.push(
       {
@@ -143,7 +147,7 @@ export function CommandBar({
       const label = rule.target.kind === "host" ? rule.target.host : rule.target.id;
       commands.push({ id: `rule-${rule.id}`, label: `Remove network rule ${label}`, onSelect: () => run(() => removeRule(id, rule.id)) });
     }
-    for (const mount of cage.mounts) {
+    for (const mount of mounts) {
       commands.push({
         id: `access-${mount.guest}`,
         label: `Make ${mount.guest} ${mount.readonly ? "read-write" : "read-only"}`,

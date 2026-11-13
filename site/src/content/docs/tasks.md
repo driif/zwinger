@@ -35,7 +35,7 @@ A run is one execution of a task. It has these stages:
 If an agent fails, the run continues in a degraded mode, and the room shows it. A degraded result is never shown as an
 agreement.
 
-A task needs a cage. A session with no cage cannot start a task: attach a cage first.
+A task needs a cage. A session with no cage cannot start a task: attach a cage, or set a default cage for its workspace.
 
 In the stages that must not change files, the run compares the Git state of its folder before and after. A change
 is a violation. Outside a Git work tree, this check is not possible, and the run tells you. A run never commits or

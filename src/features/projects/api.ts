@@ -41,9 +41,18 @@ export const resolveFolder = (path: string) =>
 export const renameSession = (sessionId: string, name: string) =>
   call<void>("rename_session", { sessionId, name });
 
-export const startCage = (cageId: string) => call<void>("start_cage", { cageId });
+/** Starts the VM of the session's effective cage. */
+export const startCage = (sessionId: string) => call<void>("start_cage", { sessionId });
 
-export const stopCage = (cageId: string) => call<void>("stop_cage", { cageId });
+/** Stops the VM that runs for the session. */
+export const stopCage = (sessionId: string) => call<void>("stop_cage", { sessionId });
+
+/** `null`: the session inherits the default cage of its workspace. */
+export const setSessionCage = (sessionId: string, cageId: string | null) =>
+  call<void>("set_session_cage", { sessionId, cageId });
+
+export const setWorkspaceCage = (workspaceId: string, cageId: string | null) =>
+  call<void>("set_workspace_cage", { workspaceId, cageId });
 
 /** The user confirms the folders that are not verified since the update. */
 export const confirmPaths = (sessionId: string) => call<void>("confirm_paths", { sessionId });

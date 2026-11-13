@@ -95,6 +95,8 @@ const sameData = (a: Record<string, unknown>, b: Record<string, unknown>) =>
 interface Props {
   session: SessionView;
   cage: CageView;
+  /** The cage of the session's VM. */
+  vmCage: CageView | null;
   /** `undefined` until the folders of this session are listed. */
   folders?: string[];
   /** The cage's network events, oldest first. */
@@ -115,7 +117,7 @@ export function ProjectMap(props: Props) {
   );
 }
 
-function MapCanvas({ session, cage, folders, events, visible, run, onJump, onDropFolder }: Props) {
+function MapCanvas({ session, cage, vmCage, folders, events, visible, run, onJump, onDropFolder }: Props) {
   const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
   const container = useRef<HTMLDivElement>(null);
   const [now, setNow] = useState(Date.now);
@@ -138,8 +140,8 @@ function MapCanvas({ session, cage, folders, events, visible, run, onJump, onDro
   }, [latest]);
 
   const map = useMemo(
-    () => mapLayout({ ...session, layout }, cage, folders ?? [], events, catalog, now),
-    [session, cage, layout, folders, events, catalog, now],
+    () => mapLayout({ ...session, layout }, cage, vmCage, folders ?? [], events, catalog, now),
+    [session, cage, vmCage, layout, folders, events, catalog, now],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 

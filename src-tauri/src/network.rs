@@ -715,7 +715,7 @@ mod tests {
         use crate::agent::AgentKind;
         use crate::cage::HostAgentUse;
 
-        let mut session = crate::session::Session::new("/tmp", "c", []).unwrap();
+        let mut session = crate::session::Session::new("/tmp", Some("c".into()), []).unwrap();
         let mut cage = crate::cage::Cage::new("c".into(), "tmp".into());
         cage.host_agents = vec![
             HostAgentUse { kind: AgentKind::Pi, profile: true, login: true },

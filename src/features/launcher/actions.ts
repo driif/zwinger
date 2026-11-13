@@ -23,12 +23,15 @@ export type LaunchAction = { id: string; label: string } & (
   | { type: "reveal" }
 );
 
-/** The shells, the agents and their last sessions, the editors that are on, then the folder actions. */
-export function launchActions(cage: CageView, editors: Editors | undefined): LaunchAction[] {
+/**
+ * The shells, the agents and their last sessions, the editors that are on, then the folder actions. With no cage, only
+ * the Mac shell runs.
+ */
+export function launchActions(cage: CageView | null, editors: Editors | undefined): LaunchAction[] {
   return [
     { id: "host", label: "New Mac shell", type: "session", kind: { type: "host" } },
-    { id: "shell", label: "New VM shell", type: "session", kind: { type: "shell" } },
-    ...agentsOf(cage).flatMap((agent): LaunchAction[] => [
+    ...(cage ? [{ id: "shell", label: "New VM shell", type: "session", kind: { type: "shell" } } as const] : []),
+    ...(cage ? agentsOf(cage) : []).flatMap((agent): LaunchAction[] => [
       { id: `agent-${agent}`, label: `New ${AGENT_NAMES[agent]}`, type: "session", kind: { type: "agent", agent, resume: false } },
       {
         id: `resume-${agent}`,

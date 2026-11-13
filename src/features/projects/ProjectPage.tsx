@@ -32,6 +32,7 @@ import { TerminalTab } from "../terminal";
 import { Notice } from "../../shared/Notice";
 import { tildePath } from "../../shared/paths";
 import { LaunchAction, launchActions } from "../launcher/actions";
+import { launchCage } from "../cages/sessionCage";
 import { Editors } from "../launcher/api";
 import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
 
@@ -168,6 +169,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
 }
 
 // Agents and Terminal are no tabs: the tree names each agent and terminal, so tabs would show them twice.
+
 const TABS = [
   { value: "overview", label: "Overview" },
   { value: "network", label: "Network" },
@@ -176,8 +178,15 @@ const TABS = [
 
 interface Props {
   session: SessionView;
-  cage: CageView;
-  /** The cage's network events, oldest first. */
+  /** The effective cage: the config that the page edits. `null`: no cage. */
+  cage: CageView | null;
+  /** The cage of the session's VM: the page shows its state. */
+  vmCage: CageView | null;
+  /** All cages. */
+  cages: CageView[];
+  /** The default cage of the session's workspace. */
+  defaultCage?: CageView;
+  /** The network events of the session's VM, oldest first. */
   events: NetEvent[];
   view: View;
   onView: (view: View) => void;
@@ -229,6 +238,9 @@ interface Props {
 export function ProjectPage({
   session,
   cage,
+  vmCage,
+  cages,
+  defaultCage,
   events,
   view,
   onView,
@@ -254,7 +266,7 @@ export function ProjectPage({
   onEditorSettings,
   ...terminal
 }: Props) {
-  const { status } = cage;
+  const status = vmCage?.status ?? { state: "stopped" };
   const [listed, setListed] = useState<{ id: string; folders: string[] }>();
   const [reloads, setReloads] = useState(0);
   /** The host notices that the user dismissed in the current running period of a project. */
@@ -295,9 +307,18 @@ export function ProjectPage({
   const running = status.state === "running" || status.state === "stopping";
   const sessions = session.processes.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
-  const unverified = [...(session.folderId ? [] : [session.folder]), ...cage.mounts.filter((m) => !m.id).map((m) => m.host)];
+  const unverified = [
+    ...(session.folderId ? [] : [session.folder]),
+    ...(cage?.mounts ?? []).filter((m) => !m.id).map((m) => m.host),
+  ];
+  const hostAgents = cage?.hostAgents ?? [];
+  const noCage = (
+    <Notice icon={<Info size={14} className="muted" />} actions={<Button size="sm" variant="outline" onClick={() => jump("settings")}>Pick a cage</Button>}>
+      This project has no cage. It opens Mac shells only. Pick a cage in Settings, or a default cage for its workspace.
+    </Notice>
+  );
   const task = view.kind === "task" ? session.tasks.find((t) => t.id === view.taskId) : undefined;
-  const actions = launchActions(cage, editors);
+  const actions = launchActions(launchCage({ session, cage, vmCage }), editors);
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
   const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
@@ -309,14 +330,18 @@ export function ProjectPage({
           <h1 className="page-title">{session.name}</h1>
           <p className="muted row">
             <span className={`dot ${status.state}`} />
-            {status.state === "error" ? (
+            {!cage && !vmCage ? (
+              "no cage"
+            ) : status.state === "error" ? (
               <span className="danger">{status.message}</span>
             ) : status.state === "starting" ? (
               <StartProgress phase={status.phase} />
             ) : (
               status.state
             )}
-            {status.state === "running" && cage.loginExpiresAt !== null && <span>· login valid until {time(cage.loginExpiresAt)}</span>}
+            {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
+            {!cage && vmCage && <span>· no cage</span>}
+            {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
           </p>
           <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
         </div>
@@ -328,8 +353,8 @@ export function ProjectPage({
           menu={[
             ...launchMenu(newTerminals, onLaunch),
             // Host agents are set up here, next to the agents that they add.
-            ...(detection?.agents ?? []).map((agent) => ({
-              label: `${cage.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+            ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
+              label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
               icon: <Plus size={14} />,
               run: () => onAdding(agent.kind),
             })),
@@ -352,13 +377,14 @@ export function ProjectPage({
           variant={running ? "secondary" : "primary"}
           iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
           loading={status.state === "stopping"}
-          disabled={status.state === "starting"}
+          disabled={(!cage && !running) || status.state === "starting"}
+          title={cage || running ? undefined : "This project has no cage."}
           onClick={onToggle}
         >
           {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
         </Button>
       </header>
-      {adding && detection && (
+      {adding && detection && cage && (
         <AddAgent
           key={adding}
           cage={cage}
@@ -384,7 +410,7 @@ export function ProjectPage({
           </Notice>
         )}
         {status.state === "running" &&
-          cage.hostNotices
+          vmCage?.hostNotices
             .filter((notice) => !hidden.includes(notice))
             .map((notice) => (
               <Notice
@@ -396,13 +422,13 @@ export function ProjectPage({
               </Notice>
             ))}
         {status.state === "running" &&
-          cage.guestLogins.map((agent) => (
+          vmCage?.guestLogins.map((agent) => (
             <Notice
               key={agent}
               icon={<TriangleAlert size={14} className="warn" />}
               actions={
                 <>
-                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(cage.id, agent).then(onRefresh))}>
+                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(vmCage.id, agent).then(onRefresh))}>
                     Remove it
                   </Button>
                   <Button size="sm" variant="outline" onClick={onHostAgents}>
@@ -440,53 +466,60 @@ export function ProjectPage({
                       </>
                     }
                   >
-                    {cage.hostAgents.length === 0 && detection && detection.agents.length > 0
+                    {hostAgents.length === 0 && detection && detection.agents.length > 0
                       ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
                       : "Next: open an agent, or a shell on this Mac in the project folder."}
                   </Notice>
                 )}
-                <Suspense>
-                  <ProjectMap
-                    key={session.id}
-                    session={session}
-                    cage={cage}
-                    folders={folders}
-                    events={events}
-                    visible={isTab && tab === "overview"}
-                    run={run}
-                    onJump={jump}
-                    onDropFolder={onDropFolder}
-                  />
-                </Suspense>
+                {cage ? (
+                  <Suspense>
+                    <ProjectMap
+                      key={session.id}
+                      session={session}
+                      cage={cage}
+                      vmCage={vmCage}
+                      folders={folders}
+                      events={events}
+                      visible={isTab && tab === "overview"}
+                      run={run}
+                      onJump={jump}
+                      onDropFolder={onDropFolder}
+                    />
+                  </Suspense>
+                ) : (
+                  noCage
+                )}
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
                     <dd className="mono">{session.harness ?? "/workspace"}</dd>
                   </div>
-                  <div>
-                    <dt>Network</dt>
-                    <dd>
-                      {cage.network.offline
-                        ? "Offline"
-                        : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
-                    </dd>
-                  </div>
+                  {cage && (
+                    <div>
+                      <dt>Network</dt>
+                      <dd>
+                        {cage.network.offline
+                          ? "Offline"
+                          : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
+                      </dd>
+                    </div>
+                  )}
                   <div>
                     <dt>Sessions</dt>
                     <dd>{sessions}</dd>
                   </div>
-                  {cage.hostAgents.length > 0 && (
+                  {hostAgents.length > 0 && (
                     <div>
                       <dt>From this Mac</dt>
                       <dd>
-                        {cage.hostAgents
+                        {hostAgents
                           .map((a) =>
                             [
                               AGENT_NAMES[a.kind],
                               a.profile && "profile",
                               a.login &&
                                 (a.kind === "claude" &&
-                                (!cage.claudeToken?.stored ||
+                                (!cage?.claudeToken?.stored ||
                                   !cage.claudeToken.expiresAt ||
                                   cage.claudeToken.expiresAt <= Date.now())
                                   ? "needs token"
@@ -502,11 +535,15 @@ export function ProjectPage({
                 </dl>
               </div>
             ),
-            network: (
+            network: !cage && !vmCage ? (
+              <div className="tab-body">{noCage}</div>
+            ) : (
               <NetworkTab
                 key={session.id}
                 session={session}
                 cage={cage}
+                vmCage={vmCage}
+                noCage={noCage}
                 events={events}
                 run={edit}
                 intent={tab === "network" ? intent : undefined}
@@ -519,7 +556,8 @@ export function ProjectPage({
               <SettingsTab
                 key={session.id}
                 session={session}
-                cage={cage}
+                cages={cages}
+                defaultCage={defaultCage}
                 folders={folders ?? []}
                 runtimes={runtimes}
                 run={edit}
@@ -529,14 +567,15 @@ export function ProjectPage({
             ),
           }}
         />
-      {task && view.kind === "task" && (
+      {!cage && (view.kind === "task" || view.kind === "taskEdit") && <div className="view task-view">{noCage}</div>}
+      {task && cage && view.kind === "task" && (
         <div className="view task-view">
           <Suspense>
             <TaskRoom
               key={task.id}
               kind="task"
               session={session}
-              cage={cage}
+              cageRunning={status.state === "running"}
               task={task}
               runs={runs.filter((r) => r.taskId === task.id)}
               run={view.run}
@@ -548,7 +587,7 @@ export function ProjectPage({
           </Suspense>
         </div>
       )}
-      {view.kind === "taskEdit" && (
+      {cage && view.kind === "taskEdit" && (
         <div className="view task-view">
           <TaskDialog
             key={view.taskId ?? "new"}
@@ -566,7 +605,7 @@ export function ProjectPage({
       <div className="view" hidden={view.kind !== "terminal"}>
         <TerminalTab
           session={session}
-          cage={cage}
+          status={status}
           panes={panes}
           focused={focused}
           editor={defaultEditor?.editor.name}

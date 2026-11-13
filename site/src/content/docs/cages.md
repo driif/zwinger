@@ -3,8 +3,38 @@ title: Cages
 description: A cage is the Linux microVM of a project.
 ---
 
-A **cage** is the microVM of a [project](/projects/). It is the unit of isolation. Each cage is a Linux microVM with
-its own kernel (microsandbox, libkrun on Hypervisor.framework).
+A **cage** is the sandbox config of a [project](/projects/): its mounts, its [network policy](/network/), its
+credentials and its agents. A cage starts as a Linux microVM with its own kernel (microsandbox, libkrun on
+Hypervisor.framework). The VM is the unit of isolation.
+
+## The cage list
+
+**Cages** at the bottom of the rail shows all cages, with the projects that use each one.
+
+- **Create cage** adds a cage with no mounts, rules or agents.
+- **Rename** changes the name of the cage. The projects keep their names.
+- **Edit** shows the mounts and the agent settings of the cage.
+- **Delete** removes the cage, its credential values and its agent state. You cannot delete a cage that a project uses,
+  that is the default cage of a workspace, or whose VM runs. The button then shows the reason as a tooltip.
+
+## Attach or inherit
+
+In **Settings** of a project, **Cage** selects the cage of the project. **Inherit from workspace** uses the default
+cage of its workspace. Set the default cage of a workspace with **Default cage…** in the menu of the workspace. A
+project that inherits, in a workspace with no default cage, has no cage: it opens Mac shells only.
+
+A change of the cage applies at the next start. A VM that runs keeps running with its old cage until it stops. The
+project page then shows "The VM runs cage X; restart to use Y". If the project has no cage now, the page still shows
+**Stop cage** for the old VM.
+
+Edits always go to the current cage of the project: mounts, network rules, offline, logins, agents and settings. A VM
+that runs with an old cage does not get these edits: they apply after the restart. The VM status, **Start** and **Stop**, the network test and
+the network activity apply to the VM that runs for the project.
+
+## One project at a time
+
+A cage runs for one project at a time. If two projects use the same cage, the start of the second project is refused
+while the VM runs for the first: "cage X runs for session Y; stop it first".
 
 ## What the cage sees
 
@@ -26,7 +56,7 @@ the cage, and has no sandbox. A cage stop ends the VM shells and the agent sessi
 
 ## Start and stop
 
-You start and stop the cage. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
+You start and stop the cage of a project. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
 status of a starting cage names the current phase. **Settings > Last start** of the project shows the time of each
 phase.
 

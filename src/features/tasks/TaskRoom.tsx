@@ -14,7 +14,7 @@ import {
   runDiff,
   watchRoom,
 } from "./api";
-import { CageView, SessionView, Task } from "../../shared/api";
+import { SessionView, Task } from "../../shared/api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -25,7 +25,8 @@ type Props =
   | {
       kind: "task";
       session: SessionView;
-      cage: CageView;
+      /** The session's VM runs. */
+      cageRunning: boolean;
       task: Task;
       runs: RunSummary[];
       /** No `run` shows the latest run. */
@@ -97,7 +98,7 @@ export function TaskRoom(props: Props) {
   }, [active?.id]);
 
   const inApp = props.kind === "task" ? props : undefined;
-  const cageRunning = inApp?.cage.status.state === "running";
+  const cageRunning = inApp?.cageRunning;
   const liveRun = status !== null && isLive(status.state);
   const canStart = inApp && cageRunning && !runs.some((r) => isLive(r.state));
 

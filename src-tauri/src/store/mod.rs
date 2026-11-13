@@ -56,13 +56,15 @@ impl Store {
 
     /// When one of the two files is missing, a conversion did not run or
     /// did not end: it converts the projects file again and writes both.
-    /// A session whose cage is not in the cages file is an error.
+    /// A session attached to a cage that is not in the cages file is an error.
     pub fn load(&self) -> Result<(Vec<Session>, Vec<Cage>)> {
         let (sessions, cages) = (self.dir.join(SESSIONS), self.dir.join(CAGES));
         if sessions.exists() && cages.exists() {
             let (sessions, cages): (Vec<Session>, Vec<Cage>) = (read(&sessions)?, read(&cages)?);
-            if let Some(s) = sessions.iter().find(|s| !cages.iter().any(|c| c.id == s.cage)) {
-                return Err(Error::MissingCage { session: format!("{} ({})", s.name, s.id), cage: s.cage.clone() });
+            for s in &sessions {
+                if let Some(cage) = &s.cage {
+                    check_cage(&cages, &format!("session {} ({})", s.name, s.id), cage)?;
+                }
             }
             let mut cages = cages;
             if drop_claude_logins(&mut cages)
@@ -118,6 +120,14 @@ fn drop_claude_logins(cages: &mut [Cage]) -> bool {
         cage.logins.retain(|secret| secret.origin != claude);
         dropped | (before != cage.logins.len())
     })
+}
+
+/// `owner` names who uses `cage` in the error.
+pub fn check_cage(cages: &[Cage], owner: &str, cage: &str) -> Result<()> {
+    if cages.iter().any(|c| c.id == cage) {
+        return Ok(());
+    }
+    Err(Error::MissingCage { owner: owner.to_owned(), cage: cage.to_owned() })
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
@@ -206,7 +216,7 @@ mod tests {
         let dir = data_dir().join("nested");
         let store = Store::new(dir.clone());
         assert_eq!(store.load().unwrap(), (Vec::new(), Vec::new()));
-        let mut session = Session::new(data_dir().to_str().unwrap(), "c", []).unwrap();
+        let mut session = Session::new(data_dir().to_str().unwrap(), Some("c".into()), []).unwrap();
         session.layout = [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into();
         let cage = Cage::new("c".into(), "proj".into());
         store.save_cages(std::slice::from_ref(&cage)).unwrap();
@@ -214,6 +224,21 @@ mod tests {
         assert_eq!(store.load().unwrap(), (vec![session], vec![cage]));
         assert!(!dir.join("sessions.json.tmp").exists() && !dir.join("cages.json.tmp").exists());
         assert!(!dir.join(PROJECTS).exists());
+    }
+
+    #[test]
+    fn a_stored_cage_id_attaches_and_no_cage_inherits() {
+        let dir = data_dir();
+        let session = |id: &str, cage: serde_json::Value| serde_json::json!({ "id": id, "name": id, "folder": "/tmp/x", "slug": id, "cage": cage });
+        let sessions = serde_json::json!([session("a", "c".into()), session("b", serde_json::Value::Null)]);
+        std::fs::write(dir.join(SESSIONS), sessions.to_string()).unwrap();
+        let store = Store::new(dir.clone());
+        store.save_cages(&[Cage::new("c".into(), "c".into())]).unwrap();
+        let (sessions, _) = store.load().unwrap();
+        assert_eq!(sessions.iter().map(|s| s.cage.as_deref()).collect::<Vec<_>>(), [Some("c"), None]);
+
+        store.save_cages(&[]).unwrap();
+        assert!(matches!(store.load(), Err(Error::MissingCage { cage, .. }) if cage == "c"));
     }
 
     /// A project of a real config: two mounts, rules with credentials, a
@@ -265,7 +290,7 @@ mod tests {
             folder: "/tmp/My Proj".into(),
             folder_id: Some(FileId { dev: 1, ino: 2 }),
             slug: "my-proj".into(),
-            cage: "p-1".into(),
+            cage: Some("p-1".into()),
             harness: Some("/workspace/agent".into()),
             terminals: vec![
                 TerminalRecord {
@@ -326,7 +351,7 @@ mod tests {
     fn a_stored_claude_host_login_is_dropped_and_saved() {
         let dir = data_dir();
         let store = Store::new(dir.clone());
-        let session = Session::new(data_dir().to_str().unwrap(), "c", []).unwrap();
+        let session = Session::new(data_dir().to_str().unwrap(), Some("c".into()), []).unwrap();
         let mut cage = Cage::new("c".into(), "proj".into());
         cage.host_agents.push(HostAgentUse { kind: AgentKind::Claude, profile: false, login: true });
         cage.logins.push(Secret {

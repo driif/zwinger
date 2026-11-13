@@ -444,6 +444,8 @@ pub mod fake {
         pub cwds: Arc<Mutex<Vec<String>>>,
         pub argvs: Arc<Mutex<Vec<Vec<String>>>>,
         pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
+        /// Holds each stop before it ends.
+        pub stop_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// Holds the exit of a killed PTY process.
         pub kill_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// The guest network of the last start.
@@ -529,6 +531,11 @@ pub mod fake {
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {
+            let gate = self.stop_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             if *self.fail_stop.lock().unwrap() {
                 return Err(Error::Io(std::io::Error::other("stop failed")));
             }

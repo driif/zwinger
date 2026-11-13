@@ -1,4 +1,4 @@
-import { Button, Card, IconButton, TextField } from "@driif/motiv";
+import { Button, Card, IconButton, Select, TextField } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -24,6 +24,7 @@ import {
   ChevronDown,
   ChevronRight,
   Ellipsis,
+  Fence,
   History,
   Laptop,
   ListChecks,
@@ -36,7 +37,16 @@ import {
   X,
 } from "lucide-react";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import { arrangeWorkspaces, createWorkspace, deleteWorkspace, renameSession, renameWorkspace } from "./api";
+import {
+  arrangeWorkspaces,
+  createWorkspace,
+  deleteWorkspace,
+  renameSession,
+  renameWorkspace,
+  setWorkspaceCage,
+  startCage,
+  stopCage,
+} from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
@@ -53,14 +63,15 @@ import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import { tildePath, truncateMiddle } from "../../shared/paths";
 import { LaunchAction, launchActions } from "../launcher/actions";
+import { launchCage } from "../cages/sessionCage";
 import { Editors } from "../launcher/api";
 import { launchMenu } from "../launcher/SplitLaunch";
 import { StartProgress } from "./StartProgress";
-import { moveSession, stepSession, stepWorkspace } from "./tree";
+import { cageAfterMove, moveSession, stepSession, stepWorkspace } from "./tree";
 import "./rail.css";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
-const FORBIDDEN = "Not allowed: each session has its own cage. Terminals stay in their session.";
+const FORBIDDEN = "Not allowed: terminals stay in their session.";
 
 type Group = "terminals" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
@@ -222,6 +233,8 @@ function NameField({ name, onDone }: { name: string; onDone: (name: string | und
 
 interface Props {
   sessions: SessionCage[];
+  /** All cages. */
+  cages: CageView[];
   /** Each session is in exactly one workspace. */
   workspaces: Workspace[];
   selectedId?: string;
@@ -234,7 +247,7 @@ interface Props {
   run: Run;
   onOpen: (sessionId: string, view: View) => void;
   onRunsChange: (sessionId: string) => void;
-  onToggle: (cage: CageView) => void;
+  onToggle: (target: SessionCage) => void;
   onNewSession: (sessionId: string, kind: TerminalKind) => void;
   onClosePane: (key: string) => void;
   /** Opens a dormant or exited terminal again. */
@@ -244,6 +257,8 @@ interface Props {
   onNew: () => void;
   /** Opens the app settings. */
   onSettings: () => void;
+  /** Opens the list of cages. */
+  onCages: () => void;
   /** A folder dropped from Finder on the rail. */
   dropFolder?: DroppedFolder;
   editors?: Editors;
@@ -257,6 +272,7 @@ interface Props {
 /** The sessions as a tree: workspace → session → Terminals / Tasks → items. */
 export function ProjectRail({
   sessions,
+  cages,
   workspaces,
   selectedId,
   view,
@@ -273,6 +289,7 @@ export function ProjectRail({
   onMoveTerminals,
   onNew,
   onSettings,
+  onCages,
   dropFolder,
   onDropDone,
   editors,
@@ -295,6 +312,10 @@ export function ProjectRail({
   const [menu, setMenu] = useState<string>();
   /** The row whose name is an input. */
   const [editing, setEditing] = useState<string>();
+  /** The workspace whose default cage the picker shows. */
+  const [picking, setPicking] = useState<string>();
+  /** A dropped session whose move changes the cage of its running VM. The draft shows the move until the user chooses. */
+  const [moving, setMoving] = useState<{ session: SessionView; next: Workspace[]; to: string | null }>();
   /** The row of a keyboard drag. A keyboard drag moves the draft one step per arrow key, and its drop saves the draft. */
   const keyboardDrag = useRef<string | undefined>(undefined);
   const keyboardStep = useRef<KeyboardCoordinateGetter>(() => undefined);
@@ -323,7 +344,8 @@ export function ProjectRail({
       return next;
     });
 
-  function leaves(session: SessionView, cage: CageView, group: Group): Leaf[] {
+  /** `vmCage`: the cage of the session's VM. */
+  function leaves(session: SessionView, vmCage: CageView | null, group: Group): Leaf[] {
     const sid = session.id;
     if (group === "terminals")
       return panes
@@ -360,7 +382,7 @@ export function ProjectRail({
                 : [...open, close],
           };
         });
-    const cageRunning = cage.status.state === "running";
+    const cageRunning = vmCage?.status.state === "running";
     return session.tasks.map((task) => {
       const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
       const latest = taskRuns[taskRuns.length - 1];
@@ -414,7 +436,8 @@ export function ProjectRail({
     const workspaceRow = `w|${workspace.id}`;
     visible.push(workspaceRow);
     const workspaceOpen = !collapsed.has(workspaceRow);
-    const sessions = workspace.sessions.flatMap((id) => byId.get(id) ?? []).map(({ session, cage }) => {
+    const sessions = workspace.sessions.flatMap((id) => byId.get(id) ?? []).map((target) => {
+      const { session, vmCage } = target;
       const sid = session.id;
       const sessionRow = `s|${sid}`;
       const sessionOpen = workspaceOpen && !collapsed.has(sessionRow);
@@ -425,7 +448,7 @@ export function ProjectRail({
       const groups = GROUPS.map(({ group, label }) => {
         const id = `g|${sid}|${group}`;
         const container = `${sid}|${group}`;
-        const items = leaves(session, cage, group);
+        const items = leaves(session, vmCage, group);
         lists[container] = items.map((i) => i.entity);
         const open = items.length > 0 && !collapsed.has(id);
         if (sessionOpen) {
@@ -439,7 +462,7 @@ export function ProjectRail({
         }
         return { group, label, id, container, items, open };
       });
-      return { session, cage, sessionRow, groups };
+      return { target, session, sessionRow, groups };
     });
     return { workspace, workspaceRow, workspaceOpen, sessions };
   });
@@ -622,7 +645,7 @@ export function ProjectRail({
       return;
     }
     let next = draft ?? workspaces;
-    if (keyboard) return save(next);
+    if (keyboard) return drop(next, data);
     if (!over) return setDraft(undefined);
     const target = dataOf(over);
     if (data.kind === "workspace") {
@@ -642,18 +665,34 @@ export function ProjectRail({
         return from >= 0 && to >= 0 ? { ...w, sessions: arrayMove(w.sessions, from, to) } : w;
       });
     }
-    save(next);
+    drop(next, data);
   }
 
-  /** Saves the order of `next`. If the tree changed since the drag began, the backend refuses it and the tree reloads. */
-  function save(next: Workspace[]) {
+  /** Saves `next`, or first asks what to do when the move changes the cage of a session whose VM runs. */
+  function drop(next: Workspace[], data: DragData) {
+    const moved = data.kind === "session" ? byId.get(data.entity) : undefined;
+    const vm = moved?.vmCage?.status.state;
+    const to = moved && vm && vm !== "error" ? cageAfterMove(moved.session, next) : undefined;
+    if (!moved || to === undefined) return save(next);
+    setDraft(next);
+    setMoving({ session: moved.session, next, to });
+  }
+
+  /**
+   * Saves the order of `next`, then runs `then`. If the tree changed since the drag began, the backend refuses it and
+   * the tree reloads. A refused save also reverts the draft.
+   */
+  function save(next: Workspace[], then?: () => Promise<unknown>) {
+    setMoving(undefined);
     const order = (list: Workspace[]) => JSON.stringify(list.map((w) => [w.id, w.sessions]));
     if (order(next) === order(workspaces)) return setDraft(undefined);
     setDraft(next);
     run(() =>
-      arrangeWorkspaces(next.map(({ id, sessions }) => ({ id, sessions }))).catch((e) => {
-        throw errorCode(e) === INVALID_ORDER ? new Error("The sidebar changed. Try again.") : e;
-      }),
+      arrangeWorkspaces(next.map(({ id, sessions }) => ({ id, sessions })))
+        .catch((e) => {
+          throw errorCode(e) === INVALID_ORDER ? new Error("The sidebar changed. Try again.") : e;
+        })
+        .then(then),
     ).finally(() => setDraft(undefined));
   }
 
@@ -667,6 +706,7 @@ export function ProjectRail({
   function workspaceMenu(workspace: Workspace): MenuAction[] {
     return [
       renameAction(`w|${workspace.id}`),
+      { label: "Default cage…", icon: <Fence size={14} />, run: () => setPicking(workspace.id) },
       {
         label: "Delete workspace",
         icon: <Trash2 size={14} />,
@@ -725,6 +765,8 @@ export function ProjectRail({
   );
 
   const dropWorkspace = workspaces.find((w) => w.id === dropFolder?.workspace);
+  const pickWorkspace = workspaces.find((w) => w.id === picking);
+  const cageName = (id: string | null) => cages.find((c) => c.id === id)?.name ?? "no cage";
 
   return (
     <aside className={forbidden ? "rail forbidden" : "rail"}>
@@ -754,6 +796,54 @@ export function ProjectRail({
               </Button>
               <Button size="sm" onClick={() => onDropDone(true)}>
                 Create project
+              </Button>
+            </div>
+          </Card>
+        )}
+        {pickWorkspace && (
+          <Card variant="outlined" padding="sm" className="stack">
+            <Select
+              label={`Default cage of ${pickWorkspace.name}`}
+              options={[{ value: "", label: "No default cage" }, ...cages.map((c) => ({ value: c.id, label: c.name }))]}
+              value={pickWorkspace.defaultCage ?? ""}
+              onChange={(id) => run(() => setWorkspaceCage(pickWorkspace.id, id || null))}
+            />
+            <p className="muted">The sessions of the workspace that inherit their cage use it.</p>
+            <div className="row end">
+              <Button size="sm" variant="ghost" onClick={() => setPicking(undefined)}>
+                Done
+              </Button>
+            </div>
+          </Card>
+        )}
+        {moving && (
+          <Card variant="outlined" padding="sm" className="stack">
+            <p>
+              The VM of <strong>{moving.session.name}</strong> runs in cage {cageName(moving.session.vmCage)}. After the
+              move, the project uses {moving.to ? `cage ${cageName(moving.to)}` : "no cage"}.
+            </p>
+            <div className="row end">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setMoving(undefined);
+                  setDraft(undefined);
+                }}
+              >
+                Cancel
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => save(moving.next)}>
+                At next start
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  const { session, next, to } = moving;
+                  save(next, () => stopCage(session.id).then(() => (to === null ? undefined : startCage(session.id))));
+                }}
+              >
+                Restart now
               </Button>
             </div>
           </Card>
@@ -833,9 +923,12 @@ export function ProjectRail({
                   {workspaceOpen && (
                     <ul role="group">
                       <SortableContext items={sessions.map((s) => s.sessionRow)} strategy={verticalListSortingStrategy}>
-                        {sessions.map(({ session, cage, sessionRow, groups }) => {
+                        {sessions.map(({ target, session, sessionRow, groups }) => {
                           const sessionExpanded = !collapsed.has(sessionRow);
-                          const running = cage.status.state === "running";
+                          const status = target.vmCage?.status ?? { state: "stopped" as const };
+                          const launch = launchActions(launchCage(target), editors);
+                          const running = status.state === "running";
+                          const effective = session.effectiveCage;
                           return (
                             <TreeRow
                               key={session.id}
@@ -868,24 +961,29 @@ export function ProjectRail({
                                       toggle(sessionRow);
                                     }}
                                   />
-                                  <span className={`dot ${cage.status.state}`} aria-label={cage.status.state} />
+                                  <span className={`dot ${status.state}`} aria-label={status.state} />
                                   {editing === sessionRow ? (
                                     nameField(sessionRow, session.name, (name) => renameSession(session.id, name))
                                   ) : (
                                     <span
                                       className="grow tree-name"
-                                      title={cage.status.state === "error" ? cage.status.message : session.folder}
+                                      title={status.state === "error" ? status.message : session.folder}
                                     >
                                       {session.name}
-                                      {cage.status.state === "starting" ? (
+                                      {status.state === "starting" ? (
                                         <span className="tree-path muted">
-                                          <StartProgress phase={cage.status.phase} />
+                                          <StartProgress phase={status.phase} />
                                         </span>
                                       ) : (
                                         <span className="tree-path muted" title={session.folder}>
                                           {truncateMiddle(tildePath(session.folder, home), 32)}
                                         </span>
                                       )}
+                                    </span>
+                                  )}
+                                  {effective && (
+                                    <span className="muted" title={`${cageName(effective.id)}${effective.inherited ? " (inherited)" : ""}`}>
+                                      <Fence size={12} aria-label={`Cage ${cageName(effective.id)}`} />
                                     </span>
                                   )}
                                   {blocked[session.id] > 0 && (
@@ -897,10 +995,10 @@ export function ProjectRail({
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
                                     label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}
                                     tabIndex={-1}
-                                    disabled={cage.status.state === "starting" || cage.status.state === "stopping"}
+                                    disabled={(!target.cage && !running) || status.state === "starting" || status.state === "stopping"}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      onToggle(cage);
+                                      onToggle(target);
                                     }}
                                   />
                                   {menuButton(sessionRow, session.name)}
@@ -911,7 +1009,7 @@ export function ProjectRail({
                                 <ActionMenu
                                   label={`Actions for ${session.name}`}
                                   actions={[
-                                    ...launchMenu(launchActions(cage, editors), (action) => onLaunch(session.id, action)),
+                                    ...launchMenu(launch, (action) => onLaunch(session.id, action)),
                                     renameAction(sessionRow),
                                   ]}
                                   onClose={closeMenu}
@@ -945,7 +1043,7 @@ export function ProjectRail({
                                         <ActionMenu
                                           label="New terminal"
                                           actions={launchMenu(
-                                            launchActions(cage, editors).filter((a) => a.type === "session"),
+                                            launch.filter((a) => a.type === "session"),
                                             (action) => onLaunch(session.id, action),
                                           )}
                                           onClose={closeMenu}
@@ -1018,6 +1116,9 @@ export function ProjectRail({
         </Button>
         <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={() => run(createWorkspace)}>
           New workspace
+        </Button>
+        <Button variant="ghost" size="sm" iconLeft={<Fence size={14} />} onClick={onCages}>
+          Cages
         </Button>
         <Button variant="ghost" size="sm" iconLeft={<Settings size={14} />} onClick={onSettings}>
           Settings <kbd className="muted">⌘,</kbd>
