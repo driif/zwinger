@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -7,8 +7,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::Instant;
 
-use crate::cage::manager::{State, lock};
+use crate::cage::manager::{AgentSink, State, lock};
 use crate::runtime::PtyEvent;
+use crate::terminal::AgentState;
 
 /// The output bytes kept per session, for a view that attaches later.
 pub(crate) const RING: usize = 1 << 20;
@@ -40,7 +41,7 @@ pub(crate) struct Output {
     pub(crate) attaches: u64,
     /// Wakes the pump when a view acknowledges a frame or goes.
     pub(crate) room: Arc<Notify>,
-    pub(crate) osc7: Osc7,
+    pub(crate) osc: Osc,
 }
 
 /// The longest OSC 7 body that the scanner keeps across frames.
@@ -48,63 +49,187 @@ const OSC7_LIMIT: usize = 4 << 10;
 
 const OSC7: &[u8] = b"\x1b]7;";
 
-/// Reads the current folder that a shell reports with OSC 7
-/// (`ESC ] 7 ; file://host/path`, ended by BEL or `ESC \`). A sequence can
-/// span frames.
+/// The sequence that an agent hook writes to its terminal, followed by its
+/// state and BEL or `ESC \`.
+pub(crate) const AGENT_OSC: &[u8] = b"\x1b]1337;zwinger-agent=";
+
+/// The longest agent state value. A longer value is no agent sequence.
+const AGENT_VALUE_LIMIT: usize = 16;
+
+/// Where the scanner is in the output.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+enum Scan {
+    #[default]
+    Text,
+    /// The held bytes are this many bytes of [`AGENT_OSC`].
+    Agent(usize),
+    /// The held bytes are the agent sequence and its value so far.
+    AgentValue,
+    /// This many bytes of [`OSC7`] went out.
+    Osc7(usize),
+    Osc7Body,
+}
+
+/// Reads the OSC sequences of the output. A sequence can span frames.
+///
+/// - OSC 7 (`ESC ] 7 ; file://host/path`): the current folder that a shell
+///   reports. It goes out unchanged.
+/// - [`AGENT_OSC`]: the state of the agent. It never goes out. The scanner
+///   holds back a tail that can start it until the next frame shows the rest.
+///
+/// Both end with BEL or `ESC \`.
 #[derive(Default)]
-pub(crate) struct Osc7 {
-    /// The bytes of [`OSC7`] matched so far; at its length, the body follows.
-    matched: usize,
+pub(crate) struct Osc {
+    scan: Scan,
+    /// The bytes that may be an agent sequence, or the ESC that may end an
+    /// OSC 7 body.
+    held: Vec<u8>,
     body: Vec<u8>,
-    /// The body had an ESC, which starts the `ESC \` end.
+    /// The OSC 7 body had an ESC, which starts the `ESC \` end.
     esc: bool,
     /// The last reported folder: a guest path for a VM shell.
     pub(crate) cwd: Option<String>,
+    pub(crate) agent: Option<AgentState>,
 }
 
-impl Osc7 {
-    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+impl Osc {
+    /// Returns the bytes that go out: the held bytes that are no agent
+    /// sequence, then `bytes` without the agent sequences.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.held.len() + bytes.len());
         let mut i = 0;
         while i < bytes.len() {
-            if self.matched == 0 {
-                let Some(at) = bytes[i..].iter().position(|&b| b == 0x1b) else { return };
+            if self.scan == Scan::Text {
+                let Some(at) = bytes[i..].iter().position(|&b| b == 0x1b) else {
+                    out.extend_from_slice(&bytes[i..]);
+                    break;
+                };
+                out.extend_from_slice(&bytes[i..i + at]);
                 i += at + 1;
-                self.matched = 1;
+                self.held.push(0x1b);
+                self.scan = Scan::Agent(1);
                 continue;
             }
             let b = bytes[i];
             i += 1;
-            if self.matched < OSC7.len() {
-                self.matched = if b == OSC7[self.matched] { self.matched + 1 } else { usize::from(b == 0x1b) };
-            } else if self.esc {
+            if !self.step(b, &mut out) {
+                // `b` ended no sequence: it can start one.
+                i -= 1;
+            }
+        }
+        out
+    }
+
+    /// The held bytes, which no later output can make an agent sequence:
+    /// the process has exited.
+    pub(crate) fn release(&mut self) -> Vec<u8> {
+        self.reset();
+        std::mem::take(&mut self.held)
+    }
+
+    /// Takes `b` in a sequence. False: `b` is not taken and goes to the text.
+    fn step(&mut self, b: u8, out: &mut Vec<u8>) -> bool {
+        match self.scan {
+            Scan::Text => unreachable!("the text is scanned in bulk"),
+            Scan::Agent(2) if b == OSC7[2] => {
+                out.append(&mut self.held);
+                out.push(b);
+                self.scan = Scan::Osc7(3);
+            }
+            Scan::Agent(n) if b == AGENT_OSC[n] => {
+                self.held.push(b);
+                self.scan = if n + 1 == AGENT_OSC.len() { Scan::AgentValue } else { Scan::Agent(n + 1) };
+            }
+            Scan::Agent(_) => {
+                out.append(&mut self.held);
+                self.scan = Scan::Text;
+                return false;
+            }
+            Scan::AgentValue => match b {
+                0x07 => self.finish_agent(),
+                b'\\' if self.held.last() == Some(&0x1b) => self.finish_agent(),
+                // The ESC was no end: drop the sequence, and the ESC may start a new one.
+                _ if self.held.last() == Some(&0x1b) => {
+                    self.held.clear();
+                    self.held.push(0x1b);
+                    self.scan = Scan::Agent(1);
+                    return false;
+                }
+                _ if self.held.len() - AGENT_OSC.len() >= AGENT_VALUE_LIMIT => {
+                    out.append(&mut self.held);
+                    self.scan = Scan::Text;
+                    return false;
+                }
+                _ => self.held.push(b),
+            },
+            Scan::Osc7(n) if b == OSC7[n] => {
+                out.push(b);
+                self.scan = if n + 1 == OSC7.len() { Scan::Osc7Body } else { Scan::Osc7(n + 1) };
+            }
+            Scan::Osc7(_) => {
+                self.scan = Scan::Text;
+                return false;
+            }
+            Scan::Osc7Body if self.esc => {
                 self.esc = false;
                 if b == b'\\' {
-                    self.finish();
+                    out.append(&mut self.held);
+                    out.push(b);
+                    self.finish_osc7();
                 } else {
                     // The ESC was no end: it may start a new sequence.
                     self.reset();
-                    self.matched = 1;
-                    i -= 1;
-                }
-            } else {
-                match b {
-                    0x07 => self.finish(),
-                    0x1b => self.esc = true,
-                    _ if self.body.len() >= OSC7_LIMIT => self.reset(),
-                    _ => self.body.push(b),
+                    self.scan = Scan::Agent(1);
+                    return false;
                 }
             }
+            Scan::Osc7Body => match b {
+                0x07 => {
+                    out.push(b);
+                    self.finish_osc7();
+                }
+                0x1b => {
+                    self.held.push(b);
+                    self.esc = true;
+                }
+                _ => {
+                    out.push(b);
+                    if self.body.len() >= OSC7_LIMIT {
+                        self.reset();
+                    } else {
+                        self.body.push(b);
+                    }
+                }
+            },
         }
+        true
     }
 
     fn reset(&mut self) {
-        self.matched = 0;
+        self.scan = Scan::Text;
         self.esc = false;
         self.body.clear();
     }
 
+    /// Keeps a known state; the sequence goes in all cases.
+    fn finish_agent(&mut self) {
+        let value = &self.held[AGENT_OSC.len()..];
+        let value = value.strip_suffix(b"\x1b").unwrap_or(value);
+        let state = match value {
+            b"active" => Some(AgentState::Active),
+            b"blocked" => Some(AgentState::Blocked),
+            b"done" => Some(AgentState::Done),
+            _ => None,
+        };
+        if state.is_some() {
+            self.agent = state;
+        }
+        self.held.clear();
+        self.reset();
+    }
+
     /// Keeps the URL-decoded path of a `file://` URL; the host is ignored.
-    fn finish(&mut self) {
+    fn finish_osc7(&mut self) {
         let path = self.body.strip_prefix(b"file://").and_then(|rest| {
             let at = rest.iter().position(|&b| b == b'/')?;
             String::from_utf8(percent_decode(&rest[at..])).ok()
@@ -147,15 +272,31 @@ pub(crate) struct Sink {
 pub(crate) type PtySink = Box<dyn Fn(PtyEvent) + Send>;
 
 impl Output {
+    /// Keeps and sends `event`. The output goes without the agent sequences;
+    /// output that may start one waits for the next frame.
     pub(crate) fn push(&mut self, event: PtyEvent) {
-        match &event {
-            PtyEvent::Output(bytes) => {
-                self.osc7.feed(bytes);
-                self.ring.extend(bytes);
-                let excess = self.ring.len().saturating_sub(RING);
-                self.ring.drain(..excess);
+        let event = match event {
+            PtyEvent::Output(bytes) => PtyEvent::Output(self.osc.feed(&bytes)),
+            PtyEvent::Exit(code) => {
+                let held = self.osc.release();
+                if !held.is_empty() {
+                    self.send(PtyEvent::Output(held));
+                }
+                self.osc.agent = None;
+                self.exit = Some(code);
+                PtyEvent::Exit(code)
             }
-            PtyEvent::Exit(code) => self.exit = Some(*code),
+        };
+        if !matches!(&event, PtyEvent::Output(bytes) if bytes.is_empty()) {
+            self.send(event);
+        }
+    }
+
+    fn send(&mut self, event: PtyEvent) {
+        if let PtyEvent::Output(bytes) = &event {
+            self.ring.extend(bytes);
+            let excess = self.ring.len().saturating_sub(RING);
+            self.ring.drain(..excess);
         }
         if let Some(sink) = &mut self.sink {
             if matches!(event, PtyEvent::Output(_)) {
@@ -266,12 +407,15 @@ impl Frames {
 /// Moves the PTY output into the session's output frame by frame, until the
 /// process exits. While the view is full, it does not read, so the process
 /// blocks on its writes. The exit code is recorded before the `Exit` event
-/// is delivered, so a listing done in reaction to it shows the exit.
+/// is delivered, so a listing done in reaction to it shows the exit. A change
+/// of the agent state goes to `agents`; at the exit, the state goes.
 pub(crate) async fn pump<V>(
     state: Arc<Mutex<State<V>>>,
     id: String,
     output: Arc<Mutex<Output>>,
     events: Receiver<PtyEvent>,
+    agent_terminal: bool,
+    agents: Arc<OnceLock<AgentSink>>,
 ) {
     let mut frames = Frames::new(events);
     let room = lock(&output).room.clone();
@@ -296,12 +440,24 @@ pub(crate) async fn pump<V>(
         {
             t.exit_code = Some(code);
         }
-        let mut output = lock(&output);
-        if !bytes.is_empty() {
-            output.push(PtyEvent::Output(bytes));
+        let (before, after) = {
+            let mut output = lock(&output);
+            let before = output.osc.agent;
+            if !bytes.is_empty() {
+                output.push(PtyEvent::Output(bytes));
+            }
+            if let Some(code) = exit {
+                output.push(PtyEvent::Exit(code));
+            }
+            (before, output.osc.agent.filter(|_| exit.is_none()))
+        };
+        if agent_terminal
+            && before != after
+            && let Some(sink) = agents.get()
+        {
+            sink(&id, after);
         }
-        if let Some(code) = exit {
-            output.push(PtyEvent::Exit(code));
+        if exit.is_some() {
             return;
         }
     }
@@ -309,14 +465,15 @@ pub(crate) async fn pump<V>(
 
 #[cfg(test)]
 mod tests {
-    use super::{OSC7_LIMIT, Osc7};
+    use super::{AGENT_OSC, OSC7_LIMIT, Osc};
     use crate::cage::testing::*;
+    use crate::terminal::AgentState;
 
     #[tokio::test]
     async fn a_stale_detach_keeps_the_new_sink() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let session = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
         let (old, _old_rx) = attach(&manager, &session);
         let (new, mut rx) = attach(&manager, &session);
         assert_ne!(old, new);
@@ -333,12 +490,125 @@ mod tests {
         manager.detach_session("gone", new);
     }
 
+    #[tokio::test]
+    async fn the_listing_and_the_sink_get_the_agent_state_until_the_exit() {
+        let (manager, _, id) = manager();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        manager.set_agent_sink(Box::new(move |process, state| lock(&into).push((process.to_owned(), state))));
+        manager.start(&id).await.unwrap();
+        let session = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        let agent = || manager.list().sessions[0].processes[0].agent;
+        manager.write(&session, b"\x1b]1337;zwinger-agent=blocked\x07".to_vec()).unwrap();
+        until(|| agent() == Some(AgentState::Blocked)).await;
+        // The same state again is no change.
+        manager.write(&session, b"\x1b]1337;zwinger-agent=blocked\x07".to_vec()).unwrap();
+        manager.write(&session, b"\x1b]1337;zwinger-agent=done\x07".to_vec()).unwrap();
+        until(|| agent() == Some(AgentState::Done)).await;
+        manager.send(&session, PtyInput::Kill).unwrap();
+        until(|| manager.list().sessions[0].processes[0].exit_code.is_some()).await;
+        assert_eq!(agent(), None);
+        until(|| lock(&seen).len() == 3).await;
+        assert_eq!(
+            *lock(&seen),
+            [(session.clone(), Some(AgentState::Blocked)), (session.clone(), Some(AgentState::Done)), (session, None)]
+        );
+    }
+
     fn cwd(chunks: &[&[u8]]) -> Option<String> {
-        let mut osc7 = Osc7::default();
+        let mut osc = Osc::default();
         for chunk in chunks {
-            osc7.feed(chunk);
+            osc.feed(chunk);
         }
-        osc7.cwd
+        osc.cwd
+    }
+
+    /// Feeds the chunks in order. Returns the output and the agent state.
+    fn scan(chunks: &[&[u8]]) -> (Vec<u8>, Option<AgentState>) {
+        let mut osc = Osc::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(osc.feed(chunk));
+        }
+        assert!(osc.release().is_empty());
+        (out, osc.agent)
+    }
+
+    #[test]
+    fn an_agent_sequence_sets_the_state_and_goes_from_the_output() {
+        assert_eq!(scan(&[b"a\x1b]1337;zwinger-agent=active\x07b"]), (b"ab".to_vec(), Some(AgentState::Active)));
+        assert_eq!(scan(&[b"\x1b]1337;zwinger-agent=blocked\x1b\\"]), (Vec::new(), Some(AgentState::Blocked)));
+        assert_eq!(
+            scan(&[b"\x1b]1337;zwinger-agent=active\x07x\x1b]1337;zwinger-agent=done\x1b\\y"]),
+            (b"xy".to_vec(), Some(AgentState::Done))
+        );
+        // An unknown value changes nothing, and goes too.
+        assert_eq!(
+            scan(&[b"\x1b]1337;zwinger-agent=done\x07\x1b]1337;zwinger-agent=sleepy\x07z"]),
+            (b"z".to_vec(), Some(AgentState::Done))
+        );
+    }
+
+    #[test]
+    fn an_agent_sequence_spans_frames() {
+        let whole: &[u8] = b"out\x1b]1337;zwinger-agent=blocked\x1b\\more";
+        for at in 0..whole.len() {
+            assert_eq!(
+                scan(&[&whole[..at], &whole[at..]]),
+                (b"outmore".to_vec(), Some(AgentState::Blocked)),
+                "split at {at}"
+            );
+        }
+        let bytes: Vec<&[u8]> = whole.chunks(1).collect();
+        assert_eq!(scan(&bytes), (b"outmore".to_vec(), Some(AgentState::Blocked)));
+    }
+
+    #[test]
+    fn osc7_updates_only_the_folder_and_goes_out_unchanged() {
+        let osc7: &[u8] = b"\x1b]7;file://vm/workspace\x07";
+        let mut osc = Osc::default();
+        assert_eq!(osc.feed(b"\x1b]1337;zwinger-agent=done\x07"), b"");
+        assert_eq!(osc.agent, Some(AgentState::Done));
+        for chunk in osc7.chunks(3) {
+            osc.feed(chunk);
+        }
+        assert_eq!((osc.agent, osc.cwd.as_deref()), (Some(AgentState::Done), Some("/workspace")));
+        let other: &[u8] = b"\x1b[31mred\x1b]0;title\x07\x1b]1337;File=x\x07\x1b]7;file://vm/a\x1b\\$ ";
+        assert_eq!(scan(&[other]), (other.to_vec(), None));
+        for at in 0..other.len() {
+            assert_eq!(scan(&[&other[..at], &other[at..]]).0, other, "split at {at}");
+        }
+    }
+
+    #[test]
+    fn a_false_prefix_is_held_until_the_next_frame_only() {
+        let mut osc = Osc::default();
+        assert_eq!(osc.feed(b"a\x1b]1337;zwinger"), b"a");
+        assert_eq!(osc.feed(b"-x"), b"\x1b]1337;zwinger-x");
+        assert_eq!(osc.feed(b"b\x1b"), b"b");
+        assert_eq!(osc.feed(b"[0m"), b"\x1b[0m");
+        // A value past its limit is no agent sequence.
+        let long = [AGENT_OSC, &[b'a'; 40], b"\x07"].concat();
+        assert_eq!(osc.feed(&long), long);
+        assert_eq!(osc.agent, None);
+        // At the exit, the held bytes go out.
+        assert_eq!(osc.feed(b"\x1b]13"), b"");
+        assert_eq!(osc.release(), b"\x1b]13");
+    }
+
+    #[test]
+    fn the_ring_and_the_sink_get_the_output_without_the_agent_sequence() {
+        let mut kept = Output::default();
+        let sent = Arc::new(Mutex::new(Vec::<PtyEvent>::new()));
+        let into = sent.clone();
+        kept.attach(Box::new(move |event| lock(&into).push(event)));
+        kept.push(PtyEvent::Output(b"a\x1b]1337;zwinger-agent=act".to_vec()));
+        kept.push(PtyEvent::Output(b"ive\x07b\x1b]".to_vec()));
+        kept.push(PtyEvent::Exit(0));
+        assert!(kept.ring.iter().eq(b"ab\x1b]"));
+        assert_eq!(kept.osc.agent, None);
+        assert_eq!(*lock(&sent), [output("a"), output("b"), output("\x1b]"), PtyEvent::Exit(0)]);
+        assert_eq!(kept.sink.as_ref().unwrap().in_flight, 3);
     }
 
     #[test]
@@ -369,11 +639,11 @@ mod tests {
         long.extend(vec![b'a'; OSC7_LIMIT]);
         long.extend(b"\x07");
         assert_eq!(cwd(&[&long]), None);
-        let mut osc7 = Osc7::default();
-        osc7.feed(&long[..OSC7_LIMIT]);
-        assert!(osc7.body.len() <= OSC7_LIMIT);
-        osc7.feed(b"\x1b]7;file://vm/ok\x07");
-        assert_eq!(osc7.cwd.as_deref(), Some("/ok"));
+        let mut osc = Osc::default();
+        osc.feed(&long[..OSC7_LIMIT]);
+        assert!(osc.body.len() <= OSC7_LIMIT);
+        osc.feed(b"\x1b]7;file://vm/ok\x07");
+        assert_eq!(osc.cwd.as_deref(), Some("/ok"));
     }
 
     #[test]

@@ -23,6 +23,9 @@ import {
   Box,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
+  CircleCheck,
+  CirclePlay,
   Ellipsis,
   Fence,
   History,
@@ -56,6 +59,7 @@ import {
   TerminalKind,
   INVALID_ORDER,
   Workspace,
+  AgentState,
 } from "../../shared/api";
 import { errorCode } from "../../shared/errorMessage";
 import type { DroppedFolder, Pane, Run, View } from "../../App";
@@ -67,6 +71,7 @@ import { launchCage } from "../cages/sessionCage";
 import { Editors } from "../launcher/api";
 import { launchMenu } from "../launcher/SplitLaunch";
 import { StartProgress } from "./StartProgress";
+import { mostUrgent } from "./agentState";
 import { cageAfterMove, moveSession, stepSession, stepWorkspace } from "./tree";
 import "./rail.css";
 
@@ -81,6 +86,23 @@ const GROUPS: { group: Group; label: string }[] = [
 
 const kindName = (kind: TerminalKind) =>
   kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
+
+function AgentStatusGlyph({ state }: { state: AgentState | null }) {
+  if (!state) return null;
+  const label = {
+    blocked: "Agent blocked: waiting for you",
+    active: "Agent active: working",
+    done: "Agent done: waiting for a new prompt",
+  }[state];
+  const Icon = { blocked: CircleAlert, active: CirclePlay, done: CircleCheck }[state];
+  // The classes set --motiv-color-warning/success/text-muted. A motiv Badge replaces this after the motiv upgrade (backlog).
+  const color = { blocked: "warn", active: "ok", done: "muted" }[state];
+  return (
+    <span role="img" aria-label={label} title={label} className={color}>
+      <Icon size={14} aria-hidden="true" />
+    </span>
+  );
+}
 
 /** Where a terminal runs: on this Mac, or in the cage. An agent always runs in the VM. */
 export function KindIcon({ kind }: { kind: TerminalKind }) {
@@ -360,10 +382,13 @@ export function ProjectRail({
           return {
             entity: pane.key,
             label: (
-              <span className="grow">
-                {name}
-                {state && <span className="muted"> · {state}</span>}
-              </span>
+              <>
+                <span className="grow">
+                  {name}
+                  {state && <span className="muted"> · {state}</span>}
+                </span>
+                <AgentStatusGlyph state={process?.exitCode === null ? process.agent : null} />
+              </>
             ),
             name,
             icon: <KindIcon kind={kind} />,
@@ -909,6 +934,9 @@ export function ProjectRail({
                         <span className="grow tree-name">{workspace.name}</span>
                       )}
                       <span className="muted tree-state">{sessions.length}</span>
+                      <AgentStatusGlyph
+                        state={mostUrgent(sessions.flatMap(({ session }) => session.processes.filter((p) => p.exitCode === null).map((p) => p.agent)))}
+                      />
                       {menuButton(workspaceRow, workspace.name)}
                     </>
                   }
@@ -991,6 +1019,9 @@ export function ProjectRail({
                                       {blocked[session.id]}
                                     </span>
                                   )}
+                                  <AgentStatusGlyph
+                                    state={mostUrgent(session.processes.filter((p) => p.exitCode === null).map((p) => p.agent))}
+                                  />
                                   <IconButton
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
                                     label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}

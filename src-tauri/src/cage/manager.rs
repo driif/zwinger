@@ -18,12 +18,12 @@ use crate::network::{self, Action, RuleDraft, Target};
 use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
-use crate::runtime::SandboxRuntime;
+use crate::runtime::{SandboxRuntime, TerminalKind};
 use crate::secrets::{self, Vault, VaultEntry};
 use crate::session::{Pos, Session};
 use crate::store::{self, Store};
 use crate::task_runs;
-use crate::terminal::{Terminal, TerminalView};
+use crate::terminal::{AgentState, Terminal, TerminalView};
 use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
 /// The network log entries kept per cage.
@@ -35,6 +35,9 @@ pub(crate) const LEGACY_STATE_DIR: &str = "shields";
 
 /// Gets each new network log entry with its cage id.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
+
+/// Gets the process id and the new agent state of a terminal.
+pub type AgentSink = Box<dyn Fn(&str, Option<AgentState>) + Send + Sync>;
 
 /// Gets the id of a cage whose guest logins changed.
 pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
@@ -67,6 +70,7 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) unsettled: Mutex<HashMap<String, Option<VaultEntry>>>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
+    pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
     pub(crate) runs: Arc<task_runs::Registry>,
     /// Serializes run starts, so two starts cannot take the same run name.
     pub(crate) run_start: Mutex<()>,
@@ -397,6 +401,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 generation: 0,
             })),
             net_sink: Arc::new(OnceLock::new()),
+            agent_sink: Arc::new(OnceLock::new()),
             runs: Arc::default(),
             run_start: Mutex::new(()),
             run_config: task_runs::Config::default(),
@@ -410,6 +415,11 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Only the first sink counts.
     pub fn set_net_sink(&self, sink: NetSink) {
         let _ = self.net_sink.set(sink);
+    }
+
+    /// Only the first sink counts.
+    pub fn set_agent_sink(&self, sink: AgentSink) {
+        let _ = self.agent_sink.set(sink);
     }
 
     /// Only the first sink counts.
@@ -447,6 +457,10 @@ impl<R: SandboxRuntime> Manager<R> {
                         kind: t.kind,
                         exit_code: t.exit_code,
                         terminal_id: t.terminal_id.clone(),
+                        agent: lock(&t.output)
+                            .osc
+                            .agent
+                            .filter(|_| t.exit_code.is_none() && matches!(t.kind, TerminalKind::Agent { .. })),
                     })
                     .collect(),
                 session: session.clone(),

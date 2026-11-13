@@ -23,6 +23,7 @@ import {
   createSession,
   listSessions,
   listWorkspaces,
+  onAgentState,
   onGuestLogin,
   onStartProgress,
   resolveFolder,
@@ -56,6 +57,7 @@ import { checkUpdate, UpdateInfo } from "./features/updates/api";
 import {
   AGENT_NAMES,
   AgentKind,
+  AgentState,
   INVALID_ORDER,
   PaneNode,
   CageView,
@@ -234,6 +236,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [intent, setIntent] = useState<Intent>();
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
+  const agentVersion = useRef(0);
+  const agentEvents = useRef(new Map<string, { state: AgentState | null; version: number }>());
   const [net, setNet] = useState<Record<string, NetEvent[]>>({});
   /** Per cage, the last `seq` that the Network tab showed. */
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
@@ -266,12 +270,23 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the sessions it read.
   const refresh = () => {
     const request = ++refreshes.current;
+    const version = agentVersion.current;
     return Promise.all([listSessions(), listWorkspaces()]).then(
       ([next, groups]) => {
         if (request === refreshes.current) {
+          next.sessions = next.sessions.map((session) => ({
+            ...session,
+            processes: session.processes.map((process) => {
+              const event = agentEvents.current.get(process.id);
+              return event && event.version > version ? { ...process, agent: event.state } : process;
+            }),
+          }));
           setSessions(next.sessions);
           setCages(next.cages);
           setWorkspaces(groups);
+          for (const [id, event] of agentEvents.current) {
+            if (event.version <= version) agentEvents.current.delete(id);
+          }
         }
         return next.sessions;
       },
@@ -302,7 +317,6 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const loadEditors = () => detectEditors().then(setEditors, (e) => setError(errorMessage(e)));
 
   useEffect(() => {
-    refresh();
     reloadRuntimes();
     detect(false);
     loadEditors();
@@ -318,6 +332,24 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   // An agent login was made in a cage, or it is gone.
   useEffect(() => {
     const stop = onGuestLogin(() => refresh());
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    const stop = onAgentState((processId, state) => {
+      agentEvents.current.set(processId, { state, version: ++agentVersion.current });
+      setSessions((current) =>
+        current.map((session) => ({
+          ...session,
+          processes: session.processes.map((process) =>
+            process.id === processId ? { ...process, agent: state } : process,
+          ),
+        })),
+      );
+    });
+    stop.then(() => refresh(), () => refresh());
     return () => {
       stop.then((unlisten) => unlisten());
     };

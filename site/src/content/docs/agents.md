@@ -17,6 +17,21 @@ In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi` and `gemini` are o
 **Continue last session** starts the agent with its continue option (`claude -c`, `codex resume --last`, `pi -c`,
 `gemini --resume latest`).
 
+## Agent status
+
+The terminal, session and workspace rows show an agent status glyph while an agent terminal runs:
+
+- **Active:** the agent is working.
+- **Blocked:** the agent waits for your answer or permission.
+- **Done:** the agent finished its turn and waits for a new prompt.
+
+Point to a glyph to read its status. A session with several agents shows the most urgent state: **blocked > active > done**.
+A workspace uses the same rule across its sessions. The glyph disappears when the agent process exits.
+
+For interactive terminals, zwinger adds status hooks to Claude Code and pi. The hooks write status signals to the
+terminal; they do not change a read-only agent profile. Claude Code reports all three states. Pi reports active and
+done; it does not report blocked. Codex and Gemini CLI do not report status yet, so their rows show no glyph.
+
 ## Permission prompts
 
 The project setting **Agents run without permission prompts** is on by default. It adds the bypass option of each

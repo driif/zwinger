@@ -113,6 +113,8 @@ export type CageStatus =
   | { state: "stopping" }
   | { state: "error"; message: string };
 
+export type AgentState = "active" | "blocked" | "done";
+
 /** A live terminal process. */
 export interface TerminalView {
   id: string;
@@ -120,6 +122,8 @@ export interface TerminalView {
   exitCode: number | null;
   /** Set for a shell or agent terminal. */
   terminalId: string | null;
+  /** Set only while an agent terminal is live. */
+  agent: AgentState | null;
 }
 
 /** A host shell, VM shell or agent terminal of a session. With no process it is dormant, and it can open again. */

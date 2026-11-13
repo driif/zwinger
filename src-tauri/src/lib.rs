@@ -167,6 +167,10 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
         let _ = handle.emit("net-event", serde_json::json!({ "cageId": cage_id, "event": event }));
     }));
     let handle = app.clone();
+    manager.set_agent_sink(Box::new(move |process_id, state| {
+        let _ = handle.emit("agent-state", serde_json::json!({ "processId": process_id, "state": state }));
+    }));
+    let handle = app.clone();
     manager.set_guest_sink(Box::new(move |cage_id| {
         let _ = handle.emit("guest-login", cage_id);
     }));

@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { CageView, call, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
+import { AgentState, CageView, call, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
 
 export interface Sessions {
   sessions: SessionView[];
@@ -63,6 +63,12 @@ export const setClaudeToken = (cageId: string, value: string, allow: boolean, pr
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (cageId: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));
+
+/** A live agent process changed state or exited. */
+export const onAgentState = (handler: (processId: string, state: AgentState | null) => void) =>
+  listen<{ processId: string; state: AgentState | null }>("agent-state", ({ payload }) =>
+    handler(payload.processId, payload.state),
+  );
 
 /** Each phase change of a cage start. Resolves to the function that stops the listener. */
 export const onStartProgress = (handler: (cageId: string, phase: StartPhase) => void) =>

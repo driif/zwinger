@@ -1303,7 +1303,7 @@ mod tests {
         assert!(view.host_notices.iter().any(|n| n.contains("darwin-arm64.node")), "{:?}", view.host_notices);
         let gemini = agent(AgentKind::Gemini, false);
         assert!(matches!(manager.open_session(&id, gemini, 24, 80).await, Err(Error::HostAgentFailed(..))));
-        assert_eq!(wrappers(&manager, &id), ["pi"]);
+        assert_eq!(wrappers(&manager, &id), ["pi", "pi-status.js"]);
         assert!(wrapper("pi").contains("exec node /opt/zwinger/pi/cli.js "));
 
         // Gemini CLI that is no host agent of the project.

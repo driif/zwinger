@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use super::{AgentKind, claude, codex, gemini, pi};
+use crate::terminal::output::AGENT_OSC;
 
 /// The guest dir of the wrappers, bound read-only.
 pub const BIN_DIR: &str = "/opt/zwinger/bin";
@@ -147,6 +148,90 @@ fn added(kind: AgentKind, unprompted: bool) -> Option<Added> {
     }
 }
 
+/// The script that an agent hook runs with the agent's state. It writes
+/// [`AGENT_OSC`] to the terminal, never to the hook's stdout.
+const STATUS: &str = "zwinger-agent-status";
+const CLAUDE_STATUS: &str = "claude-status.json";
+const PI_STATUS: &str = "pi-status.js";
+/// The wrapper adds the status hooks only to an agent in a terminal: a
+/// headless call from a tool cannot change its parent's state.
+const TTY: &str = "[ -t 0 ] && [ -t 1 ]";
+
+/// The flag that adds the status hooks, and the arguments that start no
+/// interactive session.
+fn status_flag(kind: AgentKind) -> Option<(String, &'static str, &'static str)> {
+    match kind {
+        AgentKind::Claude => Some((
+            format!("--settings {BIN_DIR}/{CLAUDE_STATUS}"),
+            "agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade",
+            "-p|--print",
+        )),
+        AgentKind::Pi => Some((
+            format!("-e {BIN_DIR}/{PI_STATUS}"),
+            "install|remove|uninstall|update|list|config|auth|mcp",
+            "-p|--print",
+        )),
+        AgentKind::Codex | AgentKind::Gemini => None,
+    }
+}
+
+/// [`AGENT_OSC`] after its ESC.
+fn agent_osc() -> &'static str {
+    std::str::from_utf8(&AGENT_OSC[1..]).expect("ASCII")
+}
+
+/// The argument of [`STATUS`] that picks the state from the tool name in
+/// the hook input on stdin: `AskUserQuestion` waits for the user, each
+/// other tool runs.
+const TOOL: &str = "tool";
+
+fn status_script() -> String {
+    format!(
+        "#!/bin/sh\n# zwinger writes this file at each cage start.\n\
+         state=$1\n\
+         if [ \"$state\" = {TOOL} ]; then\n  \
+           case \"$(cat)\" in *'\"tool_name\":\"AskUserQuestion\"'*|*'\"tool_name\": \"AskUserQuestion\"'*) state=blocked ;; \
+           *) state=active ;; esac\n\
+         fi\n\
+         printf '\\033{}%s\\007' \"$state\" > /dev/tty 2>/dev/null || true\n",
+        agent_osc()
+    )
+}
+
+/// Claude Code settings with the status hooks only. `--settings` adds them
+/// to the hooks of the user's settings.
+fn claude_status() -> String {
+    let set =
+        |state: &str| serde_json::json!([{ "type": "command", "command": format!("{BIN_DIR}/{STATUS} {state}") }]);
+    let hooks = serde_json::json!({
+        "UserPromptSubmit": [{ "hooks": set("active") }],
+        // One hook for all tools: two matching hooks would run in parallel.
+        "PreToolUse": [{ "hooks": set(TOOL) }],
+        // After the user approves a permission, the tool runs.
+        "PostToolUse": [{ "hooks": set("active") }],
+        // Not `idle_prompt`: it comes after `Stop`, when the turn is done.
+        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": set("blocked") }],
+        "Stop": [{ "hooks": set("done") }],
+    });
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).expect("JSON")
+}
+
+/// A pi extension. pi asks for no permissions, so it is never blocked.
+fn pi_status() -> String {
+    format!(
+        "// zwinger writes this file at each cage start.\n\
+         import {{ writeFileSync }} from \"node:fs\";\n\
+         const status = (state) => {{\n  \
+           try {{\n    writeFileSync(\"/dev/tty\", `\\x1b{}${{state}}\\x07`);\n  }} catch {{}}\n\
+         }};\n\
+         export default function (pi) {{\n  \
+           pi.on(\"agent_start\", () => status(\"active\"));\n  \
+           pi.on(\"agent_settled\", () => status(\"done\"));\n\
+         }}\n",
+        agent_osc()
+    )
+}
+
 /// `text` as one word of `sh`.
 fn quote(text: &str) -> String {
     if !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-=:".contains(&b)) {
@@ -175,12 +260,21 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
              *) NODE_OPTIONS=\"${{NODE_OPTIONS:+$NODE_OPTIONS }}{NODE_FLAG}\" ;; esac\nexport NODE_OPTIONS\n"
         ));
     }
-    if let Some(added) = added(kind, unprompted) {
+    script.push_str("first=$1\n");
+    let permission = added(kind, unprompted);
+    if let Some(added) = &permission {
         script.push_str("add=1\n");
         if let Some(subcommands) = added.subcommands {
-            script.push_str(&format!("case \"$1\" in {subcommands}) add= ;; esac\n"));
+            script.push_str(&format!("case \"$first\" in {subcommands}) add= ;; esac\n"));
         }
         script.push_str(&format!("for arg do\n  case \"$arg\" in {}) add= ;; esac\ndone\n", added.user));
+    }
+    if let Some((flag, subcommands, other)) = status_flag(kind) {
+        script.push_str(&format!("status=\n{TTY} && status=1\ncase \"$first\" in {subcommands}) status= ;; esac\n"));
+        script.push_str(&format!("for arg do\n  case \"$arg\" in {other}) status= ;; esac\ndone\n"));
+        script.push_str(&format!("[ -n \"$status\" ] && set -- {flag} \"$@\"\n"));
+    }
+    if let Some(added) = permission {
         script.push_str(&format!("[ -n \"$add\" ] && set -- {} \"$@\"\n", added.flag.join(" ")));
     }
     script.push_str(&format!("exec {} \"$@\"\n", program.join(" ")));
@@ -275,19 +369,26 @@ pub fn trust_argv() -> Vec<String> {
     ["/bin/sh", "-c", &script].map(str::to_owned).into()
 }
 
-/// Writes the wrapper of each agent in `kinds` to the host dir `dir`, which
-/// is bound at [`BIN_DIR`]. Each file is written in place, so the guest
-/// sees the new text at once.
+/// Writes the wrapper of each agent in `kinds` and the status hooks to the
+/// host dir `dir`, which is bound at [`BIN_DIR`]. Each file is written in
+/// place, so the guest sees the new text at once.
 pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    for &kind in kinds {
-        let Some(script) = wrapper(kind, found, unprompted) else {
-            continue;
-        };
-        let path = dir.join(kind.name());
+    let wrappers = kinds.iter().filter_map(|&kind| Some((kind.name(), wrapper(kind, found, unprompted)?)));
+    for (name, script) in wrappers {
+        let path = dir.join(name);
         std::fs::write(&path, script)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if kinds.contains(&AgentKind::Claude) {
+        let path = dir.join(STATUS);
+        std::fs::write(&path, status_script())?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::write(dir.join(CLAUDE_STATUS), claude_status())?;
+    }
+    if kinds.contains(&AgentKind::Pi) {
+        std::fs::write(dir.join(PI_STATUS), pi_status())?;
     }
     Ok(())
 }
@@ -301,8 +402,10 @@ mod tests {
         Found { pi_host: true, gemini: Some("/opt/zwinger/host/gemini/bundle/gemini.js"), proxy: Some(PROXY) };
 
     /// Runs the wrapper with `sh`, with a program that prints its env and arguments.
-    fn run(kind: AgentKind, unprompted: bool, args: &[&str]) -> String {
+    fn run_with_tty_check(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool) -> String {
         let script = wrapper(kind, HOST, unprompted).unwrap();
+        // The test process has pipes; substitute the TTY check to exercise the interactive branch.
+        let script = if tty { script.replace(TTY, "true") } else { script };
         let program = program(kind, HOST).unwrap().iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
         let script =
             script.replace(&format!("exec {program}"), "exec printf '%s\\n' \"$HOME$CODEX_HOME$PI_CODING_AGENT_DIR\"");
@@ -318,15 +421,46 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
+    fn run(kind: AgentKind, unprompted: bool, args: &[&str]) -> String {
+        run_with_tty_check(kind, unprompted, args, false)
+    }
+
+    #[test]
+    fn status_flags_use_the_original_user_arguments() {
+        let run = |kind, args: &[&str]| run_with_tty_check(kind, true, args, true);
+        assert_eq!(
+            run(AgentKind::Claude, &["-c"]),
+            "/opt/zwinger/state/claude\n--dangerously-skip-permissions\n--settings\n/opt/zwinger/bin/claude-status.json\n-c\n"
+        );
+        assert_eq!(run(AgentKind::Claude, &["mcp", "list"]), "/opt/zwinger/state/claude\nmcp\nlist\n");
+        assert_eq!(
+            run(AgentKind::Claude, &["-p", "hi"]),
+            "/opt/zwinger/state/claude\n--dangerously-skip-permissions\n-p\nhi\n"
+        );
+        assert_eq!(
+            run(AgentKind::Pi, &[]),
+            "/opt/zwinger/state/agent\n--session-dir\n/opt/zwinger/state/sessions\n-e\n/opt/zwinger/bin/pi-status.js\n"
+        );
+        assert_eq!(
+            run(AgentKind::Pi, &["-p", "hi"]),
+            "/opt/zwinger/state/agent\n--session-dir\n/opt/zwinger/state/sessions\n-p\nhi\n"
+        );
+    }
+
     #[test]
     fn claude_wrapper_sets_its_state_and_skips_permissions() {
         assert_eq!(
             wrapper(AgentKind::Claude, Found::default(), true).unwrap(),
             "#!/bin/sh\n# zwinger writes this file at each cage start.\n\
              export IS_SANDBOX=1 HOME=/opt/zwinger/state/claude\n\
+             first=$1\n\
              add=1\n\
-             case \"$1\" in mcp|config|doctor|update) add= ;; esac\n\
+             case \"$first\" in mcp|config|doctor|update) add= ;; esac\n\
              for arg do\n  case \"$arg\" in --dangerously-skip-permissions|--permission-mode|--permission-mode=*) add= ;; esac\ndone\n\
+             status=\n[ -t 0 ] && [ -t 1 ] && status=1\n\
+             case \"$first\" in agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) status= ;; esac\n\
+             for arg do\n  case \"$arg\" in -p|--print) status= ;; esac\ndone\n\
+             [ -n \"$status\" ] && set -- --settings /opt/zwinger/bin/claude-status.json \"$@\"\n\
              [ -n \"$add\" ] && set -- --dangerously-skip-permissions \"$@\"\n\
              exec /opt/zwinger/claude/claude \"$@\"\n"
         );
@@ -615,6 +749,55 @@ mod tests {
     }
 
     #[test]
+    fn claude_status_hooks_give_one_state_per_event() {
+        let settings: serde_json::Value = serde_json::from_str(&claude_status()).unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+        let command = |event: &str| {
+            let groups = hooks[event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{event}: one hook group, no race");
+            assert_eq!(groups[0]["hooks"].as_array().unwrap().len(), 1, "{event}: one hook");
+            groups[0]["hooks"][0]["command"].as_str().unwrap().to_owned()
+        };
+        let state = |name: &str| format!("{BIN_DIR}/{STATUS} {name}");
+        assert_eq!(command("UserPromptSubmit"), state("active"));
+        // No matcher: the hook runs for each tool and reads the tool name.
+        assert!(hooks["PreToolUse"][0].get("matcher").is_none());
+        assert_eq!(command("PreToolUse"), state(TOOL));
+        assert_eq!(command("PostToolUse"), state("active"));
+        assert_eq!(command("Notification"), state("blocked"));
+        assert_eq!(hooks["Notification"][0]["matcher"], "permission_prompt|elicitation_dialog");
+        assert_eq!(command("Stop"), state("done"));
+    }
+
+    #[test]
+    fn status_script_picks_the_state_from_the_tool_name() {
+        let tty = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
+        let script = status_script().replace("/dev/tty", &tty.display().to_string());
+        let run = |arg: &str, input: &str| {
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .arg("sh")
+                .arg(arg)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            assert!(child.wait().unwrap().success());
+            let out = std::fs::read(&tty).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let osc = |state: &str| format!("\x1b{}{state}\x07", agent_osc());
+        assert_eq!(run(TOOL, r#"{"tool_name":"AskUserQuestion","tool_input":{}}"#), osc("blocked"));
+        assert_eq!(run(TOOL, r#"{"tool_name": "AskUserQuestion"}"#), osc("blocked"));
+        assert_eq!(run(TOOL, r#"{"tool_name":"Bash","tool_input":{"command":"AskUserQuestion"}}"#), osc("active"));
+        assert_eq!(run(TOOL, r#"{"tool_name":"Read"}"#), osc("active"));
+        assert_eq!(run("done", ""), osc("done"));
+        std::fs::remove_file(tty).unwrap();
+    }
+
+    #[test]
     fn write_makes_executable_wrappers_for_the_given_agents() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -623,10 +806,20 @@ mod tests {
         write(&dir, &[AgentKind::Pi, AgentKind::Claude, AgentKind::Gemini], Found::default(), true).unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         names.sort();
-        assert_eq!(names, ["claude", "pi"]);
+        assert_eq!(names, ["claude", "claude-status.json", "pi", "pi-status.js", "zwinger-agent-status"]);
         let mode = std::fs::metadata(dir.join("claude")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(std::fs::metadata(dir.join(STATUS)).unwrap().permissions().mode() & 0o777, 0o755);
+        let hooks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(CLAUDE_STATUS)).unwrap()).unwrap();
+        assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{BIN_DIR}/{STATUS} done"));
+        let pi = std::fs::read_to_string(dir.join(PI_STATUS)).unwrap();
+        assert!(pi.contains("agent_start") && pi.contains("agent_settled"));
         write(&dir, &[AgentKind::Claude], Found::default(), false).unwrap();
         assert!(!std::fs::read_to_string(dir.join("claude")).unwrap().contains("dangerously"));
+        let empty = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        write(&empty, &[], Found::default(), false).unwrap();
+        assert_eq!(std::fs::read_dir(empty).unwrap().count(), 0);
     }
 }

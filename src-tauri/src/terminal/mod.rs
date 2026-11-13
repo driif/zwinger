@@ -54,6 +54,20 @@ pub struct TerminalView {
     pub kind: TerminalKind,
     pub exit_code: Option<i32>,
     pub terminal_id: Option<String>,
+    /// Set only while an agent terminal is live.
+    pub agent: Option<AgentState>,
+}
+
+/// What an agent in a terminal does, as its hooks report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentState {
+    /// It works on a turn.
+    Active,
+    /// It waits for the user: a permission prompt or a question.
+    Blocked,
+    /// Its turn ended, and it waits for a new prompt.
+    Done,
 }
 
 impl<V> State<V> {
@@ -186,7 +200,14 @@ impl<R: SandboxRuntime> Manager<R> {
                 host_group,
             });
         }
-        tokio::spawn(pump(self.state.clone(), id.clone(), output, pty.events));
+        tokio::spawn(pump(
+            self.state.clone(),
+            id.clone(),
+            output,
+            pty.events,
+            matches!(kind, TerminalKind::Agent { .. }),
+            self.agent_sink.clone(),
+        ));
         Ok(id)
     }
 
@@ -322,7 +343,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let found = match cwd {
             Some(Cwd::Host(group)) => group.cwd().filter(|path| path.is_dir()),
             Some(Cwd::Guest(output, start, applied)) => {
-                let guest = lock(&output).osc7.cwd.clone().or(start);
+                let guest = lock(&output).osc.cwd.clone().or(start);
                 editor::map_guest(
                     guest.as_deref().unwrap_or(WORKSPACE),
                     Bound { session: &applied.0, cage: &applied.1 },
@@ -418,7 +439,7 @@ mod tests {
                 Bind { guest: launch::CA_DIR.into(), host: Ca::dir(&manager.data) },
             ]
         );
-        assert_eq!(wrappers(&manager, &id), ["pi"]);
+        assert_eq!(wrappers(&manager, &id), ["pi", "pi-status.js"]);
         let pi = std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap();
         // The wrapper sets the proxy env itself, so a cleared env keeps it.
         assert!(pi.contains(" HTTPS_PROXY='http://zw:") && pi.contains(" NODE_USE_ENV_PROXY=1 "), "{pi}");
@@ -449,7 +470,10 @@ mod tests {
 
         manager.stop(&id).await.unwrap();
         manager.start(&id).await.unwrap();
-        assert_eq!(wrappers(&manager, &id), ["claude", "codex", "pi"]);
+        assert_eq!(
+            wrappers(&manager, &id),
+            ["claude", "claude-status.json", "codex", "pi", "pi-status.js", "zwinger-agent-status"]
+        );
         manager.open_session(&id, agent(AgentKind::Codex, true), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/codex", "resume", "--last"]);
         assert_eq!(manager.list().sessions[0].processes[0].kind, agent(AgentKind::Codex, true));
