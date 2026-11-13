@@ -7,7 +7,34 @@ A **project** is one folder on your Mac and its configuration: the mounts, the n
 tasks and the agents from your Mac. Each project has one [cage](/cages/). The project folder is mounted
 read-write at `/workspace` in the cage.
 
-You can create, rename and delete projects. Use ⌘N to create a project.
+You can create, rename and delete projects. Use ⌘N to create a project. If you rename a project to an empty name,
+it gets the name of its folder again.
+
+## Workspaces
+
+The rail shows your projects in **workspaces**. In the rail, a project is a **session**. Each session is in one
+workspace. The tree is workspace → session → Terminals and Tasks.
+
+- At the first start, one workspace with the name "Workspace" holds all projects.
+- **New workspace** at the bottom of the rail adds an empty workspace.
+- To rename a workspace or a session, double-click its row, or use **Rename** in its menu (right-click or the **…**
+  button). The name becomes a field in the row. Press Enter or click outside the field to save the name. Press Escape
+  to cancel. An empty name gives a workspace the name "Workspace" again.
+- You can delete only an empty workspace. The last workspace cannot be deleted.
+- Drag a workspace to change the order of the workspaces. Drag a session to change its place or to move it to a
+  different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
+- With the keyboard, press Space to pick up a row, the Up and Down arrow keys to move it, and Space to drop it. Escape
+  cancels the move. Each arrow key moves a session one row. At the border of its workspace, the session goes to the
+  end of the workspace above or to the start of the workspace below. A collapsed workspace expands. A workspace moves
+  one place for each arrow key.
+- If the sidebar changed during a drag, zwinger shows "The sidebar changed. Try again." and shows the saved order.
+- A terminal stays in its session. You can change only the order of the terminals in a session.
+- Click a session to open its terminal view.
+- Drop a folder from Finder on a workspace or a session row to create a project in that workspace. A folder dropped
+  on empty rail space goes to the first workspace. A Terminals or Tasks row, a terminal row and a task row do not
+  accept a folder.
+
+zwinger saves the workspaces in `workspaces.json`, next to `projects.json`.
 
 ## Mounts
 

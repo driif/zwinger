@@ -831,9 +831,9 @@ mod tests {
         let runtime = FakeRuntime::default();
         let manager =
             Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host()).unwrap();
-        let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
-        let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
-        manager.create(temp_dir().to_str().unwrap()).unwrap();
+        let a = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.create(temp_dir().to_str().unwrap(), None).unwrap();
         manager.start(&a).await.unwrap();
         manager.start(&b).await.unwrap();
 
@@ -1177,7 +1177,7 @@ mod tests {
         let host = host_with(fs, FakeLogins::default(), NOW);
         let manager =
             Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
         for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
             std::fs::write(package.join("package.json"), format!(r#"{{"version":"{version}"}}"#)).unwrap();
@@ -1338,7 +1338,7 @@ mod tests {
         let manager =
             Manager::new(runtime.clone(), Store::new(temp_dir().join("projects.json")), vault(), temp_dir(), host())
                 .unwrap();
-        let ids: Vec<String> = (0..6).map(|_| manager.create(temp_dir().to_str().unwrap()).unwrap()).collect();
+        let ids: Vec<String> = (0..6).map(|_| manager.create(temp_dir().to_str().unwrap(), None).unwrap()).collect();
         for id in &ids {
             manager.start(id).await.unwrap();
         }
@@ -1389,7 +1389,7 @@ mod tests {
         std::fs::write(folder.join("hello.txt"), "from the host").unwrap();
         let store = Store::new(data.join("projects.json"));
         let manager = Manager::new(Microsandbox { pi }, store, vault(), data.clone(), host()).unwrap();
-        let id = manager.create(folder.to_str().unwrap()).unwrap();
+        let id = manager.create(folder.to_str().unwrap(), None).unwrap();
         manager.add_mount(&id, readonly.to_str().unwrap(), "/mnt/ro", true).unwrap();
         // A credential host, a host with no credential, and the Debian mirror:
         // the image has no curl, so the test installs it.

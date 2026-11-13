@@ -69,8 +69,12 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
   ];
   if (project.harness && !harnessOptions.includes(project.harness)) harnessOptions.push(project.harness);
 
+  // A blank name reverts to the folder name, as in the backend.
+  const nextName = name.trim() || (project.folder.split("/").filter(Boolean).pop() ?? project.folder);
+
   function rename(event: FormEvent) {
     event.preventDefault();
+    setName(nextName);
     run(() => renameProject(id, name).catch((e) => setNameError(errorMessage(e))));
   }
 
@@ -138,7 +142,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
                 setNameError(undefined);
               }}
             />
-            <Button type="submit" variant="outline" disabled={name.trim() === project.name}>
+            <Button type="submit" variant="outline" disabled={nextName === project.name}>
               Rename
             </Button>
           </form>

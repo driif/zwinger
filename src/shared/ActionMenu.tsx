@@ -1,12 +1,15 @@
-import { Button, Card, FloatingField } from "@driif/motiv";
-import { FormEvent, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { Button, Card } from "@driif/motiv";
+import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import "./actionMenu.css";
 
-/** A menu action. `confirm` asks first; `rename` asks for a new name first. */
-export type MenuAction = { label: string; icon: ReactNode; disabled?: boolean } & (
-  | { run: () => void; confirm?: string }
-  | { rename: string; onRename: (name: string) => void }
-);
+/** A menu action. `confirm` asks first. */
+export interface MenuAction {
+  label: string;
+  icon: ReactNode;
+  disabled?: boolean;
+  run: () => void;
+  confirm?: string;
+}
 
 /**
  * A popover of actions below its positioned parent. Arrow keys move between them; Escape and a click outside close it.
@@ -15,12 +18,11 @@ export type MenuAction = { label: string; icon: ReactNode; disabled?: boolean } 
 export function ActionMenu({ label, actions, onClose }: { label: string; actions: MenuAction[]; onClose: (refocus: boolean) => void }) {
   const card = useRef<HTMLElement>(null);
   const [step, setStep] = useState<MenuAction>();
-  const [name, setName] = useState("");
   const close = useRef(onClose);
   close.current = onClose;
 
   useEffect(() => {
-    card.current?.querySelector<HTMLElement>("input, button:not(:disabled)")?.focus();
+    card.current?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
   }, [step]);
 
   useEffect(() => {
@@ -44,20 +46,9 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
   }
 
   function choose(action: MenuAction) {
-    if ("rename" in action) {
-      setName(action.rename);
-      return setStep(action);
-    }
     if (action.confirm) return setStep(action);
     onClose(true);
     action.run();
-  }
-
-  function rename(event: FormEvent) {
-    event.preventDefault();
-    if (!step || !("rename" in step) || !name.trim()) return;
-    onClose(true);
-    step.onRename(name.trim());
   }
 
   return (
@@ -78,18 +69,6 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
             </Button>
           ))}
         </div>
-      ) : "rename" in step ? (
-        <form className="stack" onSubmit={rename}>
-          <FloatingField label="Name" value={name} maxLength={200} showValidity={false} onChange={(e) => setName(e.target.value)} />
-          <div className="row end">
-            <Button size="sm" variant="ghost" onClick={() => onClose(true)}>
-              Cancel
-            </Button>
-            <Button size="sm" type="submit" disabled={!name.trim()}>
-              Rename
-            </Button>
-          </div>
-        </form>
       ) : (
         <div className="stack" role="alertdialog" aria-label={step.label}>
           <p>{step.confirm}</p>

@@ -1,16 +1,29 @@
 import { listen } from "@tauri-apps/api/event";
-import { call, Pos, ProjectView, StartPhase } from "../../shared/api";
+import { call, Pos, ProjectView, StartPhase, Workspace } from "../../shared/api";
 
 export const listProjects = () => call<ProjectView[]>("list_projects");
 
-export const createProject = (folder: string) =>
-  call<string>("create_project", { folder });
+/** No `workspace`: the first workspace. */
+export const createProject = (folder: string, workspace?: string) =>
+  call<string>("create_project", { folder, workspace });
 
 export const deleteProject = (id: string) => call<void>("delete_project", { id });
 
-/** `ids` must name each project once. */
-export const reorderProjects = (ids: string[]) =>
-  call<void>("reorder_projects", { ids });
+export const listWorkspaces = () => call<Workspace[]>("list_workspaces");
+
+/** Adds an empty workspace at the end. Resolves to its id. */
+export const createWorkspace = () => call<string>("create_workspace");
+
+/** A blank name reverts to "Workspace". */
+export const renameWorkspace = (id: string, name: string) =>
+  call<void>("rename_workspace", { id, name });
+
+/** Only an empty workspace that is not the last one. */
+export const deleteWorkspace = (id: string) => call<void>("delete_workspace", { id });
+
+/** The workspaces in order, each with its sessions in order. Must name each workspace and each project once. */
+export const arrangeWorkspaces = (workspaces: Pick<Workspace, "id" | "sessions">[]) =>
+  call<void>("arrange_workspaces", { workspaces });
 
 /** `null` restores the auto layout. */
 export const setLayout = (id: string, layout: Record<string, Pos> | null) =>

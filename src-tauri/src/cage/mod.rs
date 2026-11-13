@@ -230,8 +230,7 @@ impl FileId {
 impl Project {
     pub fn new(folder: &str) -> Result<Self> {
         let (folder, folder_id) = host_dir_with_id(folder)?;
-        let name =
-            folder.file_name().map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let name = folder_name(&folder);
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
@@ -252,8 +251,9 @@ impl Project {
         })
     }
 
+    /// A blank name reverts to the folder name.
     pub fn rename(&mut self, name: &str) -> Result<()> {
-        self.name = display_name(name)?;
+        self.name = if name.trim().is_empty() { folder_name(&self.folder) } else { display_name(name)? };
         Ok(())
     }
 
@@ -639,8 +639,12 @@ impl Project {
     }
 }
 
+fn folder_name(folder: &Path) -> String {
+    folder.file_name().map_or_else(|| folder.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
 /// A trimmed name of 1 to 64 characters with no control characters.
-fn display_name(input: &str) -> Result<String> {
+pub(crate) fn display_name(input: &str) -> Result<String> {
     let name = input.trim();
     if !(1..=64).contains(&name.chars().count()) || name.chars().any(char::is_control) {
         return Err(Error::InvalidName(name.to_owned()));
@@ -1099,10 +1103,14 @@ mod tests {
         project.rename("  api  ").unwrap();
         assert_eq!(project.name, "api");
         project.rename(&"ü".repeat(64)).unwrap();
-        for name in ["", "   ", "a\nb", "tab\there", &"x".repeat(65)] {
+        for name in ["a\nb", "tab\there", &"x".repeat(65)] {
             assert!(matches!(project.rename(name), Err(Error::InvalidName(_))), "{name:?}");
         }
         assert_eq!(project.name, "ü".repeat(64));
+        for name in ["", "   "] {
+            project.rename(name).unwrap();
+            assert_eq!(project.name, "project");
+        }
     }
 
     #[test]

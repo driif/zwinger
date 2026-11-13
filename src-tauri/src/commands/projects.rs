@@ -4,6 +4,7 @@ use crate::agent::AgentKind;
 use crate::cage::manager::ProjectView;
 use crate::cage::{self, HostAgentUse, Pos};
 use crate::error::Result;
+use crate::workspaces::{Arrangement, Workspace};
 
 use super::Projects;
 
@@ -13,8 +14,8 @@ pub fn list_projects(projects: Projects<'_>) -> Vec<ProjectView> {
 }
 
 #[tauri::command]
-pub fn create_project(projects: Projects<'_>, folder: String) -> Result<String> {
-    projects.create(&folder)
+pub fn create_project(projects: Projects<'_>, folder: String, workspace: Option<String>) -> Result<String> {
+    projects.create(&folder, workspace.as_deref())
 }
 
 #[tauri::command]
@@ -28,8 +29,28 @@ pub fn rename_project(projects: Projects<'_>, id: String, name: String) -> Resul
 }
 
 #[tauri::command]
-pub fn reorder_projects(projects: Projects<'_>, ids: Vec<String>) -> Result<()> {
-    projects.reorder_projects(&ids)
+pub fn list_workspaces(projects: Projects<'_>) -> Vec<Workspace> {
+    projects.workspaces()
+}
+
+#[tauri::command]
+pub fn create_workspace(projects: Projects<'_>) -> Result<String> {
+    projects.create_workspace()
+}
+
+#[tauri::command]
+pub fn rename_workspace(projects: Projects<'_>, id: String, name: String) -> Result<()> {
+    projects.rename_workspace(&id, &name)
+}
+
+#[tauri::command]
+pub fn delete_workspace(projects: Projects<'_>, id: String) -> Result<()> {
+    projects.delete_workspace(&id)
+}
+
+#[tauri::command]
+pub fn arrange_workspaces(projects: Projects<'_>, workspaces: Vec<Arrangement>) -> Result<()> {
+    projects.arrange_workspaces(workspaces)
 }
 
 #[tauri::command]

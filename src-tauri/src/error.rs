@@ -81,6 +81,16 @@ pub enum Error {
     VaultMode { path: String, expected: String },
     #[error("project not found")]
     ProjectNotFound,
+    #[error("workspace not found")]
+    WorkspaceNotFound,
+    #[error("the workspace has sessions; move them to a different workspace first")]
+    WorkspaceNotEmpty,
+    #[error("the last workspace cannot be deleted")]
+    LastWorkspace,
+    #[error(
+        "zwinger could not read or back up {0}, so it does not save workspace changes; move the file away, then open zwinger again"
+    )]
+    WorkspacesLocked(String),
     #[error("mount not found")]
     MountNotFound,
     #[error("session not found")]

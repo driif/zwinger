@@ -69,7 +69,7 @@ pub(crate) fn manager_with_vault() -> (Manager<FakeRuntime>, FakeRuntime, String
     let manager =
         Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
             .unwrap();
-    let id = manager.create(dir.to_str().unwrap()).unwrap();
+    let id = manager.create(dir.to_str().unwrap(), None).unwrap();
     (manager, runtime, id, vault)
 }
 
@@ -288,7 +288,7 @@ pub(crate) fn host_manager(
     let host = host_with(mac(&home), logins, now);
     let manager =
         Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host).unwrap();
-    let id = manager.create(dir.to_str().unwrap()).unwrap();
+    let id = manager.create(dir.to_str().unwrap(), None).unwrap();
     (manager, runtime, id, vault)
 }
 

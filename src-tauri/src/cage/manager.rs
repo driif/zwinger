@@ -23,6 +23,7 @@ use crate::secrets::{self, SecretValue, Vault};
 use crate::store::Store;
 use crate::task_runs;
 use crate::terminal::{Session, SessionView};
+use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
 /// The network log entries kept per project.
 pub(crate) const NET_RING: usize = 2000;
@@ -41,6 +42,7 @@ pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
 pub struct Manager<R: SandboxRuntime> {
     pub(crate) runtime: R,
     pub(crate) store: Store,
+    pub(crate) workspace_store: WorkspaceStore,
     /// The app data dir. It holds the agent runtimes, `shields/<id>`, the
     /// agent state of each project, and `bin/<id>`, the host-only agent
     /// wrappers of each project.
@@ -77,6 +79,8 @@ pub struct Manager<R: SandboxRuntime> {
 
 pub(crate) struct State<V> {
     pub(crate) projects: Vec<Project>,
+    /// Each project is in exactly one workspace, and there is at least one.
+    pub(crate) workspaces: Vec<Workspace>,
     pub(crate) vms: HashMap<String, Vm<V>>,
     pub(crate) sessions: Vec<Session>,
     /// Per cage that starts or runs, the policy and the credential values
@@ -214,6 +218,10 @@ impl<V> State<V> {
     }
 }
 
+fn ids(projects: &[Project]) -> Vec<String> {
+    projects.iter().map(|p| p.id.clone()).collect()
+}
+
 /// The app data dir and `~/.zwinger`, canonical where they exist, so that
 /// they compare with the canonical host paths of the projects.
 fn reserved_dirs(data: &Path, home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -231,9 +239,23 @@ impl<R: SandboxRuntime> Manager<R> {
         prune_vault(vault.as_ref(), &projects);
         let ca = Ca::load(&Ca::dir(&data))?;
         eprintln!("proxy CA sha256 {}", ca.fingerprint());
+        let mut workspace_store = WorkspaceStore::new(store.dir().join(workspaces::FILE));
+        // A file that cannot be read or moved aside stays as it is: the
+        // default workspace is used and the store refuses to save over it.
+        let stored = workspace_store.load().unwrap_or_else(|e| {
+            eprintln!("the workspaces could not be loaded, the default is used: {e}");
+            None
+        });
+        let workspaces = workspaces::reconcile(stored.clone(), &ids(&projects));
+        if stored.as_ref() != Some(&workspaces)
+            && let Err(e) = workspace_store.save(&workspaces)
+        {
+            eprintln!("the workspaces could not be saved: {e}");
+        }
         Ok(Self {
             runtime,
             store,
+            workspace_store,
             reserved: reserved_dirs(&data, dirs::home_dir()),
             data,
             vault,
@@ -244,6 +266,7 @@ impl<R: SandboxRuntime> Manager<R> {
             unsettled: Mutex::default(),
             state: Arc::new(Mutex::new(State {
                 projects,
+                workspaces,
                 vms: HashMap::new(),
                 sessions: Vec::new(),
                 live: HashMap::new(),
@@ -354,23 +377,93 @@ impl<R: SandboxRuntime> Manager<R> {
         self.data.join("profiles").join(id)
     }
 
-    pub fn create(&self, folder: &str) -> Result<String> {
+    /// Adds the project at the end of `workspace`, or of the first workspace.
+    pub fn create(&self, folder: &str, workspace: Option<&str>) -> Result<String> {
         let project = Project::new(folder)?;
         project.check_app_data(&self.reserved)?;
         let id = project.id.clone();
         let mut state = lock(&self.state);
-        state.projects.push(project);
-        self.store.save(&state.projects)?;
+        let mut workspaces = state.workspaces.clone();
+        let target = match workspace {
+            Some(wanted) => workspaces.iter_mut().find(|w| w.id == wanted).ok_or(Error::WorkspaceNotFound)?,
+            None => &mut workspaces[0],
+        };
+        target.sessions.push(id.clone());
+        let mut projects = state.projects.clone();
+        projects.push(project);
+        self.save_both(&state.projects, &projects, &workspaces)?;
+        state.projects = projects;
+        state.workspaces = workspaces;
         Ok(id)
     }
 
-    /// `ids` must name each project once.
-    pub fn reorder_projects(&self, ids: &[String]) -> Result<()> {
+    /// Saves the projects, then the workspaces. If the second save fails,
+    /// the projects file gets `old` back. The load reconciles what is left.
+    fn save_both(&self, old: &[Project], projects: &[Project], workspaces: &[Workspace]) -> Result<()> {
+        self.store.save(projects)?;
+        if let Err(e) = self.workspace_store.save(workspaces) {
+            if let Err(undo) = self.store.save(old) {
+                eprintln!("the projects could not be restored: {undo}");
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn workspaces(&self) -> Vec<Workspace> {
+        lock(&self.state).workspaces.clone()
+    }
+
+    /// Adds an empty workspace at the end and returns its id.
+    pub fn create_workspace(&self) -> Result<String> {
+        let workspace = Workspace::new(Vec::new());
+        let id = workspace.id.clone();
+        self.edit_workspaces(|workspaces| {
+            workspaces.push(workspace);
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    /// A blank name reverts to the default name.
+    pub fn rename_workspace(&self, id: &str, name: &str) -> Result<()> {
+        let name = workspaces::workspace_name(name)?;
+        self.edit_workspaces(|workspaces| {
+            workspaces.iter_mut().find(|w| w.id == id).ok_or(Error::WorkspaceNotFound)?.name = name;
+            Ok(())
+        })
+    }
+
+    /// Only an empty workspace that is not the last one.
+    pub fn delete_workspace(&self, id: &str) -> Result<()> {
+        self.edit_workspaces(|workspaces| {
+            let i = workspaces.iter().position(|w| w.id == id).ok_or(Error::WorkspaceNotFound)?;
+            if !workspaces[i].sessions.is_empty() {
+                return Err(Error::WorkspaceNotEmpty);
+            }
+            if workspaces.len() == 1 {
+                return Err(Error::LastWorkspace);
+            }
+            workspaces.remove(i);
+            Ok(())
+        })
+    }
+
+    /// `wanted` must name each workspace and each project exactly once.
+    pub fn arrange_workspaces(&self, wanted: Vec<Arrangement>) -> Result<()> {
         let mut state = lock(&self.state);
-        let mut projects = state.projects.clone();
-        cage::reorder(&mut projects, ids, |s| &s.id)?;
-        self.store.save(&projects)?;
-        state.projects = projects;
+        let workspaces = workspaces::arrange(&state.workspaces, wanted, &ids(&state.projects))?;
+        self.workspace_store.save(&workspaces)?;
+        state.workspaces = workspaces;
+        Ok(())
+    }
+
+    fn edit_workspaces(&self, edit: impl FnOnce(&mut Vec<Workspace>) -> Result<()>) -> Result<()> {
+        let mut state = lock(&self.state);
+        let mut workspaces = state.workspaces.clone();
+        edit(&mut workspaces)?;
+        self.workspace_store.save(&workspaces)?;
+        state.workspaces = workspaces;
         Ok(())
     }
 
@@ -520,8 +613,13 @@ impl<R: SandboxRuntime> Manager<R> {
                 None | Some(Vm::Failed(_)) => {}
             }
             let projects: Vec<Project> = state.projects.iter().filter(|s| s.id != id).cloned().collect();
-            self.store.save(&projects)?;
+            let mut workspaces = state.workspaces.clone();
+            for workspace in &mut workspaces {
+                workspace.sessions.retain(|s| s != id);
+            }
+            self.save_both(&state.projects, &projects, &workspaces)?;
             state.projects = projects;
+            state.workspaces = workspaces;
             state.vms.remove(id);
             state.live.remove(id);
             state.net.remove(id);
@@ -593,6 +691,7 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 mod tests {
     use super::reserved_dirs;
     use crate::cage::testing::*;
+    use crate::workspaces::{self, Arrangement};
 
     #[tokio::test]
     async fn delete_refuses_a_project_that_is_starting() {
@@ -643,12 +742,47 @@ mod tests {
         assert!(!manager.data.join("chats").join(&id).exists());
     }
 
+    #[test]
+    fn a_workspaces_file_that_does_not_parse_gives_the_default_workspace() {
+        let dir = temp_dir();
+        let store = || Store::new(dir.join("projects.json"));
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
+        std::fs::write(dir.join(workspaces::FILE), "{not json").unwrap();
+
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        let list = reloaded.workspaces();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, workspaces::DEFAULT_NAME);
+        assert_eq!(list[0].sessions, [id]);
+        assert_eq!(std::fs::read(dir.join("workspaces.json.bad")).unwrap(), b"{not json");
+        assert!(dir.join(workspaces::FILE).exists());
+    }
+
+    #[test]
+    fn a_failed_backup_blocks_each_later_workspace_save() {
+        let dir = temp_dir();
+        std::fs::write(dir.join(workspaces::FILE), "{not json").unwrap();
+        // A non-empty directory at the backup path makes the move fail.
+        std::fs::create_dir_all(dir.join("workspaces.json.bad").join("x")).unwrap();
+
+        let manager =
+            Manager::new(FakeRuntime::default(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host())
+                .unwrap();
+        assert_eq!(manager.workspaces().len(), 1);
+        assert!(matches!(manager.create_workspace(), Err(Error::WorkspacesLocked(_))));
+        assert!(matches!(manager.create(dir.to_str().unwrap(), None), Err(Error::WorkspacesLocked(_))));
+        assert_eq!(manager.workspaces().len(), 1);
+        assert!(manager.list().is_empty());
+        assert_eq!(std::fs::read(dir.join(workspaces::FILE)).unwrap(), b"{not json");
+    }
+
     #[tokio::test]
     async fn config_persists_across_managers() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("projects.json"));
         let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.add_mount(&id, temp_dir().to_str().unwrap(), "/mnt/data", true).unwrap();
         manager.set_mount_readonly(&id, "/mnt/data", false).unwrap();
 
@@ -683,7 +817,10 @@ mod tests {
         let view = &manager.list()[0];
         assert_eq!(view.project.name, "api");
         assert!(!view.pending_restart);
-        assert!(matches!(manager.rename(&id, ""), Err(Error::InvalidName(_))));
+        assert!(matches!(manager.rename(&id, "a\nb"), Err(Error::InvalidName(_))));
+        manager.rename(&id, " ").unwrap();
+        let project = &manager.list()[0].project;
+        assert_eq!(Some(project.name.as_str()), project.folder.file_name().and_then(|n| n.to_str()));
     }
 
     #[tokio::test]
@@ -691,25 +828,50 @@ mod tests {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
         manager.set_layout(&id, Some([("harness".to_owned(), Pos { x: 1.0, y: 2.0 })].into())).unwrap();
-        manager.reorder_projects(std::slice::from_ref(&id)).unwrap();
+        let workspace = manager.workspaces()[0].id.clone();
+        manager.arrange_workspaces(vec![Arrangement { id: workspace, sessions: vec![id.clone()] }]).unwrap();
         let view = &manager.list()[0];
         assert!(!view.pending_restart);
         assert_eq!(view.project.layout.len(), 1);
     }
 
     #[tokio::test]
-    async fn reorder_projects_persists() {
+    async fn workspaces_persist_and_follow_create_and_delete() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("projects.json"));
         let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let a = manager.create(temp_dir().to_str().unwrap()).unwrap();
-        let b = manager.create(temp_dir().to_str().unwrap()).unwrap();
-        assert!(matches!(manager.reorder_projects(std::slice::from_ref(&b)), Err(Error::InvalidOrder)));
-        manager.reorder_projects(&[b.clone(), a.clone()]).unwrap();
+        let first = manager.workspaces()[0].id.clone();
+        let second = manager.create_workspace().unwrap();
+        let a = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        let b = manager.create(temp_dir().to_str().unwrap(), Some(&second)).unwrap();
+        assert!(matches!(manager.create(temp_dir().to_str().unwrap(), Some("nope")), Err(Error::WorkspaceNotFound)));
+        assert_eq!(manager.list().len(), 2);
+        assert!(matches!(manager.delete_workspace(&second), Err(Error::WorkspaceNotEmpty)));
+        assert!(matches!(
+            manager.arrange_workspaces(vec![Arrangement { id: first.clone(), sessions: vec![a.clone()] }]),
+            Err(Error::InvalidOrder)
+        ));
+        manager
+            .arrange_workspaces(vec![
+                Arrangement { id: second.clone(), sessions: vec![b.clone(), a.clone()] },
+                Arrangement { id: first.clone(), sessions: Vec::new() },
+            ])
+            .unwrap();
+        manager.rename_workspace(&second, " Work ").unwrap();
 
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let order: Vec<String> = reloaded.list().into_iter().map(|v| v.project.id).collect();
-        assert_eq!(order, [b, a]);
+        let workspaces = reloaded.workspaces();
+        assert_eq!(workspaces.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), [&second, &first]);
+        assert_eq!(workspaces[0].name, "Work");
+        assert_eq!(workspaces[0].sessions, [b.clone(), a.clone()]);
+
+        reloaded.delete(&a).await.unwrap();
+        assert_eq!(reloaded.workspaces()[0].sessions, std::slice::from_ref(&b));
+        reloaded.delete_workspace(&first).unwrap();
+        reloaded.delete(&b).await.unwrap();
+        assert!(matches!(reloaded.delete_workspace(&second), Err(Error::LastWorkspace)));
+        reloaded.rename_workspace(&second, "").unwrap();
+        assert_eq!(reloaded.workspaces()[0].name, workspaces::DEFAULT_NAME);
     }
 
     #[test]
@@ -736,7 +898,7 @@ mod tests {
         let data = manager.data.clone();
         std::fs::create_dir(data.join("sub")).unwrap();
         for folder in [data.parent().unwrap(), &data, &data.join("sub"), Path::new("/")] {
-            let error = manager.create(folder.to_str().unwrap()).unwrap_err();
+            let error = manager.create(folder.to_str().unwrap(), None).unwrap_err();
             assert!(matches!(error, Error::AppDataOverlap(..)), "{}: {error}", folder.display());
         }
         assert!(manager.list().is_empty());
@@ -780,7 +942,7 @@ mod tests {
         let store = || Store::new(dir.join("projects.json"));
         let vault: Arc<dyn Vault> = Arc::new(secrets::FileVault::new(&temp_dir()).unwrap());
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.set("deleted-project", "KEY", &SecretValue::new("y")).unwrap();
@@ -797,7 +959,7 @@ mod tests {
         let store = || Store::new(dir.join("projects.json"));
         let vault = vault();
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         let rule = allow(&manager, &id, "a.io");
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();

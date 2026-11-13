@@ -1,4 +1,4 @@
-import { Button, Card, IconButton } from "@driif/motiv";
+import { Button, Card, IconButton, TextField } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -7,9 +7,13 @@ import {
   DndContext,
   DragEndEvent,
   DragMoveEvent,
+  DragOverEvent,
+  DragStartEvent,
+  KeyboardCoordinateGetter,
   KeyboardSensor,
   Over,
   PointerSensor,
+  useDroppable,
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
@@ -32,13 +36,16 @@ import {
   X,
 } from "lucide-react";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import { reorderProjects } from "./api";
+import { arrangeWorkspaces, createWorkspace, deleteWorkspace, renameProject, renameWorkspace } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
   SessionKind,
   ProjectView,
+  INVALID_ORDER,
+  Workspace,
 } from "../../shared/api";
+import { errorCode } from "../../shared/errorMessage";
 import type { DroppedFolder, Pane, Run, View } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
@@ -47,10 +54,11 @@ import { LaunchAction, launchActions } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import { launchMenu } from "../launcher/SplitLaunch";
 import { StartProgress } from "./StartProgress";
+import { moveSession, stepSession, stepWorkspace } from "./tree";
 import "./rail.css";
 
 const COLLAPSED_KEY = "zwinger.tree.collapsed";
-const FORBIDDEN = "Not allowed: each project has its own cage. Items stay in their project.";
+const FORBIDDEN = "Not allowed: each session has its own cage. Terminals stay in their session.";
 
 type Group = "terminals" | "tasks";
 const GROUPS: { group: Group; label: string }[] = [
@@ -84,10 +92,14 @@ function runBadge(run: RunSummary | undefined) {
   return run.state;
 }
 
-/** What dnd-kit carries per sortable row. Only rows of the same container can swap. */
+/**
+ * What dnd-kit carries per row. `container` is "workspaces" for a workspace, the workspace id for a session and
+ * `<project id>|terminals` for a terminal. A `drop` is the header of a collapsed or empty workspace.
+ */
 interface DragData {
+  kind: "workspace" | "session" | "terminal" | "drop";
   container: string;
-  projectId: string;
+  projectId?: string;
   entity: string;
   label: string;
 }
@@ -113,16 +125,25 @@ interface RowProps {
   tabStop: boolean;
   className?: string;
   projectDrop?: string;
+  /** The workspace that a folder dropped from Finder on this row goes to. */
+  workspaceDrop?: string;
+  /** Makes the row itself a drop target for sessions. */
+  drop?: DragData;
   row: ReactNode;
   onOpen: () => void;
   /** Opens the row menu on a right-click. */
   onMenu?: () => void;
+  /** Starts a rename on a double-click. */
+  onRename?: () => void;
   children?: ReactNode;
 }
 
 /** A treeitem. A sortable one is dragged by its own row only, so a drag in a child list does not move the parent. */
-function TreeRow({ id, level, drag, expanded, selected, tabStop, className, projectDrop, row, onOpen, onMenu, children }: RowProps) {
+function TreeRow(props: RowProps) {
+  const { id, level, drag, expanded, selected, tabStop, className, projectDrop, workspaceDrop, drop, row, onOpen, onMenu, onRename, children } =
+    props;
   const sortable = useSortable({ id, data: drag, disabled: !drag });
+  const droppable = useDroppable({ id: `d|${id}`, data: drop, disabled: !drop });
   return (
     <li
       ref={sortable.setNodeRef}
@@ -134,15 +155,20 @@ function TreeRow({ id, level, drag, expanded, selected, tabStop, className, proj
       tabIndex={tabStop ? 0 : -1}
       data-tree-id={id}
       data-project-drop={projectDrop}
-      className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""}`}
+      data-workspace-drop={workspaceDrop}
+      className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""} ${droppable.isOver ? "drop-target" : ""}`}
       style={{ transform: CSS.Translate.toString(sortable.transform), transition: sortable.transition }}
       onKeyDown={(event) => event.target === event.currentTarget && sortable.listeners?.onKeyDown?.(event)}
     >
       <div
-        ref={sortable.setActivatorNodeRef}
+        ref={(element) => {
+          sortable.setActivatorNodeRef(element);
+          droppable.setNodeRef(element);
+        }}
         className={`tree-row level-${level}`}
         onPointerDown={(event) => sortable.listeners?.onPointerDown?.(event)}
         onClick={onOpen}
+        onDoubleClick={(event) => !(event.target as Element).closest("button") && onRename?.()}
         onContextMenu={(event) => {
           if (!onMenu) return;
           event.preventDefault();
@@ -156,8 +182,46 @@ function TreeRow({ id, level, drag, expanded, selected, tabStop, className, proj
   );
 }
 
+/**
+ * The name of a row as an input. Enter or a blur saves, Escape cancels. `onDone` runs once: with the new name, or with
+ * `undefined` on Escape. Its keys and clicks stay here, so the tree and dnd-kit do not see them.
+ */
+function NameField({ name, onDone }: { name: string; onDone: (name: string | undefined, refocus: boolean) => void }) {
+  const done = useRef(false);
+  const finish = (next: string | undefined, refocus: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    onDone(next, refocus);
+  };
+  const stop = (event: { stopPropagation: () => void }) => event.stopPropagation();
+  return (
+    <span className="grow tree-edit" onPointerDown={stop} onClick={stop} onDoubleClick={stop} onContextMenu={stop}>
+      <TextField
+        label={<span className="sr-only">Name</span>}
+        defaultValue={name}
+        maxLength={200}
+        autoFocus
+        onFocus={(event) => event.currentTarget.select()}
+        onBlur={(event) => finish(event.currentTarget.value.trim(), false)}
+        onKeyDown={(event) => {
+          event.stopPropagation();
+          if (event.key === "Enter") {
+            event.preventDefault();
+            finish(event.currentTarget.value.trim(), true);
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            finish(undefined, true);
+          }
+        }}
+      />
+    </span>
+  );
+}
+
 interface Props {
   projects: ProjectView[];
+  /** Each project is in exactly one workspace. */
+  workspaces: Workspace[];
   selectedId?: string;
   view: View;
   /** Per project, the blocked events that the Network tab has not shown yet. */
@@ -166,7 +230,6 @@ interface Props {
   runs: Record<string, RunSummary[]>;
   panes: Pane[];
   run: Run;
-  onSelect: (id: string) => void;
   onOpen: (projectId: string, view: View) => void;
   onRunsChange: (projectId: string) => void;
   onToggle: (project: ProjectView) => void;
@@ -179,7 +242,7 @@ interface Props {
   onNew: () => void;
   /** Opens the app settings. */
   onSettings: () => void;
-  /** A folder dropped from Finder on empty rail space. */
+  /** A folder dropped from Finder on the rail. */
   dropFolder?: DroppedFolder;
   editors?: Editors;
   /** The home folder, shown as `~`. */
@@ -189,16 +252,16 @@ interface Props {
   children: ReactNode;
 }
 
-/** The projects as a tree: project → Terminals / Tasks → items. */
+/** The sessions as a tree: workspace → session → Terminals / Tasks → items. A session is a project. */
 export function ProjectRail({
   projects,
+  workspaces,
   selectedId,
   view,
   blocked,
   runs,
   panes,
   run,
-  onSelect,
   onOpen,
   onRunsChange,
   onToggle,
@@ -221,16 +284,23 @@ export function ProjectRail({
   );
   const [focused, setFocused] = useState<string>();
   const [dragging, setDragging] = useState(false);
-  /** The other project that a dragged item is over. */
+  /** During a session drag and until its save is done: the workspaces with the session where it is now. */
+  const [draft, setDraft] = useState<Workspace[]>();
+  /** The other session that a dragged terminal is over. */
   const [forbidden, setForbidden] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
   /** The row whose menu is open. */
   const [menu, setMenu] = useState<string>();
+  /** The row whose name is an input. */
+  const [editing, setEditing] = useState<string>();
+  /** The row of a keyboard drag. A keyboard drag moves the draft one step per arrow key, and its drop saves the draft. */
+  const keyboardDrag = useRef<string | undefined>(undefined);
+  const keyboardStep = useRef<KeyboardCoordinateGetter>(() => undefined);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     // Enter opens a row, so only Space picks up and drops.
     useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
+      coordinateGetter: (event, args) => keyboardStep.current(event, args),
       keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
     }),
   );
@@ -238,6 +308,11 @@ export function ProjectRail({
   useEffect(() => {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed]));
   }, [collapsed]);
+
+  // A session that moves to another workspace is a new element, so it gets the focus again.
+  useEffect(() => {
+    if (keyboardDrag.current) focusRow(keyboardDrag.current);
+  }, [draft]);
 
   const toggle = (id: string) =>
     setCollapsed((current) => {
@@ -326,33 +401,45 @@ export function ProjectRail({
     });
   }
 
+  const shown = draft ?? workspaces;
+  const byId = new Map(projects.map((p) => [p.id, p]));
+
   // The rows in tree order, for the arrow keys, and each row's parent.
   const visible: string[] = [];
   const parentOf: Record<string, string> = {};
-  const lists: Record<string, string[]> = { projects: projects.map((s) => s.id) };
-  const content = projects.map((project) => {
-    const sid = project.id;
-    const projectRow = `s|${sid}`;
-    visible.push(projectRow);
-    const groups = GROUPS.map(({ group, label }) => {
-      const id = `g|${sid}|${group}`;
-      const container = `${sid}|${group}`;
-      const items = leaves(project, group);
-      lists[container] = items.map((i) => i.entity);
-      const open = items.length > 0 && !collapsed.has(id);
-      const showOpen = !collapsed.has(projectRow);
-      if (showOpen) {
-        visible.push(id);
-        parentOf[id] = projectRow;
-        if (open)
-          for (const item of items) {
-            visible.push(`i|${container}|${item.entity}`);
-            parentOf[`i|${container}|${item.entity}`] = id;
-          }
+  const lists: Record<string, string[]> = {};
+  const content = shown.map((workspace) => {
+    const workspaceRow = `w|${workspace.id}`;
+    visible.push(workspaceRow);
+    const workspaceOpen = !collapsed.has(workspaceRow);
+    const sessions = workspace.sessions.flatMap((id) => byId.get(id) ?? []).map((project) => {
+      const sid = project.id;
+      const projectRow = `s|${sid}`;
+      const sessionOpen = workspaceOpen && !collapsed.has(projectRow);
+      if (workspaceOpen) {
+        visible.push(projectRow);
+        parentOf[projectRow] = workspaceRow;
       }
-      return { group, label, id, container, items, open };
+      const groups = GROUPS.map(({ group, label }) => {
+        const id = `g|${sid}|${group}`;
+        const container = `${sid}|${group}`;
+        const items = leaves(project, group);
+        lists[container] = items.map((i) => i.entity);
+        const open = items.length > 0 && !collapsed.has(id);
+        if (sessionOpen) {
+          visible.push(id);
+          parentOf[id] = projectRow;
+          if (open)
+            for (const item of items) {
+              visible.push(`i|${container}|${item.entity}`);
+              parentOf[`i|${container}|${item.entity}`] = id;
+            }
+        }
+        return { group, label, id, container, items, open };
+      });
+      return { project, projectRow, groups };
     });
-    return { project, projectRow, groups };
+    return { workspace, workspaceRow, workspaceOpen, sessions };
   });
   const tabStop = focused && visible.includes(focused) ? focused : (visible.find((id) => id === `s|${selectedId}`) ?? visible[0]);
 
@@ -363,11 +450,13 @@ export function ProjectRail({
         ? `i|${selectedId}|tasks|${view.taskId}`
         : `s|${selectedId}`;
 
+  const focusRow = (id: string) => tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(id)}"]`)?.focus();
+
   function focus(id: string | undefined, event: KeyboardEvent) {
     if (!id) return;
     event.preventDefault();
     setFocused(id);
-    tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(id)}"]`)?.focus();
+    focusRow(id);
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLUListElement>) {
@@ -412,24 +501,80 @@ export function ProjectRail({
   }
 
   function closeMenu(refocus: boolean) {
-    if (refocus && menu) tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(menu)}"]`)?.focus();
+    if (refocus && menu) focusRow(menu);
     setMenu(undefined);
   }
 
-  const collision: CollisionDetection = (args) =>
-    closestCenter({
-      ...args,
-      droppableContainers: args.droppableContainers.filter(
-        (c) => (c.data.current as DragData | undefined)?.container === dataOf(args.active).container,
-      ),
-    });
+  /** The name input of row `id`. A changed name is saved; a blank one goes to the backend, which applies its rules. */
+  function nameField(id: string, name: string, save: (name: string) => Promise<unknown>) {
+    return (
+      <NameField
+        name={name}
+        onDone={(next, refocus) => {
+          setEditing(undefined);
+          if (refocus) focusRow(id);
+          if (next !== undefined && next !== name) run(() => save(next));
+        }}
+      />
+    );
+  }
 
-  // An item over another project shows a forbidden drop. The check uses the
+  const renameAction = (id: string): MenuAction => ({ label: "Rename", icon: <Pencil size={14} />, run: () => setEditing(id) });
+
+  // With the keyboard, a session or a workspace moves one step per arrow key in the draft. The drag itself stays where
+  // it is: the rows move in the DOM. A terminal moves to the next terminal of its own session.
+  keyboardStep.current = (event, args) => {
+    if (!args.context.active) return;
+    const data = dataOf(args.context.active);
+    if (data.kind === "terminal") {
+      const { droppableContainers } = args.context;
+      const same = {
+        getEnabled: () => droppableContainers.getEnabled().filter((c) => (c.data.current as DragData | undefined)?.container === data.container),
+        get: (id: string) => droppableContainers.get(id),
+      } as unknown as typeof droppableContainers;
+      return sortableKeyboardCoordinates(event, { ...args, context: { ...args.context, droppableContainers: same } });
+    }
+    if (event.code !== "ArrowDown" && event.code !== "ArrowUp") return;
+    event.preventDefault();
+    const dir = event.code === "ArrowDown" ? 1 : -1;
+    const list = draft ?? workspaces;
+    const next = data.kind === "workspace" ? stepWorkspace(list, data.entity, dir) : stepSession(list, data.entity, dir);
+    if (next === list) return;
+    setDraft(next);
+    const workspace = next.find((w) => (data.kind === "workspace" ? w.id === data.entity : w.sessions.includes(data.entity)))!;
+    if (data.kind === "workspace") {
+      setAnnouncement(`${data.label} is at place ${next.indexOf(workspace) + 1} of ${next.length}.`);
+    } else {
+      setCollapsed((current) => {
+        const open = new Set(current);
+        open.delete(`w|${workspace.id}`);
+        return open;
+      });
+      const place = workspace.sessions.indexOf(data.entity) + 1;
+      setAnnouncement(`${data.label} is in ${workspace.name} at place ${place} of ${workspace.sessions.length}.`);
+    }
+  };
+
+  // A session can go to another workspace; a workspace and a terminal only move in their own list.
+  const collision: CollisionDetection = (args) => {
+    const active = dataOf(args.active);
+    return closestCenter({
+      ...args,
+      droppableContainers: args.droppableContainers.filter((c) => {
+        const data = c.data.current as DragData | undefined;
+        if (!data) return false;
+        if (active.kind === "session") return data.kind === "session" || data.kind === "drop";
+        return data.kind === active.kind && data.container === active.container;
+      }),
+    });
+  };
+
+  // A terminal over another session shows a forbidden drop. The check uses the
   // dragged row's rect, so it works for the pointer and the keyboard.
   function onDragMove({ active }: DragMoveEvent) {
     const data = dataOf(active);
     const rect = active.rect.current.translated;
-    if (data.container === "projects" || !rect) return;
+    if (data.kind !== "terminal" || !rect) return;
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-project-drop]") ?? [])].find((el) => {
@@ -442,19 +587,72 @@ export function ProjectRail({
     if (next) setAnnouncement(FORBIDDEN);
   }
 
+  function onDragStart({ active, activatorEvent }: DragStartEvent) {
+    setDragging(true);
+    keyboardDrag.current = activatorEvent instanceof globalThis.KeyboardEvent ? String(active.id) : undefined;
+  }
+
+  // A session over a session of another workspace moves there at once, so the rows make room for it.
+  function onDragOver({ active, over }: DragOverEvent) {
+    const data = dataOf(active);
+    if (keyboardDrag.current || data.kind !== "session" || !over) return;
+    const target = dataOf(over);
+    if (target.kind !== "session") return;
+    const list = draft ?? workspaces;
+    if (list.find((w) => w.sessions.includes(data.entity))?.id === target.container) return;
+    setDraft(moveSession(list, data.entity, target.container, target.entity));
+  }
+
   function onDragEnd({ active, over }: DragEndEvent) {
     setDragging(false);
-    if (forbidden) {
-      setForbidden(undefined);
-      setAnnouncement(`${dataOf(active).label} was not moved. ${FORBIDDEN}`);
+    const keyboard = keyboardDrag.current;
+    keyboardDrag.current = undefined;
+    const data = dataOf(active);
+    if (data.kind === "terminal") {
+      if (forbidden) {
+        setForbidden(undefined);
+        setAnnouncement(`${data.label} was not moved. ${FORBIDDEN}`);
+        return;
+      }
+      if (!over || over.id === active.id) return;
+      const list = lists[data.container];
+      onMoveTerminals(data.projectId!, arrayMove(list, list.indexOf(data.entity), list.indexOf(dataOf(over).entity)));
       return;
     }
-    if (!over || over.id === active.id) return;
-    const { container, projectId, entity } = dataOf(active);
-    const list = lists[container];
-    const next = arrayMove(list, list.indexOf(entity), list.indexOf(dataOf(over).entity));
-    if (container === "projects") run(() => reorderProjects(next));
-    else onMoveTerminals(projectId, next);
+    let next = draft ?? workspaces;
+    if (keyboard) return save(next);
+    if (!over) return setDraft(undefined);
+    const target = dataOf(over);
+    if (data.kind === "workspace") {
+      const ids = next.map((w) => w.id);
+      next = arrayMove(next, ids.indexOf(data.entity), ids.indexOf(target.entity));
+    } else if (target.kind === "drop") {
+      next = moveSession(next, data.entity, target.entity);
+      setCollapsed((current) => {
+        const open = new Set(current);
+        open.delete(`w|${target.entity}`);
+        return open;
+      });
+    } else {
+      next = next.map((w) => {
+        const from = w.sessions.indexOf(data.entity);
+        const to = w.sessions.indexOf(target.entity);
+        return from >= 0 && to >= 0 ? { ...w, sessions: arrayMove(w.sessions, from, to) } : w;
+      });
+    }
+    save(next);
+  }
+
+  /** Saves the order of `next`. If the tree changed since the drag began, the backend refuses it and the tree reloads. */
+  function save(next: Workspace[]) {
+    const order = (list: Workspace[]) => JSON.stringify(list.map((w) => [w.id, w.sessions]));
+    if (order(next) === order(workspaces)) return setDraft(undefined);
+    setDraft(next);
+    run(() =>
+      arrangeWorkspaces(next.map(({ id, sessions }) => ({ id, sessions }))).catch((e) => {
+        throw errorCode(e) === INVALID_ORDER ? new Error("The sidebar changed. Try again.") : e;
+      }),
+    ).finally(() => setDraft(undefined));
   }
 
   const announcements: Announcements = {
@@ -463,6 +661,18 @@ export function ProjectRail({
     onDragEnd: ({ active, over }) => (over ? `${dataOf(active).label} was dropped over ${dataOf(over).label}.` : undefined),
     onDragCancel: ({ active }) => `Moving ${dataOf(active).label} was cancelled.`,
   };
+
+  function workspaceMenu(workspace: Workspace): MenuAction[] {
+    return [
+      renameAction(`w|${workspace.id}`),
+      {
+        label: "Delete workspace",
+        icon: <Trash2 size={14} />,
+        disabled: workspace.sessions.length > 0 || workspaces.length === 1,
+        run: () => run(() => deleteWorkspace(workspace.id)),
+      },
+    ];
+  }
 
   function groupAction(project: ProjectView, group: Group) {
     const id = `g|${project.id}|terminals`;
@@ -498,6 +708,22 @@ export function ProjectRail({
     );
   }
 
+  const menuButton = (id: string, name: string) => (
+    <IconButton
+      icon={<Ellipsis size={12} />}
+      label={`Actions for ${name}`}
+      aria-haspopup="menu"
+      aria-expanded={menu === id}
+      tabIndex={-1}
+      onClick={(e) => {
+        e.stopPropagation();
+        setMenu(id);
+      }}
+    />
+  );
+
+  const dropWorkspace = workspaces.find((w) => w.id === dropFolder?.workspace);
+
   return (
     <aside className={forbidden ? "rail forbidden" : "rail"}>
       {children}
@@ -505,7 +731,14 @@ export function ProjectRail({
         {dropFolder && (
           <Card variant="outlined" padding="sm" className="stack">
             <p>
-              Create a project for <span className="mono">{dropFolder.folder}</span>?
+              Create a project for <span className="mono">{dropFolder.folder}</span>
+              {dropWorkspace && (
+                <>
+                  {" "}
+                  in <strong>{dropWorkspace.name}</strong>
+                </>
+              )}
+              ?
             </p>
             {dropFolder.dropped !== dropFolder.folder && (
               <p className="muted">
@@ -530,197 +763,246 @@ export function ProjectRail({
             announcements,
             screenReaderInstructions: {
               draggable:
-                "To move a row, press Space. Use the arrow keys to move it in its group, then press Space to drop it or Escape to cancel.",
+                "To move a row, press Space. Use the arrow keys to move it, then press Space to drop it or Escape to cancel. A session can go to another workspace. A terminal stays in its session.",
             },
           }}
-          onDragStart={() => setDragging(true)}
+          onDragStart={onDragStart}
           onDragMove={onDragMove}
+          onDragOver={onDragOver}
           onDragEnd={onDragEnd}
           onDragCancel={() => {
+            keyboardDrag.current = undefined;
             setDragging(false);
             setForbidden(undefined);
+            setDraft(undefined);
           }}
         >
           <ul
             ref={tree}
             className="tree"
             role="tree"
-            aria-label="Projects"
+            aria-label="Workspaces"
             onKeyDown={onKeyDown}
             onFocus={(e) => {
               const id = (e.target as HTMLElement).dataset.treeId;
               if (id) setFocused(id);
             }}
           >
-            <SortableContext items={projects.map((s) => `s|${s.id}`)} strategy={verticalListSortingStrategy}>
-              {content.map(({ project, projectRow, groups }) => {
-                const projectOpen = !collapsed.has(projectRow);
-                const running = project.status.state === "running";
-                return (
-                  <TreeRow
-                    key={project.id}
-                    id={projectRow}
-                    level={1}
-                    drag={{ container: "projects", projectId: project.id, entity: project.id, label: project.name }}
-                    expanded={projectOpen}
-                    selected={selectedRow === projectRow}
-                    tabStop={tabStop === projectRow}
-                    className={`tree-project ${project.id === selectedId ? "current" : ""} ${forbidden === project.id ? "forbidden-target" : ""}`}
-                    projectDrop={project.id}
-                    onOpen={() => onSelect(project.id)}
-                    onMenu={() => setMenu(projectRow)}
-                    row={
-                      <>
-                        <IconButton
-                          icon={<ChevronRight size={14} className={projectOpen ? "tree-chevron open" : "tree-chevron"} />}
-                          label={projectOpen ? `Collapse ${project.name}` : `Expand ${project.name}`}
-                          tabIndex={-1}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggle(projectRow);
-                          }}
-                        />
-                        <span className={`dot ${project.status.state}`} aria-label={project.status.state} />
-                        <span
-                          className="grow tree-name"
-                          title={project.status.state === "error" ? project.status.message : project.folder}
-                        >
-                          {project.name}
-                          {project.status.state === "starting" ? (
-                            <span className="tree-path muted">
-                              <StartProgress phase={project.status.phase} />
-                            </span>
-                          ) : (
-                            <span className="tree-path muted" title={project.folder}>
-                              {truncateMiddle(tildePath(project.folder, home), 32)}
-                            </span>
-                          )}
-                        </span>
-                        {blocked[project.id] > 0 && (
-                          <span className="rail-blocked" title="Blocked network events since you last saw them">
-                            {blocked[project.id]}
-                          </span>
-                        )}
-                        <IconButton
-                          icon={running ? <Square size={12} /> : <Play size={12} />}
-                          label={running ? `Stop ${project.name} cage` : `Start ${project.name} cage`}
-                          tabIndex={-1}
-                          disabled={project.status.state === "starting" || project.status.state === "stopping"}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onToggle(project);
-                          }}
-                        />
-                        <IconButton
-                          icon={<Ellipsis size={12} />}
-                          label={`Actions for ${project.name}`}
-                          aria-haspopup="menu"
-                          aria-expanded={menu === projectRow}
-                          tabIndex={-1}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setMenu(projectRow);
-                          }}
-                        />
-                      </>
-                    }
-                  >
-                    {menu === projectRow && (
-                      <ActionMenu
-                        label={`Actions for ${project.name}`}
-                        actions={launchMenu(launchActions(project, editors), (action) => onLaunch(project.id, action))}
-                        onClose={closeMenu}
-                      />
-                    )}
-                    {projectOpen && (
-                      <ul role="group">
-                        {groups.map(({ group, label, id, container, items, open }) => (
-                          <TreeRow
-                            key={group}
-                            id={id}
-                            level={2}
-                            expanded={items.length > 0 ? open : undefined}
-                            selected={selectedRow === id}
-                            tabStop={tabStop === id}
-                            onOpen={() => items.length > 0 && toggle(id)}
-                            row={
-                              <>
-                                <ChevronRight
-                                  size={12}
-                                  className={open ? "tree-chevron open" : "tree-chevron"}
-                                  visibility={items.length > 0 ? "visible" : "hidden"}
+            <SortableContext items={shown.map((w) => `w|${w.id}`)} strategy={verticalListSortingStrategy}>
+              {content.map(({ workspace, workspaceRow, workspaceOpen, sessions }) => (
+                <TreeRow
+                  key={workspace.id}
+                  id={workspaceRow}
+                  level={1}
+                  drag={{ kind: "workspace", container: "workspaces", entity: workspace.id, label: workspace.name }}
+                  drop={
+                    !workspaceOpen || sessions.length === 0
+                      ? { kind: "drop", container: workspace.id, entity: workspace.id, label: workspace.name }
+                      : undefined
+                  }
+                  expanded={workspaceOpen}
+                  selected={false}
+                  tabStop={tabStop === workspaceRow}
+                  className="tree-workspace"
+                  workspaceDrop={workspace.id}
+                  onOpen={() => toggle(workspaceRow)}
+                  onMenu={() => setMenu(workspaceRow)}
+                  onRename={() => setEditing(workspaceRow)}
+                  row={
+                    <>
+                      <ChevronRight size={12} className={workspaceOpen ? "tree-chevron open" : "tree-chevron"} />
+                      {editing === workspaceRow ? (
+                        nameField(workspaceRow, workspace.name, (name) => renameWorkspace(workspace.id, name))
+                      ) : (
+                        <span className="grow tree-name">{workspace.name}</span>
+                      )}
+                      <span className="muted tree-state">{sessions.length}</span>
+                      {menuButton(workspaceRow, workspace.name)}
+                    </>
+                  }
+                >
+                  {menu === workspaceRow && (
+                    <ActionMenu
+                      label={`Actions for ${workspace.name}`}
+                      actions={workspaceMenu(workspace)}
+                      onClose={closeMenu}
+                    />
+                  )}
+                  {workspaceOpen && (
+                    <ul role="group">
+                      <SortableContext items={sessions.map((s) => s.projectRow)} strategy={verticalListSortingStrategy}>
+                        {sessions.map(({ project, projectRow, groups }) => {
+                          const projectOpen = !collapsed.has(projectRow);
+                          const running = project.status.state === "running";
+                          return (
+                            <TreeRow
+                              key={project.id}
+                              id={projectRow}
+                              level={2}
+                              drag={{
+                                kind: "session",
+                                container: workspace.id,
+                                projectId: project.id,
+                                entity: project.id,
+                                label: project.name,
+                              }}
+                              expanded={projectOpen}
+                              selected={selectedRow === projectRow}
+                              tabStop={tabStop === projectRow}
+                              className={`tree-project ${project.id === selectedId ? "current" : ""} ${forbidden === project.id ? "forbidden-target" : ""}`}
+                              projectDrop={project.id}
+                              workspaceDrop={workspace.id}
+                              onOpen={() => onOpen(project.id, { kind: "terminal" })}
+                              onMenu={() => setMenu(projectRow)}
+                              onRename={() => setEditing(projectRow)}
+                              row={
+                                <>
+                                  <IconButton
+                                    icon={<ChevronRight size={14} className={projectOpen ? "tree-chevron open" : "tree-chevron"} />}
+                                    label={projectOpen ? `Collapse ${project.name}` : `Expand ${project.name}`}
+                                    tabIndex={-1}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggle(projectRow);
+                                    }}
+                                  />
+                                  <span className={`dot ${project.status.state}`} aria-label={project.status.state} />
+                                  {editing === projectRow ? (
+                                    nameField(projectRow, project.name, (name) => renameProject(project.id, name))
+                                  ) : (
+                                    <span
+                                      className="grow tree-name"
+                                      title={project.status.state === "error" ? project.status.message : project.folder}
+                                    >
+                                      {project.name}
+                                      {project.status.state === "starting" ? (
+                                        <span className="tree-path muted">
+                                          <StartProgress phase={project.status.phase} />
+                                        </span>
+                                      ) : (
+                                        <span className="tree-path muted" title={project.folder}>
+                                          {truncateMiddle(tildePath(project.folder, home), 32)}
+                                        </span>
+                                      )}
+                                    </span>
+                                  )}
+                                  {blocked[project.id] > 0 && (
+                                    <span className="rail-blocked" title="Blocked network events since you last saw them">
+                                      {blocked[project.id]}
+                                    </span>
+                                  )}
+                                  <IconButton
+                                    icon={running ? <Square size={12} /> : <Play size={12} />}
+                                    label={running ? `Stop ${project.name} cage` : `Start ${project.name} cage`}
+                                    tabIndex={-1}
+                                    disabled={project.status.state === "starting" || project.status.state === "stopping"}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      onToggle(project);
+                                    }}
+                                  />
+                                  {menuButton(projectRow, project.name)}
+                                </>
+                              }
+                            >
+                              {menu === projectRow && (
+                                <ActionMenu
+                                  label={`Actions for ${project.name}`}
+                                  actions={[
+                                    ...launchMenu(launchActions(project, editors), (action) => onLaunch(project.id, action)),
+                                    renameAction(projectRow),
+                                  ]}
+                                  onClose={closeMenu}
                                 />
-                                <span className="grow">{label}</span>
-                                <span className="muted tree-state">{items.length}</span>
-                                {groupAction(project, group)}
-                              </>
-                            }
-                          >
-                            {menu === id && (
-                              <ActionMenu
-                                label="New terminal"
-                                actions={launchMenu(
-                                  launchActions(project, editors).filter((a) => a.type === "session"),
-                                  (action) => onLaunch(project.id, action),
-                                )}
-                                onClose={closeMenu}
-                              />
-                            )}
-                            {open && (
-                              <ul role="group">
-                                <SortableContext
-                                  items={items.map((i) => `i|${container}|${i.entity}`)}
-                                  strategy={verticalListSortingStrategy}
-                                >
-                                  {items.map((item) => {
-                                    const rowId = `i|${container}|${item.entity}`;
-                                    return (
-                                      <TreeRow
-                                        key={item.entity}
-                                        id={rowId}
-                                        level={3}
-                                        // Tasks have no saved order.
-                                        drag={group === "tasks" ? undefined : { container, projectId: project.id, entity: item.entity, label: item.name }}
-                                        selected={selectedRow === rowId}
-                                        tabStop={tabStop === rowId}
-                                        onOpen={() => onOpen(project.id, item.view)}
-                                        onMenu={() => setMenu(rowId)}
-                                        row={
-                                          <>
-                                            {item.icon}
-                                            <span className="row grow" title={item.title ?? item.name}>
-                                              {item.label}
-                                            </span>
-                                            <IconButton
-                                              icon={<Ellipsis size={12} />}
-                                              label={`Actions for ${item.name}`}
-                                              aria-haspopup="menu"
-                                              aria-expanded={menu === rowId}
-                                              tabIndex={-1}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                setMenu(rowId);
-                                              }}
-                                            />
-                                          </>
-                                        }
-                                      >
-                                        {menu === rowId && (
-                                          <ActionMenu label={`Actions for ${item.name}`} actions={item.menu} onClose={closeMenu} />
-                                        )}
-                                      </TreeRow>
-                                    );
-                                  })}
-                                </SortableContext>
-                              </ul>
-                            )}
-                          </TreeRow>
-                        ))}
-                      </ul>
-                    )}
-                  </TreeRow>
-                );
-              })}
+                              )}
+                              {projectOpen && (
+                                <ul role="group">
+                                  {groups.map(({ group, label, id, container, items, open }) => (
+                                    <TreeRow
+                                      key={group}
+                                      id={id}
+                                      level={3}
+                                      expanded={items.length > 0 ? open : undefined}
+                                      selected={selectedRow === id}
+                                      tabStop={tabStop === id}
+                                      onOpen={() => items.length > 0 && toggle(id)}
+                                      row={
+                                        <>
+                                          <ChevronRight
+                                            size={12}
+                                            className={open ? "tree-chevron open" : "tree-chevron"}
+                                            visibility={items.length > 0 ? "visible" : "hidden"}
+                                          />
+                                          <span className="grow">{label}</span>
+                                          <span className="muted tree-state">{items.length}</span>
+                                          {groupAction(project, group)}
+                                        </>
+                                      }
+                                    >
+                                      {menu === id && (
+                                        <ActionMenu
+                                          label="New terminal"
+                                          actions={launchMenu(
+                                            launchActions(project, editors).filter((a) => a.type === "session"),
+                                            (action) => onLaunch(project.id, action),
+                                          )}
+                                          onClose={closeMenu}
+                                        />
+                                      )}
+                                      {open && (
+                                        <ul role="group">
+                                          <SortableContext
+                                            items={items.map((i) => `i|${container}|${i.entity}`)}
+                                            strategy={verticalListSortingStrategy}
+                                          >
+                                            {items.map((item) => {
+                                              const rowId = `i|${container}|${item.entity}`;
+                                              return (
+                                                <TreeRow
+                                                  key={item.entity}
+                                                  id={rowId}
+                                                  level={4}
+                                                  // Tasks have no saved order.
+                                                  drag={
+                                                    group === "tasks"
+                                                      ? undefined
+                                                      : { kind: "terminal", container, projectId: project.id, entity: item.entity, label: item.name }
+                                                  }
+                                                  selected={selectedRow === rowId}
+                                                  tabStop={tabStop === rowId}
+                                                  onOpen={() => onOpen(project.id, item.view)}
+                                                  onMenu={() => setMenu(rowId)}
+                                                  row={
+                                                    <>
+                                                      {item.icon}
+                                                      <span className="row grow" title={item.title ?? item.name}>
+                                                        {item.label}
+                                                      </span>
+                                                      {menuButton(rowId, item.name)}
+                                                    </>
+                                                  }
+                                                >
+                                                  {menu === rowId && (
+                                                    <ActionMenu label={`Actions for ${item.name}`} actions={item.menu} onClose={closeMenu} />
+                                                  )}
+                                                </TreeRow>
+                                              );
+                                            })}
+                                          </SortableContext>
+                                        </ul>
+                                      )}
+                                    </TreeRow>
+                                  ))}
+                                </ul>
+                              )}
+                            </TreeRow>
+                          );
+                        })}
+                      </SortableContext>
+                    </ul>
+                  )}
+                </TreeRow>
+              ))}
             </SortableContext>
           </ul>
         </DndContext>
@@ -731,6 +1013,9 @@ export function ProjectRail({
       <div className="row">
         <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
           New project
+        </Button>
+        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={() => run(createWorkspace)}>
+          New workspace
         </Button>
         <Button variant="ghost" size="sm" iconLeft={<Settings size={14} />} onClick={onSettings}>
           Settings <kbd className="muted">⌘,</kbd>

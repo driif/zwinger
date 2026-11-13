@@ -19,6 +19,7 @@ mod task_artifacts;
 mod task_runs;
 mod terminal;
 mod updates;
+mod workspaces;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -262,7 +263,11 @@ pub fn run() {
             commands::projects::create_project,
             commands::projects::delete_project,
             commands::projects::rename_project,
-            commands::projects::reorder_projects,
+            commands::projects::list_workspaces,
+            commands::projects::create_workspace,
+            commands::projects::rename_workspace,
+            commands::projects::delete_workspace,
+            commands::projects::arrange_workspaces,
             commands::projects::set_layout,
             commands::terminal::reorder_terminals,
             commands::terminal::set_pane_layout,

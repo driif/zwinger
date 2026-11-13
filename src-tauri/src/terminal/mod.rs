@@ -601,7 +601,7 @@ mod tests {
         let dir = temp_dir();
         let store = || Store::new(dir.join("projects.json"));
         let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.start(&id).await.unwrap();
         for kind in [SessionKind::Shell, agent(AgentKind::Pi, false), SessionKind::Shell] {
             manager.open_session(&id, kind, 24, 80).await.unwrap();

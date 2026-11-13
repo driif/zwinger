@@ -31,6 +31,11 @@ impl Store {
         Self { path }
     }
 
+    /// The dir of the store file.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
     #[cfg(test)]
     pub fn path(&self) -> &std::path::Path {
         &self.path

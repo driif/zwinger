@@ -605,7 +605,7 @@ mod tests {
             Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
                 .unwrap(),
         );
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         let rule = allow(&manager, &id, "a.io");
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
 

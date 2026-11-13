@@ -22,6 +22,7 @@ import {
 import {
   createProject,
   listProjects,
+  listWorkspaces,
   onGuestLogin,
   onStartProgress,
   resolveFolder,
@@ -59,6 +60,8 @@ import {
   PaneNode,
   SessionKind,
   ProjectView,
+  // The component that shows the projects is also named Workspace.
+  Workspace as WorkspaceGroup,
 } from "./shared/api";
 import { AppSettings } from "./features/settings/AppSettings";
 import { CommandBar } from "./shared/CommandBar";
@@ -114,10 +117,11 @@ export interface Intent {
   dropped?: string;
 }
 
-/** A dropped folder: the dropped path and its canonical folder. */
+/** A dropped folder: the dropped path, its canonical folder and the workspace of the row it was dropped on. */
 export interface DroppedFolder {
   dropped: string;
   folder: string;
+  workspace?: string;
 }
 
 /** The runtimes and their installs, for the views that offer Install. */
@@ -215,6 +219,7 @@ interface WorkspaceProps {
 
 function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
   const [projects, setProjects] = useState<ProjectView[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceGroup[]>([]);
   const [selectedId, setSelectedId] = useState(firstProject);
   const [view, setView] = useState<View>({ kind: "overview" });
   /** Per project, the terminal of the pane that has the focus. */
@@ -251,12 +256,15 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   const terminalTheme = appearance.themes.find((t) => t.id === prefs.terminal.themeId) ?? appearance.theme;
   setLook(prefs.terminal, terminalTheme.terminal);
 
-  // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the list it read.
+  // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the projects it read.
   const refresh = () => {
     const request = ++refreshes.current;
-    return listProjects().then(
-      (next) => {
-        if (request === refreshes.current) setProjects(next);
+    return Promise.all([listProjects(), listWorkspaces()]).then(
+      ([next, groups]) => {
+        if (request === refreshes.current) {
+          setProjects(next);
+          setWorkspaces(groups);
+        }
         return next;
       },
       (e) => {
@@ -469,12 +477,14 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
     setRoundFolder(undefined);
     setSettingsTab(undefined);
     setSelectedId(projectId);
-    if (next.kind === "terminal") showPane(next.key, projects.find((s) => s.id === projectId));
+    const target = projects.find((s) => s.id === projectId);
+    // A session click opens the terminal view with its focused pane.
+    if (next.kind === "terminal") showPane(next.key ?? (target && focusedOf(target)), target);
     else setView(next);
   }
 
-  async function addProject(folder: string) {
-    setSelectedId(await createProject(folder));
+  async function addProject(folder: string, workspace?: string) {
+    setSelectedId(await createProject(folder, workspace));
     setView({ kind: "overview" });
   }
 
@@ -558,7 +568,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   }
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
-  // empty rail space creates a project. The map has its own listener.
+  // a workspace or session row, or on empty rail space, creates a project. The map has its own listener.
   useEffect(() => {
     const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
@@ -569,9 +579,13 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         setRoundFolder(dropped);
         return;
       }
-      if (!element?.closest("[data-drop=rail]") || element.closest("[role=treeitem]")) return;
+      if (!element?.closest("[data-drop=rail]")) return;
+      // Only the nearest row counts: a terminal, task or group row inside a session refuses the drop.
+      const row = element.closest<HTMLElement>("[role=treeitem]");
+      if (row && !row.dataset.workspaceDrop) return;
+      const workspace = row?.dataset.workspaceDrop;
       setError(undefined);
-      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder }), (e) => setError(errorMessage(e)));
+      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder, workspace }), (e) => setError(errorMessage(e)));
     });
     return () => {
       stop.then((unlisten) => unlisten());
@@ -650,13 +664,13 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
     <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
       <ProjectRail
         projects={projects}
+        workspaces={workspaces}
         selectedId={project?.id}
         view={view}
         blocked={blocked}
         runs={runs}
         panes={panes}
         run={run}
-        onSelect={select}
         onOpen={openView}
         onRunsChange={reloadRuns}
         onToggle={toggle}
@@ -675,7 +689,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         }}
         onDropDone={(create) => {
           setDropFolder(undefined);
-          if (create && dropFolder) run(() => addProject(dropFolder.folder));
+          if (create && dropFolder) run(() => addProject(dropFolder.folder, dropFolder.workspace));
         }}
       >
         <CommandBar

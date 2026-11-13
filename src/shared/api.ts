@@ -194,6 +194,14 @@ export interface ProjectView {
   startTimings: StartTimings | null;
 }
 
+/** A group of sessions in the rail. A session is a project: each project is in exactly one workspace. */
+export interface Workspace {
+  id: string;
+  name: string;
+  /** Project ids, in rail order. */
+  sessions: string[];
+}
+
 export interface AgentNeed {
   agent: AgentKind;
   /** The catalog service of the host. */
