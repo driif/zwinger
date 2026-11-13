@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -119,7 +120,8 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Adds, changes or (with `inject` `None`) removes the credential `name`
-    /// of the rule. A new name needs a value; `None` keeps the current value.
+    /// of the rule. A new name, or a name with no stored value, needs a
+    /// value; `None` keeps the current value.
     /// The vault is written before the config, and a failed config save
     /// restores the vault. A running proxy uses the value from its next request.
     pub fn set_rule_credential(
@@ -132,9 +134,6 @@ impl<R: SandboxRuntime> Manager<R> {
     ) -> Result<()> {
         let Some(inject) = inject else {
             let _edit = lock(&self.secret_edit);
-            if self.vault.is_pending(id, name) {
-                return Err(Error::SecretPending(name.to_owned()));
-            }
             self.edit_network(id, |n| {
                 let rule = n.rule_mut(rule_id)?;
                 let before = rule.credentials.len();
@@ -169,19 +168,18 @@ impl<R: SandboxRuntime> Manager<R> {
             project.check()?;
             is_new
         };
+        let prior = self.vault.get(id, &name)?;
         let Some(value) = value else {
-            if is_new {
+            if is_new || prior.is_none() {
                 return Err(Error::SecretValueRequired(name));
             }
             return self.edit_network(id, put);
         };
 
-        let prior = self.vault.get(id, &name)?;
+        // A failed set can still have changed the value, for example when
+        // the file vault fails after its rename. The restore is safe either way.
         if let Err(e) = self.vault.set(id, &name, &value) {
-            // The late write still runs; the restore runs after it.
-            if matches!(e, Error::KeychainTimeout) {
-                self.restore_value(id, &name, prior.as_ref());
-            }
+            self.restore_value(id, &name, prior.as_ref());
             return Err(e);
         }
         if let Err(e) = self.edit(id, |s| put(&mut s.network)) {
@@ -191,6 +189,17 @@ impl<R: SandboxRuntime> Manager<R> {
         // A request must not see the new rule with the old value.
         self.publish(id, Some((&name, value)));
         Ok(())
+    }
+
+    /// The names of the project's credentials that have a stored value.
+    /// Returns no values.
+    pub fn stored_credentials(&self, id: &str) -> Result<Vec<String>> {
+        let names: BTreeSet<String> = {
+            let mut state = lock(&self.state);
+            state.project_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect()
+        };
+        let accounts: HashSet<String> = self.vault.accounts()?.into_iter().collect();
+        Ok(names.into_iter().filter(|name| accounts.contains(&secrets::account(id, name))).collect())
     }
 
     /// Tests the network from inside the running cage: first a TCP connect
@@ -227,45 +236,33 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Puts the prior value back after a failed edit. The old hosts must
     /// never get the new value: if the old value cannot come back, the value
-    /// is removed, and the secret is then missing. If neither ends, the
-    /// account stays unsettled until [`Self::settle`] sees the prior value.
+    /// is removed, and the secret is then missing. If both fail, the account
+    /// stays unsettled until [`Self::settle`] sees the prior value.
     pub(crate) fn restore_value(&self, id: &str, name: &str, prior: Option<&SecretValue>) {
         let restored = match prior {
             Some(prior) => self.vault.set(id, name, prior),
             None => self.vault.delete(id, name),
-        };
-        let restored = match restored {
-            // A restore past its deadline still runs, after the write.
-            Err(e) if !matches!(e, Error::KeychainTimeout) => self.vault.delete(id, name),
-            other => other,
-        };
+        }
+        .or_else(|_| self.vault.delete(id, name));
         if restored.is_err() {
             lock(&self.unsettled).insert(secrets::account(id, name), prior.cloned());
         }
     }
 
-    /// Fails while a write of the account still runs, or while the vault may
-    /// hold a value that the saved config does not expect. An unsettled
-    /// account is checked, and restored again, here.
+    /// Fails while the vault may hold a value that the saved config does not
+    /// expect. An unsettled account is checked, and restored again, here.
     pub(crate) fn settle(&self, id: &str, name: &str) -> Result<()> {
-        if self.vault.is_pending(id, name) {
-            return Err(Error::SecretPending(name.to_owned()));
-        }
         let account = secrets::account(id, name);
         let Some(prior) = lock(&self.unsettled).get(&account).cloned() else {
             return Ok(());
         };
-        let held = self.vault.get(id, name).map_err(|_| Error::SecretPending(name.to_owned()))?;
-        let matches = held.as_ref().map(SecretValue::expose) == prior.as_ref().map(SecretValue::expose);
-        let restored = matches
-            || match &prior {
+        let held = self.vault.get(id, name)?;
+        if held.as_ref().map(SecretValue::expose) != prior.as_ref().map(SecretValue::expose) {
+            match &prior {
                 Some(prior) => self.vault.set(id, name, prior),
                 None => self.vault.delete(id, name),
             }
-            .or_else(|_| self.vault.delete(id, name))
-            .is_ok();
-        if !restored {
-            return Err(Error::SecretPending(name.to_owned()));
+            .or_else(|_| self.vault.delete(id, name))?;
         }
         lock(&self.unsettled).remove(&account);
         Ok(())
@@ -638,85 +635,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_keychain_write_past_its_deadline_blocks_the_account_until_it_ends() {
-        let dir = temp_dir();
-        let slow = Arc::new(secrets::fake::SlowVault::default());
-        let vault = Arc::new(secrets::Ordered::alone(slow.clone(), Duration::from_millis(50)));
-        let manager = Manager::new(
-            FakeRuntime::default(),
-            Store::new(dir.join("projects.json")),
-            vault.clone(),
-            temp_dir(),
-            host(),
-        )
-        .unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
-        credential(&manager, &id, "old.io", "KEY", Some("v1")).unwrap();
-        let new = allow(&manager, &id, "new.io");
-
-        // A new host and a new value: the set passes its deadline.
-        slow.hold();
-        assert!(matches!(
-            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")),
-            Err(Error::KeychainTimeout)
-        ));
-        assert!(matches!(manager.start(&id).await, Err(Error::SecretPending(n)) if n == "KEY"));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
-        assert!(matches!(
-            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")),
-            Err(Error::SecretPending(_))
-        ));
-        assert!(matches!(manager.set_rule_credential(&id, &new, "KEY", None, None), Err(Error::SecretPending(_))));
-
-        // The late set runs, then the restore: the old hosts keep the old value.
-        slow.release();
-        secrets::tests::until_settled(vault.as_ref(), &id, "KEY");
-        let account = secrets::account(&id, "KEY");
-        let writes: Vec<_> =
-            slow.writes.lock().unwrap().iter().map(|(a, v)| (a == &account, v.clone().unwrap())).collect();
-        assert_eq!(writes, [(true, "v1".to_owned()), (true, "v2".to_owned()), (true, "v1".to_owned())]);
-        assert_eq!(holders(&manager), ["old.io"]);
-        manager.start(&id).await.unwrap();
-    }
-
-    #[tokio::test]
     async fn a_failed_restore_blocks_the_account_until_the_vault_holds_the_prior_value() {
-        let dir = temp_dir();
-        let slow = Arc::new(secrets::fake::SlowVault::default());
-        let vault = Arc::new(secrets::Ordered::alone(slow.clone(), Duration::from_millis(50)));
-        let manager = Manager::new(
-            FakeRuntime::default(),
-            Store::new(dir.join("projects.json")),
-            vault.clone(),
-            temp_dir(),
-            host(),
-        )
-        .unwrap();
-        let id = manager.create(dir.to_str().unwrap()).unwrap();
+        let (manager, _, id, vault) = manager_with_vault();
         credential(&manager, &id, "old.io", "KEY", Some("v1")).unwrap();
         let new = allow(&manager, &id, "new.io");
 
-        // The late set of v2 runs; the restore and its fallback delete fail.
-        slow.hold();
-        *slow.fail_after.lock().unwrap() = Some(2);
-        assert!(matches!(
-            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")),
-            Err(Error::KeychainTimeout)
-        ));
-        slow.release();
-        secrets::tests::until_settled(vault.as_ref(), &id, "KEY");
-        assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "v2");
+        // The set of v2 works, the save fails, and the restore and its fallback delete fail.
+        break_store(&manager);
+        *vault.writes_left.lock().unwrap() = Some(1);
+        assert!(manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")).is_err());
+        assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v2"));
+        std::fs::remove_dir_all(manager.store.path()).unwrap();
 
-        assert!(matches!(manager.start(&id).await, Err(Error::SecretPending(n)) if n == "KEY"));
-        assert!(matches!(
-            manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")),
-            Err(Error::SecretPending(_))
-        ));
+        assert!(matches!(manager.start(&id).await, Err(Error::Vault(_))));
+        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert!(matches!(manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")), Err(Error::Vault(_))));
 
         // The vault works again: the next start restores v1 for the old hosts.
-        *slow.fail_after.lock().unwrap() = None;
+        *vault.writes_left.lock().unwrap() = None;
         manager.start(&id).await.unwrap();
-        assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "v1");
+        assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
         assert_eq!(holders(&manager), ["old.io"]);
+    }
+
+    #[test]
+    fn a_set_that_fails_after_its_write_restores_the_prior_value() {
+        let (manager, _, id, vault) = manager_with_vault();
+        let rule = allow(&manager, &id, "a.io");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
+
+        vault.fail_after_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")),
+            Err(Error::Vault(_))
+        ));
+        assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn stored_credentials_name_only_the_values_in_the_vault() {
+        let (manager, _, id, vault) = manager_with_vault();
+        credential(&manager, &id, "a.io", "A", Some("1")).unwrap();
+        credential(&manager, &id, "b.io", "B", Some("2")).unwrap();
+        let rule = allow(&manager, &id, "c.io");
+        manager.set_rule_credential(&id, &rule, "A", bearer(), None).unwrap();
+        // A value from before the file vault: the config has the name, the vault has no value.
+        vault.delete(&id, "B").unwrap();
+        assert_eq!(manager.stored_credentials(&id).unwrap(), ["A"]);
+        assert!(matches!(manager.stored_credentials("nope"), Err(Error::ProjectNotFound)));
+
+        // An old name needs a value again.
+        let b = manager.list()[0].project.network.rules[1].id.clone();
+        assert!(matches!(
+            manager.set_rule_credential(&id, &b, "B", bearer(), None),
+            Err(Error::SecretValueRequired(n)) if n == "B"
+        ));
+        manager.set_rule_credential(&id, &b, "B", bearer(), value("new")).unwrap();
+        assert_eq!(manager.stored_credentials(&id).unwrap(), ["A", "B"]);
     }
 }

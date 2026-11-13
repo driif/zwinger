@@ -32,7 +32,7 @@ export const putRule = (
 export const removeRule = (id: string, ruleId: string) =>
   call<void>("remove_rule", { id, ruleId });
 
-/** `inject` null removes the credential. `value` null keeps the stored value; a new name needs one. */
+/** `inject` null removes the credential. `value` null keeps the stored value; a new name, or a name with no stored value, needs one. */
 export const setRuleCredential = (
   id: string,
   ruleId: string,
@@ -40,6 +40,10 @@ export const setRuleCredential = (
   inject: Inject | null,
   value: string | null,
 ) => call<void>("set_rule_credential", { id, ruleId, name, inject, value });
+
+/** The names of the project's credentials that have a stored value. It returns no values. */
+export const storedCredentials = (id: string) =>
+  call<string[]>("stored_credentials", { id });
 
 export interface NetStage {
   ok: boolean;

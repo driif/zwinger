@@ -5,8 +5,8 @@ import {
   SpringCheckbox,
 } from "@driif/motiv";
 import { KeyRound, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
-import { FormEvent, useState } from "react";
-import { Service, setRuleCredential } from "./api";
+import { FormEvent, useEffect, useState } from "react";
+import { Service, setRuleCredential, storedCredentials } from "./api";
 import { Credential, Inject, Rule, ProjectView } from "../../shared/api";
 import type { Run } from "../../App";
 import { echoHost } from "./echoHost";
@@ -82,11 +82,18 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
   const [draft, setDraft] = useState<Draft>();
   const [removing, setRemoving] = useState<string>();
   // Rules can share a name, and with it one value.
-  const stored = new Set(
-    project.network.rules.flatMap((r) =>
-      (r.credentials ?? []).map((c) => c.name),
-    ),
-  );
+  const [stored, setStored] = useState<Set<string>>();
+  const [vaultError, setVaultError] = useState<string>();
+
+  useEffect(() => {
+    storedCredentials(project.id).then(
+      (names) => {
+        setStored(new Set(names));
+        setVaultError(undefined);
+      },
+      (e) => setVaultError(errorMessage(e)),
+    );
+  }, [project]);
 
   function save(event: FormEvent) {
     event.preventDefault();
@@ -129,7 +136,7 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
   }
 
   const needsValue =
-    draft !== undefined && draft.isNew && !stored.has(draft.name.trim());
+    draft !== undefined && !stored?.has(draft.name.trim());
   // A host that echoes the query or the body shows the value to the agent.
   const readBack = (places: { query: boolean; body: boolean }) =>
     (places.query || places.body) &&
@@ -161,6 +168,12 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
           {host} echoes requests back, so the agent can read the value.
         </span>
       ))}
+      {vaultError && (
+        <p className="danger row">
+          <TriangleAlert size={14} />
+          {vaultError}
+        </p>
+      )}
       <ul className="list">
         {credentials.map((credential) => (
           <li key={credential.name} className="stack">
@@ -175,6 +188,15 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
               <span className="grow muted mono">
                 {describe(credential.inject)}
               </span>
+              {stored && !stored.has(credential.name) && (
+                <span
+                  className="warn row"
+                  title="It has no stored value. Edit it and enter the value again."
+                >
+                  <TriangleAlert size={14} />
+                  Not set
+                </span>
+              )}
               {removing === credential.name ? (
                 <>
                   <span className="danger">Remove?</span>

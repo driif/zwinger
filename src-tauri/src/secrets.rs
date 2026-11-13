@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,10 +14,6 @@ use crate::agent::AgentKind;
 use crate::cage;
 use crate::error::{Error, Result};
 use crate::host_agents::login;
-
-const SERVICE: &str = "zwinger";
-/// The longest wait for a Keychain call, which can show the macOS access prompt.
-pub const KEYCHAIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// Names that the image, the shell or microsandbox set in the guest. A secret
 /// with one of these names would replace them.
@@ -236,280 +235,212 @@ pub trait Vault: Send + Sync {
     fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>>;
     /// Deleting an absent value is not an error.
     fn delete(&self, project_id: &str, name: &str) -> Result<()>;
-    /// The [`account`]s of all stored values. Reads no values.
+    /// The [`account`]s of all stored values. Returns no values.
     fn accounts(&self) -> Result<Vec<String>>;
-    /// A write of the value passed its deadline and still runs.
-    fn is_pending(&self, _project_id: &str, _name: &str) -> bool {
-        false
-    }
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+/// The folder of the vault file, in the app data folder.
+const VAULT_DIR: &str = "vault";
+const VAULT_FILE: &str = "credentials.json";
+/// The temp files of a write. A file with this prefix is from a write that
+/// did not end, and the next write removes it.
+const TEMP_PREFIX: &str = ".credentials.json.tmp-";
+const FORMAT: u32 = 1;
 
-/// One thread that runs its jobs one after another, in submit order.
-struct Worker(Sender<Job>);
-
-impl Worker {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("zwinger-keychain".into())
-            .spawn(move || {
-                for job in rx {
-                    job();
-                }
-            })
-            .expect("spawn the Keychain worker");
-        Self(tx)
-    }
-
-    /// Runs `f` after the jobs before it. `None` if it does not end in
-    /// `limit`: it then still runs, and the jobs after it wait for it.
-    fn run<T: Send + 'static>(&self, limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (tx, rx) = mpsc::channel();
-        self.submit(move || {
-            let _ = tx.send(f());
-        });
-        rx.recv_timeout(limit).ok()
-    }
-
-    fn submit(&self, job: impl FnOnce() + Send + 'static) {
-        // The thread never ends, so the send cannot fail.
-        let _ = self.0.send(Box::new(job));
-    }
+#[derive(Default, Serialize, Deserialize)]
+struct Stored {
+    version: u32,
+    values: BTreeMap<String, String>,
 }
 
-/// The worker of all Keychain calls, so they run in submit order.
-static KEYCHAIN: LazyLock<Arc<Worker>> = LazyLock::new(|| Arc::new(Worker::new()));
-
-/// Runs a Keychain call on the Keychain worker. `None` if it does not end in
-/// `limit`, such as when nobody answers the macOS prompt.
-pub fn bounded<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    KEYCHAIN.run(limit, f)
-}
-
-/// A vault whose calls run on one ordered worker, each with a deadline. A
-/// write that passes its deadline still runs, and its account is pending
-/// until it ends. A later call on the same account runs after it.
-pub struct Ordered {
-    inner: Arc<dyn Vault>,
-    worker: Arc<Worker>,
-    limit: Duration,
-    /// Per account, the writes that passed their deadline and still run.
-    pending: Arc<Mutex<HashMap<String, usize>>>,
-}
-
-impl Ordered {
-    /// `inner` runs on the Keychain worker.
-    pub fn new(inner: Arc<dyn Vault>) -> Self {
-        Self { inner, worker: KEYCHAIN.clone(), limit: KEYCHAIN_LIMIT, pending: Arc::default() }
-    }
-
-    /// On a worker of its own, so a slow test vault holds no other test.
+/// The values in one JSON file that only the user can read and write
+/// (mode 0600, in a folder with mode 0700). Any process of the user can read
+/// the file. Each write replaces the file atomically.
+pub struct FileVault {
+    dir: PathBuf,
+    file: PathBuf,
+    /// Held for each read and each read-modify-write.
+    lock: Mutex<()>,
+    /// Makes the next write fail after the temp file is written.
     #[cfg(test)]
-    pub fn alone(inner: Arc<dyn Vault>, limit: Duration) -> Self {
-        Self { inner, worker: Arc::new(Worker::new()), limit, pending: Arc::default() }
+    fail_rename: AtomicBool,
+}
+
+impl FileVault {
+    /// Creates `<data>/vault` with mode 0700 if it does not exist.
+    pub fn new(data: &Path) -> Result<Self> {
+        let dir = data.join(VAULT_DIR);
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(vault_io(&dir, e)),
+            _ => {}
+        }
+        // A crash can leave a temp file with all values, also deleted ones.
+        remove_temps(&dir)?;
+        Ok(Self {
+            file: dir.join(VAULT_FILE),
+            dir,
+            lock: Mutex::default(),
+            #[cfg(test)]
+            fail_rename: AtomicBool::new(false),
+        })
     }
 
-    fn read<T: Send + 'static>(&self, f: impl FnOnce(&dyn Vault) -> Result<T> + Send + 'static) -> Result<T> {
-        let inner = self.inner.clone();
-        self.worker.run(self.limit, move || f(inner.as_ref())).ok_or(Error::KeychainTimeout)?
+    fn load(&self) -> Result<BTreeMap<String, String>> {
+        if !private(&self.dir, 0o700)? {
+            return Ok(BTreeMap::new());
+        }
+        // O_NOFOLLOW and the mode check on the open handle: the file that is
+        // checked is the file that is read.
+        let mut file = match fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&self.file) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(mode_error(&self.file, 0o600)),
+            Err(e) => return Err(vault_io(&self.file, e)),
+        };
+        let meta = file.metadata().map_err(|e| vault_io(&self.file, e))?;
+        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(mode_error(&self.file, 0o600));
+        }
+        let mut text = Vec::new();
+        io::Read::read_to_end(&mut file, &mut text).map_err(|e| vault_io(&self.file, e))?;
+        // The serde_json message can quote a value, so only its place is shown.
+        let stored: Stored = serde_json::from_slice(&text).map_err(|e| {
+            Error::Vault(format!("{} is not valid at line {}, column {}", self.file.display(), e.line(), e.column()))
+        })?;
+        if stored.version != FORMAT {
+            return Err(Error::Vault(format!("{} has unknown version {}", self.file.display(), stored.version)));
+        }
+        Ok(stored.values)
     }
 
-    /// The job and a caller that gives up agree under the `pending` lock:
-    /// either the result is there, or the job sees `late` and clears the mark.
-    fn write(&self, account: String, f: impl FnOnce(&dyn Vault) -> Result<()> + Send + 'static) -> Result<()> {
-        let (inner, pending) = (self.inner.clone(), self.pending.clone());
-        let late = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let (job_late, job_account) = (late.clone(), account.clone());
-        self.worker.submit(move || {
-            let result = f(inner.as_ref());
-            let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = tx.send(result);
-            if job_late.load(Ordering::SeqCst)
-                && let Some(count) = pending.get_mut(&job_account)
-            {
-                *count -= 1;
-                if *count == 0 {
-                    pending.remove(&job_account);
-                }
+    fn save(&self, values: BTreeMap<String, String>) -> Result<()> {
+        remove_temps(&self.dir)?;
+        let temp = self.dir.join(format!("{TEMP_PREFIX}{}", std::process::id()));
+        let json = serde_json::to_vec_pretty(&Stored { version: FORMAT, values })?;
+        let written = self.write_temp(&temp, &json).and_then(|()| {
+            #[cfg(test)]
+            if self.fail_rename.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("test failure"));
             }
+            fs::rename(&temp, &self.file)
         });
-        if let Ok(result) = rx.recv_timeout(self.limit) {
-            return result;
+        if let Err(e) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(vault_io(&self.file, e));
         }
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Ok(result) = rx.try_recv() {
-            return result;
-        }
-        late.store(true, Ordering::SeqCst);
-        *pending.entry(account).or_default() += 1;
-        Err(Error::KeychainTimeout)
+        // The rename is durable only when the folder is synced.
+        fs::File::open(&self.dir).and_then(|dir| dir.sync_all()).map_err(|e| vault_io(&self.dir, e))
+    }
+
+    fn write_temp(&self, temp: &Path, json: &[u8]) -> io::Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(temp)?;
+        file.write_all(json)?;
+        file.sync_all()
+    }
+
+    fn locked(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-impl Vault for Ordered {
+/// `false` if `path` does not exist. An error if it is a symlink or if group
+/// or other have a permission bit.
+fn private(path: &Path, expected: u32) -> Result<bool> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(vault_io(path, e)),
+    };
+    if meta.file_type().is_symlink() || meta.permissions().mode() & 0o077 != 0 {
+        return Err(mode_error(path, expected));
+    }
+    Ok(true)
+}
+
+fn mode_error(path: &Path, expected: u32) -> Error {
+    Error::VaultMode { path: path.display().to_string(), expected: format!("{expected:o}") }
+}
+
+fn remove_temps(dir: &Path) -> Result<()> {
+    let entries = fs::read_dir(dir).map_err(|e| vault_io(dir, e))?;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn vault_io(path: &Path, e: io::Error) -> Error {
+    Error::Vault(format!("{}: {e}", path.display()))
+}
+
+impl Vault for FileVault {
     fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-        let (id, key, value) = (project_id.to_owned(), name.to_owned(), value.clone());
-        self.write(account(project_id, name), move |v| v.set(&id, &key, &value))
+        let _lock = self.locked();
+        let mut values = self.load()?;
+        values.insert(account(project_id, name), value.expose().to_owned());
+        self.save(values)
     }
 
     fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        let (id, key) = (project_id.to_owned(), name.to_owned());
-        self.read(move |v| v.get(&id, &key))
+        let _lock = self.locked();
+        Ok(self.load()?.remove(&account(project_id, name)).map(SecretValue::new))
     }
 
     fn delete(&self, project_id: &str, name: &str) -> Result<()> {
-        let (id, key) = (project_id.to_owned(), name.to_owned());
-        self.write(account(project_id, name), move |v| v.delete(&id, &key))
+        let _lock = self.locked();
+        let mut values = self.load()?;
+        if values.remove(&account(project_id, name)).is_none() {
+            return Ok(());
+        }
+        self.save(values)
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
-        self.read(|v| v.accounts())
-    }
-
-    fn is_pending(&self, project_id: &str, name: &str) -> bool {
-        let pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        pending.contains_key(&account(project_id, name))
-    }
-}
-
-/// The macOS Keychain, one generic password per secret. Its calls have no
-/// deadline: the app runs them in [`Ordered`].
-#[cfg(target_os = "macos")]
-pub struct Keychain;
-
-#[cfg(target_os = "macos")]
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-
-#[cfg(target_os = "macos")]
-impl Keychain {
-    fn entry(project_id: &str, name: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE, &account(project_id, name)).map_err(keychain_error)
-    }
-
-    fn query() -> security_framework::item::ItemSearchOptions {
-        let mut query = security_framework::item::ItemSearchOptions::new();
-        query.class(security_framework::item::ItemClass::generic_password()).service(SERVICE);
-        query
-    }
-}
-
-/// The keyring and OS messages contain no secret data.
-#[cfg(target_os = "macos")]
-fn keychain_error(e: impl fmt::Display) -> Error {
-    Error::Keychain(e.to_string())
-}
-
-#[cfg(target_os = "macos")]
-impl Vault for Keychain {
-    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-        Self::entry(project_id, name)?.set_password(value.expose()).map_err(keychain_error)
-    }
-
-    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        match Self::entry(project_id, name)?.get_password() {
-            Ok(value) => Ok(Some(SecretValue::new(value))),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(keychain_error(e)),
-        }
-    }
-
-    /// Not through keyring, because keyring drops the result of the delete.
-    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
-        match Self::query().account(&account(project_id, name)).delete() {
-            Err(e) if e.code() != ERR_SEC_ITEM_NOT_FOUND => Err(keychain_error(e)),
-            _ => Ok(()),
-        }
-    }
-
-    fn accounts(&self) -> Result<Vec<String>> {
-        let found =
-            Self::query().load_attributes(true).load_data(false).limit(security_framework::item::Limit::All).search();
-        match found {
-            Ok(items) => Ok(items.iter().filter_map(|item| item.simplify_dict()?.remove("acct")).collect()),
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(Vec::new()),
-            Err(e) => Err(keychain_error(e)),
-        }
+        let _lock = self.locked();
+        Ok(self.load()?.into_keys().collect())
     }
 }
 
 #[cfg(test)]
 pub mod fake {
-    use std::sync::Condvar;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
-    /// A vault whose writes wait while it is held, as a Keychain call waits
-    /// for the macOS prompt.
-    #[derive(Default)]
-    pub struct SlowVault {
-        pub memory: MemoryVault,
-        held: Mutex<bool>,
-        released: Condvar,
-        /// The writes in the order that they ran: the account, and the value or `None` for a delete.
-        pub writes: Mutex<Vec<(String, Option<String>)>>,
-        /// Once this many writes ran, the next writes fail, as when the
-        /// Keychain denies them.
-        pub fail_after: Mutex<Option<usize>>,
-    }
-
-    impl SlowVault {
-        pub fn hold(&self) {
-            *self.held.lock().unwrap() = true;
-        }
-
-        pub fn release(&self) {
-            *self.held.lock().unwrap() = false;
-            self.released.notify_all();
-        }
-
-        /// Waits while held, then fails past `fail_after`.
-        fn wait(&self) -> Result<()> {
-            let held = self.held.lock().unwrap();
-            drop(self.released.wait_while(held, |held| *held).unwrap());
-            if self.fail_after.lock().unwrap().is_some_and(|n| self.writes.lock().unwrap().len() >= n) {
-                return Err(Error::Keychain("denied".into()));
-            }
-            Ok(())
-        }
-    }
-
-    impl Vault for SlowVault {
-        fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
-            self.wait()?;
-            self.writes.lock().unwrap().push((account(project_id, name), Some(value.expose().to_owned())));
-            self.memory.set(project_id, name, value)
-        }
-
-        fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
-            self.memory.get(project_id, name)
-        }
-
-        fn delete(&self, project_id: &str, name: &str) -> Result<()> {
-            self.wait()?;
-            self.writes.lock().unwrap().push((account(project_id, name), None));
-            self.memory.delete(project_id, name)
-        }
-
-        fn accounts(&self) -> Result<Vec<String>> {
-            self.memory.accounts()
-        }
-    }
-
     #[derive(Default)]
     pub struct MemoryVault {
         pub values: Mutex<HashMap<String, SecretValue>>,
-        /// When set, each delete fails and keeps the value.
-        pub fail_delete: AtomicBool,
+        /// When set, this many more writes succeed, and the writes after
+        /// them fail and keep the values.
+        pub writes_left: Mutex<Option<usize>>,
         pub gets: AtomicUsize,
+        /// Makes the next set change the value and then fail.
+        pub fail_after_write: AtomicBool,
+    }
+
+    impl MemoryVault {
+        fn write(&self) -> Result<()> {
+            match self.writes_left.lock().unwrap().as_mut() {
+                Some(0) => Err(Error::Vault("write failed".into())),
+                Some(left) => {
+                    *left -= 1;
+                    Ok(())
+                }
+                None => Ok(()),
+            }
+        }
     }
 
     impl Vault for MemoryVault {
         fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+            self.write()?;
             self.values.lock().unwrap().insert(account(project_id, name), value.clone());
+            if self.fail_after_write.swap(false, Ordering::SeqCst) {
+                return Err(Error::Vault("folder sync failed".into()));
+            }
             Ok(())
         }
 
@@ -519,9 +450,7 @@ pub mod fake {
         }
 
         fn delete(&self, project_id: &str, name: &str) -> Result<()> {
-            if self.fail_delete.load(Ordering::SeqCst) {
-                return Err(Error::Keychain("delete failed".into()));
-            }
+            self.write()?;
             self.values.lock().unwrap().remove(&account(project_id, name));
             Ok(())
         }
@@ -534,65 +463,127 @@ pub mod fake {
 
 #[cfg(test)]
 pub mod tests {
-    use super::fake::SlowVault;
     use super::*;
 
-    const DEADLINE: Duration = Duration::from_millis(50);
+    fn file_vault() -> (FileVault, PathBuf) {
+        let data = std::env::temp_dir().join(format!("zwinger-vault-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&data).unwrap();
+        let vault = FileVault::new(&data).unwrap();
+        let dir = vault.dir.clone();
+        (vault, dir)
+    }
 
-    /// Waits until no write of the account is pending.
-    pub fn until_settled(vault: &dyn Vault, project_id: &str, name: &str) {
-        let end = std::time::Instant::now() + Duration::from_secs(5);
-        while vault.is_pending(project_id, name) {
-            assert!(std::time::Instant::now() < end, "{project_id}/{name} stays pending");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+    fn chmod(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
-    fn a_write_past_its_deadline_is_pending_until_it_ends() {
-        let slow = Arc::new(SlowVault::default());
-        let vault = Ordered::alone(slow.clone(), DEADLINE);
-        vault.set("s", "B", &SecretValue::new("b")).unwrap();
-        slow.hold();
-        assert!(matches!(vault.set("s", "A", &SecretValue::new("1")), Err(Error::KeychainTimeout)));
-        assert!(vault.is_pending("s", "A"));
-        assert!(!vault.is_pending("s", "B"));
-        // A read waits behind the write and passes its deadline too.
-        assert!(matches!(vault.get("s", "B"), Err(Error::KeychainTimeout)));
-        slow.release();
-        until_settled(&vault, "s", "A");
-        assert_eq!(vault.get("s", "A").unwrap(), Some(SecretValue::new("1")));
+    fn the_file_vault_round_trips_multi_line_values() {
+        let (vault, dir) = file_vault();
+        assert_eq!(mode(&dir), 0o700);
+        let pem = "-----BEGIN KEY-----\nabc/def+\n\"quoted\"\n-----END KEY-----\n";
+        vault.set("p/1", "KEY", &SecretValue::new(pem)).unwrap();
+        vault.set("p/1", "OTHER", &SecretValue::new("x")).unwrap();
+        assert_eq!(mode(&dir.join(VAULT_FILE)), 0o600);
+
+        let again = FileVault::new(dir.parent().unwrap()).unwrap();
+        assert_eq!(again.get("p/1", "KEY").unwrap().unwrap().expose(), pem);
+        assert_eq!(again.accounts().unwrap(), ["p/1/KEY", "p/1/OTHER"]);
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(VAULT_FILE)).unwrap()).unwrap();
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["values"]["p/1/KEY"], pem);
     }
 
     #[test]
-    fn keychain_calls_run_in_submit_order() {
-        let slow = Arc::new(SlowVault::default());
-        let vault = Ordered::alone(slow.clone(), DEADLINE);
-        slow.hold();
-        assert!(vault.set("s", "A", &SecretValue::new("1")).is_err());
-        assert!(vault.set("s", "A", &SecretValue::new("2")).is_err());
-        assert!(vault.delete("s", "B").is_err());
-        slow.release();
-        until_settled(&vault, "s", "A");
-        until_settled(&vault, "s", "B");
-        assert_eq!(
-            *slow.writes.lock().unwrap(),
-            [
-                ("s/A".to_owned(), Some("1".to_owned())),
-                ("s/A".to_owned(), Some("2".to_owned())),
-                ("s/B".to_owned(), None)
-            ]
-        );
-        assert_eq!(vault.get("s", "A").unwrap(), Some(SecretValue::new("2")));
+    fn a_missing_file_is_an_empty_vault() {
+        let (vault, dir) = file_vault();
+        assert_eq!(vault.get("p", "KEY").unwrap(), None);
+        assert!(vault.accounts().unwrap().is_empty());
+        vault.delete("p", "KEY").unwrap();
+        assert!(!dir.join(VAULT_FILE).exists());
     }
 
     #[test]
-    fn a_write_in_time_leaves_nothing_pending() {
-        let vault = Ordered::alone(Arc::new(SlowVault::default()), Duration::from_secs(5));
-        vault.set("s", "A", &SecretValue::new("1")).unwrap();
-        vault.delete("s", "A").unwrap();
-        assert!(!vault.is_pending("s", "A"));
-        assert_eq!(vault.accounts().unwrap(), Vec::<String>::new());
+    fn delete_removes_one_value_and_an_absent_value_is_no_error() {
+        let (vault, _) = file_vault();
+        vault.set("p", "A", &SecretValue::new("1")).unwrap();
+        vault.set("p", "B", &SecretValue::new("2")).unwrap();
+        vault.delete("p", "A").unwrap();
+        vault.delete("p", "A").unwrap();
+        vault.delete("q", "B").unwrap();
+        assert_eq!(vault.accounts().unwrap(), ["p/B"]);
+    }
+
+    #[test]
+    fn wide_modes_and_symlinks_are_refused() {
+        let (vault, dir) = file_vault();
+        vault.set("p", "KEY", &SecretValue::new("v")).unwrap();
+        let file = dir.join(VAULT_FILE);
+
+        chmod(&file, 0o644);
+        let error = vault.get("p", "KEY").unwrap_err();
+        assert!(matches!(&error, Error::VaultMode { expected, .. } if expected == "600"), "{error:?}");
+        assert!(error.to_string().contains(&format!("chmod 600 {}", file.display())));
+        assert!(vault.set("p", "KEY", &SecretValue::new("w")).is_err());
+        chmod(&file, 0o600);
+
+        chmod(&dir, 0o755);
+        assert!(matches!(vault.accounts(), Err(Error::VaultMode { expected, .. }) if expected == "700"));
+        chmod(&dir, 0o700);
+
+        let real = dir.join("real.json");
+        fs::rename(&file, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &file).unwrap();
+        assert!(matches!(vault.get("p", "KEY"), Err(Error::VaultMode { .. })));
+    }
+
+    #[test]
+    fn an_unknown_version_or_bad_json_is_an_error_that_shows_no_value() {
+        let (vault, dir) = file_vault();
+        let file = dir.join(VAULT_FILE);
+        let write = |text: &str| {
+            fs::write(&file, text).unwrap();
+            chmod(&file, 0o600);
+        };
+        write(r#"{"version":2,"values":{}}"#);
+        assert!(matches!(vault.get("p", "KEY"), Err(Error::Vault(m)) if m.contains("unknown version 2")));
+        write(r#"{"version":1,"values":{"p/KEY":"sk-hidden" "#);
+        let error = vault.get("p", "KEY").unwrap_err();
+        assert!(matches!(error, Error::Vault(_)) && !error.to_string().contains("sk-hidden"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_old_file_and_leaves_no_temp_file() {
+        let (vault, dir) = file_vault();
+        vault.set("p", "KEY", &SecretValue::new("old")).unwrap();
+        vault.fail_rename.store(true, Ordering::SeqCst);
+        assert!(matches!(vault.set("p", "KEY", &SecretValue::new("new")), Err(Error::Vault(_))));
+        assert_eq!(vault.get("p", "KEY").unwrap().unwrap().expose(), "old");
+        let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, [VAULT_FILE]);
+    }
+
+    #[test]
+    fn a_new_vault_removes_stale_temp_files() {
+        let (_, dir) = file_vault();
+        let stale = dir.join(format!("{TEMP_PREFIX}1"));
+        fs::write(&stale, "old values").unwrap();
+        FileVault::new(dir.parent().unwrap()).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn the_next_write_removes_stale_temp_files() {
+        let (vault, dir) = file_vault();
+        let stale = dir.join(format!("{TEMP_PREFIX}1"));
+        fs::write(&stale, "partial").unwrap();
+        vault.set("p", "KEY", &SecretValue::new("v")).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(vault.get("p", "KEY").unwrap().unwrap().expose(), "v");
     }
 
     pub fn secret(name: &str, hosts: &[&str]) -> Secret {

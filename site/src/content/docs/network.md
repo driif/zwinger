@@ -42,11 +42,24 @@ The log keeps the names of the query parameters, never their values, headers or 
 A credential is a named value, for example `GITHUB_TOKEN`, that an Allow rule gives to its hosts. The agent sees only
 a placeholder. The proxy puts the real value into the request.
 
-- The value is in the macOS Keychain, never in the project file. The app can write the value but cannot read it.
+- The value is in the vault file, never in the project file. The app can write the value but cannot show it.
 - The proxy adds a credential only to HTTPS requests.
 - A credential on a Block rule is inactive. The proxy does not use it until the rule allows the host again.
 - A wildcard host rule (`*.a.io`) cannot have a credential.
 - A change of the value applies to the next request.
+
+The vault file is `~/Library/Application Support/com.driif.zwinger/vault/credentials.json`. It holds the values of all
+cages. The file has mode 0600 and its folder has mode 0700. The app replaces the file in one atomic step at each
+change. If the file or the folder has a wider mode or is a symlink, the app refuses to use the vault and gives the
+`chmod` command that fixes it.
+
+:::caution
+Any process that runs as your macOS user can read the vault file. The file protects the values from other users and
+from the cages, not from other programs of your user.
+:::
+
+Older versions kept the values in the macOS Keychain. The app does not move them to the vault file. A credential from
+before shows **Not set**: enter its value again. A cage with such a credential does not start until you do.
 
 :::caution
 Do not give a credential to a host that sends requests back, for example `httpbin.org`, `postman-echo.com` or an

@@ -69,14 +69,16 @@ pub enum Error {
     InvalidRule(String),
     #[error("the network proxy of the cage does not start, so the cage does not start: {0}")]
     Proxy(String),
-    #[error("secret {0} has no value in the Keychain; set it again")]
+    #[error("secret {0} has no stored value; set it again")]
     SecretMissing(String),
     #[error("Keychain: {0}")]
     Keychain(String),
-    #[error("the Keychain did not answer in time; allow access in the macOS prompt, then try again")]
-    KeychainTimeout,
-    #[error("a Keychain change of secret {0} has not finished; answer the macOS prompt, then try again")]
-    SecretPending(String),
+    #[error("credential vault: {0}")]
+    Vault(String),
+    #[error(
+        "the credential vault {path} must have mode {expected} and must not be a symlink; run chmod {expected} {path}"
+    )]
+    VaultMode { path: String, expected: String },
     #[error("project not found")]
     ProjectNotFound,
     #[error("mount not found")]

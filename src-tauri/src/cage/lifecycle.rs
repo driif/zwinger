@@ -464,8 +464,8 @@ impl<R: SandboxRuntime> Manager<R> {
         pi::check_node(&version)
     }
 
-    /// The vault value of each credential. A value with a write that still
-    /// runs fails the start: the vault may not match the config yet.
+    /// The vault value of each credential. An account whose restore failed
+    /// is restored first; if that fails again, the start fails.
     pub(crate) fn vault_values(&self, project: &Project) -> Result<HashMap<String, SecretValue>> {
         let mut values = HashMap::new();
         for credential in project.network.credentials() {

@@ -37,9 +37,7 @@ pub fn list_net_events(projects: Projects<'_>, project_id: String) -> Result<Vec
     projects.list_net_events(&project_id)
 }
 
-// The credential commands are async, so the Keychain calls do not block the main thread.
-
-// The credential commands are async, so the Keychain calls do not block the main thread.
+// The credential commands are async, so the vault file I/O does not block the main thread.
 
 #[tauri::command]
 pub async fn remove_rule(projects: Projects<'_>, id: String, rule_id: String) -> Result<()> {
@@ -57,6 +55,12 @@ pub async fn set_rule_credential(
     value: Option<SecretValue>,
 ) -> Result<()> {
     projects.set_rule_credential(&id, &rule_id, &name, inject, value)
+}
+
+/// The names of the project's credentials that have a stored value. Returns no values.
+#[tauri::command]
+pub async fn stored_credentials(projects: Projects<'_>, id: String) -> Result<Vec<String>> {
+    projects.stored_credentials(&id)
 }
 
 #[tauri::command]

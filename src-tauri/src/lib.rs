@@ -206,7 +206,7 @@ pub fn run() {
                 let host = host.clone();
                 move || host.detect()
             });
-            let vault = Arc::new(secrets::Ordered::new(Arc::new(secrets::Keychain)));
+            let vault = Arc::new(secrets::FileVault::new(&data)?);
             let minimum = app.config().bundle.macos.minimum_system_version.clone().unwrap_or_default();
             app.manage(Bootstrap::default());
             app.manage(preferences::Preferences::load(data.join("preferences.json")));
@@ -281,6 +281,7 @@ pub fn run() {
             commands::network::put_rule,
             commands::network::remove_rule,
             commands::network::set_rule_credential,
+            commands::network::stored_credentials,
             commands::network::test_network,
             commands::network::wildcard_for,
             commands::network::list_net_events,

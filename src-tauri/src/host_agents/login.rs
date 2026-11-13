@@ -11,13 +11,19 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::LazyLock;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::{self, Sender};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{Map, Value};
 
 use crate::agent::{AgentKind, cli};
 use crate::error::{Error, Result};
-use crate::secrets::{self, Origin, Places, Secret, SecretValue};
+use crate::secrets::{Origin, Places, Secret, SecretValue};
 
 /// The Keychain item of Claude Code's login.
 const CLAUDE_SERVICE: &str = "Claude Code-credentials";
@@ -173,12 +179,61 @@ fn read_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// The longest wait for a Keychain call, which can show the macOS access prompt.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_LIMIT: Duration = Duration::from_secs(60);
+
+#[cfg(target_os = "macos")]
+type Job = Box<dyn FnOnce() + Send>;
+
+/// One thread that runs its jobs one after another, in submit order.
+#[cfg(target_os = "macos")]
+struct Worker(Sender<Job>);
+
+#[cfg(target_os = "macos")]
+impl Worker {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("zwinger-keychain".into())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .expect("spawn the Keychain worker");
+        Self(tx)
+    }
+
+    /// Runs `f` after the jobs before it. `None` if it does not end in
+    /// `limit`: it then still runs, and the jobs after it wait for it.
+    fn run<T: Send + 'static>(&self, limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        // The thread never ends, so the send cannot fail.
+        let _ = self.0.send(Box::new(move || {
+            let _ = tx.send(f());
+        }));
+        rx.recv_timeout(limit).ok()
+    }
+}
+
+/// The worker of all Keychain calls, so they run in submit order.
+#[cfg(target_os = "macos")]
+static KEYCHAIN: LazyLock<Worker> = LazyLock::new(Worker::new);
+
+/// Runs a Keychain call on the Keychain worker. `None` if it does not end in
+/// `limit`, such as when nobody answers the macOS prompt.
+#[cfg(target_os = "macos")]
+fn bounded<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    KEYCHAIN.run(limit, f)
+}
+
 /// On the Keychain worker, so a macOS access prompt that nobody answers ends
 /// the wait after `KEYCHAIN_LIMIT`.
 #[cfg(target_os = "macos")]
 fn read_keychain() -> Result<Option<String>> {
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-    let found = secrets::bounded(secrets::KEYCHAIN_LIMIT, || {
+    let found = bounded(KEYCHAIN_LIMIT, || {
         let mut query = security_framework::item::ItemSearchOptions::new();
         query
             .class(security_framework::item::ItemClass::generic_password())
@@ -210,7 +265,7 @@ fn read_keychain() -> Result<Option<String>> {
 /// No answer in time counts as no login.
 #[cfg(target_os = "macos")]
 fn keychain_exists() -> bool {
-    secrets::bounded(secrets::KEYCHAIN_LIMIT, || {
+    bounded(KEYCHAIN_LIMIT, || {
         let mut query = security_framework::item::ItemSearchOptions::new();
         query
             .class(security_framework::item::ItemClass::generic_password())

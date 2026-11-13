@@ -171,9 +171,6 @@ pub enum Status {
     Error { message: String },
 }
 
-/// The vault account of the CA key of older versions. The prune keeps it and never reads it.
-const LEGACY_CA_KEY: &str = "zwinger/PROXY_CA_KEY";
-
 /// Deletes the values that no configured secret uses, such as the values of a
 /// project whose delete failed. A failure does not stop the app load.
 pub(crate) fn prune_vault(vault: &dyn Vault, projects: &[Project]) {
@@ -186,7 +183,7 @@ pub(crate) fn prune_vault(vault: &dyn Vault, projects: &[Project]) {
         .iter()
         .flat_map(|project| project.network.credentials().into_iter().map(|c| secrets::account(&project.id, &c.name)))
         .collect();
-    for account in accounts.iter().filter(|a| *a != LEGACY_CA_KEY && !configured.contains(*a)) {
+    for account in accounts.iter().filter(|a| !configured.contains(*a)) {
         let Some((project_id, name)) = account.split_once('/') else {
             continue;
         };
@@ -778,26 +775,20 @@ mod tests {
     }
 
     #[test]
-    fn load_prunes_values_with_no_credential_and_keeps_the_legacy_ca_key() {
+    fn load_prunes_the_values_of_the_vault_file_with_no_credential() {
         let dir = temp_dir();
         let store = || Store::new(dir.join("projects.json"));
-        let vault = vault();
+        let vault: Arc<dyn Vault> = Arc::new(secrets::FileVault::new(&temp_dir()).unwrap());
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap()).unwrap();
         credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
         vault.set("deleted-project", "KEY", &SecretValue::new("y")).unwrap();
         vault.set("zwinger", "PROXY_CA_KEY", &SecretValue::new("ca")).unwrap();
-        vault.set("zwinger", "OTHER", &SecretValue::new("z")).unwrap();
 
         Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
-        let mut accounts = vault.accounts().unwrap();
-        accounts.sort();
-        let mut kept = [secrets::account(&id, "KEY"), "zwinger/PROXY_CA_KEY".to_owned()];
-        kept.sort();
-        assert_eq!(accounts, kept);
-        assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("keep"));
-        assert_eq!(stored(&vault, "zwinger", "PROXY_CA_KEY").as_deref(), Some("ca"));
+        assert_eq!(vault.accounts().unwrap(), [secrets::account(&id, "KEY")]);
+        assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "keep");
     }
 
     #[test]
@@ -810,9 +801,9 @@ mod tests {
         let rule = allow(&manager, &id, "a.io");
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v")).unwrap();
         vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
-        vault.fail_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        *vault.writes_left.lock().unwrap() = Some(0);
 
-        assert!(matches!(manager.set_rule_credential(&id, &rule, "KEY", None, None), Err(Error::Keychain(_))));
+        assert!(matches!(manager.set_rule_credential(&id, &rule, "KEY", None, None), Err(Error::Vault(_))));
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(stored(&vault, &id, "GONE").as_deref(), Some("x"));

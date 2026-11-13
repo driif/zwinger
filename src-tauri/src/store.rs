@@ -73,7 +73,7 @@ impl Store {
 }
 
 /// Each user secret becomes a credential with the same name, so it keeps its
-/// Keychain account, on a rule for each of its exact hosts, with its header,
+/// vault account, on a rule for each of its exact hosts, with its header,
 /// query or body places. The rule allows the host only where the old policy
 /// reached it: Public mode, or a host on the allow list of List mode. Else
 /// (Deny mode, or a host off the list) the rule blocks the host and keeps
@@ -339,7 +339,7 @@ mod tests {
                 places: Places { header_fields: vec!["openai-organization".into()], query: false, body: false }
             }
         );
-        // One secret on two hosts: one credential name, so one Keychain account, on each host.
+        // One secret on two hosts: one credential name, so one vault account, on each host.
         // The host off the allow list stays blocked, with the credential inactive.
         let maps = Places { header_fields: vec![], query: true, body: true };
         for (host, action) in [("maps.example.com", Action::Allow), ("tiles.example.com", Action::Block)] {

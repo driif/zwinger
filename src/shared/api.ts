@@ -66,7 +66,7 @@ export type Inject =
   | { mode: "set"; header: string; template: string }
   | { mode: "replace"; places: Places };
 
-/** The value is in the Keychain. The UI can write it but never reads it. The guest gets the placeholder in `$name`. */
+/** The value is in the vault file of the app. The UI can write it but never reads it. The guest gets the placeholder in `$name`. */
 export interface Credential {
   name: string;
   inject: Inject;
