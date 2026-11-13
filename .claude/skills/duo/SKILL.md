@@ -17,6 +17,8 @@ The models are `claude/opus:xhigh` and `codex/gpt-6-sol:xhigh`. A round with two
 | `revise` | the implementer, if the verdict is `revise` | **write** |
 | `final review` | both, independently | read-only |
 
+Both models get the same rights in all stages: opus bypasses permissions, and sol runs in `workspace-write` with `CARGO_HOME` writable, so each can run the gates. "read-only" is a rule in the prompt. The script hashes the tree before and after a read-only stage and logs `agent_wrote_in_readonly` if it changed. Before the cross review and the final review, the script runs the gates one time and gives the output (`gates-*.md`) to the reviewers.
+
 **Invariant: the first plans and the final reviews are blind.** A model does not see the other model's output before it writes its own.
 
 The changes stay uncommitted on the **current branch**. The models never commit, stage or push. `.claude/hooks/duo-no-commit.sh` blocks this while `DUO_ROUND` is set; the codex sandbox also blocks it. The caller does the commit and the external review.
@@ -42,7 +44,7 @@ The models read only `task.md` and `AGENTS.md`.
 A round takes 20-50 minutes.
 
 1. **Run the script in the background.** Wait for the notification.
-2. Tell the user about each `walkover`, `agent_degraded` and `stopped` event in `events.jsonl` when it occurs.
+2. Tell the user about each `walkover`, `agent_degraded`, `agent_wrote_in_readonly` and `stopped` event in `events.jsonl` when it occurs.
 
 | exit | meaning | action |
 |---|---|---|
@@ -59,7 +61,7 @@ A round takes 20-50 minutes.
 
 ## Round directory
 
-`docs/tasks/<slug>/<round>/` (gitignored): `transcript.md`, `turns/`, `tiebreak.json`, `plan.md`, `implementation.json`, `crossreview.json`, `revision.json`, `final-{opus,sol}.json`, `history.md`, `events.jsonl`, `manifest.json`.
+`docs/tasks/<slug>/<round>/` (gitignored): `transcript.md`, `turns/`, `tiebreak.json`, `plan.md`, `implementation.json`, `crossreview.json`, `revision.json`, `final-{opus,sol}.json`, `gates-{crossreview,final}.md`, `history.md`, `events.jsonl`, `manifest.json`.
 
 Environment knobs: `DUO_TURNS` (2), `DUO_IDLE_TIMEOUT` (600s), `DUO_HARD_TIMEOUT` (1800s), `DUO_STAGGER` (10s).
 

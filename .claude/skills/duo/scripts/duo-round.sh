@@ -87,17 +87,56 @@ for l in sys.stdin:
     if e.get("type") == "result": sys.stdout.write(e.get("result") or "")'
 }
 
+# The working tree, as one hash: tracked changes plus untracked files.
+tree_sig() {
+  { git -C "$ROOT" diff HEAD --binary
+    git -C "$ROOT" ls-files -o --exclude-standard -z | (cd "$ROOT" && xargs -0 shasum 2>/dev/null)
+  } | shasum | cut -c1-40
+}
+
+# Both models get the same rights in every stage, so each can run the gates.
+# A read stage is read-only by its prompt; the tree hash before and after shows
+# a model that wrote anyway. Codex also needs the cargo lock in CARGO_HOME.
+CODEX_ROOTS="[\"${CARGO_HOME:-$HOME/.cargo}\"]"
 run_model() {  # run_model <opus|sol> <promptfile> <outfile> <name> <read|write>
-  local who="$1" prompt="$2" out="$3" name="$4" mode="$5"
+  local who="$1" prompt="$2" out="$3" name="$4" mode="$5" before rc
+  [ "$mode" = read ] && before=$(tree_sig)
   if [ "$who" = opus ]; then
     run_watched "$prompt" "$out" "$name" claude_streamed --model opus \
       --permission-mode bypassPermissions --add-dir "$ROOT"
   else
-    local sandbox=read-only
-    [ "$mode" = write ] && sandbox=workspace-write
-    run_watched "$prompt" "$out" "$name" codex exec -m gpt-6-sol -s "$sandbox" \
+    run_watched "$prompt" "$out" "$name" codex exec -m gpt-6-sol -s workspace-write \
+      -c "sandbox_workspace_write.writable_roots=$CODEX_ROOTS" \
       -C "$ROOT" -c model_reasoning_effort="xhigh" --skip-git-repo-check -
   fi
+  rc=$?
+  if [ "$mode" = read ] && [ "$before" != "$(tree_sig)" ]; then
+    ev agent_wrote_in_readonly "the tree changed during $name"
+  fi
+  return $rc
+}
+
+# The runner runs the gates once per review stage, so both reviewers judge the
+# same output and do not build in parallel.
+run_gates() {  # run_gates <outfile>
+  local out="$1" cmd rc
+  local cmds=("pnpm build")
+  if git -C "$ROOT" status --porcelain -- src-tauri | grep -q .; then
+    cmds+=("cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings"
+           "cargo test --manifest-path src-tauri/Cargo.toml")
+  fi
+  : > "$out"
+  for cmd in "${cmds[@]}"; do
+    printf '## `%s`\n\n```\n' "$cmd" >> "$out"
+    (cd "$ROOT" && bash -c "$cmd") > "$out.log" 2>&1; rc=$?
+    tail -40 "$out.log" >> "$out"; rm -f "$out.log"
+    printf '```\nexit: %s\n\n' "$rc" >> "$out"
+  done
+  ev gates "$(grep -c '^exit: 0' "$out")/${#cmds[@]} passed"
+}
+
+gate_note() {  # gate_note <promptfile> <gatesfile>
+  printf '\n## Gate results\n\nThe runner ran the gates on the current tree. The output is in `%s`. Use it. Run a gate again only to check a specific doubt.\n' "$2" >> "$1"
 }
 
 jsonblock() { python3 "$SKILL/scripts/jsonblock.py" "$1"; }
@@ -210,6 +249,8 @@ ev stage "crossreview by $reviewer"
 compose "$PROMPTS/crossreview.md" "$ROUND/crossreview.prompt.md" \
   "ME=$reviewer" "PEER=$implementer" "PLAN=$ROUND/plan.md" \
   "RESULT=$ROUND/implementation.json" "RULES=$RULES" "WORKDIR=$ROOT"
+run_gates "$ROUND/gates-crossreview.md"
+gate_note "$ROUND/crossreview.prompt.md" "$ROUND/gates-crossreview.md"
 run_model "$reviewer" "$ROUND/crossreview.prompt.md" "$ROUND/crossreview.raw" crossreview read
 jsonblock "$ROUND/crossreview.raw" > "$ROUND/crossreview.json" 2>/dev/null || \
   ev agent_degraded "$reviewer returned no structured review"
@@ -239,6 +280,8 @@ for who in opus sol; do
     "ME=$who" "PEER=$(peer_of "$who")" "TASK=$TASKFILE" "PLAN=$ROUND/plan.md" \
     "HISTORY=$ROUND/history.md" "RULES=$RULES" "WORKDIR=$ROOT"
 done
+run_gates "$ROUND/gates-final.md"
+for who in opus sol; do gate_note "$ROUND/final-$who.prompt.md" "$ROUND/gates-final.md"; done
 run_model opus "$ROUND/final-opus.prompt.md" "$ROUND/final-opus.raw" final-opus read & fp=$!
 sleep "$STAGGER"
 run_model sol "$ROUND/final-sol.prompt.md" "$ROUND/final-sol.raw" final-sol read & ap=$!
