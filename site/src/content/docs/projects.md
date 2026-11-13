@@ -14,6 +14,10 @@ You can create, rename and delete projects. Use ⌘N to create a project.
 A mount is an extra folder on your Mac that you add to a project. It has an absolute path in the cage. This path must
 not overlap `/workspace`. A mount is read-only by default.
 
+A project folder or a mount cannot contain the zwinger data folder or `~/.zwinger`, and cannot be inside them. For
+example, `~`, `~/Library` and `/` are refused. zwinger compares the real paths, after it follows symlinks. It checks
+this when you create a project, when you add a mount and at each cage start.
+
 zwinger keeps the identity of the project folder and of each mount. Each cage start checks them. If a folder changed
 (for example, another folder now has the same path), zwinger does not start the cage. If a folder was missing, you
 must confirm it on the project page before the next start.

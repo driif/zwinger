@@ -662,13 +662,14 @@ impl Project {
         Ok(())
     }
 
-    /// No host path may nest with the app data dir, in either direction, even
-    /// read-only: it holds the pi runtime and the agent state of every project.
-    pub fn check_app_data(&self, data: &Path) -> Result<()> {
+    /// No host path may nest with a reserved dir, in either direction, even
+    /// read-only: the app data dir holds the pi runtime, the credentials and
+    /// the agent state of every project. All paths are canonical.
+    pub fn check_app_data(&self, reserved: &[PathBuf]) -> Result<()> {
         let paths = std::iter::once(&self.folder).chain(self.mounts.iter().map(|m| &m.host));
         for path in paths {
-            if path.starts_with(data) || data.starts_with(path) {
-                return Err(Error::AppDataOverlap(path.display().to_string(), data.display().to_string()));
+            if let Some(dir) = reserved.iter().find(|dir| path.starts_with(dir) || dir.starts_with(path)) {
+                return Err(Error::AppDataOverlap(path.display().to_string(), dir.display().to_string()));
             }
         }
         Ok(())
@@ -924,11 +925,29 @@ mod tests {
     fn app_data_may_not_nest_with_any_path() {
         let (mut project, root) = project_with_dirs(&["project", "data", "data/app", "other"]);
         project.add_mount(&path(&root, "other"), "/mnt/other", true).unwrap();
-        assert!(project.check_app_data(&root.join("data/app")).is_ok());
+        let app = [root.join("data/app")];
+        assert!(project.check_app_data(&app).is_ok());
 
         project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        assert!(matches!(project.check_app_data(&root.join("data/app")), Err(Error::AppDataOverlap(..))));
-        assert!(matches!(project.check_app_data(&project.folder.join("x")), Err(Error::AppDataOverlap(..))));
+        assert!(matches!(project.check_app_data(&app), Err(Error::AppDataOverlap(..))));
+        assert!(matches!(project.check_app_data(&[project.folder.join("x")]), Err(Error::AppDataOverlap(..))));
+    }
+
+    #[test]
+    fn app_data_check_covers_each_reserved_dir() {
+        let (project, root) = project_with_dirs(&["project", "data", "home/.zwinger"]);
+        let reserved = [root.join("data"), root.join("home/.zwinger")];
+        assert!(project.check_app_data(&reserved).is_ok());
+
+        for (folder, dir) in [("/", "data"), ("home", "home/.zwinger"), ("home/.zwinger", "home/.zwinger")] {
+            let mut other = project.clone();
+            other.folder = if folder == "/" { PathBuf::from("/") } else { root.join(folder) };
+            let error = other.check_app_data(&reserved).unwrap_err();
+            assert!(
+                matches!(&error, Error::AppDataOverlap(_, d) if *d == root.join(dir).display().to_string()),
+                "{error}"
+            );
+        }
     }
 
     #[test]

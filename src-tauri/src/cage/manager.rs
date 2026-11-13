@@ -45,6 +45,9 @@ pub struct Manager<R: SandboxRuntime> {
     /// agent state of each project, and `bin/<id>`, the host-only agent
     /// wrappers of each project.
     pub(crate) data: PathBuf,
+    /// The canonical dirs that no project folder or mount may nest with:
+    /// the app data dir and `~/.zwinger`.
+    pub(crate) reserved: Vec<PathBuf>,
     pub(crate) vault: Arc<dyn Vault>,
     /// The zwinger CA, loaded at the first start.
     pub(crate) ca: tokio::sync::OnceCell<Arc<Ca>>,
@@ -213,6 +216,17 @@ impl<V> State<V> {
     }
 }
 
+/// The app data dir and `~/.zwinger`, canonical where they exist, so that
+/// they compare with the canonical host paths of the projects.
+fn reserved_dirs(data: &Path, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
+    let mut dirs = vec![canonical(data.to_owned())];
+    if let Some(home) = home {
+        dirs.push(canonical(canonical(home).join(".zwinger")));
+    }
+    dirs
+}
+
 impl<R: SandboxRuntime> Manager<R> {
     pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf, host: Arc<HostAgents>) -> Result<Self> {
         let projects = store.load()?;
@@ -220,6 +234,7 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(Self {
             runtime,
             store,
+            reserved: reserved_dirs(&data, dirs::home_dir()),
             data,
             vault,
             ca: tokio::sync::OnceCell::new(),
@@ -352,6 +367,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     pub fn create(&self, folder: &str) -> Result<String> {
         let project = Project::new(folder)?;
+        project.check_app_data(&self.reserved)?;
         let id = project.id.clone();
         let mut state = lock(&self.state);
         state.projects.push(project);
@@ -400,7 +416,10 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn add_mount(&self, id: &str, host: &str, guest: &str, readonly: bool) -> Result<()> {
-        self.edit(id, |s| s.add_mount(host, guest, readonly))
+        self.edit(id, |s| {
+            s.add_mount(host, guest, readonly)?;
+            s.check_app_data(&self.reserved)
+        })
     }
 
     pub fn remove_mount(&self, id: &str, guest: &str) -> Result<()> {
@@ -583,6 +602,7 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 
 #[cfg(test)]
 mod tests {
+    use super::reserved_dirs;
     use crate::cage::testing::*;
 
     #[tokio::test]
@@ -708,6 +728,49 @@ mod tests {
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
         let order: Vec<String> = reloaded.list().into_iter().map(|v| v.project.id).collect();
         assert_eq!(order, [b, a]);
+    }
+
+    #[test]
+    fn reserved_dirs_are_canonical_and_include_the_zwinger_home() {
+        let root = temp_dir();
+        std::fs::create_dir_all(root.join("home/.zwinger")).unwrap();
+        std::fs::create_dir_all(root.join("home/data")).unwrap();
+        std::os::unix::fs::symlink(root.join("home"), root.join("link")).unwrap();
+        let dirs = reserved_dirs(&root.join("link/data"), Some(root.join("link")));
+        assert_eq!(dirs, [root.join("home/data"), root.join("home/.zwinger")]);
+        assert_eq!(reserved_dirs(&root, None), std::slice::from_ref(&root));
+    }
+
+    #[test]
+    fn create_refuses_a_folder_that_nests_with_app_data() {
+        let manager = Manager::new(
+            FakeRuntime::default(),
+            Store::new(temp_dir().join("projects.json")),
+            vault(),
+            temp_dir(),
+            host(),
+        )
+        .unwrap();
+        let data = manager.data.clone();
+        std::fs::create_dir(data.join("sub")).unwrap();
+        for folder in [data.parent().unwrap(), &data, &data.join("sub"), Path::new("/")] {
+            let error = manager.create(folder.to_str().unwrap()).unwrap_err();
+            assert!(matches!(error, Error::AppDataOverlap(..)), "{}: {error}", folder.display());
+        }
+        assert!(manager.list().is_empty());
+    }
+
+    #[test]
+    fn add_mount_refuses_app_data_by_its_canonical_path() {
+        let (manager, _, id) = manager();
+        let link = temp_dir().join("link");
+        std::os::unix::fs::symlink(&manager.data, &link).unwrap();
+        std::fs::create_dir(manager.data.join("sub")).unwrap();
+        for host in [link.clone(), link.join("sub")] {
+            let error = manager.add_mount(&id, host.to_str().unwrap(), "/mnt/data", true).unwrap_err();
+            assert!(matches!(error, Error::AppDataOverlap(..)), "{}: {error}", host.display());
+        }
+        assert!(manager.list()[0].project.mounts.is_empty());
     }
 
     #[test]

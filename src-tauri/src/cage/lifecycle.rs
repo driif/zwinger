@@ -438,7 +438,7 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         project.verify_paths()?;
         project.network.check()?;
-        project.check_app_data(&self.data)?;
+        project.check_app_data(&self.reserved)?;
         project.check_overlap_with(state.projects.iter().filter(|s| s.id != id))?;
         state.vms.insert(id.to_owned(), Vm::Starting(Phase::Vault));
         Ok(project)
@@ -812,7 +812,8 @@ mod tests {
     #[tokio::test]
     async fn start_refuses_a_mount_of_the_app_data_dir() {
         let (manager, runtime, id) = manager();
-        manager.add_mount(&id, manager.data.to_str().unwrap(), "/mnt/data", true).unwrap();
+        // An old config can hold such a mount: the add check is newer.
+        manager.edit(&id, |s| s.add_mount(manager.data.to_str().unwrap(), "/mnt/data", true)).unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::AppDataOverlap(..))));
         assert_eq!(manager.list()[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
