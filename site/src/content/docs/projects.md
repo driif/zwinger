@@ -34,7 +34,9 @@ workspace. The tree is workspace → session → Terminals and Tasks.
   on empty rail space goes to the first workspace. A Terminals or Tasks row, a terminal row and a task row do not
   accept a folder.
 
-zwinger saves the workspaces in `workspaces.json`, next to `projects.json`.
+zwinger saves the workspaces in `workspaces.json`, the projects in `sessions.json` and their cage settings in
+`cages.json`, all in the app data folder. A start after an update from an older version converts `projects.json` to
+the two new files once and keeps `projects.json` unchanged.
 
 ## Mounts
 

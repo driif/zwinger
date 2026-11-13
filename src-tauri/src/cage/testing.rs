@@ -12,7 +12,7 @@ pub(crate) use crate::agent::{AgentKind, launch};
 pub(crate) use crate::cage::manager::*;
 pub(crate) use crate::cage::network::*;
 pub(crate) use crate::cage::progress::Phase;
-pub(crate) use crate::cage::{self, HostAgentUse, Pos, TaskDraft, WORKSPACE};
+pub(crate) use crate::cage::{HostAgentUse, WORKSPACE};
 pub(crate) use crate::error::{Error, Result};
 pub(crate) use crate::host_agents::HostAgents;
 pub(crate) use crate::host_agents::fake::{FakeClock, FakeFs};
@@ -24,10 +24,11 @@ pub(crate) use crate::proxy::log::Entry;
 pub(crate) use crate::proxy::{self, Live};
 pub(crate) use crate::runtime::PTY_QUEUE;
 pub(crate) use crate::runtime::fake::{FakeRuntime, PtyGate};
-pub(crate) use crate::runtime::{Bind, PipeEvent, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
+pub(crate) use crate::runtime::{Bind, PipeEvent, PtyEvent, PtyInput, SandboxRuntime, TerminalKind};
 pub(crate) use crate::runtimes;
 pub(crate) use crate::secrets::fake::MemoryVault;
 pub(crate) use crate::secrets::{self, SecretValue, Vault};
+pub(crate) use crate::session::{self, Pos, TaskDraft};
 pub(crate) use crate::store::Store;
 pub(crate) use crate::terminal::output::*;
 
@@ -66,9 +67,7 @@ pub(crate) fn manager_with_vault() -> (Manager<FakeRuntime>, FakeRuntime, String
     let dir = temp_dir();
     let runtime = FakeRuntime::default();
     let vault = vault();
-    let manager =
-        Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
-            .unwrap();
+    let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault.clone(), temp_dir(), host()).unwrap();
     let id = manager.create(dir.to_str().unwrap(), None).unwrap();
     (manager, runtime, id, vault)
 }
@@ -131,7 +130,7 @@ pub(crate) async fn open_during(restart: bool) {
     let manager = Arc::new(manager);
     let opening = tokio::spawn({
         let (manager, id) = (manager.clone(), id.clone());
-        async move { manager.open_session(&id, SessionKind::Shell, 24, 80).await }
+        async move { manager.open_session(&id, TerminalKind::Shell, 24, 80).await }
     });
     gate.entered.notified().await;
     manager.stop(&id).await.unwrap();
@@ -142,7 +141,7 @@ pub(crate) async fn open_during(restart: bool) {
     gate.release.notify_one();
 
     assert!(matches!(opening.await.unwrap(), Err(Error::NotRunning)));
-    assert!(manager.list()[0].sessions.is_empty());
+    assert!(manager.list().sessions[0].processes.is_empty());
     tokio::time::timeout(Duration::from_secs(2), async {
         while !runtime.log.lock().unwrap().contains(&"kill".to_owned()) {
             tokio::task::yield_now().await;
@@ -152,8 +151,8 @@ pub(crate) async fn open_during(restart: bool) {
     .expect("the new process was not killed");
 }
 
-pub(crate) fn agent(agent: AgentKind, resume: bool) -> SessionKind {
-    SessionKind::Agent { agent, resume }
+pub(crate) fn agent(agent: AgentKind, resume: bool) -> TerminalKind {
+    TerminalKind::Agent { agent, resume }
 }
 
 pub(crate) fn wrappers(manager: &Manager<FakeRuntime>, id: &str) -> Vec<String> {
@@ -189,7 +188,7 @@ pub(crate) fn task_draft(id: Option<String>, title: &str, kinds: [AgentKind; 2])
         id,
         title: title.into(),
         request: "  Fix the map.  ".into(),
-        agents: kinds.map(|kind| cage::TaskAgent { kind, model: None }),
+        agents: kinds.map(|kind| session::TaskAgent { kind, model: None }),
         gates: vec!["pnpm build".into(), "  ".into()],
         workdir: "/workspace".into(),
     }
@@ -206,7 +205,7 @@ pub(crate) async fn until(mut done: impl FnMut() -> bool) {
 }
 
 pub(crate) fn terminal_ids(manager: &Manager<FakeRuntime>) -> Vec<String> {
-    manager.list()[0].project.terminals.iter().map(|t| t.id.clone()).collect()
+    manager.list().sessions[0].session.terminals.iter().map(|t| t.id.clone()).collect()
 }
 
 pub(crate) fn value(text: &str) -> Option<SecretValue> {
@@ -217,9 +216,9 @@ pub(crate) fn stored(vault: &MemoryVault, id: &str, name: &str) -> Option<String
     vault.get(id, name).unwrap().map(|v| v.expose().to_owned())
 }
 
-/// Makes the next config save fail: the store renames onto a non-empty folder.
+/// Makes the next cage save fail: the store renames onto a non-empty folder.
 pub(crate) fn break_store(manager: &Manager<FakeRuntime>) {
-    let path = manager.store.path().to_owned();
+    let path = manager.store.cages_path();
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir_all(path.join("blocker")).unwrap();
 }
@@ -232,20 +231,20 @@ pub(crate) struct GatedVault {
 }
 
 impl Vault for GatedVault {
-    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
         if let Some((entered, release)) = self.gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv().unwrap();
         }
-        self.inner.set(project_id, name, value)
+        self.inner.set(cage_id, name, value)
     }
 
-    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
-        self.inner.get(project_id, name)
+    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        self.inner.get(cage_id, name)
     }
 
-    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
-        self.inner.delete(project_id, name)
+    fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
+        self.inner.delete(cage_id, name)
     }
 
     fn accounts(&self) -> Result<Vec<String>> {
@@ -286,8 +285,7 @@ pub(crate) fn host_manager(
     let runtime = FakeRuntime::default();
     let vault = vault();
     let host = host_with(mac(&home), logins, now);
-    let manager =
-        Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host).unwrap();
+    let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault.clone(), temp_dir(), host).unwrap();
     let id = manager.create(dir.to_str().unwrap(), None).unwrap();
     (manager, runtime, id, vault)
 }
@@ -303,7 +301,7 @@ pub(crate) fn manager_with_host() -> (Manager<FakeRuntime>, FakeRuntime, String)
 
 /// The hosts of the rules with a credential.
 pub(crate) fn holders(manager: &Manager<FakeRuntime>) -> Vec<String> {
-    let rules = manager.list().remove(0).project.network.rules;
+    let rules = manager.list().cages.remove(0).cage.network.rules;
     rules.iter().filter(|r| !r.credentials.is_empty()).map(|r| r.label()).collect()
 }
 

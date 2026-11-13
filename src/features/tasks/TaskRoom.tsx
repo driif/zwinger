@@ -14,7 +14,7 @@ import {
   runDiff,
   watchRoom,
 } from "./api";
-import { ProjectView, Task } from "../../shared/api";
+import { CageView, SessionView, Task } from "../../shared/api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -24,7 +24,8 @@ type Props =
   | { kind: "folder"; path: string }
   | {
       kind: "task";
-      project: ProjectView;
+      session: SessionView;
+      cage: CageView;
       task: Task;
       runs: RunSummary[];
       /** No `run` shows the latest run. */
@@ -43,7 +44,7 @@ export function TaskRoom(props: Props) {
     props.kind === "folder"
       ? { kind: "folder", path: props.path }
       : run
-        ? { kind: "run", projectId: props.project.id, taskId: props.task.id, run }
+        ? { kind: "run", sessionId: props.session.id, taskId: props.task.id, run }
         : undefined;
   const sourceKey = JSON.stringify(source ?? null);
 
@@ -96,7 +97,7 @@ export function TaskRoom(props: Props) {
   }, [active?.id]);
 
   const inApp = props.kind === "task" ? props : undefined;
-  const cageRunning = inApp?.project.status.state === "running";
+  const cageRunning = inApp?.cage.status.state === "running";
   const liveRun = status !== null && isLive(status.state);
   const canStart = inApp && cageRunning && !runs.some((r) => isLive(r.state));
 
@@ -107,11 +108,11 @@ export function TaskRoom(props: Props) {
       (e) => setError(errorMessage(e)),
     );
   };
-  const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.project.id, inApp.task.id, run, c));
+  const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.session.id, inApp.task.id, run, c));
   const start = () =>
     inApp &&
     act(async () => {
-      const next = await startTaskRun(inApp.project.id, inApp.task.id);
+      const next = await startTaskRun(inApp.session.id, inApp.task.id);
       inApp.onRun(next);
     });
 
@@ -303,7 +304,7 @@ export function TaskRoom(props: Props) {
                   iconLeft={<FileDiff size={14} />}
                   disabled={!cageRunning}
                   title={cageRunning ? undefined : "Start the cage to read the working dir"}
-                  onClick={() => run && act(() => runDiff(inApp.project.id, inApp.task.id, run).then(setDiff))}
+                  onClick={() => run && act(() => runDiff(inApp.session.id, inApp.task.id, run).then(setDiff))}
                 >
                   {diff === undefined ? "Show the diff" : "Read the diff again"}
                 </Button>

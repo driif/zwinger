@@ -6,7 +6,7 @@ import {
   setOffline,
 } from "../features/network/api";
 import { removeMount, setMountReadonly } from "../features/settings/api";
-import { ProjectView } from "./api";
+import { CageView, SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
 import { LaunchAction, launchActions } from "../features/launcher/actions";
@@ -15,10 +15,11 @@ import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 
 interface Props {
   ref: Ref<HTMLDivElement>;
-  projects: ProjectView[];
-  project?: ProjectView;
+  sessions: SessionView[];
+  /** The selected session and its cage. */
+  selected?: SessionCage;
   panes: Pane[];
-  /** The focused pane of the project. */
+  /** The focused pane of the session. */
   focused?: string;
   /** The focused pane when the terminal view shows; the editor items open its folder. */
   here?: string;
@@ -26,7 +27,7 @@ interface Props {
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
   onView: (view: View) => void;
-  onToggle: (project: ProjectView) => void;
+  onToggle: (cage: CageView) => void;
   onRestart: (id: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
@@ -37,8 +38,8 @@ interface Props {
 
 export function CommandBar({
   ref,
-  projects,
-  project,
+  sessions,
+  selected,
   panes,
   focused,
   here,
@@ -67,19 +68,20 @@ export function CommandBar({
   });
 
   const commands: CommandMenuItem[] = [];
-  if (project) {
-    const { state } = project.status;
+  if (selected) {
+    const { session, cage } = selected;
+    const { state } = cage.status;
     if (state === "running" || state === "stopped" || state === "error")
       commands.push({
         id: "toggle",
-        label: state === "running" ? `Stop ${project.name} cage` : `Start ${project.name} cage`,
-        onSelect: () => onToggle(project),
+        label: state === "running" ? `Stop ${session.name} cage` : `Start ${session.name} cage`,
+        onSelect: () => onToggle(cage),
       });
-    if (project.pendingRestart)
-      commands.push({ id: "restart", label: `Restart ${project.name} cage`, onSelect: () => onRestart(project.id) });
+    if (cage.pendingRestart)
+      commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(cage.id) });
     commands.push(action("newAgent", "New agent"));
     const herePane = panes.find((p) => p.key === here);
-    for (const launch of launchActions(project, editors)) {
+    for (const launch of launchActions(cage, editors)) {
       const shortcut =
         launch.type === "session" && launch.kind.type !== "agent"
           ? shortcutLabel(launch.kind.type === "host" ? "newShell" : "newVmShell")
@@ -91,7 +93,7 @@ export function CommandBar({
           ? launch.label
           : herePane
             ? `Open ${paneName(herePane, panes)}'s folder in ${launch.editor.name}`
-            : `Open ${project.name} in ${launch.editor.name}`;
+            : `Open ${session.name} in ${launch.editor.name}`;
       commands.push({ id: launch.id, label, shortcut, onSelect: () => onLaunch(launch) });
     }
     panes.forEach((pane) =>
@@ -120,9 +122,9 @@ export function CommandBar({
       intent("harness", "Set harness…"),
       intent("delete", "Delete project…"),
     );
-    const { id, network } = project;
+    const { id, network } = cage;
     commands.push({ id: "new-task", label: "New task…", onSelect: () => onView({ kind: "taskEdit" }) });
-    for (const task of project.tasks)
+    for (const task of session.tasks)
       commands.push({ id: `task-${task.id}`, label: `Show task ${task.title}`, onSelect: () => onView({ kind: "task", taskId: task.id }) });
     const other = network.default === "allow" ? "block" : "allow";
     commands.push(
@@ -141,7 +143,7 @@ export function CommandBar({
       const label = rule.target.kind === "host" ? rule.target.host : rule.target.id;
       commands.push({ id: `rule-${rule.id}`, label: `Remove network rule ${label}`, onSelect: () => run(() => removeRule(id, rule.id)) });
     }
-    for (const mount of project.mounts) {
+    for (const mount of cage.mounts) {
       commands.push({
         id: `access-${mount.guest}`,
         label: `Make ${mount.guest} ${mount.readonly ? "read-write" : "read-only"}`,
@@ -155,8 +157,8 @@ export function CommandBar({
     { id: "open-round", label: "Open round folder…", onSelect: onOpenRound },
     action("appSettings", "Settings: agents on this Mac, updates, storage"),
   );
-  for (const other of projects)
-    if (other.id !== project?.id)
+  for (const other of sessions)
+    if (other.id !== selected?.session.id)
       commands.push({ id: `project-${other.id}`, label: `Switch to ${other.name}`, onSelect: () => onSelect(other.id) });
 
   return <CommandMenu ref={ref} className="command-bar" hotkey placeholder="Actions" commands={commands} />;

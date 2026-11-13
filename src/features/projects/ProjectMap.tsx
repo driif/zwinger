@@ -20,7 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { NetEvent } from "../network/api";
 import { setLayout } from "./api";
 import { isRoundFolder } from "../tasks/api";
-import { Pos, ProjectView } from "../../shared/api";
+import { CageView, Pos, SessionView } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
 import { CageMark } from "../../shared/CageMark";
@@ -93,10 +93,11 @@ const sameData = (a: Record<string, unknown>, b: Record<string, unknown>) =>
   );
 
 interface Props {
-  project: ProjectView;
-  /** `undefined` until the folders of this project are listed. */
+  session: SessionView;
+  cage: CageView;
+  /** `undefined` until the folders of this session are listed. */
   folders?: string[];
-  /** The project's network events, oldest first. */
+  /** The cage's network events, oldest first. */
   events: NetEvent[];
   visible: boolean;
   run: Run;
@@ -114,15 +115,15 @@ export function ProjectMap(props: Props) {
   );
 }
 
-function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolder }: Props) {
+function MapCanvas({ session, cage, folders, events, visible, run, onJump, onDropFolder }: Props) {
   const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
   const container = useRef<HTMLDivElement>(null);
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
   const catalog = useCatalog();
-  // The layout that the last save sent, until the project list has it.
+  // The layout that the last save sent, until the session list has it.
   const [saved, setSaved] = useState<{ base: Record<string, Pos>; layout: Record<string, Pos> }>();
-  const layout = saved?.base === project.layout ? saved.layout : project.layout;
+  const layout = saved?.base === session.layout ? saved.layout : session.layout;
 
   // Ticks while an event is recent, so the activity dots and blocked hosts expire.
   useEffect(() => {
@@ -137,8 +138,8 @@ function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolde
   }, [latest]);
 
   const map = useMemo(
-    () => mapLayout({ ...project, layout }, folders ?? [], events, catalog, now),
-    [project, layout, folders, events, catalog, now],
+    () => mapLayout({ ...session, layout }, cage, folders ?? [], events, catalog, now),
+    [session, cage, layout, folders, events, catalog, now],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 
@@ -165,8 +166,8 @@ function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolde
   }, [map]);
 
   function save(next: Record<string, Pos> | null) {
-    setSaved({ base: project.layout, layout: next ?? {} });
-    run(() => setLayout(project.id, next));
+    setSaved({ base: session.layout, layout: next ?? {} });
+    run(() => setLayout(session.id, next));
   }
 
   // Positions of nodes that no longer exist are dropped. Folder nodes are
@@ -180,7 +181,7 @@ function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolde
 
   // The auto layout fits the box when it shows and when the box resizes. A saved
   // layout keeps its viewport, unless the nodes do not fit in the box anymore.
-  const auto = Object.keys(project.layout).length === 0;
+  const auto = Object.keys(session.layout).length === 0;
   useEffect(() => {
     if (!visible) return;
     const box = container.current!;
@@ -232,7 +233,7 @@ function MapCanvas({ project, folders, events, visible, run, onJump, onDropFolde
   const jump = (node?: MapNode) => node?.type === "item" && node.data.jump && onJump(node.data.jump);
 
   return (
-    <div ref={container} className="map" role="group" aria-label={`Map of project ${project.name}`}>
+    <div ref={container} className="map" role="group" aria-label={`Map of project ${session.name}`}>
       <ReactFlow<MapNode>
         nodes={nodes}
         edges={map.edges}

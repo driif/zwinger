@@ -5,9 +5,10 @@ use serde::Serialize;
 
 use crate::agent::AgentKind;
 use crate::cage::manager::{Manager, Vm, blocking, lock};
-use crate::cage::{TaskDraft, WORKSPACE};
+use crate::cage::{Bound, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
+use crate::session::TaskDraft;
 use crate::task_agents::Exec;
 use crate::task_artifacts::{self, Mirror, RoundWriter};
 use crate::task_runs::{self, Control, RunHandle, RunState};
@@ -15,8 +16,8 @@ use crate::task_runs::{self, Control, RunHandle, RunState};
 impl<R: SandboxRuntime> Manager<R> {
     pub fn put_task(&self, id: &str, draft: TaskDraft) -> Result<String> {
         let mut task_id = String::new();
-        self.edit(id, |s| {
-            task_id = s.put_task(draft)?;
+        self.edit_session(id, |s, c| {
+            task_id = s.put_task(c, draft)?;
             Ok(())
         })?;
         Ok(task_id)
@@ -27,8 +28,8 @@ impl<R: SandboxRuntime> Manager<R> {
         if self.runs.is_running(id, task_id) {
             return Err(Error::TaskRunning);
         }
-        let slug = lock(&self.state).project_mut(id)?.task(task_id)?.slug.clone();
-        self.edit(id, |s| s.remove_task(task_id))?;
+        let slug = lock(&self.state).session(id)?.task(task_id)?.slug.clone();
+        self.edit_session(id, |s, _| s.remove_task(task_id))?;
         self.runs.forget(id, Some(task_id));
         match std::fs::remove_dir_all(self.task_dir(id, &slug)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -43,7 +44,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The round folder of a run. Only an existing run of the task counts.
     pub fn round_dir(&self, id: &str, task_id: &str, run: &str) -> Result<PathBuf> {
-        let slug = lock(&self.state).project_mut(id)?.task(task_id)?.slug.clone();
+        let slug = lock(&self.state).session(id)?.task(task_id)?.slug.clone();
         let dir = self.task_dir(id, &slug);
         if !run_names(&dir).iter().any(|r| r == run) {
             return Err(Error::RunNotFound);
@@ -57,9 +58,10 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn start_task_run(&self, id: &str, task_id: &str) -> Result<String> {
         let _start = lock(&self.run_start);
         let (task, vm, applied, pi_host, gemini, proxy, unmounted) = {
-            let mut state = lock(&self.state);
-            let task = state.project_mut(id)?.task(task_id)?.clone();
-            match state.vms.get(id) {
+            let state = lock(&self.state);
+            let session = state.session(id)?;
+            let task = session.task(task_id)?.clone();
+            match state.vms.get(&session.cage) {
                 Some(Vm::Running { vm, applied, runtimes, host, .. }) => {
                     let unmounted = task
                         .agents
@@ -76,12 +78,13 @@ impl<R: SandboxRuntime> Manager<R> {
             return Err(Error::TaskRunning);
         }
         // The VM has the mounts of its start, so the paths are checked there.
+        let applied = Bound { session: &applied.0, cage: &applied.1 };
         if applied.host_of(&task.workdir).is_none() {
             return Err(Error::TaskWorkdir(task.title.clone(), task.workdir.clone()));
         }
         let dir = self.task_dir(id, &task.slug);
         let run = format!("{:02}", run_names(&dir).iter().filter_map(|r| r.parse::<u32>().ok()).max().unwrap_or(0) + 1);
-        let harness = applied.harness.as_deref().unwrap_or(WORKSPACE);
+        let harness = applied.session.harness.as_deref().unwrap_or(WORKSPACE);
         let mirror = match applied.host_of(harness) {
             Some((root, rel, true)) => {
                 let mut parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().into_owned()).collect();
@@ -105,7 +108,7 @@ impl<R: SandboxRuntime> Manager<R> {
             proxy,
         };
         self.runs.start(task_runs::Spec {
-            project_id: id.to_owned(),
+            session_id: id.to_owned(),
             task,
             run: run.clone(),
             exec,
@@ -124,14 +127,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.runs.find(id, task_id, run)
     }
 
-    /// The runs of all tasks of the project, oldest first per task.
+    /// The runs of all tasks of the session, oldest first per task.
     pub async fn list_task_runs(&self, id: &str) -> Result<Vec<RunSummary>> {
-        let tasks: Vec<(String, PathBuf)> = lock(&self.state)
-            .project_mut(id)?
-            .tasks
-            .iter()
-            .map(|t| (t.id.clone(), self.task_dir(id, &t.slug)))
-            .collect();
+        let tasks: Vec<(String, PathBuf)> =
+            lock(&self.state).session(id)?.tasks.iter().map(|t| (t.id.clone(), self.task_dir(id, &t.slug))).collect();
         let found = blocking(move || {
             let mut found = Vec::new();
             for (task_id, dir) in tasks {
@@ -175,10 +174,11 @@ impl<R: SandboxRuntime> Manager<R> {
             None => blocking(move || Ok(task_artifacts::read_room(&dir).outcome.and_then(|o| o.base))).await?,
         };
         let (task, vm, harness) = {
-            let mut state = lock(&self.state);
-            let task = state.project_mut(id)?.task(task_id)?.clone();
-            match state.vms.get(id) {
-                Some(Vm::Running { vm, applied, .. }) => (task, vm.clone(), applied.harness.clone()),
+            let state = lock(&self.state);
+            let session = state.session(id)?;
+            let task = session.task(task_id)?.clone();
+            match state.vms.get(&session.cage) {
+                Some(Vm::Running { vm, applied, .. }) => (task, vm.clone(), applied.0.harness.clone()),
                 _ => return Err(Error::NotRunning),
             }
         };
@@ -247,7 +247,7 @@ mod tests {
         ));
         let task_id = manager.put_task(&id, task_draft(None, "Fix the map!", kinds)).unwrap();
         manager.put_task(&id, task_draft(None, "Fix the map", kinds)).unwrap();
-        let tasks = manager.list()[0].project.tasks.clone();
+        let tasks = manager.list().sessions[0].session.tasks.clone();
         assert_eq!(tasks.iter().map(|t| t.slug.as_str()).collect::<Vec<_>>(), ["fix-the-map", "fix-the-map-2"]);
         assert_eq!(
             (tasks[0].request.as_str(), tasks[0].gates.as_slice()),
@@ -255,7 +255,7 @@ mod tests {
         );
         // A rename keeps the folder of the runs.
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Renamed", kinds)).unwrap();
-        assert_eq!(manager.list()[0].project.tasks[0].slug, "fix-the-map");
+        assert_eq!(manager.list().sessions[0].session.tasks[0].slug, "fix-the-map");
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::NotRunning)));
 
         // The harness is in a read-only mount: the run cannot write its mirror.
@@ -266,7 +266,7 @@ mod tests {
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::MirrorUnwritable(..))));
         // A task edit needs no restart.
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Again", kinds)).unwrap();
-        assert!(!manager.list()[0].pending_restart);
+        assert!(!manager.list().cages[0].pending_restart);
 
         manager.stop(&id).await.unwrap();
         manager.set_mount_readonly(&id, "/mnt/ro", false).unwrap();
@@ -277,6 +277,6 @@ mod tests {
         assert!(matches!(manager.round_dir(&id, &task_id, "01"), Err(Error::RunNotFound)));
 
         manager.remove_task(&id, &task_id).unwrap();
-        assert_eq!(manager.list()[0].project.tasks.len(), 1);
+        assert_eq!(manager.list().sessions[0].session.tasks.len(), 1);
     }
 }

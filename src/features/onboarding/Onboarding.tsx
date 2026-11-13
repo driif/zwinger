@@ -5,7 +5,7 @@ import { ArrowRight, Bot, CircleCheck, CircleX, Folder, FolderOpen, Globe, Trian
 import { ReactNode, useEffect, useState } from "react";
 import { Startup, StartupStep } from "./api";
 import { Detection, hostAgents, putHostAgent } from "../settings/api";
-import { createProject, resolveFolder } from "../projects/api";
+import { createSession, listSessions, resolveFolder } from "../projects/api";
 import { detectEditors, Editors } from "../launcher/api";
 import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
@@ -105,10 +105,11 @@ export function Onboarding({
   banner?: ReactNode;
   /** Saves the default editor. */
   onEditor: (id: string) => Promise<void>;
-  onDone: (projectId?: string) => Promise<void>;
+  onDone: (sessionId?: string) => Promise<void>;
 }) {
   const [step, setStep] = useState(0);
-  const [projectId, setProjectId] = useState<string>();
+  /** The new session and the id of its cage. */
+  const [created, setCreated] = useState<{ session: string; cage: string }>();
   const [detection, setDetection] = useState<Detection>();
   const [added, setAdded] = useState<AgentKind[]>([]);
   const [editors, setEditors] = useState<Editors>();
@@ -129,7 +130,9 @@ export function Onboarding({
   }
 
   async function create(folder: string) {
-    setProjectId(await createProject(await resolveFolder(folder)));
+    const session = await createSession(await resolveFolder(folder));
+    const { sessions } = await listSessions();
+    setCreated({ session, cage: sessions.find((s) => s.id === session)!.cage });
     setStep(2);
   }
 
@@ -155,12 +158,12 @@ export function Onboarding({
 
   const add = (kind: AgentKind, profile: boolean, login: boolean) =>
     act(async () => {
-      // The login needs its provider host, so the project allows it.
-      await putHostAgent(projectId!, { kind, profile, login }, login);
+      // The login needs its provider host, so the cage allows it.
+      await putHostAgent(created!.cage, { kind, profile, login }, login);
       setAdded((current) => [...current, kind]);
     });
 
-  const finish = () => act(() => onDone(projectId));
+  const finish = () => act(() => onDone(created?.session));
 
   return (
     <div className="onboarding">

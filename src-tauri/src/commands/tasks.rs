@@ -7,49 +7,50 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tokio::task::AbortHandle;
 
+use crate::cage;
 use crate::cage::tasks::RunSummary;
-use crate::cage::{self, TaskDraft};
 use crate::error::Result;
+use crate::session::TaskDraft;
 use crate::task_artifacts::{self, Room};
 use crate::task_runs::{Control, LiveRecord, Status};
 
-use super::Projects;
+use super::Managed;
 
 #[tauri::command]
-pub fn put_task(projects: Projects<'_>, id: String, task: TaskDraft) -> Result<String> {
-    projects.put_task(&id, task)
+pub fn put_task(manager: Managed<'_>, session_id: String, task: TaskDraft) -> Result<String> {
+    manager.put_task(&session_id, task)
 }
 
 #[tauri::command]
-pub fn remove_task(projects: Projects<'_>, id: String, task_id: String) -> Result<()> {
-    projects.remove_task(&id, &task_id)
+pub fn remove_task(manager: Managed<'_>, session_id: String, task_id: String) -> Result<()> {
+    manager.remove_task(&session_id, &task_id)
 }
 
 // Async, so the run's task starts on the tokio runtime.
 #[tauri::command]
-pub async fn start_task_run(projects: Projects<'_>, project_id: String, task_id: String) -> Result<String> {
-    projects.start_task_run(&project_id, &task_id)
+pub async fn start_task_run(manager: Managed<'_>, session_id: String, task_id: String) -> Result<String> {
+    manager.start_task_run(&session_id, &task_id)
 }
 
 #[tauri::command]
 pub fn control_task_run(
-    projects: Projects<'_>,
-    project_id: String,
+    manager: Managed<'_>,
+    session_id: String,
     task_id: String,
     run: String,
     control: Control,
 ) -> Result<()> {
-    projects.control_task_run(&project_id, &task_id, &run, control)
+    manager.control_task_run(&session_id, &task_id, &run, control)
 }
 
 #[tauri::command]
-pub async fn list_task_runs(projects: Projects<'_>, project_id: String) -> Result<Vec<RunSummary>> {
-    projects.list_task_runs(&project_id).await
+pub async fn list_task_runs(manager: Managed<'_>, session_id: String) -> Result<Vec<RunSummary>> {
+    manager.list_task_runs(&session_id).await
 }
 
 #[tauri::command]
-pub async fn run_diff(projects: Projects<'_>, project_id: String, task_id: String, run: String) -> Result<String> {
-    projects.run_diff(&project_id, &task_id, &run).await
+pub async fn run_diff(manager: Managed<'_>, session_id: String, task_id: String, run: String) -> Result<String> {
+    manager.run_diff(&session_id, &task_id, &run).await
 }
 
 /// True if the folder looks like a duo round, so a drop opens its room.
@@ -63,7 +64,7 @@ pub fn is_round_folder(path: String) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RoomSource {
-    Run { project_id: String, task_id: String, run: String },
+    Run { session_id: String, task_id: String, run: String },
     Folder { path: String },
 }
 
@@ -88,14 +89,14 @@ pub struct Watches {
 /// its tasks start on the tokio runtime.
 #[tauri::command]
 pub async fn watch_room(
-    projects: Projects<'_>,
+    manager: Managed<'_>,
     watches: State<'_, Watches>,
     source: RoomSource,
     on_event: Channel<RoomEvent>,
 ) -> Result<u64> {
     let (dir, run) = match source {
-        RoomSource::Run { project_id, task_id, run } => {
-            (projects.round_dir(&project_id, &task_id, &run)?, projects.run_handle(&project_id, &task_id, &run))
+        RoomSource::Run { session_id, task_id, run } => {
+            (manager.round_dir(&session_id, &task_id, &run)?, manager.run_handle(&session_id, &task_id, &run))
         }
         RoomSource::Folder { path } => {
             let dir = cage::host_dir(&path)?;

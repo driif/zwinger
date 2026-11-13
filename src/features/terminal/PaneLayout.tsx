@@ -81,10 +81,10 @@ export function PaneLayout({
       {panes.map((pane) => {
         const rect = rects.get(pane.key);
         return (
-          pane.sessionId && (
+          pane.processId && (
             <TerminalView
-              key={pane.sessionId}
-              sessionId={pane.sessionId}
+              key={pane.processId}
+              processId={pane.processId}
               visible={visible && rect !== undefined}
               focused={pane.key === focused}
               style={rect && body(rect)}
@@ -99,7 +99,7 @@ export function PaneLayout({
         const pane = panes.find((p) => p.key === terminal);
         return (
           pane &&
-          !pane.sessionId && (
+          !pane.processId && (
             <div key={terminal} className="pane-dormant" style={body(rect)}>
               {status.state === "starting" && pane.kind.type !== "host" ? (
                 <StartProgress phase={status.phase} />

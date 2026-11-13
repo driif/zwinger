@@ -13,6 +13,7 @@ mod proxy;
 mod runtime;
 mod runtimes;
 mod secrets;
+mod session;
 mod store;
 mod task_agents;
 mod task_artifacts;
@@ -94,7 +95,7 @@ fn report_panics(app: AppHandle) {
     }));
 }
 
-/// Removes the VMs of an earlier run, loads the projects and makes the
+/// Removes the VMs of an earlier run, loads the sessions and cages and makes the
 /// manager. The manager starts with no VMs, so every cage shows as
 /// stopped; a notice names the removed VMs. If the reap fails, the first
 /// cage start reaps again.
@@ -104,7 +105,6 @@ fn boot<R: SandboxRuntime>(
     data: &Path,
     host: Arc<HostAgents>,
 ) -> error::Result<Manager<R>> {
-    store::migrate_legacy(data)?;
     // The timer must be made inside the runtime, so it is in the future.
     let reaped = tauri::async_runtime::block_on(async { tokio::time::timeout(REAP_LIMIT, runtime.reap()).await });
     let reaped = match reaped {
@@ -118,19 +118,19 @@ fn boot<R: SandboxRuntime>(
             None
         }
     };
-    let store = store::Store::new(data.join(store::FILE));
+    let store = store::Store::new(data.to_owned());
     let manager = Manager::new(runtime, store, vault, data.to_owned(), host)?;
     let Some(reaped) = reaped else {
         manager.reap_pending.store(true, Ordering::SeqCst);
         return Ok(manager);
     };
     if !reaped.is_empty() {
-        let projects = manager.list();
+        let cages = manager.list().cages;
         let names: Vec<String> = reaped
             .iter()
             .map(|vm| {
-                let project = runtime::project_id(vm).and_then(|id| projects.iter().find(|v| v.project.id == id));
-                project.map_or_else(|| vm.clone(), |v| v.project.name.clone())
+                let cage = runtime::cage_id(vm).and_then(|id| cages.iter().find(|v| v.cage.id == id));
+                cage.map_or_else(|| vm.clone(), |v| v.cage.name.clone())
             })
             .collect();
         manager
@@ -163,16 +163,16 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     // One app-wide event, so the rail and the map update while the
     // Network tab is closed.
     let handle = app.clone();
-    manager.set_net_sink(Box::new(move |project_id, event| {
-        let _ = handle.emit("net-event", serde_json::json!({ "projectId": project_id, "event": event }));
+    manager.set_net_sink(Box::new(move |cage_id, event| {
+        let _ = handle.emit("net-event", serde_json::json!({ "cageId": cage_id, "event": event }));
     }));
     let handle = app.clone();
-    manager.set_guest_sink(Box::new(move |project_id| {
-        let _ = handle.emit("guest-login", project_id);
+    manager.set_guest_sink(Box::new(move |cage_id| {
+        let _ = handle.emit("guest-login", cage_id);
     }));
     let handle = app.clone();
-    manager.set_progress_sink(Box::new(move |project_id, phase, elapsed_ms| {
-        let payload = serde_json::json!({ "projectId": project_id, "phase": phase, "elapsedMs": elapsed_ms });
+    manager.set_progress_sink(Box::new(move |cage_id, phase, elapsed_ms| {
+        let payload = serde_json::json!({ "cageId": cage_id, "phase": phase, "elapsedMs": elapsed_ms });
         let _ = handle.emit("cage-start-progress", payload);
     }));
 }
@@ -191,7 +191,7 @@ pub fn run() {
             }
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
-            // Canonical, like the host paths of the projects it is compared with.
+            // Canonical, like the host paths of the sessions it is compared with.
             let data = data.canonicalize()?;
             let pi = agent::pi::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
             let runtime = Microsandbox { pi };
@@ -259,27 +259,27 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::projects::list_projects,
-            commands::projects::create_project,
-            commands::projects::delete_project,
-            commands::projects::rename_project,
-            commands::projects::list_workspaces,
-            commands::projects::create_workspace,
-            commands::projects::rename_workspace,
-            commands::projects::delete_workspace,
-            commands::projects::arrange_workspaces,
-            commands::projects::set_layout,
+            commands::sessions::list_sessions,
+            commands::sessions::create_session,
+            commands::sessions::delete_session,
+            commands::sessions::rename_session,
+            commands::sessions::list_workspaces,
+            commands::sessions::create_workspace,
+            commands::sessions::rename_workspace,
+            commands::sessions::delete_workspace,
+            commands::sessions::arrange_workspaces,
+            commands::sessions::set_layout,
             commands::terminal::reorder_terminals,
             commands::terminal::set_pane_layout,
             commands::terminal::attach_session,
             commands::terminal::detach_session,
             commands::terminal::ack_session,
-            commands::projects::resolve_folder,
-            commands::projects::set_harness,
-            commands::projects::list_folders,
-            commands::projects::add_mount,
-            commands::projects::remove_mount,
-            commands::projects::set_mount_readonly,
+            commands::sessions::resolve_folder,
+            commands::sessions::set_harness,
+            commands::sessions::list_folders,
+            commands::cages::add_mount,
+            commands::cages::remove_mount,
+            commands::cages::set_mount_readonly,
             commands::network::network_catalog,
             commands::network::set_network_default,
             commands::network::set_offline,
@@ -290,8 +290,8 @@ pub fn run() {
             commands::network::test_network,
             commands::network::wildcard_for,
             commands::network::list_net_events,
-            commands::projects::start_cage,
-            commands::projects::stop_cage,
+            commands::cages::start_cage,
+            commands::cages::stop_cage,
             commands::terminal::open_session,
             commands::terminal::reopen_terminal,
             commands::terminal::write_session,
@@ -302,9 +302,9 @@ pub fn run() {
             commands::settings::cancel_runtime_install,
             commands::settings::host_agents,
             commands::settings::detect_host_agents,
-            commands::projects::put_host_agent,
-            commands::projects::remove_host_agent,
-            commands::projects::set_agents_unprompted,
+            commands::cages::put_host_agent,
+            commands::cages::remove_host_agent,
+            commands::cages::set_agents_unprompted,
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,
@@ -314,9 +314,9 @@ pub fn run() {
             commands::tasks::is_round_folder,
             commands::tasks::watch_room,
             commands::tasks::unwatch_room,
-            commands::projects::take_app_notices,
-            commands::projects::remove_guest_login,
-            commands::projects::confirm_paths,
+            commands::sessions::take_app_notices,
+            commands::cages::remove_guest_login,
+            commands::sessions::confirm_paths,
             commands::settings::startup_status,
             commands::settings::get_preferences,
             commands::settings::set_preferences,
@@ -327,7 +327,7 @@ pub fn run() {
             commands::settings::remove_legacy_runtime,
             commands::editors::detect_editors,
             commands::editors::open_in_editor,
-            commands::editors::reveal_project,
+            commands::editors::reveal_session,
             commands::appearance::list_themes,
             commands::appearance::save_theme,
             commands::appearance::delete_theme,
@@ -378,6 +378,7 @@ mod tests {
     use crate::host_agents::login::fake::FakeLogins;
     use crate::runtime::fake::FakeRuntime;
     use crate::secrets::fake::MemoryVault;
+    use std::path::PathBuf;
 
     /// A plain test: `boot` makes its own runtime context, as in the app's setup.
     #[test]
@@ -385,10 +386,9 @@ mod tests {
         let data = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(data.join("proj")).unwrap();
         let data = data.canonicalize().unwrap();
-        let project = cage::Project::new(data.join("proj").to_str().unwrap()).unwrap();
-        store::Store::new(data.join("projects.json")).save(std::slice::from_ref(&project)).unwrap();
+        let [id] = stored(&data, [data.join("proj")]);
         let runtime = FakeRuntime::default();
-        *runtime.reaped.lock().unwrap() = vec![format!("zwinger-{}", project.id), "zwinger-gone".into()];
+        *runtime.reaped.lock().unwrap() = vec![format!("zwinger-{id}"), "zwinger-gone".into()];
         let host = Arc::new(HostAgents::new(
             Arc::new(FakeFs::default()),
             Arc::new(FakeLogins::default()),
@@ -398,7 +398,7 @@ mod tests {
 
         let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host).unwrap();
         assert_eq!(*runtime.log.lock().unwrap(), ["reap"]);
-        assert_eq!(manager.list().len(), 1);
+        assert_eq!(manager.list().sessions.len(), 1);
         assert_eq!(
             manager.take_app_notices(),
             ["zwinger stopped the VMs that the last run left running: proj, zwinger-gone."]
@@ -415,20 +415,34 @@ mod tests {
         ))
     }
 
-    /// Boots with two stored projects whose folders are outside the app data.
+    /// Saves a session with its own cage of the same id per folder, as the
+    /// conversion does. Returns their ids.
+    fn stored<const N: usize>(data: &Path, folders: [PathBuf; N]) -> [String; N] {
+        let pairs = folders.map(|folder| {
+            let session = session::Session::new(folder.to_str().unwrap(), "", []).unwrap();
+            let cage = cage::Cage::new(session.id.clone(), session.name.clone());
+            (session::Session { cage: cage.id.clone(), ..session }, cage)
+        });
+        let store = store::Store::new(data.to_owned());
+        store.save_cages(&pairs.iter().map(|p| p.1.clone()).collect::<Vec<_>>()).unwrap();
+        store.save_sessions(&pairs.iter().map(|p| p.0.clone()).collect::<Vec<_>>()).unwrap();
+        pairs.map(|p| p.0.id)
+    }
+
+    /// Boots with two stored sessions whose folders are outside the app data.
     fn boot_two(runtime: &FakeRuntime) -> (Manager<FakeRuntime>, [String; 2]) {
         let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
         let root = root.canonicalize().unwrap();
-        let projects = ["a", "b"].map(|name| {
+        let folders = ["a", "b"].map(|name| {
             std::fs::create_dir_all(root.join(name)).unwrap();
-            cage::Project::new(root.join(name).to_str().unwrap()).unwrap()
+            root.join(name)
         });
-        store::Store::new(root.join("data/projects.json")).save(&projects).unwrap();
         let data = root.join("data");
+        let ids = stored(&data, folders);
         let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host_agents(&root)).unwrap();
-        (manager, projects.map(|p| p.id))
+        (manager, ids)
     }
 
     fn reaps(runtime: &FakeRuntime) -> usize {
@@ -460,7 +474,7 @@ mod tests {
             assert!(e.to_string().contains("the VMs of the last app run are not stopped: reap failed"), "{e}");
         }
         assert_eq!(*runtime.log.lock().unwrap(), ["reap", "reap", "reap"]);
-        assert_eq!(manager.list()[0].status, cage::manager::Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, cage::manager::Status::Stopped);
     }
 
     #[test]
@@ -499,7 +513,7 @@ mod tests {
         let handler = &source[source.find("generate_handler![").unwrap()..];
         let handler = &handler[..handler.find("])").unwrap()];
         assert!(handler.contains("commands::terminal::open_session,"));
-        assert!(handler.contains("commands::projects::set_agents_unprompted,"));
+        assert!(handler.contains("commands::cages::set_agents_unprompted,"));
         for gone in ["open_agent", "agent_call", "close_agent", "list_chats", "delete_chat", "rename_chat"] {
             assert!(!handler.contains(&format!("::{gone},")), "{gone}");
         }

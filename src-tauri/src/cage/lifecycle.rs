@@ -13,7 +13,7 @@ use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
 use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, Vm, bin_dir, blocking, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
-use crate::cage::{Project, WORKSPACE};
+use crate::cage::{Bound, Cage, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
@@ -23,9 +23,10 @@ use crate::proxy::inject::Login;
 use crate::proxy::log::Entry;
 use crate::proxy::{self, Live, Proxy};
 use crate::runtime;
-use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, SessionKind};
+use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, TerminalKind};
 use crate::runtimes;
 use crate::secrets::{self, SecretValue};
+use crate::session::Session;
 
 pub(crate) const NODE_LIMIT: Duration = Duration::from_secs(15);
 
@@ -59,7 +60,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// the start reaches the proxy. The lock is released before the host
     /// logins are read (the Keychain can wait for the macOS prompt) and
     /// before the runtime start. The proxy starts before the VM: if it
-    /// cannot start, the cage does not start.
+    /// cannot start, the cage does not start. `id` is the cage id.
     pub async fn start(&self, id: &str) -> Result<()> {
         let started = Instant::now();
         let mut timings = Timings::default();
@@ -77,18 +78,18 @@ impl<R: SandboxRuntime> Manager<R> {
             state: self.state.clone(),
             sink: self.progress_sink.clone(),
         });
-        let (project, live) = {
+        let ((session, cage), live) = {
             let _edit = lock(&self.secret_edit);
-            let project = self.claim_start(id)?;
+            let claimed = self.claim_start(id)?;
             // After the claim: only a cage that is starting reports a phase.
             progress.begin(Phase::Vault);
-            let values = self.vault_values(&project);
+            let values = self.vault_values(&claimed.1);
             timings.add(Phase::Vault, started.elapsed());
             match values {
                 Ok(values) => {
-                    let live = Live::new(project.network.clone(), values);
+                    let live = Live::new(claimed.1.network.clone(), values);
                     lock(&self.state).live.insert(id.to_owned(), live.clone());
-                    (project, live)
+                    (claimed, live)
                 }
                 Err(e) => return fail(e, &mut timings),
             }
@@ -98,9 +99,8 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         progress.begin(Phase::Prepare);
         let (prepared, prepare_took) = {
-            let (host, data, project, progress) =
-                (self.host.clone(), self.data.clone(), project.clone(), progress.clone());
-            timed(blocking(move || prepare(&host, &data, &project, &|phase| progress.begin(phase)))).await
+            let (host, data, cage, progress) = (self.host.clone(), self.data.clone(), cage.clone(), progress.clone());
+            timed(blocking(move || prepare(&host, &data, &cage, &|phase| progress.begin(phase)))).await
         };
         let Prepared { mut binds, wanted, mut run, tokens, profiles, tui_probe } = match prepared {
             Ok(prepared) => prepared,
@@ -111,7 +111,7 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         timings.add(Phase::Prepare, prepare_took);
         progress.begin(Phase::Proxy);
-        let (proxy, proxy_took) = timed(self.start_proxy(id, &project, live, tokens)).await;
+        let (proxy, proxy_took) = timed(self.start_proxy(id, &cage, live, tokens)).await;
         timings.add(Phase::Proxy, proxy_took);
         let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
@@ -120,8 +120,8 @@ impl<R: SandboxRuntime> Manager<R> {
         binds.push(Bind { guest: launch::CA_DIR.to_owned(), host: Ca::dir(&self.data) });
         run.proxy = Some(proxy.url());
         let mut env = launch::net_env(&proxy.url());
-        let names = project.logins.iter().map(|l| l.name.clone());
-        env.extend(names.chain(placeholders(&project.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
+        let names = cage.logins.iter().map(|l| l.name.clone());
+        env.extend(names.chain(placeholders(&cage.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
         let net = GuestNet { port: proxy.port, env };
         let installed = runtimes::installed(&self.data, &wanted);
         for kind in [AgentKind::Claude, AgentKind::Codex] {
@@ -142,9 +142,10 @@ impl<R: SandboxRuntime> Manager<R> {
         // The paths again right before and after the boot, which binds them: a
         // folder that was swapped meanwhile is refused.
         progress.begin(Phase::Boot);
+        let bound = Bound { session: &session, cage: &cage };
         let boot = async {
-            project.verify_paths()?;
-            self.runtime.start(&project, &net, &self.state_dir(id), &installed, &binds).await
+            bound.verify_paths()?;
+            self.runtime.start(bound, &net, &self.state_dir(id), &installed, &binds).await
         };
         let (booted, boot_took) = timed(boot).await;
         timings.add(Phase::Boot, boot_took);
@@ -153,7 +154,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Ok(vm) => {
                 progress.begin(Phase::Guest);
                 let at = Instant::now();
-                let set_up = match project.verify_paths() {
+                let set_up = match bound.verify_paths() {
                     Ok(()) => self.set_up_guest(&vm, tui_probe.as_deref(), &mut run, &mut names, &mut timings).await,
                     Err(e) => Err(e),
                 };
@@ -187,7 +188,7 @@ impl<R: SandboxRuntime> Manager<R> {
             match result {
                 Ok(vm) => {
                     // In the lock, so an edit of the setting cannot write between the read and the write.
-                    let unprompted = state.project_mut(id).is_ok_and(|s| s.agents_unprompted);
+                    let unprompted = state.cage(id).is_ok_and(|c| c.agents_unprompted);
                     if let Err(e) = launch::write(&self.bin_dir(id), &mounted(&names), run.found(), unprompted) {
                         run.notices.push(format!("The agent commands could not be written: {e}"));
                     }
@@ -198,7 +199,7 @@ impl<R: SandboxRuntime> Manager<R> {
                         id.to_owned(),
                         Vm::Running {
                             vm,
-                            applied: Box::new(project),
+                            applied: Box::new((session, cage)),
                             proxy,
                             net,
                             runtimes: names,
@@ -322,16 +323,16 @@ impl<R: SandboxRuntime> Manager<R> {
         Err(Error::Io(std::io::Error::other(format!("the VMs of the last app run are not stopped: {why}"))))
     }
 
-    /// Starts the cage's proxy. Its log entries go to the project's ring and the sink.
+    /// Starts the cage's proxy. Its log entries go to the cage's ring and the sink.
     pub(crate) async fn start_proxy(
         &self,
         id: &str,
-        project: &Project,
+        cage: &Cage,
         live: Arc<Live>,
         tokens: Vec<HostToken>,
     ) -> Result<Proxy> {
         let ca = self.ca.clone();
-        let logins = project
+        let logins = cage
             .logins
             .iter()
             .zip(tokens)
@@ -344,7 +345,7 @@ impl<R: SandboxRuntime> Manager<R> {
             ca,
             live,
             logins,
-            refresh: login::denied_hosts(&project.logins),
+            refresh: login::denied_hosts(&cage.logins),
             sink: Arc::new(move |entry| {
                 let entry = lock(&state).push_net(&id, entry);
                 if let Some(sink) = sink.get() {
@@ -388,7 +389,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Deletes the agent's login that was made in the guest.
     pub fn remove_guest_login(&self, id: &str, kind: AgentKind) -> Result<()> {
-        lock(&self.state).project_mut(id)?;
+        lock(&self.state).cage(id)?;
         let dir = self.state_dir(id);
         guest_login::remove(&dir, kind)?;
         let found = guest_login::found(&dir);
@@ -398,7 +399,7 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Turns the runtime log lines into the project's log: the direct
+    /// Turns the runtime log lines into the cage's log: the direct
     /// connections that the VM blocked, because a tool ignores the proxy.
     pub(crate) fn follow_net(&self, id: &str, mut lines: Receiver<String>) -> AbortHandle {
         let state = self.state.clone();
@@ -422,22 +423,28 @@ impl<R: SandboxRuntime> Manager<R> {
         .abort_handle()
     }
 
-    /// Checks the project, marks it as starting and returns its config.
-    pub(crate) fn claim_start(&self, id: &str) -> Result<Project> {
+    /// Checks the cage and its session, marks the cage as starting and
+    /// returns both.
+    pub(crate) fn claim_start(&self, id: &str) -> Result<(Session, Cage)> {
         let mut state = lock(&self.state);
-        let project = state.project_mut(id)?.clone();
+        let cage = state.cage(id)?.clone();
+        let session = state.session_of(id)?.clone();
         match state.vms.get(id) {
             Some(Vm::Starting(_)) => return Err(Error::Starting),
             Some(Vm::Running { .. }) => return Err(Error::AlreadyStarted),
             Some(Vm::Stopping) => return Err(Error::Stopping),
             None | Some(Vm::Failed(_)) => {}
         }
-        project.verify_paths()?;
-        project.network.check()?;
-        project.check_app_data(&self.reserved)?;
-        project.check_overlap_with(state.projects.iter().filter(|s| s.id != id))?;
+        let bound = Bound { session: &session, cage: &cage };
+        bound.verify_paths()?;
+        cage.network.check()?;
+        bound.check_app_data(&self.reserved)?;
+        // A session with no known cage cannot start, so it is not checked.
+        let others: Vec<Bound> =
+            state.sessions.iter().filter(|s| s.cage != id).filter_map(|s| state.bound(&s.id).ok()).collect();
+        bound.check_overlap_with(others)?;
         state.vms.insert(id.to_owned(), Vm::Starting(Phase::Vault));
-        Ok(project)
+        Ok((session, cage))
     }
 
     /// pi needs a newer Node than some `node:22-slim` images have.
@@ -466,11 +473,11 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The vault value of each credential. An account whose restore failed
     /// is restored first; if that fails again, the start fails.
-    pub(crate) fn vault_values(&self, project: &Project) -> Result<HashMap<String, SecretValue>> {
+    pub(crate) fn vault_values(&self, cage: &Cage) -> Result<HashMap<String, SecretValue>> {
         let mut values = HashMap::new();
-        for credential in project.network.credentials() {
-            self.settle(&project.id, &credential.name)?;
-            match self.vault.get(&project.id, &credential.name)? {
+        for credential in cage.network.credentials() {
+            self.settle(&cage.id, &credential.name)?;
+            match self.vault.get(&cage.id, &credential.name)? {
                 Some(value) => values.insert(credential.name.clone(), value),
                 None => return Err(Error::SecretMissing(credential.name.clone())),
             };
@@ -536,10 +543,17 @@ impl<R: SandboxRuntime> Manager<R> {
     /// stop leaves the cage running and the user can retry.
     pub async fn stop(&self, id: &str) -> Result<()> {
         // First, so each run settles its manifest before its processes die with the VM.
-        self.runs.cancel_project(id, "the cage stopped", RUN_STOP_LIMIT).await;
+        let sessions: Vec<String> = {
+            let state = lock(&self.state);
+            state.cage(id)?;
+            state.sessions.iter().filter(|s| s.cage == id).map(|s| s.id.clone()).collect()
+        };
+        for session in &sessions {
+            self.runs.cancel_session(session, "the cage stopped", RUN_STOP_LIMIT).await;
+        }
         let (vm, applied, proxy, net, runtimes, host) = {
             let mut state = lock(&self.state);
-            state.project_mut(id)?;
+            state.cage(id)?;
             match state.vms.get(id) {
                 Some(Vm::Running { .. }) => {}
                 Some(Vm::Starting(_)) => return Err(Error::Starting),
@@ -552,10 +566,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 unreachable!("checked above");
             };
             // A host shell runs on the Mac, so it outlives the VM.
-            state.sessions.retain(|s| {
-                let ends = s.project_id == id && s.kind != SessionKind::Host;
+            state.terminals.retain(|t| {
+                let ends = sessions.contains(&t.session_id) && t.kind != TerminalKind::Host;
                 if ends {
-                    let _ = s.input.send(PtyInput::Kill);
+                    let _ = t.input.send(PtyInput::Kill);
                 }
                 !ends
             });
@@ -609,7 +623,7 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 }
 
-/// What a start needs for the project's host agents.
+/// What a start needs for the cage's host agents.
 pub(crate) struct Prepared {
     /// The token of each host login, in the order of the config.
     pub(crate) tokens: Vec<HostToken>,
@@ -628,11 +642,11 @@ pub(crate) struct Prepared {
 /// runtime versions. It reads the Keychain and copies files, so it runs on a
 /// blocking thread. The state dir is guest-writable: each write there
 /// follows no link. `begin` gets the phase of each profile copy.
-pub(crate) fn prepare(host: &HostAgents, data: &Path, project: &Project, begin: &dyn Fn(Phase)) -> Result<Prepared> {
-    let state = data.join(LEGACY_STATE_DIR).join(&project.id);
+pub(crate) fn prepare(host: &HostAgents, data: &Path, cage: &Cage, begin: &dyn Fn(Phase)) -> Result<Prepared> {
+    let state = data.join(LEGACY_STATE_DIR).join(&cage.id);
     std::fs::create_dir_all(&state)?;
     // Empty: the start writes the wrappers of the agents that run in the VM.
-    let bin = bin_dir(data, &project.id);
+    let bin = bin_dir(data, &cage.id);
     if let Err(e) = std::fs::remove_dir_all(&bin)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -651,8 +665,8 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, project: &Project, begin: 
     let mut wanted = HashMap::new();
     let (mut profiles, mut tui_probe) = (Vec::new(), None);
     for kind in host_agents::KINDS {
-        let used = project.host_agent(kind);
-        let snapshot_dir = data.join("profiles").join(&project.id).join(kind.name());
+        let used = cage.host_agent(kind);
+        let snapshot_dir = data.join("profiles").join(&cage.id).join(kind.name());
         let mut entries = Vec::new();
         if used.is_some_and(|u| u.profile) {
             begin(Phase::Profile(kind));
@@ -716,7 +730,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, project: &Project, begin: 
     // After the links, so no link of the profile replaces a login file.
     let now = host.now_ms();
     let mut tokens = Vec::new();
-    for secret in &project.logins {
+    for secret in &cage.logins {
         let crate::secrets::Origin::HostLogin { agent } = secret.origin else {
             continue;
         };
@@ -742,7 +756,7 @@ pub(crate) fn prepare(host: &HostAgents, data: &Path, project: &Project, begin: 
     }
     // After the host logins: a placeholder that replaced a guest login is not one.
     run.guest_logins = guest_login::found(&state);
-    if login::denied_hosts(&project.logins).contains(&login::GITHUB_API) {
+    if login::denied_hosts(&cage.logins).contains(&login::GITHUB_API) {
         run.notices.push(format!(
             "The GitHub API ({}) is blocked in this cage: pi's Copilot login is refreshed there.",
             login::GITHUB_API
@@ -801,7 +815,7 @@ mod tests {
         let (manager, runtime, id) = manager();
         *runtime.node_version.lock().unwrap() = Some("v22.12.0\n".into());
         assert!(matches!(manager.start(&id).await, Err(Error::NodeTooOld(v)) if v == "v22.12.0"));
-        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
+        assert!(matches!(manager.list().cages[0].status, Status::Error { .. }));
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
     }
 
@@ -809,19 +823,21 @@ mod tests {
     async fn start_refuses_a_mount_of_the_app_data_dir() {
         let (manager, runtime, id) = manager();
         // An old config can hold such a mount: the add check is newer.
-        manager.edit(&id, |s| s.add_mount(manager.data.to_str().unwrap(), "/mnt/data", true)).unwrap();
+        manager
+            .edit_cage(&id, |c, sessions| c.add_mount(sessions, manager.data.to_str().unwrap(), "/mnt/data", true))
+            .unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::AppDataOverlap(..))));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn start_refuses_changed_path() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].project.folder.clone();
+        let folder = manager.list().sessions[0].session.folder.clone();
         std::fs::remove_dir_all(&folder).unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::MissingPath(_))));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
     }
 
@@ -829,8 +845,7 @@ mod tests {
     async fn stop_all_stops_running_cages() {
         let dir = temp_dir();
         let runtime = FakeRuntime::default();
-        let manager =
-            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host()).unwrap();
+        let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault(), temp_dir(), host()).unwrap();
         let a = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
         let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
         manager.create(temp_dir().to_str().unwrap(), None).unwrap();
@@ -838,7 +853,7 @@ mod tests {
         manager.start(&b).await.unwrap();
 
         manager.stop_all(Duration::from_secs(2)).await;
-        assert!(manager.list().iter().all(|v| v.status == Status::Stopped));
+        assert!(manager.list().cages.iter().all(|v| v.status == Status::Stopped));
         let log = runtime.log.lock().unwrap();
         assert!(log.contains(&format!("stop {a}")) && log.contains(&format!("stop {b}")));
     }
@@ -869,9 +884,9 @@ mod tests {
 
         manager.stop(&id).await.unwrap();
         assert_eq!(next(&mut rx).await, PtyEvent::Exit(137));
-        assert!(manager.list()[0].sessions.is_empty());
+        assert!(manager.list().sessions[0].processes.is_empty());
         // The terminal stays as a dormant row.
-        assert_eq!(manager.list()[0].project.terminals.len(), 1);
+        assert_eq!(manager.list().sessions[0].session.terminals.len(), 1);
     }
 
     #[tokio::test]
@@ -881,11 +896,11 @@ mod tests {
 
         *runtime.fail_stop.lock().unwrap() = true;
         assert!(manager.stop(&id).await.is_err());
-        assert_eq!(manager.list()[0].status, Status::Running);
+        assert_eq!(manager.list().cages[0].status, Status::Running);
 
         *runtime.fail_stop.lock().unwrap() = false;
         manager.stop(&id).await.unwrap();
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
     }
 
     #[tokio::test]
@@ -895,7 +910,7 @@ mod tests {
         vault.delete(&id, "KEY").unwrap();
 
         assert!(matches!(manager.start(&id).await, Err(Error::SecretMissing(n)) if n == "KEY"));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
         assert!(lock(&manager.state).live.is_empty());
     }
@@ -906,10 +921,10 @@ mod tests {
     async fn start_refuses_an_invalid_stored_host() {
         let (manager, runtime, id) = manager();
         allow(&manager, &id, "a.io");
-        lock(&manager.state).projects[0].network.rules[0].target = Target::Host { host: "*".into() };
+        lock(&manager.state).cages[0].network.rules[0].target = Target::Host { host: "*".into() };
 
         assert!(matches!(manager.start(&id).await, Err(Error::InvalidDomain(..))));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
     }
 
@@ -920,7 +935,7 @@ mod tests {
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), true).await.unwrap();
 
-        let project = manager.list().remove(0).project;
+        let project = manager.list().cages.remove(0).cage;
         let rules: Vec<_> = project.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
         assert_eq!(rules, [(Target::Host { host: "api.anthropic.com".into() }, Action::Allow)]);
         assert_eq!(project.logins[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
@@ -948,7 +963,7 @@ mod tests {
         let skills = manager.state_dir(&id).join("claude/.claude/skills");
         assert_eq!(std::fs::read_link(skills).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
 
-        let view = manager.list().remove(0);
+        let view = manager.list().cages.remove(0);
         assert_eq!(view.login_expires_at, Some(NOW + 3_600_000));
         // Neither the host version nor the pinned Claude Code is downloaded.
         assert!(
@@ -992,10 +1007,10 @@ mod tests {
             auth.contains("$MSB_CODEX_HOST_LOGIN$") && auth.contains(login::INERT_REFRESH) && auth.contains("id.real")
         );
         assert!(!auth.contains("at-real") && !auth.contains("rt-real"));
-        assert_eq!(manager.list()[0].project.logins[0].hosts, ["chatgpt.com"]);
+        assert_eq!(manager.list().cages[0].cage.logins[0].hosts, ["chatgpt.com"]);
         assert!(!format!("{:?}", runtime.net.lock().unwrap()).contains("at-real"));
         // The access token here is no JWT, so its expiry is unknown.
-        let notices = manager.list().remove(0).host_notices;
+        let notices = manager.list().cages.remove(0).host_notices;
         assert_eq!(
             notices,
             [
@@ -1007,7 +1022,7 @@ mod tests {
         manager.stop(&id).await.unwrap();
         runtimes::fake_install(&manager.data, "codex");
         manager.start(&id).await.unwrap();
-        assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("not downloaded")));
+        assert!(manager.list().cages[0].host_notices.iter().all(|n| !n.contains("not downloaded")));
         assert_eq!(*runtime.runtimes.lock().unwrap(), ["codex"]);
     }
 
@@ -1018,7 +1033,7 @@ mod tests {
         let (manager, runtime, id, _) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(runtime.log.lock().unwrap().is_empty());
         // pi's login names its provider, so pi needs one to be added with a login.
         assert!(matches!(
@@ -1051,10 +1066,10 @@ mod tests {
             manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await,
             Err(Error::RefreshHostConflict(..))
         ));
-        let github = manager.list()[0].project.network.rules[1].id.clone();
+        let github = manager.list().cages[0].cage.network.rules[1].id.clone();
         manager.remove_rule(&id, &github).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), true).await.unwrap();
-        let project = manager.list().remove(0).project;
+        let project = manager.list().cages.remove(0).cage;
         let hosts: Vec<_> = project.network.rules.iter().map(|r| r.label()).collect();
         assert_eq!(hosts, ["cloudcode-pa.googleapis.com", "api.business.githubcopilot.com"]);
 
@@ -1063,7 +1078,7 @@ mod tests {
         assert!(
             creds.contains("$MSB_GEMINI_HOST_LOGIN$") && !creds.contains("ya29.real") && !creds.contains("1//real")
         );
-        let view = manager.list().remove(0);
+        let view = manager.list().cages.remove(0);
         assert!(view.guest_logins.is_empty(), "the placeholder login is not a guest login");
         assert!(
             view.host_notices.iter().any(|n| n.contains("GitHub API (api.github.com) is blocked")),
@@ -1080,7 +1095,7 @@ mod tests {
         let (manager, _, id, _) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         manager.start(&id).await.unwrap();
-        let view = manager.list().remove(0);
+        let view = manager.list().cages.remove(0);
         assert_eq!(view.login_expires_at, None);
         assert!(view.host_notices.iter().any(|n| n.contains("does not read it again")), "{:?}", view.host_notices);
     }
@@ -1093,7 +1108,7 @@ mod tests {
         manager.start(&id).await.unwrap();
         let binds: Vec<String> = runtime.binds.lock().unwrap().iter().map(|b| b.guest.clone()).collect();
         assert_eq!(binds, ["/opt/zwinger/bin", "/opt/zwinger/host/pi", "/opt/zwinger/host/gemini", "/opt/zwinger/ca"]);
-        assert!(manager.list()[0].runtimes.contains(&"gemini"));
+        assert!(manager.list().cages[0].runtimes.contains(&"gemini"));
         // The TUI probe: a terminal, with no session file.
         let probe = runtime.argvs.lock().unwrap()[0].clone();
         assert_eq!(probe[0], "env");
@@ -1119,7 +1134,7 @@ mod tests {
         *runtime.probe_fail.lock().unwrap() =
             vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
         manager.start(&id).await.unwrap();
-        let view = manager.list().remove(0);
+        let view = manager.list().cages.remove(0);
         assert!(!view.runtimes.contains(&"gemini"));
         assert!(view.host_notices.iter().any(|n| n.contains("bundled pi")), "{:?}", view.host_notices);
         assert!(view.host_notices.iter().any(|n| n.contains("darwin-arm64.node")), "{:?}", view.host_notices);
@@ -1146,14 +1161,14 @@ mod tests {
         for probes in [1, 2] {
             manager.start(&id).await.unwrap();
             assert_eq!(tui_probes(&runtime), probes);
-            assert!(manager.list()[0].host_notices.iter().any(|n| n.contains("bundled pi")));
+            assert!(manager.list().cages[0].host_notices.iter().any(|n| n.contains("bundled pi")));
             manager.stop(&id).await.unwrap();
         }
         runtime.probe_fail.lock().unwrap().clear();
         for _ in 0..2 {
             manager.start(&id).await.unwrap();
             assert_eq!(tui_probes(&runtime), 3);
-            assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("bundled pi")));
+            assert!(manager.list().cages[0].host_notices.iter().all(|n| !n.contains("bundled pi")));
             assert!(wrappers(&manager, &id).contains(&"pi".to_owned()));
             assert!(
                 std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap().contains("/opt/zwinger/host/pi/")
@@ -1175,8 +1190,7 @@ mod tests {
         fs.links.insert("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent".into(), package.clone());
         let runtime = FakeRuntime::default();
         let host = host_with(fs, FakeLogins::default(), NOW);
-        let manager =
-            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault(), temp_dir(), host).unwrap();
+        let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault(), temp_dir(), host).unwrap();
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
         for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
@@ -1197,7 +1211,7 @@ mod tests {
             vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
         *runtime.trust_fail.lock().unwrap() = true;
         assert!(matches!(manager.start(&id).await, Err(Error::NodeTooOld(_))));
-        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
+        assert!(matches!(manager.list().cages[0].status, Status::Error { .. }));
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
     }
 
@@ -1210,7 +1224,7 @@ mod tests {
             vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
         *runtime.trust_fail.lock().unwrap() = true;
         manager.start(&id).await.unwrap();
-        let view = manager.list().remove(0);
+        let view = manager.list().cages.remove(0);
         let found: Vec<usize> = ["bundled pi", "Gemini CLI from this Mac", "Only Node trusts"]
             .iter()
             .map(|text| view.host_notices.iter().position(|n| n.contains(text)).expect(text))
@@ -1256,7 +1270,7 @@ mod tests {
             async move { manager.start(&id).await }
         });
         gate.entered.notified().await;
-        assert_eq!(manager.list()[0].status, Status::Starting { phase: Phase::Boot });
+        assert_eq!(manager.list().cages[0].status, Status::Starting { phase: Phase::Boot });
         gate.release.notify_one();
         starting.await.unwrap().unwrap();
         let phases: Vec<Phase> = seen
@@ -1281,7 +1295,7 @@ mod tests {
                 Phase::Wrappers
             ]
         );
-        let timings = manager.list().remove(0).start_timings.unwrap();
+        let timings = manager.list().cages.remove(0).start_timings.unwrap();
         assert_eq!(timings.phases[1].phase, Phase::Profile(AgentKind::Claude));
     }
 
@@ -1290,12 +1304,12 @@ mod tests {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();
         assert_eq!(*runtime.trusts.lock().unwrap(), 1);
-        assert!(manager.list()[0].host_notices.iter().all(|n| !n.contains("Only Node")));
+        assert!(manager.list().cages[0].host_notices.iter().all(|n| !n.contains("Only Node")));
         manager.stop(&id).await.unwrap();
 
         *runtime.trust_fail.lock().unwrap() = true;
         manager.start(&id).await.unwrap();
-        let notices = &manager.list()[0].host_notices;
+        let notices = &manager.list().cages[0].host_notices;
         assert!(
             notices.iter().any(|n| n.contains("Only Node trusts") && n.contains("no system CA bundle")),
             "{notices:?}"
@@ -1305,7 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn start_refuses_a_folder_swapped_at_the_same_path() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].project.folder.clone();
+        let folder = manager.list().sessions[0].session.folder.clone();
         std::fs::rename(&folder, folder.with_extension("was")).unwrap();
         std::fs::create_dir(&folder).unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::PathChanged(_))));
@@ -1315,7 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn a_folder_swapped_during_the_boot_stops_the_vm() {
         let (manager, runtime, id) = manager();
-        let folder = manager.list()[0].project.folder.clone();
+        let folder = manager.list().sessions[0].session.folder.clone();
         let gate = Arc::new(PtyGate::default());
         *runtime.start_gate.lock().unwrap() = Some(gate.clone());
         let manager = Arc::new(manager);
@@ -1329,15 +1343,13 @@ mod tests {
         gate.release.notify_one();
         assert!(matches!(starting.await.unwrap(), Err(Error::PathChanged(_))));
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
-        assert!(matches!(manager.list()[0].status, Status::Error { .. }));
+        assert!(matches!(manager.list().cages[0].status, Status::Error { .. }));
     }
 
     #[tokio::test]
     async fn stop_all_stops_four_cages_at_a_time() {
         let runtime = FakeRuntime::default();
-        let manager =
-            Manager::new(runtime.clone(), Store::new(temp_dir().join("projects.json")), vault(), temp_dir(), host())
-                .unwrap();
+        let manager = Manager::new(runtime.clone(), Store::new(temp_dir()), vault(), temp_dir(), host()).unwrap();
         let ids: Vec<String> = (0..6).map(|_| manager.create(temp_dir().to_str().unwrap(), None).unwrap()).collect();
         for id in &ids {
             manager.start(id).await.unwrap();
@@ -1348,7 +1360,7 @@ mod tests {
         manager.stop_all(Duration::from_secs(20)).await;
         assert_eq!(started.elapsed().as_secs(), 2, "two rounds of four and two");
         assert_eq!(runtime.most_stopping.load(std::sync::atomic::Ordering::SeqCst), 4);
-        assert!(manager.list().iter().all(|v| v.status == Status::Stopped));
+        assert!(manager.list().cages.iter().all(|v| v.status == Status::Stopped));
     }
 
     #[tokio::test]
@@ -1356,9 +1368,9 @@ mod tests {
         let (manager, _, id) = manager();
         let file = put_codex_login(&manager, &id);
         manager.start(&id).await.unwrap();
-        assert_eq!(manager.list()[0].guest_logins, [AgentKind::Codex]);
+        assert_eq!(manager.list().cages[0].guest_logins, [AgentKind::Codex]);
         manager.remove_guest_login(&id, AgentKind::Codex).unwrap();
-        assert!(manager.list()[0].guest_logins.is_empty());
+        assert!(manager.list().cages[0].guest_logins.is_empty());
         assert!(!file.exists());
     }
 
@@ -1370,12 +1382,12 @@ mod tests {
             let _ = tx.send(id.to_owned());
         }));
         manager.start(&id).await.unwrap();
-        assert!(manager.list()[0].guest_logins.is_empty());
+        assert!(manager.list().cages[0].guest_logins.is_empty());
         tokio::time::pause();
         put_codex_login(&manager, &id);
         let reported = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await.unwrap();
         assert_eq!(reported, Some(id.clone()));
-        assert_eq!(manager.list()[0].guest_logins, [AgentKind::Codex]);
+        assert_eq!(manager.list().cages[0].guest_logins, [AgentKind::Codex]);
     }
 
     /// Boots a real project. Needs microsandbox and network:
@@ -1387,7 +1399,7 @@ mod tests {
 
         let (folder, readonly, pi, data) = (temp_dir(), temp_dir(), temp_dir(), temp_dir());
         std::fs::write(folder.join("hello.txt"), "from the host").unwrap();
-        let store = Store::new(data.join("projects.json"));
+        let store = Store::new(data.clone());
         let manager = Manager::new(Microsandbox { pi }, store, vault(), data.clone(), host()).unwrap();
         let id = manager.create(folder.to_str().unwrap(), None).unwrap();
         manager.add_mount(&id, readonly.to_str().unwrap(), "/mnt/ro", true).unwrap();

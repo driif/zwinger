@@ -1,19 +1,20 @@
 import { Button } from "@driif/motiv";
 import { Bot, Laptop } from "lucide-react";
-import { PaneNode, SessionKind, ProjectView } from "../../shared/api";
+import { CageView, PaneNode, SessionView, TerminalKind } from "../../shared/api";
 import type { Pane } from "../../App";
 import { PaneLayout } from "./PaneLayout";
 import { StartProgress } from "../projects/StartProgress";
 
 interface Props {
-  project: ProjectView;
+  session: SessionView;
+  cage: CageView;
   /** The terminals of all projects. */
   panes: Pane[];
   /** The focused pane of the shown project. */
   focused?: string;
   visible: boolean;
   /** `agent` opens the project's first agent. */
-  onNewSession: (kind: SessionKind | "agent") => void;
+  onNewSession: (kind: TerminalKind | "agent") => void;
   onFocus: (key: string) => void;
   onLayout: (layout: PaneNode) => void;
   /** Opens a dormant or exited terminal again. */
@@ -28,19 +29,19 @@ interface Props {
 }
 
 /** The pane layout of the shown project. The terminals of every project stay attached. */
-export function TerminalTab({ project, onNewSession, ...layout }: Props) {
+export function TerminalTab({ session, cage, onNewSession, ...layout }: Props) {
   return (
     <div className="terminal-tab">
-      {!project.paneLayout && project.status.state === "starting" && (
+      {!session.paneLayout && cage.status.state === "starting" && (
         <div className="empty">
-          <StartProgress phase={project.status.phase} />
+          <StartProgress phase={cage.status.phase} />
         </div>
       )}
-      {!project.paneLayout && project.status.state !== "starting" && (
+      {!session.paneLayout && cage.status.state !== "starting" && (
         <div className="empty">
           <p className="muted">
-            No pane is open. A Mac shell starts in {project.folder} and needs no cage start. An agent starts in the cage,
-            in {project.harness ?? "/workspace"}.
+            No pane is open. A Mac shell starts in {session.folder} and needs no cage start. An agent starts in the cage,
+            in {session.harness ?? "/workspace"}.
           </p>
           <div className="row">
             <Button variant="outline" iconLeft={<Laptop size={14} />} onClick={() => onNewSession({ type: "host" })}>
@@ -52,7 +53,7 @@ export function TerminalTab({ project, onNewSession, ...layout }: Props) {
           </div>
         </div>
       )}
-      <PaneLayout layout={project.paneLayout} status={project.status} {...layout} />
+      <PaneLayout layout={session.paneLayout} status={cage.status} {...layout} />
     </div>
   );
 }

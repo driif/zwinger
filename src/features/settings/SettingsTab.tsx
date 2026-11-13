@@ -18,8 +18,8 @@ import {
   setHarness,
   setMountReadonly,
 } from "./api";
-import { deleteProject, renameProject } from "../projects/api";
-import { AGENT_NAMES, ProjectView } from "../../shared/api";
+import { deleteSession, renameSession } from "../projects/api";
+import { AGENT_NAMES, CageView, SessionView } from "../../shared/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -46,7 +46,8 @@ interface MountDraft {
 }
 
 interface Props {
-  project: ProjectView;
+  session: SessionView;
+  cage: CageView;
   folders: string[];
   runtimes: Runtimes;
   run: Run;
@@ -54,9 +55,9 @@ interface Props {
   onIntentDone: () => void;
 }
 
-export function SettingsTab({ project, folders, runtimes, run, intent, onIntentDone }: Props) {
-  const { id, status } = project;
-  const [name, setName] = useState(project.name);
+export function SettingsTab({ session, cage, folders, runtimes, run, intent, onIntentDone }: Props) {
+  const { status } = cage;
+  const [name, setName] = useState(session.name);
   const [nameError, setNameError] = useState<string>();
   const [draft, setDraft] = useState<MountDraft>();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -65,17 +66,17 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
 
   const harnessOptions = [
     ...folders.map((f) => `${WORKSPACE}/${f}`),
-    ...project.mounts.map((m) => m.guest),
+    ...cage.mounts.map((m) => m.guest),
   ];
-  if (project.harness && !harnessOptions.includes(project.harness)) harnessOptions.push(project.harness);
+  if (session.harness && !harnessOptions.includes(session.harness)) harnessOptions.push(session.harness);
 
   // A blank name reverts to the folder name, as in the backend.
-  const nextName = name.trim() || (project.folder.split("/").filter(Boolean).pop() ?? project.folder);
+  const nextName = name.trim() || (session.folder.split("/").filter(Boolean).pop() ?? session.folder);
 
   function rename(event: FormEvent) {
     event.preventDefault();
     setName(nextName);
-    run(() => renameProject(id, name).catch((e) => setNameError(errorMessage(e))));
+    run(() => renameSession(session.id, name).catch((e) => setNameError(errorMessage(e))));
   }
 
   function draftMount(host: string, dropped?: string) {
@@ -115,7 +116,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
     const error = guestError(draft.guest);
     if (error) return setDraft({ ...draft, error });
     run(() =>
-      addMount(id, draft.host, draft.guest, draft.readonly).then(
+      addMount(cage.id, draft.host, draft.guest, draft.readonly).then(
         () => setDraft(undefined),
         (e) => setDraft({ ...draft, error: errorMessage(e) }),
       ),
@@ -142,12 +143,12 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
                 setNameError(undefined);
               }}
             />
-            <Button type="submit" variant="outline" disabled={nextName === project.name}>
+            <Button type="submit" variant="outline" disabled={nextName === session.name}>
               Rename
             </Button>
           </form>
           <p className="muted">
-            Folder <span className="mono">{project.folder}</span> is <span className="mono">{WORKSPACE}</span> in the
+            Folder <span className="mono">{session.folder}</span> is <span className="mono">{WORKSPACE}</span> in the
             cage. It is read-write.
           </p>
         </CardBody>
@@ -209,9 +210,9 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
               </div>
             </form>
           )}
-          {project.mounts.length === 0 && !draft && <p className="muted">No mounts. Only {WORKSPACE} is visible.</p>}
+          {cage.mounts.length === 0 && !draft && <p className="muted">No mounts. Only {WORKSPACE} is visible.</p>}
           <ul className="list">
-            {project.mounts.map((m) => (
+            {cage.mounts.map((m) => (
               <li key={m.guest} className="row">
                 <span className="mono">{m.guest}</span>
                 <span className="grow muted mono" title={m.host}>
@@ -221,7 +222,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
                   size="sm"
                   variant="outline"
                   aria-label={`${m.guest} is ${m.readonly ? "read-only" : "read-write"}. Toggle.`}
-                  onClick={() => run(() => setMountReadonly(id, m.guest, !m.readonly))}
+                  onClick={() => run(() => setMountReadonly(cage.id, m.guest, !m.readonly))}
                 >
                   {m.readonly ? "ro" : "rw"}
                 </Button>
@@ -230,7 +231,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
                   variant="ghost"
                   aria-label={`Remove ${m.guest}`}
                   iconLeft={<X size={14} />}
-                  onClick={() => run(() => removeMount(id, m.guest))}
+                  onClick={() => run(() => removeMount(cage.id, m.guest))}
                 />
               </li>
             ))}
@@ -247,14 +248,14 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
         <CardBody>
           <RadioGroup
             ref={harnessGroup}
-            name={`harness-${id}`}
+            name={`harness-${session.id}`}
             legend="Agent starts in"
             options={[
               { value: "", label: <span className="mono">{WORKSPACE}</span>, hint: "No harness" },
               ...harnessOptions.map((path) => ({ value: path, label: <span className="mono">{path}</span> })),
             ]}
-            value={project.harness ?? ""}
-            onChange={(value) => run(() => setHarness(id, value || null))}
+            value={session.harness ?? ""}
+            onChange={(value) => run(() => setHarness(session.id, value || null))}
           />
         </CardBody>
       </Card>
@@ -268,8 +269,8 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
         <CardBody className="stack">
           <LiquidSwitch
             label="Agents run without permission prompts"
-            checked={project.agentsUnprompted}
-            onChange={(on) => run(() => setAgentsUnprompted(id, on))}
+            checked={cage.agentsUnprompted}
+            onChange={(on) => run(() => setAgentsUnprompted(cage.id, on))}
           />
           <p className="muted">
             For this project: the cage is the sandbox. Run the agents from the Agents group or as claude, codex, pi and
@@ -286,7 +287,7 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
                 <strong>{AGENT_NAMES[runtime.name]}</strong>
                 <span className="grow muted">
                   {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
-                  {runtime.installed && status.state === "running" && !project.runtimes.includes(runtime.name)
+                  {runtime.installed && status.state === "running" && !cage.runtimes.includes(runtime.name)
                     ? " · restart the cage to use it"
                     : ""}
                 </span>
@@ -297,16 +298,16 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
         </CardBody>
       </Card>
 
-      {project.startTimings && (
+      {cage.startTimings && (
         <Card variant="outlined" padding="md">
           <CardHeader
             title="Last start"
             titleAs="h2"
-            description={`The start took ${project.startTimings.totalMs} ms. Some phases ran at the same time.`}
+            description={`The start took ${cage.startTimings.totalMs} ms. Some phases ran at the same time.`}
           />
           <CardBody>
             <ul className="list">
-              {project.startTimings.phases.map(({ phase, ms }, i) => (
+              {cage.startTimings.phases.map(({ phase, ms }, i) => (
                 <li key={i} className="row">
                   <span className="grow">{phaseName(phase)}</span>
                   <span className="muted mono">{ms} ms</span>
@@ -322,11 +323,11 @@ export function SettingsTab({ project, folders, runtimes, run, intent, onIntentD
         <CardBody className="row">
           {confirmDelete ? (
             <>
-              <span className="grow danger">Delete {project.name}?</span>
+              <span className="grow danger">Delete {session.name}?</span>
               <Button variant="ghost" onClick={() => setConfirmDelete(false)}>
                 Cancel
               </Button>
-              <Button variant="danger" iconLeft={<Trash2 size={14} />} onClick={() => run(() => deleteProject(id))}>
+              <Button variant="danger" iconLeft={<Trash2 size={14} />} onClick={() => run(() => deleteSession(session.id))}>
                 Delete
               </Button>
             </>

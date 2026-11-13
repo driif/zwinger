@@ -1,4 +1,4 @@
-//! The network policy of a project (ADR 0003): one default, a list of Allow
+//! The network policy of a cage (ADR 0003): one default, a list of Allow
 //! and Block rules where Block always wins, and the always-blocked floor in
 //! the proxy. A credential belongs to a rule; the proxy injects it only for
 //! an Allow rule. On a Block rule it is inactive. The service catalog ships
@@ -7,11 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
-use crate::cage::{self, Project};
+use crate::cage::{self, Bound};
 use crate::error::{Error, Result};
 use crate::host_agents::{self, login};
 use crate::proxy::decide::{self, Decision};
-use crate::runtime::SessionKind;
+use crate::runtime::TerminalKind;
 use crate::secrets::{self, Origin, Places};
 
 /// The marks of a credential template that the proxy replaces.
@@ -20,7 +20,7 @@ pub const SECRET_MARK: &str = "{secret}";
 const BASIC_MARK: &str = "{basic:";
 /// The longest template.
 const TEMPLATE_LIMIT: usize = 512;
-/// The most rules of a project.
+/// The most rules of a cage.
 const RULE_LIMIT: usize = 500;
 /// The most credentials of one rule.
 const CREDENTIAL_LIMIT: usize = 16;
@@ -72,7 +72,7 @@ pub enum Inject {
     Replace { places: Places },
 }
 
-/// The value is in the vault, at the account `<project>/<name>`. Rules can
+/// The value is in the vault, at the account `<cage id>/<name>`. Rules can
 /// share a name, and with it one value. The guest gets the placeholder in
 /// the variable `name`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,7 +542,7 @@ pub fn service(id: &str) -> Option<&'static Service> {
     CATALOG.iter().find(|s| s.id == id)
 }
 
-/// A host that an agent of the project needs, and the proxy's decision on it.
+/// A host that an agent of the session needs, and the proxy's decision on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentNeed {
@@ -553,27 +553,28 @@ pub struct AgentNeed {
     pub allowed: bool,
 }
 
-/// The hosts that the project's agents need: pi the provider of its Mac
+/// The hosts that the agents of the session and its cage need: pi the provider of its Mac
 /// login, and npm for the extensions of its Mac profile; Claude Code the
 /// Anthropic API; Codex the OpenAI API; Gemini CLI Google Gemini. An agent
 /// with a Mac login needs the hosts of the login. The agents are the ones
 /// of the host agents, the terminals and the tasks. `allowed` is the
 /// decision of the proxy on the name, before the address check.
-pub fn agent_needs(project: &Project) -> Vec<AgentNeed> {
-    let terminals = project.terminals.iter().filter_map(|t| match t.kind {
-        SessionKind::Agent { agent, .. } => Some(agent),
-        SessionKind::Shell | SessionKind::Host => None,
+pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
+    let (session, cage) = (bound.session, bound.cage);
+    let terminals = session.terminals.iter().filter_map(|t| match t.kind {
+        TerminalKind::Agent { agent, .. } => Some(agent),
+        TerminalKind::Shell | TerminalKind::Host => None,
     });
-    let used: Vec<AgentKind> = project
+    let used: Vec<AgentKind> = cage
         .host_agents
         .iter()
         .map(|a| a.kind)
         .chain(terminals)
-        .chain(project.tasks.iter().flat_map(|t| t.agents.iter().map(|a| a.kind)))
+        .chain(session.tasks.iter().flat_map(|t| t.agents.iter().map(|a| a.kind)))
         .collect();
     let mut needs: Vec<(AgentKind, String)> = Vec::new();
     for kind in host_agents::KINDS.into_iter().filter(|k| used.contains(k)) {
-        let logins: Vec<String> = project
+        let logins: Vec<String> = cage
             .logins
             .iter()
             .filter(|l| matches!(l.origin, Origin::HostLogin { agent } if agent == kind))
@@ -590,13 +591,13 @@ pub fn agent_needs(project: &Project) -> Vec<AgentNeed> {
         } else if let Some(host) = fallback.and_then(service).and_then(|s| s.domains.first()) {
             needs.push((kind, (*host).to_owned()));
         }
-        if kind == AgentKind::Pi && project.host_agent(kind).is_some_and(|a| a.profile) {
+        if kind == AgentKind::Pi && cage.host_agent(kind).is_some_and(|a| a.profile) {
             needs.push((kind, "registry.npmjs.org".to_owned()));
         }
     }
-    let refresh = login::denied_hosts(&project.logins);
-    let tokeninfo = project.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
-    let ctx = decide::Context { policy: &project.network, refresh: &refresh, tokeninfo };
+    let refresh = login::denied_hosts(&cage.logins);
+    let tokeninfo = cage.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
+    let ctx = decide::Context { policy: &cage.network, refresh: &refresh, tokeninfo };
     needs
         .into_iter()
         .filter_map(|(agent, host)| {
@@ -714,24 +715,25 @@ mod tests {
         use crate::agent::AgentKind;
         use crate::cage::HostAgentUse;
 
-        let mut project = Project::new("/tmp").unwrap();
-        project.host_agents = vec![
+        let mut session = crate::session::Session::new("/tmp", "c", []).unwrap();
+        let mut cage = crate::cage::Cage::new("c".into(), "tmp".into());
+        cage.host_agents = vec![
             HostAgentUse { kind: AgentKind::Pi, profile: true, login: true },
             HostAgentUse { kind: AgentKind::Codex, profile: false, login: false },
         ];
-        project.logins = vec![login::secret(AgentKind::Pi, "api.anthropic.com")];
-        project.terminals = vec![crate::cage::Terminal {
+        cage.logins = vec![login::secret(AgentKind::Pi, "api.anthropic.com")];
+        session.terminals = vec![crate::session::TerminalRecord {
             id: "t".into(),
-            kind: SessionKind::Agent { agent: AgentKind::Gemini, resume: false },
+            kind: TerminalKind::Agent { agent: AgentKind::Gemini, resume: false },
         }];
-        project.network.rules = vec![
+        cage.network.rules = vec![
             Rule::new(Target::Service { id: "anthropic".into() }, Action::Allow),
             Rule::new(host("registry.npmjs.org"), Action::Allow),
             Rule::new(Target::Service { id: "openai".into() }, Action::Block),
         ];
         let need = |agent, service, host: &str, allowed| AgentNeed { agent, service, host: host.into(), allowed };
         assert_eq!(
-            agent_needs(&project),
+            agent_needs(Bound { session: &session, cage: &cage }),
             [
                 need(AgentKind::Codex, "openai", "api.openai.com", false),
                 need(AgentKind::Pi, "anthropic", "api.anthropic.com", true),

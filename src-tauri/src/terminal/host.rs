@@ -15,7 +15,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
-use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput, SessionKind};
+use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput, TerminalKind};
 
 /// How long the exit waits for the last output after the shell exits. A
 /// background job can keep the terminal open after its shell has exited.
@@ -144,7 +144,7 @@ fn fallback_lang(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
 pub(crate) fn open_host_pty(folder: &Path, rows: u16, cols: u16) -> Result<(Pty, HostGroup)> {
     let pair =
         native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(pty_error)?;
-    let mut command = CommandBuilder::from_argv(SessionKind::Host.argv().into_iter().map(Into::into).collect());
+    let mut command = CommandBuilder::from_argv(TerminalKind::Host.argv().into_iter().map(Into::into).collect());
     command.cwd(folder);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");

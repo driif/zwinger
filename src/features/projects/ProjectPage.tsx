@@ -16,8 +16,9 @@ import {
   AGENT_NAMES,
   AgentKind,
   PaneNode,
-  SessionKind,
-  ProjectView,
+  CageView,
+  SessionView,
+  TerminalKind,
 } from "../../shared/api";
 import { time } from "../settings/HostAgentsSettings";
 import { decide, useCatalog } from "../network/network";
@@ -43,27 +44,27 @@ const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
   gemini: "cloudcode-pa.googleapis.com",
 };
 
-/** The step that adds a host agent to the project, or changes or removes it. */
-function AddAgent({ project, detection, kind, run, onDone }: {
-  project: ProjectView;
+/** The step that adds a host agent to the cage, or changes or removes it. */
+function AddAgent({ cage, detection, kind, run, onDone }: {
+  cage: CageView;
   detection: Detection;
   kind: AgentKind;
   run: Run;
   onDone: () => void;
 }) {
   const agent = detection.agents.find((a) => a.kind === kind);
-  const current = project.hostAgents.find((a) => a.kind === kind);
+  const current = cage.hostAgents.find((a) => a.kind === kind);
   const catalog = useCatalog();
   const canLogin = agent?.login.state === "found";
   const [profile, setProfile] = useState(current?.profile ?? agent?.profile === true);
   const [login, setLogin] = useState(current?.login ?? canLogin);
   const host = LOGIN_HOSTS[kind];
-  const blocked = host === undefined || !decide(project.network, host, catalog).allowed;
+  const blocked = host === undefined || !decide(cage.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
   if (!agent) return null;
   const name = AGENT_NAMES[kind];
   const save = () =>
-    run(() => putHostAgent(project.id, { kind, profile, login }, login && blocked && allow).then(onDone));
+    run(() => putHostAgent(cage.id, { kind, profile, login }, login && blocked && allow).then(onDone));
 
   return (
     <Card variant="outlined" padding="md">
@@ -101,7 +102,7 @@ function AddAgent({ project, detection, kind, run, onDone }: {
         )}
         <div className="row end">
           {current && (
-            <Button variant="danger" onClick={() => run(() => removeHostAgent(project.id, kind).then(onDone))}>
+            <Button variant="danger" onClick={() => run(() => removeHostAgent(cage.id, kind).then(onDone))}>
               Remove
             </Button>
           )}
@@ -123,8 +124,9 @@ const TABS = [
 ];
 
 interface Props {
-  project: ProjectView;
-  /** The project's network events, oldest first. */
+  session: SessionView;
+  cage: CageView;
+  /** The cage's network events, oldest first. */
   events: NetEvent[];
   view: View;
   onView: (view: View) => void;
@@ -144,7 +146,7 @@ interface Props {
   /** The runs of the project's tasks. */
   runs: RunSummary[];
   onRunsChange: () => void;
-  /** Reads the projects again. Resolves when the new state is set. */
+  /** Reads the sessions again. Resolves when the new state is set. */
   onRefresh: () => Promise<unknown>;
   panes: Pane[];
   /** The focused pane of this project. */
@@ -152,7 +154,7 @@ interface Props {
   run: Run;
   onToggle: () => void;
   /** `agent` opens the project's first agent. */
-  onNewSession: (kind: SessionKind | "agent") => void;
+  onNewSession: (kind: TerminalKind | "agent") => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
   onFocus: (key: string) => void;
@@ -174,7 +176,8 @@ interface Props {
 
 // Not keyed by project: the terminal view keeps the panes of every project attached.
 export function ProjectPage({
-  project,
+  session,
+  cage,
   events,
   view,
   onView,
@@ -200,14 +203,14 @@ export function ProjectPage({
   onEditorSettings,
   ...terminal
 }: Props) {
-  const { status } = project;
+  const { status } = cage;
   const [listed, setListed] = useState<{ id: string; folders: string[] }>();
   const [reloads, setReloads] = useState(0);
   /** The host notices that the user dismissed in the current running period of a project. */
-  const [dismissed, setDismissed] = useState<{ project: string; notices: string[] }>();
-  if (dismissed?.project === project.id && status.state !== "running") setDismissed(undefined);
-  const hidden = dismissed?.project === project.id ? dismissed.notices : [];
-  const folders = listed?.id === project.id ? listed.folders : undefined;
+  const [dismissed, setDismissed] = useState<{ session: string; notices: string[] }>();
+  if (dismissed?.session === session.id && status.state !== "running") setDismissed(undefined);
+  const hidden = dismissed?.session === session.id ? dismissed.notices : [];
+  const folders = listed?.id === session.id ? listed.folders : undefined;
   // The tab that shows again after a terminal or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
@@ -217,12 +220,12 @@ export function ProjectPage({
   // Folders change outside the app, so the list reloads on focus and after each edit.
   useEffect(() => {
     let live = true;
-    const id = project.id;
+    const id = session.id;
     listFolders(id).then((folders) => live && setListed({ id, folders }), () => {});
     return () => {
       live = false;
     };
-  }, [project.id, reloads]);
+  }, [session.id, reloads]);
 
   useEffect(() => {
     const reload = () => setReloads((n) => n + 1);
@@ -239,11 +242,11 @@ export function ProjectPage({
     );
 
   const running = status.state === "running" || status.state === "stopping";
-  const sessions = project.sessions.filter((s) => s.exitCode === null).length;
+  const sessions = session.processes.filter((s) => s.exitCode === null).length;
   const jump = (kind: TabView) => onView({ kind });
-  const unverified = [...(project.folderId ? [] : [project.folder]), ...project.mounts.filter((m) => !m.id).map((m) => m.host)];
-  const task = view.kind === "task" ? project.tasks.find((t) => t.id === view.taskId) : undefined;
-  const actions = launchActions(project, editors);
+  const unverified = [...(session.folderId ? [] : [session.folder]), ...cage.mounts.filter((m) => !m.id).map((m) => m.host)];
+  const task = view.kind === "task" ? session.tasks.find((t) => t.id === view.taskId) : undefined;
+  const actions = launchActions(cage, editors);
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
   const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
@@ -252,7 +255,7 @@ export function ProjectPage({
     <section className="page">
       <header className="page-header row">
         <div className="grow">
-          <h1 className="page-title">{project.name}</h1>
+          <h1 className="page-title">{session.name}</h1>
           <p className="muted row">
             <span className={`dot ${status.state}`} />
             {status.state === "error" ? (
@@ -262,9 +265,9 @@ export function ProjectPage({
             ) : (
               status.state
             )}
-            {status.state === "running" && project.loginExpiresAt !== null && <span>· login valid until {time(project.loginExpiresAt)}</span>}
+            {status.state === "running" && cage.loginExpiresAt !== null && <span>· login valid until {time(cage.loginExpiresAt)}</span>}
           </p>
-          <CopyField className="mono" value={project.folder} display={tildePath(project.folder, home)} title={project.folder} />
+          <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
         </div>
         <SplitLaunch
           label="New terminal"
@@ -275,7 +278,7 @@ export function ProjectPage({
             ...launchMenu(newTerminals, onLaunch),
             // Host agents are set up here, next to the agents that they add.
             ...(detection?.agents ?? []).map((agent) => ({
-              label: `${project.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+              label: `${cage.hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
               icon: <Plus size={14} />,
               run: () => onAdding(agent.kind),
             })),
@@ -305,14 +308,14 @@ export function ProjectPage({
         </Button>
       </header>
       {adding && detection && (
-        <AddAgent key={adding} project={project} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
+        <AddAgent key={adding} cage={cage} detection={detection} kind={adding} run={run} onDone={() => onAdding(undefined)} />
       )}
       <div className="notices">
         {unverified.length > 0 && (
           <Notice
             icon={<TriangleAlert size={14} className="warn" />}
             actions={
-              <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(project.id).then(onRefresh))}>
+              <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(session.id).then(onRefresh))}>
                 Confirm folders
               </Button>
             }
@@ -322,25 +325,25 @@ export function ProjectPage({
           </Notice>
         )}
         {status.state === "running" &&
-          project.hostNotices
+          cage.hostNotices
             .filter((notice) => !hidden.includes(notice))
             .map((notice) => (
               <Notice
                 key={notice}
                 icon={<Info size={14} className="muted" />}
-                onDismiss={() => setDismissed({ project: project.id, notices: [...hidden, notice] })}
+                onDismiss={() => setDismissed({ session: session.id, notices: [...hidden, notice] })}
               >
                 {notice}
               </Notice>
             ))}
         {status.state === "running" &&
-          project.guestLogins.map((agent) => (
+          cage.guestLogins.map((agent) => (
             <Notice
               key={agent}
               icon={<TriangleAlert size={14} className="warn" />}
               actions={
                 <>
-                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(project.id, agent).then(onRefresh))}>
+                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(cage.id, agent).then(onRefresh))}>
                     Remove it
                   </Button>
                   <Button size="sm" variant="outline" onClick={onHostAgents}>
@@ -364,7 +367,7 @@ export function ProjectPage({
           panels={{
             overview: (
               <div className="overview">
-                {project.terminals.length === 0 && (
+                {session.terminals.length === 0 && (
                   <Notice
                     icon={<Info size={14} className="muted" />}
                     actions={
@@ -378,15 +381,16 @@ export function ProjectPage({
                       </>
                     }
                   >
-                    {project.hostAgents.length === 0 && detection && detection.agents.length > 0
+                    {cage.hostAgents.length === 0 && detection && detection.agents.length > 0
                       ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
                       : "Next: open an agent, or a shell on this Mac in the project folder."}
                   </Notice>
                 )}
                 <Suspense>
                   <ProjectMap
-                    key={project.id}
-                    project={project}
+                    key={session.id}
+                    session={session}
+                    cage={cage}
                     folders={folders}
                     events={events}
                     visible={isTab && tab === "overview"}
@@ -398,25 +402,25 @@ export function ProjectPage({
                 <dl className="facts">
                   <div>
                     <dt>Agent starts in</dt>
-                    <dd className="mono">{project.harness ?? "/workspace"}</dd>
+                    <dd className="mono">{session.harness ?? "/workspace"}</dd>
                   </div>
                   <div>
                     <dt>Network</dt>
                     <dd>
-                      {project.network.offline
+                      {cage.network.offline
                         ? "Offline"
-                        : `${project.network.default === "allow" ? "Allow" : "Block"} everything else, ${project.network.rules.length} rules`}
+                        : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
                     </dd>
                   </div>
                   <div>
                     <dt>Sessions</dt>
                     <dd>{sessions}</dd>
                   </div>
-                  {project.hostAgents.length > 0 && (
+                  {cage.hostAgents.length > 0 && (
                     <div>
                       <dt>From this Mac</dt>
                       <dd>
-                        {project.hostAgents
+                        {cage.hostAgents
                           .map((a) => [AGENT_NAMES[a.kind], a.profile && "profile", a.login && "login"].filter(Boolean).join(" + "))
                           .join(", ")}
                       </dd>
@@ -427,8 +431,9 @@ export function ProjectPage({
             ),
             network: (
               <NetworkTab
-                key={project.id}
-                project={project}
+                key={session.id}
+                session={session}
+                cage={cage}
                 events={events}
                 run={edit}
                 intent={tab === "network" ? intent : undefined}
@@ -439,8 +444,9 @@ export function ProjectPage({
             ),
             settings: (
               <SettingsTab
-                key={project.id}
-                project={project}
+                key={session.id}
+                session={session}
+                cage={cage}
                 folders={folders ?? []}
                 runtimes={runtimes}
                 run={edit}
@@ -456,7 +462,8 @@ export function ProjectPage({
             <TaskRoom
               key={task.id}
               kind="task"
-              project={project}
+              session={session}
+              cage={cage}
               task={task}
               runs={runs.filter((r) => r.taskId === task.id)}
               run={view.run}
@@ -472,7 +479,8 @@ export function ProjectPage({
         <div className="view task-view">
           <TaskDialog
             key={view.taskId ?? "new"}
-            project={project}
+            session={session}
+            cage={cage}
             taskId={view.taskId}
             onDone={async (taskId) => {
               // The tree and the task view need the saved task.
@@ -484,7 +492,8 @@ export function ProjectPage({
       )}
       <div className="view" hidden={view.kind !== "terminal"}>
         <TerminalTab
-          project={project}
+          session={session}
+          cage={cage}
           panes={panes}
           focused={focused}
           editor={defaultEditor?.editor.name}

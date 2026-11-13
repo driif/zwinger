@@ -1,24 +1,25 @@
 import { Button, Card, CardBody, CardFooter, CardHeader, FloatingField, SegmentedControl, Textarea } from "@driif/motiv";
 import { FormEvent, useState } from "react";
 import { putTask } from "./api";
-import { AGENT_NAMES, AgentKind, ProjectView, TaskAgent } from "../../shared/api";
+import { AGENT_NAMES, AgentKind, CageView, SessionView, TaskAgent } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
 
 const KINDS: AgentKind[] = ["claude", "codex", "pi"];
 /** Gemini CLI runs only from this Mac. */
-const kinds = (project: ProjectView): AgentKind[] =>
-  project.hostAgents.some((a) => a.kind === "gemini") ? [...KINDS, "gemini"] : KINDS;
+const kinds = (cage: CageView): AgentKind[] =>
+  cage.hostAgents.some((a) => a.kind === "gemini") ? [...KINDS, "gemini"] : KINDS;
 
 interface Props {
-  project: ProjectView;
+  session: SessionView;
+  cage: CageView;
   /** No `taskId` adds a task. */
   taskId?: string;
   onDone: (taskId?: string) => Promise<void>;
 }
 
 /** The form of a new or changed task. */
-export function TaskDialog({ project, taskId, onDone }: Props) {
-  const task = project.tasks.find((t) => t.id === taskId);
+export function TaskDialog({ session, cage, taskId, onDone }: Props) {
+  const task = session.tasks.find((t) => t.id === taskId);
   const [title, setTitle] = useState(task?.title ?? "");
   const [request, setRequest] = useState(task?.request ?? "");
   const [agents, setAgents] = useState<[TaskAgent, TaskAgent]>(
@@ -28,7 +29,7 @@ export function TaskDialog({ project, taskId, onDone }: Props) {
     ],
   );
   const [gates, setGates] = useState(task?.gates.join("\n") ?? "");
-  const [workdir, setWorkdir] = useState(task?.workdir ?? project.harness ?? "/workspace");
+  const [workdir, setWorkdir] = useState(task?.workdir ?? session.harness ?? "/workspace");
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const sameKind = agents[0].kind === agents[1].kind;
@@ -45,7 +46,7 @@ export function TaskDialog({ project, taskId, onDone }: Props) {
     setError(undefined);
     setSaving(true);
     try {
-      const id = await putTask(project.id, {
+      const id = await putTask(session.id, {
         id: taskId,
         title,
         request,
@@ -75,7 +76,7 @@ export function TaskDialog({ project, taskId, onDone }: Props) {
             <div key={index} className="row">
               <SegmentedControl
                 label={index === 0 ? "First agent (decides a tiebreak)" : "Second agent"}
-                options={kinds(project).map((kind) => ({ value: kind, label: AGENT_NAMES[kind] }))}
+                options={kinds(cage).map((kind) => ({ value: kind, label: AGENT_NAMES[kind] }))}
                 value={agents[index].kind}
                 onChange={(kind) => setAgent(index, { kind: kind as AgentKind })}
               />

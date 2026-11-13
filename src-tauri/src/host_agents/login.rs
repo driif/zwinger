@@ -101,7 +101,7 @@ fn copilot_endpoint(access: &str) -> Option<(String, usize)> {
 }
 
 /// The refresh hosts that the network policy denies: the ones of the
-/// providers of the project's host logins.
+/// providers of the cage's host logins.
 pub fn denied_hosts(secrets: &[Secret]) -> Vec<&'static str> {
     let mut denied = Vec::new();
     for secret in secrets.iter().filter(|s| matches!(s.origin, Origin::HostLogin { .. })) {
@@ -437,7 +437,7 @@ pub fn secret(kind: AgentKind, host: &str) -> Secret {
     }
 }
 
-/// A file of a guest login, below the project's state dir.
+/// A file of a guest login, below the VM's state dir.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GuestFile {
     /// The folders below the state dir.
@@ -605,7 +605,7 @@ mod tests {
         let doc = json!({
             "openai": { "type": "api_key", "key": "sk-1" },
             "github-copilot": { "type": "oauth", "refresh": "gho-secret", "access": "tid-secret", "expires": NOW + 1000, "availableModelIds": ["gpt-5"], "extra": "x-secret" },
-            "google-gemini-cli": { "type": "oauth", "refresh": "g-r", "access": "g-a", "expires": NOW + 1000, "projectId": "p-1" },
+            "google-gemini-cli": { "type": "oauth", "refresh": "g-r", "access": "g-a", "expires": NOW + 1000 },
         });
         let token = parse(AgentKind::Pi, &doc.to_string()).unwrap();
         assert_eq!((token.access.expose(), token.host.as_str()), ("tid-secret", "api.individual.githubcopilot.com"));

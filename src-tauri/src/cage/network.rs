@@ -36,8 +36,8 @@ pub struct NetTest {
 
 impl<R: SandboxRuntime> Manager<R> {
     pub fn list_net_events(&self, id: &str) -> Result<Vec<Entry>> {
-        let mut state = lock(&self.state);
-        state.project_mut(id)?;
+        let state = lock(&self.state);
+        state.cage(id)?;
         Ok(state.net.get(id).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
     }
 
@@ -45,8 +45,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// uses the new policy from its next request.
     pub(crate) fn edit_network<T>(&self, id: &str, edit: impl FnOnce(&mut NetworkPolicy) -> Result<T>) -> Result<T> {
         let mut out = None;
-        self.edit(id, |s| {
-            out = Some(edit(&mut s.network)?);
+        self.edit_cage(id, |c, _| {
+            out = Some(edit(&mut c.network)?);
             Ok(())
         })?;
         self.publish(id, None);
@@ -58,10 +58,10 @@ impl<R: SandboxRuntime> Manager<R> {
     pub(crate) fn publish(&self, id: &str, value: Option<(&str, SecretValue)>) {
         let state = lock(&self.state);
         if let Some(live) = state.live.get(id)
-            && let Some(project) = state.projects.iter().find(|s| s.id == id)
+            && let Ok(cage) = state.cage(id)
         {
             live.edit(|policy, values| {
-                *policy = project.network.clone();
+                *policy = cage.network.clone();
                 if let Some((name, value)) = value {
                     values.insert(name.to_owned(), value);
                 }
@@ -96,12 +96,11 @@ impl<R: SandboxRuntime> Manager<R> {
         self.drop_unused(id, removed.credentials.iter().map(|c| c.name.as_str()))
     }
 
-    /// Deletes the values of `names` that no credential of the project uses.
+    /// Deletes the values of `names` that no credential of the cage uses.
     pub(crate) fn drop_unused<'a>(&self, id: &str, names: impl Iterator<Item = &'a str>) -> Result<()> {
         let (used, live) = {
-            let mut state = lock(&self.state);
-            let used: Vec<String> =
-                state.project_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
+            let state = lock(&self.state);
+            let used: Vec<String> = state.cage(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
             (used, state.live.get(id).cloned())
         };
         let mut result = Ok(());
@@ -162,10 +161,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.settle(id, &name)?;
         let is_new = {
             let state = lock(&self.state);
-            let mut project = state.projects.iter().find(|s| s.id == id).ok_or(Error::ProjectNotFound)?.clone();
-            let is_new = !project.network.credentials().iter().any(|c| c.name == name);
-            put(&mut project.network)?;
-            project.check()?;
+            let mut cage = state.cage(id)?.clone();
+            let is_new = !cage.network.credentials().iter().any(|c| c.name == name);
+            put(&mut cage.network)?;
+            cage.check()?;
             is_new
         };
         let prior = self.vault.get(id, &name)?;
@@ -182,7 +181,7 @@ impl<R: SandboxRuntime> Manager<R> {
             self.restore_value(id, &name, prior.as_ref());
             return Err(e);
         }
-        if let Err(e) = self.edit(id, |s| put(&mut s.network)) {
+        if let Err(e) = self.edit_cage(id, |c, _| put(&mut c.network)) {
             self.restore_value(id, &name, prior.as_ref());
             return Err(e);
         }
@@ -191,12 +190,12 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// The names of the project's credentials that have a stored value.
+    /// The names of the cage's credentials that have a stored value.
     /// Returns no values.
     pub fn stored_credentials(&self, id: &str) -> Result<Vec<String>> {
         let names: BTreeSet<String> = {
-            let mut state = lock(&self.state);
-            state.project_mut(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect()
+            let state = lock(&self.state);
+            state.cage(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect()
         };
         let accounts: HashSet<String> = self.vault.accounts()?.into_iter().collect();
         Ok(names.into_iter().filter(|name| accounts.contains(&secrets::account(id, name))).collect())
@@ -415,16 +414,16 @@ mod tests {
             (DefaultAction::Allow, true, rule.as_str())
         );
         assert_eq!(policy.rules[0].target, Target::Host { host: "registry.npmjs.org".into() });
-        assert!(!manager.list()[0].pending_restart);
+        assert!(!manager.list().cages[0].pending_restart);
 
         // A new credential name needs its placeholder variable in the guest.
         manager.set_rule_credential(&id, &rule, "NPM_TOKEN", bearer(), Some(SecretValue::new("t"))).unwrap();
-        assert!(manager.list()[0].pending_restart);
+        assert!(manager.list().cages[0].pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["NPM_TOKEN"], SecretValue::new("t"));
         manager.stop(&id).await.unwrap();
         assert!(lock(&manager.state).live.is_empty());
         manager.start(&id).await.unwrap();
-        assert!(!manager.list()[0].pending_restart);
+        assert!(!manager.list().cages[0].pending_restart);
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("NPM_TOKEN".to_owned(), "$MSB_NPM_TOKEN$".to_owned())));
         assert!(!net.env.iter().any(|(_, v)| v == "t"));
@@ -440,10 +439,10 @@ mod tests {
             manager.put_rule(&id, host_rule("https://example.com", Action::Allow)),
             Err(Error::InvalidDomain(..))
         ));
-        assert!(matches!(manager.put_rule("nope", host_rule("a.io", Action::Allow)), Err(Error::ProjectNotFound)));
+        assert!(matches!(manager.put_rule("nope", host_rule("a.io", Action::Allow)), Err(Error::CageNotFound)));
         manager.remove_rule(&id, &first).unwrap();
         assert!(matches!(manager.remove_rule(&id, &first), Err(Error::RuleNotFound)));
-        let rules = manager.list()[0].project.network.rules.clone();
+        let rules = manager.list().cages[0].cage.network.rules.clone();
         assert_eq!(rules.iter().map(|r| r.label()).collect::<Vec<_>>(), ["*.anthropic.com"]);
     }
 
@@ -452,12 +451,12 @@ mod tests {
         let (manager, runtime, id, vault) = manager_with_vault();
         credential(&manager, &id, "api.openai.com", " OPENAI_API_KEY ", Some("sk-hidden")).unwrap();
         assert_eq!(stored(&vault, &id, "OPENAI_API_KEY").as_deref(), Some("sk-hidden"));
-        let rules = manager.list()[0].project.network.rules.clone();
+        let rules = manager.list().cages[0].cage.network.rules.clone();
         assert_eq!(rules[0].credentials[0].name, "OPENAI_API_KEY");
 
-        let config = std::fs::read_to_string(manager.store.path()).unwrap();
-        let projects = serde_json::to_string(&manager.list()).unwrap();
-        for text in [config, projects] {
+        let config = std::fs::read_to_string(manager.store.cages_path()).unwrap();
+        let listing = serde_json::to_string(&manager.list()).unwrap();
+        for text in [config, listing] {
             assert!(text.contains("OPENAI_API_KEY") && !text.contains("sk-hidden"), "{text}");
         }
 
@@ -477,20 +476,20 @@ mod tests {
         };
         assert!(matches!(set("KEY", bearer(), None), Err(Error::SecretValueRequired(_))));
         assert!(matches!(set("KEY", bearer(), value("")), Err(Error::SecretValueRequired(_))));
-        assert!(manager.list()[0].project.network.rules[0].credentials.is_empty());
+        assert!(manager.list().cages[0].cage.network.rules[0].credentials.is_empty());
 
         set("KEY", bearer(), value("v1")).unwrap();
         let replace = Inject::Replace {
             places: secrets::Places { header_fields: vec!["x-api-key".into()], query: false, body: false },
         };
         set("KEY", Some(replace.clone()), None).unwrap();
-        assert_eq!(manager.list()[0].project.network.rules[0].credentials[0].inject, replace);
+        assert_eq!(manager.list().cages[0].cage.network.rules[0].credentials[0].inject, replace);
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
 
         assert!(matches!(set("PATH", bearer(), value("x")), Err(Error::InvalidSecret(..))));
         assert!(matches!(
             manager.set_rule_credential("nope", &rule, "KEY", bearer(), value("x")),
-            Err(Error::ProjectNotFound)
+            Err(Error::CageNotFound)
         ));
         let wildcard = manager.put_rule(&id, host_rule("*.b.io", Action::Allow)).unwrap();
         assert!(matches!(
@@ -508,7 +507,7 @@ mod tests {
                 RuleDraft { id: Some(rule), target: Target::Host { host: "a.io".into() }, action: Action::Block },
             )
             .unwrap();
-        assert_eq!(manager.list()[0].project.network.rules[0].credentials.len(), 1);
+        assert_eq!(manager.list().cages[0].cage.network.rules[0].credentials.len(), 1);
     }
 
     #[test]
@@ -524,7 +523,7 @@ mod tests {
         let error = manager.set_rule_credential(&id, &rule, "NEW", bearer(), value("fresh")).unwrap_err();
         assert!(!error.to_string().contains("fresh"));
         assert_eq!(stored(&vault, &id, "NEW"), None);
-        let names: Vec<_> = manager.list()[0].project.network.credentials().iter().map(|c| c.name.clone()).collect();
+        let names: Vec<_> = manager.list().cages[0].cage.network.credentials().iter().map(|c| c.name.clone()).collect();
         assert_eq!(names, ["OLD"]);
     }
 
@@ -544,13 +543,13 @@ mod tests {
         break_store(&manager);
         assert!(manager.remove_rule(&id, &b).is_err());
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v"));
-        assert_eq!(manager.list()[0].project.network.credentials().len(), 1);
+        assert_eq!(manager.list().cages[0].cage.network.credentials().len(), 1);
 
-        let path = manager.store.path().to_owned();
+        let path = manager.store.cages_path();
         std::fs::remove_dir_all(&path).unwrap();
         manager.remove_rule(&id, &b).unwrap();
         assert_eq!(stored(&vault, &id, "KEY"), None);
-        assert!(manager.list()[0].project.network.credentials().is_empty());
+        assert!(manager.list().cages[0].cage.network.credentials().is_empty());
     }
 
     #[tokio::test]
@@ -561,13 +560,13 @@ mod tests {
         manager.start(&id).await.unwrap();
 
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
-        assert!(!manager.list()[0].pending_restart);
+        assert!(!manager.list().cages[0].pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
 
         // The guest still has the placeholder variable of a removed name.
         manager.set_rule_credential(&id, &rule, "KEY", None, None).unwrap();
         assert!(!live(&manager, &id).snapshot().values.contains_key("KEY"));
-        assert!(manager.list()[0].pending_restart);
+        assert!(manager.list().cages[0].pending_restart);
     }
 
     #[tokio::test]
@@ -584,12 +583,12 @@ mod tests {
             async move { manager.start(&id).await }
         });
         gate.entered.notified().await;
-        assert!(matches!(manager.list()[0].status, Status::Starting { .. }));
+        assert!(matches!(manager.list().cages[0].status, Status::Starting { .. }));
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
         gate.release.notify_one();
 
         starting.await.unwrap().unwrap();
-        let view = &manager.list()[0];
+        let view = &manager.list().cages[0];
         assert_eq!(view.status, Status::Running);
         assert!(!view.pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
@@ -602,8 +601,7 @@ mod tests {
         let vault = Arc::new(GatedVault::default());
         let runtime = FakeRuntime::default();
         let manager = Arc::new(
-            Manager::new(runtime.clone(), Store::new(dir.join("projects.json")), vault.clone(), temp_dir(), host())
-                .unwrap(),
+            Manager::new(runtime.clone(), Store::new(dir.clone()), vault.clone(), temp_dir(), host()).unwrap(),
         );
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         let rule = allow(&manager, &id, "a.io");
@@ -629,7 +627,7 @@ mod tests {
         starting.await.unwrap().unwrap();
 
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
-        let view = &manager.list()[0];
+        let view = &manager.list().cages[0];
         assert_eq!(view.status, Status::Running);
         assert!(!view.pending_restart);
     }
@@ -645,10 +643,10 @@ mod tests {
         *vault.writes_left.lock().unwrap() = Some(1);
         assert!(manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v2")).is_err());
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v2"));
-        std::fs::remove_dir_all(manager.store.path()).unwrap();
+        std::fs::remove_dir_all(manager.store.cages_path()).unwrap();
 
         assert!(matches!(manager.start(&id).await, Err(Error::Vault(_))));
-        assert_eq!(manager.list()[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].status, Status::Stopped);
         assert!(matches!(manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")), Err(Error::Vault(_))));
 
         // The vault works again: the next start restores v1 for the old hosts.
@@ -665,10 +663,7 @@ mod tests {
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v1")).unwrap();
 
         vault.fail_after_write.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(matches!(
-            manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")),
-            Err(Error::Vault(_))
-        ));
+        assert!(matches!(manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")), Err(Error::Vault(_))));
         assert_eq!(stored(&vault, &id, "KEY").as_deref(), Some("v1"));
     }
 
@@ -682,10 +677,10 @@ mod tests {
         // A value from before the file vault: the config has the name, the vault has no value.
         vault.delete(&id, "B").unwrap();
         assert_eq!(manager.stored_credentials(&id).unwrap(), ["A"]);
-        assert!(matches!(manager.stored_credentials("nope"), Err(Error::ProjectNotFound)));
+        assert!(matches!(manager.stored_credentials("nope"), Err(Error::CageNotFound)));
 
         // An old name needs a value again.
-        let b = manager.list()[0].project.network.rules[1].id.clone();
+        let b = manager.list().cages[0].cage.network.rules[1].id.clone();
         assert!(matches!(
             manager.set_rule_credential(&id, &b, "B", bearer(), None),
             Err(Error::SecretValueRequired(n)) if n == "B"

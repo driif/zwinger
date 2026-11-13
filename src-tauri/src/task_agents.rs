@@ -12,8 +12,8 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
-use crate::cage::TaskAgent;
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
+use crate::session::TaskAgent;
 
 /// How long a killed process has to exit.
 const KILL_WAIT: Duration = Duration::from_secs(10);

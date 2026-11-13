@@ -1,13 +1,18 @@
 import { listen } from "@tauri-apps/api/event";
-import { call, Pos, ProjectView, StartPhase, Workspace } from "../../shared/api";
+import { CageView, call, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
 
-export const listProjects = () => call<ProjectView[]>("list_projects");
+export interface Sessions {
+  sessions: SessionView[];
+  cages: CageView[];
+}
+
+export const listSessions = () => call<Sessions>("list_sessions");
 
 /** No `workspace`: the first workspace. */
-export const createProject = (folder: string, workspace?: string) =>
-  call<string>("create_project", { folder, workspace });
+export const createSession = (folder: string, workspace?: string) =>
+  call<string>("create_session", { folder, workspace });
 
-export const deleteProject = (id: string) => call<void>("delete_project", { id });
+export const deleteSession = (sessionId: string) => call<void>("delete_session", { sessionId });
 
 export const listWorkspaces = () => call<Workspace[]>("list_workspaces");
 
@@ -21,36 +26,36 @@ export const renameWorkspace = (id: string, name: string) =>
 /** Only an empty workspace that is not the last one. */
 export const deleteWorkspace = (id: string) => call<void>("delete_workspace", { id });
 
-/** The workspaces in order, each with its sessions in order. Must name each workspace and each project once. */
+/** The workspaces in order, each with its sessions in order. Must name each workspace and each session once. */
 export const arrangeWorkspaces = (workspaces: Pick<Workspace, "id" | "sessions">[]) =>
   call<void>("arrange_workspaces", { workspaces });
 
 /** `null` restores the auto layout. */
-export const setLayout = (id: string, layout: Record<string, Pos> | null) =>
-  call<void>("set_layout", { id, layout });
+export const setLayout = (sessionId: string, layout: Record<string, Pos> | null) =>
+  call<void>("set_layout", { sessionId, layout });
 
 /** The canonical folder of a host path: a link resolves to its target. */
 export const resolveFolder = (path: string) =>
   call<string>("resolve_folder", { path });
 
-export const renameProject = (id: string, name: string) =>
-  call<void>("rename_project", { id, name });
+export const renameSession = (sessionId: string, name: string) =>
+  call<void>("rename_session", { sessionId, name });
 
-export const startCage = (id: string) => call<void>("start_cage", { id });
+export const startCage = (cageId: string) => call<void>("start_cage", { cageId });
 
-export const stopCage = (id: string) => call<void>("stop_cage", { id });
+export const stopCage = (cageId: string) => call<void>("stop_cage", { cageId });
 
 /** The user confirms the folders that are not verified since the update. */
-export const confirmPaths = (id: string) => call<void>("confirm_paths", { id });
+export const confirmPaths = (sessionId: string) => call<void>("confirm_paths", { sessionId });
 
 /** Resolves to the function that stops the listener. */
-export const onGuestLogin = (handler: (projectId: string) => void) =>
+export const onGuestLogin = (handler: (cageId: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));
 
 /** Each phase change of a cage start. Resolves to the function that stops the listener. */
-export const onStartProgress = (handler: (projectId: string, phase: StartPhase) => void) =>
-  listen<{ projectId: string; phase: StartPhase; elapsedMs: number }>("cage-start-progress", ({ payload }) =>
-    handler(payload.projectId, payload.phase),
+export const onStartProgress = (handler: (cageId: string, phase: StartPhase) => void) =>
+  listen<{ cageId: string; phase: StartPhase; elapsedMs: number }>("cage-start-progress", ({ payload }) =>
+    handler(payload.cageId, payload.phase),
   );
 
 /** Each notice comes once, such as the VMs that the app start removed. */

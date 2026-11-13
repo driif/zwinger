@@ -1,27 +1,27 @@
 import { Channel } from "@tauri-apps/api/core";
 import { AgentKind, call, HostAgentUse } from "../../shared/api";
 
-export const setHarness = (id: string, harness: string | null) =>
-  call<void>("set_harness", { id, harness });
+export const setHarness = (sessionId: string, harness: string | null) =>
+  call<void>("set_harness", { sessionId, harness });
 
-export const listFolders = (id: string) =>
-  call<string[]>("list_folders", { id });
+export const listFolders = (sessionId: string) =>
+  call<string[]>("list_folders", { sessionId });
 
 export const addMount = (
-  id: string,
+  cageId: string,
   host: string,
   guest: string,
   readonly: boolean,
-) => call<void>("add_mount", { id, host, guest, readonly });
+) => call<void>("add_mount", { cageId, host, guest, readonly });
 
-export const removeMount = (id: string, guest: string) =>
-  call<void>("remove_mount", { id, guest });
+export const removeMount = (cageId: string, guest: string) =>
+  call<void>("remove_mount", { cageId, guest });
 
 export const setMountReadonly = (
-  id: string,
+  cageId: string,
   guest: string,
   readonly: boolean,
-) => call<void>("set_mount_readonly", { id, guest, readonly });
+) => call<void>("set_mount_readonly", { cageId, guest, readonly });
 
 /** The agents that zwinger downloads on first use. pi is bundled. */
 export type RuntimeName = "claude" | "codex";
@@ -56,7 +56,7 @@ export function installRuntime(
   });
 }
 
-/** Where a project's copy of a host agent comes from. */
+/** Where a cage's copy of a host agent comes from. */
 export type RuntimeSource = "host" | "cached" | "pinned";
 
 export type LoginState =
@@ -91,22 +91,22 @@ export const detectHostAgents = () => call<Detection>("detect_host_agents");
 
 /** `allowHosts` also adds an Allow rule for the login's provider host. Applies on the next start. */
 export const putHostAgent = (
-  id: string,
+  cageId: string,
   agent: HostAgentUse,
   allowHosts: boolean,
-) => call<void>("put_host_agent", { id, agent, allowHosts });
+) => call<void>("put_host_agent", { cageId, agent, allowHosts });
 
 /** Also removes its host login. */
-export const removeHostAgent = (id: string, agent: AgentKind) =>
-  call<void>("remove_host_agent", { id, agent });
+export const removeHostAgent = (cageId: string, agent: AgentKind) =>
+  call<void>("remove_host_agent", { cageId, agent });
 
 /** Needs no restart: the running cage gets new agent commands at once. */
-export const setAgentsUnprompted = (id: string, on: boolean) =>
-  call<void>("set_agents_unprompted", { id, on });
+export const setAgentsUnprompted = (cageId: string, on: boolean) =>
+  call<void>("set_agents_unprompted", { cageId, on });
 
 /** Deletes the agent's login that was made in the guest. */
-export const removeGuestLogin = (id: string, agent: AgentKind) =>
-  call<void>("remove_guest_login", { id, agent });
+export const removeGuestLogin = (cageId: string, agent: AgentKind) =>
+  call<void>("remove_guest_login", { cageId, agent });
 
 /** Stops the download. The install then fails with a cancel error. */
 export const cancelRuntimeInstall = (name: RuntimeName) =>

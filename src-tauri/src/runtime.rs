@@ -10,7 +10,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
-use crate::cage::{Project, WORKSPACE};
+use crate::cage::{Bound, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::netlog;
 use crate::runtimes::Installed;
@@ -40,18 +40,18 @@ const SIGTERM: i32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum SessionKind {
+pub enum TerminalKind {
     /// A login shell in the VM. The UI calls it "VM shell"; the name stays
     /// `shell`, so saved terminals load.
     Shell,
-    /// The user's login shell on the Mac, unsandboxed, in the project's folder.
+    /// The user's login shell on the Mac, unsandboxed, in the session folder.
     Host,
     /// The agent's own TUI, through its wrapper. `resume` continues the
     /// agent's last session.
     Agent { agent: AgentKind, resume: bool },
 }
 
-impl SessionKind {
+impl TerminalKind {
     pub fn argv(self) -> Vec<String> {
         match self {
             Self::Shell => vec!["/bin/bash".to_owned(), "-l".to_owned()],
@@ -129,17 +129,18 @@ pub struct Pipe {
     pub events: Receiver<PipeEvent>,
 }
 
-/// The seam between the project manager and the VM backend, so tests do not boot VMs.
+/// The seam between the manager and the VM backend, so tests do not boot VMs.
 pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
+    /// Boots the VM of the cage with the session folder at `/workspace`.
     /// The VM reaches only `net.port` on the host. `state` is the host dir
-    /// of the project's agent state. Each runtime in `runtimes` is mounted
+    /// of the VM's agent state. Each runtime in `runtimes` is mounted
     /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
     /// its guest path.
     fn start(
         &self,
-        project: &Project,
+        bound: Bound<'_>,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
@@ -179,8 +180,8 @@ pub fn sandbox_policy(port: u16) -> Result<microsandbox::NetworkPolicy> {
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-/// The project id of a VM name that [`Microsandbox`] gave.
-pub fn project_id(vm_name: &str) -> Option<&str> {
+/// The cage id of a VM name that [`Microsandbox`] gave.
+pub fn cage_id(vm_name: &str) -> Option<&str> {
     vm_name.strip_prefix(NAME_PREFIX)
 }
 
@@ -238,14 +239,14 @@ impl SandboxRuntime for Microsandbox {
 
     async fn start(
         &self,
-        project: &Project,
+        bound: Bound<'_>,
         net: &GuestNet,
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<Sandbox> {
         let policy = sandbox_policy(net.port)?;
-        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", project.id))
+        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", bound.cage.id))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
             .deployment_profile(DeploymentProfile::SingleTenant)
@@ -254,8 +255,8 @@ impl SandboxRuntime for Microsandbox {
             // The network events are debug lines of the runtime log.
             .log_level(LogLevel::Debug)
             .workdir(WORKSPACE)
-            .volume(WORKSPACE, |m| m.bind(&project.folder));
-        for mount in &project.mounts {
+            .volume(WORKSPACE, |m| m.bind(&bound.session.folder));
+        for mount in &bound.cage.mounts {
             builder = builder.volume(&mount.guest, |m| {
                 let m = m.bind(&mount.host);
                 if mount.readonly { m.readonly() } else { m }
@@ -501,7 +502,7 @@ pub mod fake {
     }
 
     pub struct FakeVm {
-        pub project_id: String,
+        pub cage_id: String,
     }
 
     impl SandboxRuntime for FakeRuntime {
@@ -509,7 +510,7 @@ pub mod fake {
 
         async fn start(
             &self,
-            project: &Project,
+            bound: Bound<'_>,
             net: &GuestNet,
             _: &Path,
             runtimes: &[Installed],
@@ -522,9 +523,9 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.log.lock().unwrap().push(format!("start {}", project.id));
+            self.log.lock().unwrap().push(format!("start {}", bound.cage.id));
             *self.net.lock().unwrap() = Some(net.clone());
-            Ok(FakeVm { project_id: project.id.clone() })
+            Ok(FakeVm { cage_id: bound.cage.id.clone() })
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {
@@ -538,7 +539,7 @@ pub mod fake {
                 tokio::time::sleep(delay).await;
             }
             self.stopping.fetch_sub(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push(format!("stop {}", vm.project_id));
+            self.log.lock().unwrap().push(format!("stop {}", vm.cage_id));
             Ok(())
         }
 
@@ -704,20 +705,20 @@ mod tests {
 
     #[test]
     fn sessions_run_a_login_shell_or_an_agent_wrapper() {
-        assert_eq!(SessionKind::Shell.argv(), ["/bin/bash", "-l"]);
-        let claude = SessionKind::Agent { agent: AgentKind::Claude, resume: false };
+        assert_eq!(TerminalKind::Shell.argv(), ["/bin/bash", "-l"]);
+        let claude = TerminalKind::Agent { agent: AgentKind::Claude, resume: false };
         assert_eq!(claude.argv(), ["/opt/zwinger/bin/claude"]);
-        let codex = SessionKind::Agent { agent: AgentKind::Codex, resume: true };
+        let codex = TerminalKind::Agent { agent: AgentKind::Codex, resume: true };
         assert_eq!(codex.argv(), ["/opt/zwinger/bin/codex", "resume", "--last"]);
-        let gemini = SessionKind::Agent { agent: AgentKind::Gemini, resume: true };
+        let gemini = TerminalKind::Agent { agent: AgentKind::Gemini, resume: true };
         assert_eq!(gemini.argv(), ["/opt/zwinger/bin/gemini", "--resume", "latest"]);
-        let pi = SessionKind::Agent { agent: AgentKind::Pi, resume: true };
+        let pi = TerminalKind::Agent { agent: AgentKind::Pi, resume: true };
         assert_eq!(pi.argv(), ["/opt/zwinger/bin/pi", "-c"]);
         assert_eq!(serde_json::to_value(codex).unwrap(), json!({ "type": "agent", "agent": "codex", "resume": true }));
-        assert_eq!(serde_json::from_value::<SessionKind>(json!({ "type": "shell" })).unwrap(), SessionKind::Shell);
-        assert_eq!(serde_json::to_value(SessionKind::Host).unwrap(), json!({ "type": "host" }));
-        assert_eq!(serde_json::from_value::<SessionKind>(json!({ "type": "host" })).unwrap(), SessionKind::Host);
-        assert_eq!(SessionKind::Host.argv()[1], "-l");
+        assert_eq!(serde_json::from_value::<TerminalKind>(json!({ "type": "shell" })).unwrap(), TerminalKind::Shell);
+        assert_eq!(serde_json::to_value(TerminalKind::Host).unwrap(), json!({ "type": "host" }));
+        assert_eq!(serde_json::from_value::<TerminalKind>(json!({ "type": "host" })).unwrap(), TerminalKind::Host);
+        assert_eq!(TerminalKind::Host.argv()[1], "-l");
     }
 
     #[test]

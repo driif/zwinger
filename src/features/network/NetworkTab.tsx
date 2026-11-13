@@ -33,7 +33,8 @@ import {
   AGENT_NAMES,
   DefaultAction,
   Rule,
-  ProjectView,
+  CageView,
+  SessionView,
   Target,
 } from "../../shared/api";
 import type { Intent, Run } from "../../App";
@@ -73,7 +74,8 @@ function domainError(input: string) {
 }
 
 interface Props {
-  project: ProjectView;
+  session: SessionView;
+  cage: CageView;
   events: NetEvent[];
   run: Run;
   intent?: Intent;
@@ -85,7 +87,8 @@ interface Props {
 }
 
 export function NetworkTab({
-  project,
+  session,
+  cage,
   events,
   run,
   intent,
@@ -93,7 +96,7 @@ export function NetworkTab({
   active,
   onSeen,
 }: Props) {
-  const { id, network } = project;
+  const { id, network } = cage;
   const catalog = useCatalog();
   const [adding, setAdding] = useState<"service" | "host">();
   const [host, setHost] = useState("");
@@ -106,7 +109,7 @@ export function NetworkTab({
   const activity = useRef<HTMLDivElement>(null);
   const [activityVisible, setActivityVisible] = useState(false);
   const latestSeq = events[events.length - 1]?.seq ?? 0;
-  const running = project.status.state === "running";
+  const running = cage.status.state === "running";
 
   useEffect(() => {
     if (intent?.kind !== "addRule") return;
@@ -164,10 +167,10 @@ export function NetworkTab({
   );
 
   const loginsOf = (rule: Rule) =>
-    project.logins.filter((l) =>
+    cage.logins.filter((l) =>
       l.hosts.some((h) => ruleDomains(rule, catalog).some((d) => covers(d, h))),
     );
-  const blockedNeeds = project.agentNeeds.filter((need) => !need.allowed);
+  const blockedNeeds = session.agentNeeds.filter((need) => !need.allowed);
   const unused = catalog.filter(
     (s) =>
       !network.rules.some(
@@ -382,7 +385,7 @@ export function NetworkTab({
                   )}
                   {credentialsOf === rule.id && takesCredentials && (
                     <RuleCredentials
-                      project={project}
+                      cage={cage}
                       rule={rule}
                       catalog={catalog}
                       run={run}
@@ -478,7 +481,7 @@ export function NetworkTab({
 
       <div ref={activity}>
         <NetworkActivity
-          project={project}
+          cage={cage}
           events={events}
           catalog={catalog}
           run={run}

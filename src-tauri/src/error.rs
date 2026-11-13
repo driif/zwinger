@@ -80,7 +80,11 @@ pub enum Error {
     )]
     VaultMode { path: String, expected: String },
     #[error("project not found")]
-    ProjectNotFound,
+    SessionNotFound,
+    #[error("the cage of this project is missing")]
+    CageNotFound,
+    #[error("session {session} uses cage {cage}, which is not in cages.json; restore cages.json, then open zwinger again")]
+    MissingCage { session: String, cage: String },
     #[error("workspace not found")]
     WorkspaceNotFound,
     #[error("the workspace has sessions; move them to a different workspace first")]
@@ -93,8 +97,8 @@ pub enum Error {
     WorkspacesLocked(String),
     #[error("mount not found")]
     MountNotFound,
-    #[error("session not found")]
-    SessionNotFound,
+    #[error("terminal process not found")]
+    ProcessNotFound,
     #[error("terminal not found")]
     TerminalNotFound,
     #[error("the terminal is already open")]
@@ -249,7 +253,7 @@ mod tests {
             serde_json::to_value(Error::MissingPath("/x".into())).unwrap(),
             json!({ "code": "MissingPath", "message": "Path does not exist: /x." })
         );
-        assert_eq!(Error::ProjectNotFound.message(), "Project not found.");
+        assert_eq!(Error::SessionNotFound.message(), "Project not found.");
         assert_eq!(Error::RunState("paused").code(), "RunState");
     }
 

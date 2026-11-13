@@ -8,7 +8,7 @@ use crate::editor::{self, Editor, Editors};
 use crate::error::{Error, Result};
 use crate::preferences::Preferences;
 
-use super::Projects;
+use super::Managed;
 
 fn detected() -> Vec<Editor> {
     editor::detect(&editor::app_dirs(&dirs::home_dir().unwrap_or_default()))
@@ -41,26 +41,26 @@ async fn open(args: &[&OsStr], name: &str) -> Result<()> {
     Err(Error::EditorFailed(name.to_owned(), String::from_utf8_lossy(&out.stderr).trim().to_owned()))
 }
 
-/// Opens the project folder, or the terminal's current folder, in `editor_id`
+/// Opens the session folder, or the terminal's current folder, in `editor_id`
 /// or the default editor. The folder comes from the backend, never from the UI.
 #[tauri::command]
 pub async fn open_in_editor(
-    projects: Projects<'_>,
+    manager: Managed<'_>,
     preferences: State<'_, Preferences>,
-    project_id: String,
+    session_id: String,
     editor_id: Option<String>,
     terminal_id: Option<String>,
 ) -> Result<Opened> {
-    let (folder, known) = projects.editor_folder(&project_id, terminal_id.as_deref())?;
+    let (folder, known) = manager.editor_folder(&session_id, terminal_id.as_deref())?;
     let (editor, editor_fell_back) =
         editor::resolve(&preferences.get().editors, &detected(), editor_id.as_deref()).ok_or(Error::NoEditor)?;
     open(&["-a".as_ref(), editor.path.as_os_str(), folder.as_os_str()], &editor.name).await?;
     Ok(Opened { editor: editor.name, folder, editor_fell_back, folder_fell_back: !known })
 }
 
-/// Shows the project folder in Finder.
+/// Shows the session folder in Finder.
 #[tauri::command]
-pub async fn reveal_project(projects: Projects<'_>, project_id: String) -> Result<()> {
-    let (folder, _) = projects.editor_folder(&project_id, None)?;
+pub async fn reveal_session(manager: Managed<'_>, session_id: String) -> Result<()> {
+    let (folder, _) = manager.editor_folder(&session_id, None)?;
     open(&["-R".as_ref(), folder.as_os_str()], "Finder").await
 }

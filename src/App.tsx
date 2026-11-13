@@ -20,8 +20,8 @@ import {
   setPreferences,
 } from "./features/settings/api";
 import {
-  createProject,
-  listProjects,
+  createSession,
+  listSessions,
   listWorkspaces,
   onGuestLogin,
   onStartProgress,
@@ -58,9 +58,11 @@ import {
   AgentKind,
   INVALID_ORDER,
   PaneNode,
-  SessionKind,
-  ProjectView,
-  // The component that shows the projects is also named Workspace.
+  CageView,
+  SessionCage,
+  SessionView,
+  TerminalKind,
+  // The component that shows the sessions is also named Workspace.
   Workspace as WorkspaceGroup,
 } from "./shared/api";
 import { AppSettings } from "./features/settings/AppSettings";
@@ -69,7 +71,7 @@ import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ProjectPage } from "./features/projects/ProjectPage";
 import { ProjectRail } from "./features/projects/ProjectRail";
 import { agentsOf, LaunchAction } from "./features/launcher/actions";
-import { detectEditors, Editors, openInEditor, revealProject } from "./features/launcher/api";
+import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
 import { Appearance, useAppearance } from "./features/appearance/themes";
@@ -87,7 +89,7 @@ const NET_RING = 2000;
 
 export type TabView = "overview" | "network" | "settings";
 
-/** What the main area shows for the selected project. */
+/** What the main area shows for the selected session. */
 export type View =
   | { kind: TabView }
   /** `key` is the focused pane. No `key`: no pane is focused. */
@@ -97,12 +99,12 @@ export type View =
   /** No `taskId` adds a task. */
   | { kind: "taskEdit"; taskId?: string };
 
-/** A terminal of a project. `key` is the terminal id. No `sessionId`: the terminal is dormant or has exited. */
+/** A terminal of a session. `key` is the terminal id. No `processId`: the terminal is dormant or has exited. */
 export interface Pane {
   key: string;
-  projectId: string;
-  kind: SessionKind;
-  sessionId?: string;
+  sessionId: string;
+  kind: TerminalKind;
+  processId?: string;
 }
 
 export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
@@ -140,7 +142,7 @@ const PHASE_ORDER: Record<Startup["phase"], number> = { checking: 0, installing:
 export default function App() {
   const [startup, setStartup] = useState<Startup>();
   const [prefs, setPrefs] = useState<Prefs>();
-  const [firstProject, setFirstProject] = useState<string>();
+  const [firstSession, setFirstSession] = useState<string>();
   const [error, setError] = useState<string>();
   const [update, setUpdate] = useState<UpdateInfo>();
   const [updateLater, setUpdateLater] = useState(false);
@@ -184,9 +186,9 @@ export default function App() {
         startup={startup}
         banner={banner}
         onEditor={(id) => savePrefs({ ...prefs, editors: { ...prefs.editors, default: id } })}
-        onDone={async (projectId) => {
+        onDone={async (sessionId) => {
           // Set first: the workspace reads it once, when it mounts.
-          setFirstProject(projectId);
+          setFirstSession(sessionId);
           await savePrefs({ ...prefs, onboarded: true });
         }}
       />
@@ -194,7 +196,7 @@ export default function App() {
   if (startup.phase !== "ready") return <StartupScreen startup={startup} banner={banner} />;
   return (
     <Workspace
-      firstProject={firstProject}
+      firstSession={firstSession}
       prefs={prefs}
       onPrefs={savePrefs}
       banner={banner}
@@ -206,8 +208,8 @@ export default function App() {
 }
 
 interface WorkspaceProps {
-  /** The project that the first-run steps made. */
-  firstProject?: string;
+  /** The session that the first-run steps made. */
+  firstSession?: string;
   prefs: Prefs;
   onPrefs: (prefs: Prefs) => Promise<void>;
   /** The update banner of the app. */
@@ -217,12 +219,13 @@ interface WorkspaceProps {
   appearance: Appearance;
 }
 
-function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
-  const [projects, setProjects] = useState<ProjectView[]>([]);
+function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, appearance }: WorkspaceProps) {
+  const [sessions, setSessions] = useState<SessionView[]>([]);
+  const [cages, setCages] = useState<CageView[]>([]);
   const [workspaces, setWorkspaces] = useState<WorkspaceGroup[]>([]);
-  const [selectedId, setSelectedId] = useState(firstProject);
+  const [selectedId, setSelectedId] = useState(firstSession);
   const [view, setView] = useState<View>({ kind: "overview" });
-  /** Per project, the terminal of the pane that has the focus. */
+  /** Per session, the terminal of the pane that has the focus. */
   const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [appNotices, setAppNotices] = useState<string[]>([]);
@@ -230,25 +233,25 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   const commandBar = useRef<HTMLDivElement>(null);
   const refreshes = useRef(0);
   const [net, setNet] = useState<Record<string, NetEvent[]>>({});
-  /** Per project, the last `seq` that the Network tab showed. */
+  /** Per cage, the last `seq` that the Network tab showed. */
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
   const [runs, setRuns] = useState<Record<string, RunSummary[]>>({});
-  /** A duo round folder on the host that the main area shows instead of a project. */
+  /** A duo round folder on the host that the main area shows instead of a session. */
   const [roundFolder, setRoundFolder] = useState<string>();
   const [dropFolder, setDropFolder] = useState<DroppedFolder>();
   const [runtimeList, setRuntimeList] = useState<RuntimeView[]>([]);
   const [installs, setInstalls] = useState<Runtimes["installs"]>({});
   /** The agents on this Mac. `undefined` while a detection runs. */
   const [detection, setDetection] = useState<Detection>();
-  /** The tab of the app settings, which the main area shows instead of a project. */
+  /** The tab of the app settings, which the main area shows instead of a session. */
   const [settingsTab, setSettingsTab] = useState<string>();
   const showSettings = settingsTab !== undefined;
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
   const [home, setHome] = useState<string>();
-  /** Per project, the host agent that its Add agent step shows. */
+  /** Per session, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
   const [railWidth, setRailWidth] = useState(() => clampRail(prefs.railWidth));
 
@@ -256,16 +259,17 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   const terminalTheme = appearance.themes.find((t) => t.id === prefs.terminal.themeId) ?? appearance.theme;
   setLook(prefs.terminal, terminalTheme.terminal);
 
-  // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the projects it read.
+  // Replies can arrive out of order. Only the reply to the latest request is used. Resolves to the sessions it read.
   const refresh = () => {
     const request = ++refreshes.current;
-    return Promise.all([listProjects(), listWorkspaces()]).then(
+    return Promise.all([listSessions(), listWorkspaces()]).then(
       ([next, groups]) => {
         if (request === refreshes.current) {
-          setProjects(next);
+          setSessions(next.sessions);
+          setCages(next.cages);
           setWorkspaces(groups);
         }
-        return next;
+        return next.sessions;
       },
       (e) => {
         if (request === refreshes.current) setError(errorMessage(e));
@@ -317,12 +321,12 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
 
   // The phase of a start that runs. A late event cannot undo a later state, such as running.
   useEffect(() => {
-    const stop = onStartProgress((projectId, phase) =>
-      setProjects((current) =>
-        current.map((s) =>
-          s.id === projectId && ["stopped", "starting", "error"].includes(s.status.state)
-            ? { ...s, status: { state: "starting", phase } }
-            : s,
+    const stop = onStartProgress((cageId, phase) =>
+      setCages((current) =>
+        current.map((c) =>
+          c.id === cageId && ["stopped", "starting", "error"].includes(c.status.state)
+            ? { ...c, status: { state: "starting", phase } }
+            : c,
         ),
       ),
     );
@@ -358,15 +362,15 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   };
 
   // Merged by seq: the live events and the backfill can overlap.
-  const addNet = (projectId: string, events: NetEvent[]) =>
+  const addNet = (cageId: string, events: NetEvent[]) =>
     setNet((current) => {
-      const bySeq = new Map((current[projectId] ?? []).map((e) => [e.seq, e]));
+      const bySeq = new Map((current[cageId] ?? []).map((e) => [e.seq, e]));
       for (const event of events) bySeq.set(event.seq, event);
-      return { ...current, [projectId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
+      return { ...current, [cageId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
     });
 
   useEffect(() => {
-    const stop = onNetEvent((projectId, event) => addNet(projectId, [event]));
+    const stop = onNetEvent((cageId, event) => addNet(cageId, [event]));
     stop.then(() => setListening(true));
     return () => {
       stop.then((unlisten) => unlisten());
@@ -376,76 +380,86 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   // The backfill starts after the listener, so no event falls between the two.
   useEffect(() => {
     if (!listening) return;
-    for (const { id } of projects) {
+    for (const { id } of cages) {
       if (backfilled.current.has(id)) continue;
       backfilled.current.add(id);
       listNetEvents(id).then((events) => addNet(id, events), () => {});
     }
-  }, [projects, listening]);
+  }, [cages, listening]);
 
   const reloadRuns = (id: string) =>
     listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
 
-  const projectIds = projects.map((s) => s.id).join(" ");
+  const sessionIds = sessions.map((s) => s.id).join(" ");
   useEffect(() => {
-    for (const { id } of projects) if (!(id in runs)) reloadRuns(id);
-  }, [projectIds]);
+    for (const { id } of sessions) if (!(id in runs)) reloadRuns(id);
+  }, [sessionIds]);
 
   // The tree shows the stage of each live run, so the list polls while one runs.
-  const liveRunProjects = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
+  const liveRunSessions = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
   useEffect(() => {
-    if (!liveRunProjects) return;
-    const timer = setInterval(() => liveRunProjects.split(" ").forEach(reloadRuns), 2000);
+    if (!liveRunSessions) return;
+    const timer = setInterval(() => liveRunSessions.split(" ").forEach(reloadRuns), 2000);
     return () => clearInterval(timer);
-  }, [liveRunProjects]);
+  }, [liveRunSessions]);
 
-  const panes: Pane[] = projects.flatMap((s) =>
-    s.terminals.map((t) => ({
+  // A session whose cage is not in the list is not shown.
+  const joined: SessionCage[] = sessions.flatMap((session) => {
+    const cage = cages.find((c) => c.id === session.cage);
+    return cage ? [{ session, cage }] : [];
+  });
+  const panes: Pane[] = joined.flatMap(({ session }) =>
+    session.terminals.map((t) => ({
       key: t.id,
-      projectId: s.id,
+      sessionId: session.id,
       kind: t.kind,
-      sessionId: s.sessions.find((session) => session.terminalId === t.id && session.exitCode === null)?.id,
+      processId: session.processes.find((p) => p.terminalId === t.id && p.exitCode === null)?.id,
     })),
   );
-  const project = projects.find((s) => s.id === selectedId) ?? projects[0];
-  const projectPanes = panes.filter((p) => p.projectId === project?.id);
-  /** The focused pane of a project; a stale one gives way to the first pane. */
-  const focusedOf = (target: ProjectView) => {
+  const selected = joined.find((j) => j.session.id === selectedId) ?? joined[0];
+  const session = selected?.session;
+  const cage = selected?.cage;
+  const sessionPanes = panes.filter((p) => p.sessionId === session?.id);
+  /** The focused pane of a session; a stale one gives way to the first pane. */
+  const focusedOf = (target: SessionView) => {
     const shown = leaves(target.paneLayout);
     return shown.includes(focusedPanes[target.id]) ? focusedPanes[target.id] : shown[0];
   };
-  const focused = project && focusedOf(project);
+  const focused = session && focusedOf(session);
   /** The pane whose folder ⌘⇧E and the command menu open. */
   const here = view.kind === "terminal" && !showSettings ? focused : undefined;
-  const events = (project && net[project.id]) ?? [];
+  const events = (cage && net[cage.id]) ?? [];
 
   // A deleted task has no view.
   useEffect(() => {
-    if (view.kind === "task" && project && !project.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
-  }, [view, project]);
+    if (view.kind === "task" && session && !session.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
+  }, [view, session]);
 
   const blocked = Object.fromEntries(
-    projects.map(({ id }) => [id, (net[id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[id] ?? 0)).length]),
+    joined.map(({ session, cage }) => [
+      session.id,
+      (net[cage.id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[cage.id] ?? 0)).length,
+    ]),
   );
 
   /** Saves at once on the screen, then in the backend. */
-  function saveLayout(projectId: string, layout: PaneNode | null) {
-    setProjects((current) => current.map((s) => (s.id === projectId ? { ...s, paneLayout: layout } : s)));
-    setPaneLayout(projectId, layout).then(refresh, (e) => {
+  function saveLayout(sessionId: string, layout: PaneNode | null) {
+    setSessions((current) => current.map((s) => (s.id === sessionId ? { ...s, paneLayout: layout } : s)));
+    setPaneLayout(sessionId, layout).then(refresh, (e) => {
       setError(errorMessage(e));
       return refresh();
     });
   }
 
   /** A focus event of the pane calls it too, so an unchanged focus keeps the state. */
-  function focusPane(key: string | undefined, projectId = project?.id) {
-    if (projectId && key)
-      setFocusedPanes((current) => (current[projectId] === key ? current : { ...current, [projectId]: key }));
+  function focusPane(key: string | undefined, sessionId = session?.id) {
+    if (sessionId && key)
+      setFocusedPanes((current) => (current[sessionId] === key ? current : { ...current, [sessionId]: key }));
     setView((current) => (current.kind === "terminal" && current.key === key ? current : { kind: "terminal", key }));
   }
 
   /** Focuses the pane of the terminal. A terminal with no pane takes the place of the focused pane; the replaced terminal keeps running. */
-  function showPane(key: string | undefined, target = project) {
+  function showPane(key: string | undefined, target = session) {
     if (!target) return;
     if (key && !leaves(target.paneLayout).includes(key))
       saveLayout(target.id, replace(target.paneLayout, focusedOf(target), key));
@@ -454,37 +468,37 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
 
   /** ⌘W or a pane's close button: hides the pane. The terminal and its process stay in the tree. */
   function hidePane(key = focused) {
-    if (!project || !key) return;
-    const layout = remove(project.paneLayout, key);
-    saveLayout(project.id, layout);
+    if (!session || !key) return;
+    const layout = remove(session.paneLayout, key);
+    saveLayout(session.id, layout);
     focusPane(key === focused ? leaves(layout)[0] : focused);
   }
 
   function moveFocus(direction: Direction) {
-    const next = project?.paneLayout && focused && neighbor(project.paneLayout, focused, direction);
+    const next = session?.paneLayout && focused && neighbor(session.paneLayout, focused, direction);
     if (next) focusPane(next);
   }
 
-  /** Items belong to one project, so another project shows its Overview instead. */
+  /** Items belong to one session, so another session shows its Overview instead. */
   function select(id: string) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
     setSelectedId(id);
-    if (id === project?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
+    if (id === session?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
-  function openView(projectId: string, next: View) {
+  function openView(sessionId: string, next: View) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
-    setSelectedId(projectId);
-    const target = projects.find((s) => s.id === projectId);
+    setSelectedId(sessionId);
+    const target = sessions.find((s) => s.id === sessionId);
     // A session click opens the terminal view with its focused pane.
     if (next.kind === "terminal") showPane(next.key ?? (target && focusedOf(target)), target);
     else setView(next);
   }
 
   async function addProject(folder: string, workspace?: string) {
-    setSelectedId(await createProject(folder, workspace));
+    setSelectedId(await createSession(folder, workspace));
     setView({ kind: "overview" });
   }
 
@@ -499,37 +513,40 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   }
 
   /**
-   * Opens a terminal, or the first agent of the project: host agents come first. It shows in the focused pane, or in a new
+   * Opens a terminal, or the first agent of the cage: host agents come first. It shows in the focused pane, or in a new
    * pane right of the pane `at` (`row`) or below it (`column`); no `at` splits the focused pane.
    */
-  async function newSession(kind: SessionKind | "agent", target = project, direction?: "row" | "column", at?: string) {
+  async function newSession(kind: TerminalKind | "agent", target = selected, direction?: "row" | "column", at?: string) {
     if (!target) return;
-    if (direction && tooDeep(target.paneLayout, at ?? focusedOf(target)))
+    const { session } = target;
+    let { cage } = target;
+    if (direction && tooDeep(session.paneLayout, at ?? focusedOf(session)))
       throw new Error("This pane cannot split again. Close a pane first.");
     // A stopped cage does not know its mounted agents. Read them after the start. A Mac shell needs no start.
-    if (target.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
-      await startCage(target.id);
-      target = (await listProjects()).find((s) => s.id === target!.id) ?? target;
+    if (cage.status.state !== "running" && (kind === "agent" || kind.type !== "host")) {
+      const id = cage.id;
+      await startCage(id);
+      cage = (await listSessions()).cages.find((c) => c.id === id) ?? cage;
     }
-    const mounted = agentsOf(target);
-    const session: SessionKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
-    if (session.type === "agent" && !mounted.includes(session.agent))
-      throw new Error(`${session.agent ? AGENT_NAMES[session.agent] : "No agent"} is not mounted in this cage.`);
+    const mounted = agentsOf(cage);
+    const terminal: TerminalKind = kind === "agent" ? { type: "agent", agent: mounted[0], resume: false } : kind;
+    if (terminal.type === "agent" && !mounted.includes(terminal.agent))
+      throw new Error(`${terminal.agent ? AGENT_NAMES[terminal.agent] : "No agent"} is not mounted in this cage.`);
     const { rows, cols } = fittedSize();
-    const sessionId = await openSession(target.id, session, rows, cols);
+    const processId = await openSession(session.id, terminal, rows, cols);
     const list = await refresh();
-    const terminalId = list?.flatMap((s) => s.sessions).find((s) => s.id === sessionId)?.terminalId;
-    const fresh = list?.find((s) => s.id === target!.id) ?? target;
-    setSelectedId(target.id);
+    const terminalId = list?.flatMap((s) => s.processes).find((p) => p.id === processId)?.terminalId;
+    const fresh = list?.find((s) => s.id === session.id) ?? session;
+    setSelectedId(session.id);
     if (!terminalId) return;
     if (direction) {
-      saveLayout(target.id, split(fresh.paneLayout, at ?? focusedOf(fresh), terminalId, direction));
-      focusPane(terminalId, target.id);
+      saveLayout(session.id, split(fresh.paneLayout, at ?? focusedOf(fresh), terminalId, direction));
+      focusPane(terminalId, session.id);
     } else showPane(terminalId, fresh);
   }
 
-  /** Opens the project folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
-  async function openEditor(target: ProjectView, editorId?: string, terminalId?: string) {
+  /** Opens the session folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
+  async function openEditor(target: SessionView, editorId?: string, terminalId?: string) {
     const askedId = editorId ?? editors?.default ?? null;
     const opened = await openInEditor(target.id, askedId, terminalId ?? null);
     const asked = editors?.editors.find((e) => e.id === askedId)?.name ?? "The editor";
@@ -541,7 +558,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   }
 
   /** A choice of an editor makes it the default, so the launchers switch to it. */
-  function launch(target: ProjectView, action: LaunchAction, terminalId?: string) {
+  function launch(target: SessionCage, action: LaunchAction, terminalId?: string) {
     switch (action.type) {
       case "session":
         return run(() => newSession(action.kind, target));
@@ -549,22 +566,22 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         return run(async () => {
           if (action.editor.id !== editors?.default)
             await savePrefs({ ...prefs, editors: { ...prefs.editors, default: action.editor.id } });
-          await openEditor(target, action.editor.id, terminalId);
+          await openEditor(target.session, action.editor.id, terminalId);
         });
       case "copyPath":
-        return run(() => navigator.clipboard.writeText(target.folder));
+        return run(() => navigator.clipboard.writeText(target.session.folder));
       case "reveal":
-        return run(() => revealProject(target.id));
+        return run(() => revealSession(target.session.id));
     }
   }
 
   /** Starts a new process for a dormant or exited terminal, in its place. */
   async function reopen(pane: Pane) {
-    if (pane.kind.type !== "host" && projects.find((s) => s.id === pane.projectId)?.status.state !== "running")
-      await startCage(pane.projectId);
+    const target = joined.find((j) => j.session.id === pane.sessionId);
+    if (pane.kind.type !== "host" && target && target.cage.status.state !== "running") await startCage(target.cage.id);
     const { rows, cols } = fittedSize();
-    await reopenTerminal(pane.projectId, pane.key, rows, cols);
-    showPane(pane.key, (await refresh())?.find((s) => s.id === pane.projectId));
+    await reopenTerminal(pane.sessionId, pane.key, rows, cols);
+    showPane(pane.key, (await refresh())?.find((s) => s.id === pane.sessionId));
   }
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
@@ -600,28 +617,28 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
     });
 
   function cycle(step: number) {
-    if (projectPanes.length === 0) return;
-    const index = projectPanes.findIndex((p) => p.key === focused);
-    showPane(projectPanes[(index + step + projectPanes.length) % projectPanes.length].key);
+    if (sessionPanes.length === 0) return;
+    const index = sessionPanes.findIndex((p) => p.key === focused);
+    showPane(sessionPanes[(index + step + sessionPanes.length) % sessionPanes.length].key);
   }
 
   /** Removes the terminal and ends its process. The backend also removes its pane. */
   function closePane(key: string) {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
-    run(() => closeTerminal(pane.projectId, key));
+    run(() => closeTerminal(pane.sessionId, key));
     if (view.kind === "terminal" && view.key === key) setView({ kind: "terminal" });
   }
 
-  /** Saves the order of the project's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
-  const moveTerminals = (projectId: string, ids: string[]) =>
-    reorderTerminals(projectId, ids).then(refresh, (e) => {
+  /** Saves the order of the session's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
+  const moveTerminals = (sessionId: string, ids: string[]) =>
+    reorderTerminals(sessionId, ids).then(refresh, (e) => {
       if (errorCode(e) !== INVALID_ORDER) setError(errorMessage(e));
       return refresh();
     });
 
-  const toggle = (project: ProjectView) =>
-    run(() => (project.status.state === "running" ? stopCage(project.id) : startCage(project.id)));
+  const toggle = (target: CageView) =>
+    run(() => (target.status.state === "running" ? stopCage(target.id) : startCage(target.id)));
 
   function startIntent(kind: Intent["kind"]) {
     setView({ kind: kind === "addRule" ? "network" : "settings" });
@@ -636,23 +653,23 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
     newProject: () => run(newProject),
     newShell: () => run(() => newSession({ type: "host" })),
     newVmShell: () => run(() => newSession({ type: "shell" })),
-    openEditor: () => project && run(() => openEditor(project, undefined, here)),
+    openEditor: () => session && run(() => openEditor(session, undefined, here)),
     newAgent: () => run(() => newSession("agent")),
     close: () => view.kind === "terminal" && hidePane(),
     next: () => cycle(1),
     previous: () => cycle(-1),
     overview: () => setView({ kind: "overview" }),
     agents: () => {
-      const agents = projectPanes.filter((p) => p.kind.type === "agent");
+      const agents = sessionPanes.filter((p) => p.kind.type === "agent");
       if (agents.length > 0) showPane(agents[agents.length - 1].key);
       else run(() => newSession("agent"));
     },
-    terminal: () => showPane(focused ?? projectPanes[projectPanes.length - 1]?.key),
+    terminal: () => showPane(focused ?? sessionPanes[sessionPanes.length - 1]?.key),
     network: () => setView({ kind: "network" }),
     settings: () => setView({ kind: "settings" }),
     appSettings: () => setSettingsTab("agents"),
-    splitRight: () => run(() => newSession({ type: "host" }, project, "row")),
-    splitDown: () => run(() => newSession({ type: "host" }, project, "column")),
+    splitRight: () => run(() => newSession({ type: "host" }, selected, "row")),
+    splitDown: () => run(() => newSession({ type: "host" }, selected, "column")),
     focusLeft: () => moveFocus("left"),
     focusRight: () => moveFocus("right"),
     focusUp: () => moveFocus("up"),
@@ -663,9 +680,9 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
   return (
     <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
       <ProjectRail
-        projects={projects}
+        sessions={joined}
         workspaces={workspaces}
-        selectedId={project?.id}
+        selectedId={session?.id}
         view={view}
         blocked={blocked}
         runs={runs}
@@ -674,7 +691,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         onOpen={openView}
         onRunsChange={reloadRuns}
         onToggle={toggle}
-        onNewSession={(id, kind) => run(() => newSession(kind, projects.find((s) => s.id === id)))}
+        onNewSession={(id, kind) => run(() => newSession(kind, joined.find((j) => j.session.id === id)))}
         onClosePane={closePane}
         onReopen={(pane) => run(() => reopen(pane))}
         onMoveTerminals={moveTerminals}
@@ -684,7 +701,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
         editors={editors}
         home={home}
         onLaunch={(id, action) => {
-          const target = projects.find((s) => s.id === id);
+          const target = joined.find((j) => j.session.id === id);
           if (target) launch(target, action);
         }}
         onDropDone={(create) => {
@@ -694,9 +711,9 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
       >
         <CommandBar
           ref={commandBar}
-          projects={projects}
-          project={project}
-          panes={projectPanes}
+          sessions={joined.map((j) => j.session)}
+          selected={selected}
+          panes={sessionPanes}
           focused={focused}
           here={here}
           actions={actions}
@@ -711,7 +728,7 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
           editors={editors}
-          onLaunch={(action) => project && launch(project, action, here)}
+          onLaunch={(action) => selected && launch(selected, action, here)}
           run={run}
         />
       </ProjectRail>
@@ -732,11 +749,11 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
             </Notice>
           ))}
           {banner}
-          {!showSettings && !roundFolder && project?.pendingRestart && (
+          {!showSettings && !roundFolder && cage?.pendingRestart && (
             <Notice
               icon={<RotateCw size={14} className="warn" />}
               actions={
-                <Button size="sm" variant="outline" onClick={() => restart(project.id)}>
+                <Button size="sm" variant="outline" onClick={() => restart(cage.id)}>
                   Restart
                 </Button>
               }
@@ -752,13 +769,13 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
             editors={editors}
             onDetectEditors={loadEditors}
             detection={detection}
-            projects={projects}
+            sessions={joined}
             runtimes={runtimes}
             run={run}
             onRefresh={() => detect(true)}
-            onUse={(projectId, agent) => {
-              select(projectId);
-              setAdding((current) => ({ ...current, [projectId]: agent.kind }));
+            onUse={(sessionId, agent) => {
+              select(sessionId);
+              setAdding((current) => ({ ...current, [sessionId]: agent.kind }));
             }}
             prefs={prefs}
             onPrefs={savePrefs}
@@ -774,39 +791,40 @@ function Workspace({ firstProject, prefs, onPrefs, banner, update, onUpdate, app
               </Suspense>
             </div>
           </section>
-        ) : project ? (
+        ) : selected ? (
           <ProjectPage
-            project={project}
+            session={selected.session}
+            cage={selected.cage}
             events={events}
             view={view}
             onView={setView}
             intent={intent}
             onIntentDone={() => setIntent(undefined)}
-            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [project.id]: seq }))}
+            onNetSeen={(seq) => setLastSeen((current) => ({ ...current, [selected.cage.id]: seq }))}
             onDropFolder={dropMount}
             runtimes={runtimes}
             detection={detection}
-            adding={adding[project.id]}
-            onAdding={(kind) => setAdding((current) => ({ ...current, [project.id]: kind }))}
+            adding={adding[session.id]}
+            onAdding={(kind) => setAdding((current) => ({ ...current, [session.id]: kind }))}
             onHostAgents={() => setSettingsTab("agents")}
             editors={editors}
             home={home}
-            onLaunch={(action) => launch(project, action)}
+            onLaunch={(action) => launch(selected, action)}
             onEditorSettings={() => setSettingsTab("editors")}
-            onSplit={(key, direction) => run(() => newSession({ type: "host" }, project, direction, key))}
-            onOpenEditor={(key) => run(() => openEditor(project, undefined, key))}
+            onSplit={(key, direction) => run(() => newSession({ type: "host" }, selected, direction, key))}
+            onOpenEditor={(key) => run(() => openEditor(session, undefined, key))}
             onHide={hidePane}
-            runs={runs[project.id] ?? []}
-            onRunsChange={() => reloadRuns(project.id)}
+            runs={runs[session.id] ?? []}
+            onRunsChange={() => reloadRuns(session.id)}
             onRefresh={refresh}
             panes={panes}
             focused={focused}
             run={run}
-            onToggle={() => toggle(project)}
+            onToggle={() => toggle(selected.cage)}
             onNewSession={(kind) => run(() => newSession(kind))}
             onReopen={(pane) => run(() => reopen(pane))}
             onFocus={(key) => focusPane(key)}
-            onLayout={(layout) => saveLayout(project.id, layout)}
+            onLayout={(layout) => saveLayout(session.id, layout)}
             onPaneExit={refresh}
             onPaneError={(e) => setError(errorMessage(e))}
           />

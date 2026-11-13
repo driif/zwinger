@@ -2,7 +2,7 @@ import { Button, Card, CardBody, CardHeader, CommandMenu } from "@driif/motiv";
 import { Download, RefreshCw, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import { Detection, HostAgent, RuntimeName } from "./api";
-import { AGENT_NAMES, ProjectView } from "../../shared/api";
+import { AGENT_NAMES, SessionCage } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 
@@ -31,16 +31,16 @@ function login(agent: HostAgent) {
 
 interface Props {
   detection?: Detection;
-  projects: ProjectView[];
+  sessions: SessionCage[];
   runtimes: Runtimes;
   run: Run;
   onRefresh: () => void;
   /** Opens the project's Add agent step for this agent. */
-  onUse: (projectId: string, agent: HostAgent) => void;
+  onUse: (sessionId: string, agent: HostAgent) => void;
 }
 
 /** The agents on this Mac, for all projects. A tab of the app settings. */
-export function HostAgentsSettings({ detection, projects, runtimes, run, onRefresh, onUse }: Props) {
+export function HostAgentsSettings({ detection, sessions, runtimes, run, onRefresh, onUse }: Props) {
   /** The agent whose unpinned download waits for a confirm. */
   const [confirming, setConfirming] = useState<RuntimeName>();
 
@@ -110,10 +110,10 @@ export function HostAgentsSettings({ detection, projects, runtimes, run, onRefre
                   className="model-picker"
                   menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a cage`}
                   placeholder="Use in projects"
-                  commands={projects.map((project) => ({
-                    id: project.id,
-                    label: project.hostAgents.some((a) => a.kind === agent.kind) ? `${project.name} (in use)` : project.name,
-                    onSelect: () => run(async () => onUse(project.id, agent)),
+                  commands={sessions.map(({ session, cage }) => ({
+                    id: session.id,
+                    label: cage.hostAgents.some((a) => a.kind === agent.kind) ? `${session.name} (in use)` : session.name,
+                    onSelect: () => run(async () => onUse(session.id, agent)),
                   }))}
                 />
               </div>

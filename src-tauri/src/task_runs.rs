@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::agent::cli::{iso, now_ms};
-use crate::cage::Task;
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
+use crate::session::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
 use crate::task_artifacts::{RoundWriter, TURNS};
 
@@ -169,7 +169,7 @@ impl Cancel {
 
 /// An in-app run, as the commands see it.
 pub struct RunHandle {
-    pub project_id: String,
+    pub session_id: String,
     pub task_id: String,
     pub run: String,
     pub agents: [String; 2],
@@ -243,7 +243,7 @@ pub struct Registry {
 
 /// What a run needs to start.
 pub struct Spec<R: SandboxRuntime> {
-    pub project_id: String,
+    pub session_id: String,
     pub task: Task,
     pub run: String,
     pub exec: Exec<R>,
@@ -252,14 +252,14 @@ pub struct Spec<R: SandboxRuntime> {
 }
 
 impl Registry {
-    pub fn find(&self, project_id: &str, task_id: &str, run: &str) -> Option<Arc<RunHandle>> {
-        lock(&self.runs).iter().find(|r| r.project_id == project_id && r.task_id == task_id && r.run == run).cloned()
+    pub fn find(&self, session_id: &str, task_id: &str, run: &str) -> Option<Arc<RunHandle>> {
+        lock(&self.runs).iter().find(|r| r.session_id == session_id && r.task_id == task_id && r.run == run).cloned()
     }
 
-    pub fn is_running(&self, project_id: &str, task_id: &str) -> bool {
+    pub fn is_running(&self, session_id: &str, task_id: &str) -> bool {
         lock(&self.runs)
             .iter()
-            .any(|r| r.project_id == project_id && r.task_id == task_id && r.status().state.is_live())
+            .any(|r| r.session_id == session_id && r.task_id == task_id && r.status().state.is_live())
     }
 
     pub fn start<R: SandboxRuntime>(&self, spec: Spec<R>) -> Arc<RunHandle> {
@@ -277,7 +277,7 @@ impl Registry {
         });
         let live = Arc::new(Live { tx: broadcast::channel(LIVE_QUEUE).0, recent: Mutex::new(VecDeque::new()) });
         let handle = Arc::new(RunHandle {
-            project_id: spec.project_id.clone(),
+            session_id: spec.session_id.clone(),
             task_id: spec.task.id.clone(),
             run: spec.run.clone(),
             agents: names.clone(),
@@ -307,17 +307,17 @@ impl Registry {
         };
         tokio::spawn(actor.run());
         let mut runs = lock(&self.runs);
-        runs.retain(|r| !(r.project_id == handle.project_id && r.task_id == handle.task_id && r.run == handle.run));
+        runs.retain(|r| !(r.session_id == handle.session_id && r.task_id == handle.task_id && r.run == handle.run));
         runs.push(handle.clone());
         handle
     }
 
-    /// Cancels the live runs of a project and waits up to `limit` until each
+    /// Cancels the live runs of a session and waits up to `limit` until each
     /// one has written its manifest.
-    pub async fn cancel_project(&self, project_id: &str, reason: &str, limit: Duration) {
+    pub async fn cancel_session(&self, session_id: &str, reason: &str, limit: Duration) {
         let runs: Vec<Arc<RunHandle>> = lock(&self.runs)
             .iter()
-            .filter(|r| r.project_id == project_id && r.status().state.is_live())
+            .filter(|r| r.session_id == session_id && r.status().state.is_live())
             .cloned()
             .collect();
         for run in &runs {
@@ -332,9 +332,9 @@ impl Registry {
         .await;
     }
 
-    /// Forgets the runs of a project or of one of its tasks.
-    pub fn forget(&self, project_id: &str, task_id: Option<&str>) {
-        lock(&self.runs).retain(|r| r.project_id != project_id || task_id.is_some_and(|t| r.task_id != t));
+    /// Forgets the runs of a session or of one of its tasks.
+    pub fn forget(&self, session_id: &str, task_id: Option<&str>) {
+        lock(&self.runs).retain(|r| r.session_id != session_id || task_id.is_some_and(|t| r.task_id != t));
     }
 }
 
@@ -1390,9 +1390,9 @@ mod tests {
 
     use super::*;
     use crate::agent::AgentKind;
-    use crate::cage::TaskAgent;
     use crate::runtime::fake::{FakePipe, FakeRuntime, FakeVm};
     use crate::runtime::{PipeEvent, PipeInput};
+    use crate::session::TaskAgent;
     use crate::task_agents::{claude_result_line, codex_result_lines};
     use crate::task_artifacts::{Mirror, read_room};
 
@@ -1642,12 +1642,12 @@ mod tests {
         };
         let registry = Registry::default();
         let handle = registry.start(Spec {
-            project_id: "s".into(),
+            session_id: "s".into(),
             task,
             run: "01".into(),
             exec: Exec {
                 runtime,
-                vm: Arc::new(FakeVm { project_id: "s".into() }),
+                vm: Arc::new(FakeVm { cage_id: "s".into() }),
                 cwd: "/workspace".into(),
                 artifacts: Some("/workspace/.zwinger/tasks/fix/01".into()),
                 pi_host: false,
@@ -2135,7 +2135,7 @@ mod tests {
         })
         .await
         .unwrap();
-        run.registry.cancel_project("s", "the cage stopped", Duration::from_secs(5)).await;
+        run.registry.cancel_session("s", "the cage stopped", Duration::from_secs(5)).await;
         assert_eq!(run.handle.status().state, RunState::Cancelled);
         let manifest = settled(&run).await;
         assert_eq!(manifest["stopped"], "the cage stopped");

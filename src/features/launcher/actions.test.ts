@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ProjectView } from "../../shared/api.ts";
+import type { CageView } from "../../shared/api.ts";
 import type { Editors } from "./api.ts";
 import { launchActions } from "./actions.ts";
 
-const project = (state: "running" | "stopped", hostAgents: ProjectView["hostAgents"] = []) =>
-  ({ status: { state }, runtimes: ["claude"], hostAgents }) as unknown as ProjectView;
+const cage = (state: "running" | "stopped", hostAgents: CageView["hostAgents"] = []) =>
+  ({ status: { state }, runtimes: ["claude"], hostAgents }) as unknown as CageView;
 
 const editors: Editors = {
   editors: [
@@ -17,7 +17,7 @@ const editors: Editors = {
 };
 
 test("the list has the shells, each agent and its last session, the editors that are on, and the folder actions", () => {
-  const actions = launchActions(project("running"), editors);
+  const actions = launchActions(cage("running"), editors);
   assert.deepEqual(
     actions.map((a) => a.label),
     [
@@ -44,7 +44,7 @@ test("the list has the shells, each agent and its last session, the editors that
 
 test("a stopped cage lists the agents that a start can mount, host agents first", () => {
   const host = [{ kind: "gemini" as const, profile: false, login: false }];
-  const agents = launchActions(project("stopped", host), undefined)
+  const agents = launchActions(cage("stopped", host), undefined)
     .filter((a) => a.type === "session" && a.kind.type === "agent" && !a.kind.resume)
     .map((a) => a.id);
   assert.deepEqual(agents, ["agent-gemini", "agent-claude", "agent-codex", "agent-pi"]);
@@ -52,5 +52,5 @@ test("a stopped cage lists the agents that a start can mount, host agents first"
 
 test("no editors, or all editors off, give no editor actions", () => {
   for (const list of [undefined, { editors: editors.editors.map((e) => ({ ...e, enabled: false })), default: null }])
-    assert.equal(launchActions(project("running"), list).filter((a) => a.type === "editor").length, 0);
+    assert.equal(launchActions(cage("running"), list).filter((a) => a.type === "editor").length, 0);
 });

@@ -269,7 +269,7 @@ impl Frames {
 /// is delivered, so a listing done in reaction to it shows the exit.
 pub(crate) async fn pump<V>(
     state: Arc<Mutex<State<V>>>,
-    session_id: String,
+    id: String,
     output: Arc<Mutex<Output>>,
     events: Receiver<PtyEvent>,
 ) {
@@ -292,9 +292,9 @@ pub(crate) async fn pump<V>(
             return;
         };
         if let Some(code) = exit
-            && let Some(s) = lock(&state).sessions.iter_mut().find(|s| s.id == session_id)
+            && let Some(t) = lock(&state).terminals.iter_mut().find(|t| t.id == id)
         {
-            s.exit_code = Some(code);
+            t.exit_code = Some(code);
         }
         let mut output = lock(&output);
         if !bytes.is_empty() {
@@ -316,7 +316,7 @@ mod tests {
     async fn a_stale_detach_keeps_the_new_sink() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         let (old, _old_rx) = attach(&manager, &session);
         let (new, mut rx) = attach(&manager, &session);
         assert_ne!(old, new);
@@ -328,7 +328,7 @@ mod tests {
         manager.detach_session(&session, new);
         manager.write(&session, b"y".to_vec()).unwrap();
         manager.send(&session, PtyInput::Kill).unwrap();
-        until(|| manager.list()[0].sessions[0].exit_code == Some(137)).await;
+        until(|| manager.list().sessions[0].processes[0].exit_code == Some(137)).await;
         assert!(rx.try_recv().is_err());
         manager.detach_session("gone", new);
     }
@@ -393,7 +393,7 @@ mod tests {
     async fn a_reattach_replays_the_output_in_order_and_a_stale_token_gets_nothing() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         for text in ["one ", "two ", "three"] {
             manager.write(&session, text.as_bytes().to_vec()).unwrap();
         }
@@ -505,7 +505,7 @@ mod tests {
         let burst = 50 << 20;
         *runtime.burst.lock().unwrap() = burst;
         let sent = runtime.burst_sent.clone();
-        let session = manager.open_session(&id, SessionKind::Shell, 24, 80).await.unwrap();
+        let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         let (token, mut rx) = attach(&manager, &session);
 
         // A view that acknowledges nothing holds the process after its window.

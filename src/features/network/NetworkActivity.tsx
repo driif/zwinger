@@ -3,7 +3,7 @@ import { Ban, Check, KeyRound, Play } from "lucide-react";
 import { useEffect, useState } from "react";
 import { NetEvent, putRule, Service, wildcardFor } from "./api";
 import { startCage } from "../projects/api";
-import { Action, ProjectView, Target } from "../../shared/api";
+import { Action, CageView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
 
@@ -35,14 +35,14 @@ interface Group {
 }
 
 interface Props {
-  project: ProjectView;
+  cage: CageView;
   events: NetEvent[];
   catalog: Service[];
   run: Run;
 }
 
-export function NetworkActivity({ project, events, catalog, run }: Props) {
-  const { id, network } = project;
+export function NetworkActivity({ cage, events, catalog, run }: Props) {
+  const { id, network } = cage;
   const [filter, setFilter] = useState("all");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
@@ -148,7 +148,7 @@ export function NetworkActivity({ project, events, catalog, run }: Props) {
         {shown.length === 0 &&
           (events.length > 0 ? (
             <p className="muted">No {filter} activity.</p>
-          ) : project.status.state === "running" ? (
+          ) : cage.status.state === "running" ? (
             <p className="muted">
               No network activity yet. The hosts show here when the agent
               reaches out.

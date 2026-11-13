@@ -7,7 +7,7 @@ import {
 import { KeyRound, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { Service, setRuleCredential, storedCredentials } from "./api";
-import { Credential, Inject, Rule, ProjectView } from "../../shared/api";
+import { CageView, Credential, Inject, Rule } from "../../shared/api";
 import type { Run } from "../../App";
 import { echoHost } from "./echoHost";
 import { errorMessage } from "../../shared/errorMessage";
@@ -62,7 +62,7 @@ function draftOf(credential: Credential): Draft {
 }
 
 interface Props {
-  project: ProjectView;
+  cage: CageView;
   rule: Rule;
   catalog: Service[];
   run: Run;
@@ -72,7 +72,7 @@ interface Props {
  * The credentials of a rule. The proxy adds them to the HTTPS requests to the rule's credential hosts.
  * On a Block rule they are inactive: they stay, but the proxy adds them nowhere.
  */
-export function RuleCredentials({ project, rule, catalog, run }: Props) {
+export function RuleCredentials({ cage, rule, catalog, run }: Props) {
   const credentials = rule.credentials ?? [];
   const hosts = credentialHosts(rule, catalog);
   const [header, template] = serviceOf(rule.target, catalog)?.credential ?? [
@@ -86,14 +86,14 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
   const [vaultError, setVaultError] = useState<string>();
 
   useEffect(() => {
-    storedCredentials(project.id).then(
+    storedCredentials(cage.id).then(
       (names) => {
         setStored(new Set(names));
         setVaultError(undefined);
       },
       (e) => setVaultError(errorMessage(e)),
     );
-  }, [project]);
+  }, [cage]);
 
   function save(event: FormEvent) {
     event.preventDefault();
@@ -123,7 +123,7 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
           };
     run(() =>
       setRuleCredential(
-        project.id,
+        cage.id,
         rule.id,
         name,
         inject,
@@ -213,7 +213,7 @@ export function RuleCredentials({ project, rule, catalog, run }: Props) {
                     onClick={() =>
                       run(() =>
                         setRuleCredential(
-                          project.id,
+                          cage.id,
                           rule.id,
                           credential.name,
                           null,

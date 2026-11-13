@@ -21,13 +21,13 @@ export async function call<T>(command: string, args?: InvokeArgs): Promise<T> {
 }
 
 /**
- * `host`: the user's login shell on the Mac, unsandboxed, in the project folder. `shell`: a VM shell in /workspace.
+ * `host`: the user's login shell on the Mac, unsandboxed, in the session folder. `shell`: a VM shell in /workspace.
  * `agent`: an agent's own TUI in the harness; `resume` continues the agent's last session.
  */
-export type SessionKind =
+export type TerminalKind =
   { type: "host" } | { type: "shell" } | { type: "agent"; agent: AgentKind; resume: boolean };
 
-/** The split tree of a project's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
+/** The split tree of a session's terminal view. `row` puts `b` right of `a`, `column` below it; `ratio` is the share of `a`. */
 export type PaneNode =
   | { type: "split"; direction: "row" | "column"; ratio: number; a: PaneNode; b: PaneNode }
   | { type: "leaf"; terminal: string };
@@ -113,18 +113,19 @@ export type CageStatus =
   | { state: "stopping" }
   | { state: "error"; message: string };
 
-export interface SessionView {
+/** A live terminal process. */
+export interface TerminalView {
   id: string;
-  kind: SessionKind;
+  kind: TerminalKind;
   exitCode: number | null;
   /** Set for a shell or agent terminal. */
   terminalId: string | null;
 }
 
-/** A host shell, VM shell or agent terminal of a project. With no session it is dormant, and it can open again. */
-export interface Terminal {
+/** A host shell, VM shell or agent terminal of a session. With no process it is dormant, and it can open again. */
+export interface TerminalRecord {
   id: string;
-  kind: SessionKind;
+  kind: TerminalKind;
 }
 
 export interface Pos {
@@ -151,54 +152,72 @@ export interface Task {
   workdir: string;
 }
 
-/** A host agent of a project: its runtime, and its read-only profile and host login if set. */
+/** A host agent of a cage: its runtime, and its read-only profile and host login if set. */
 export interface HostAgentUse {
   kind: AgentKind;
   profile: boolean;
   login: boolean;
 }
 
-export interface ProjectView {
+/** A host folder with its terminals, pane layout and tasks. It uses the cage `cage`. */
+export interface SessionView {
   id: string;
   name: string;
   folder: string;
   folderId: FileId | null;
-  mounts: Mount[];
-  network: NetworkPolicy;
+  /** The guest folder name of the session, fixed when the session is made. */
+  slug: string;
+  /** The id of its cage. */
+  cage: string;
   harness: string | null;
-  logins: HostLogin[];
-  /** The map positions that the user dragged, by node id. */
-  layout: Record<string, Pos>;
-  tasks: Task[];
   /** In tree order. */
-  terminals: Terminal[];
+  terminals: TerminalRecord[];
   /** `null`: no pane is open. */
   paneLayout: PaneNode | null;
-  status: CageStatus;
-  pendingRestart: boolean;
-  sessions: SessionView[];
-  /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
-  runtimes: ("claude" | "codex" | "gemini")[];
+  tasks: Task[];
+  /** The map positions that the user dragged, by node id. */
+  layout: Record<string, Pos>;
+  /** The live terminal processes. */
+  processes: TerminalView[];
+  /** The hosts that the session's agents need, with the proxy's decision on each. */
+  agentNeeds: AgentNeed[];
+}
+
+/** The sandbox config of a session and the state of its VM. */
+export interface CageView {
+  id: string;
+  name: string;
+  mounts: Mount[];
+  network: NetworkPolicy;
+  logins: HostLogin[];
   hostAgents: HostAgentUse[];
   /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
+  status: CageStatus;
+  pendingRestart: boolean;
+  /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
+  runtimes: ("claude" | "codex" | "gemini")[];
   /** The earliest expiry of the host logins that the proxy has now, in ms since the epoch. The proxy reads a newer login when it is due. */
   loginExpiresAt: number | null;
   /** What the start did differently for the host agents, such as a fallback. */
   hostNotices: string[];
   /** The agents of the running VM with a login made in the guest: the agent can read its real token. */
   guestLogins: AgentKind[];
-  /** The hosts that the project's agents need, with the proxy's decision on each. */
-  agentNeeds: AgentNeed[];
   /** The phase durations of the start of the running VM. */
   startTimings: StartTimings | null;
 }
 
-/** A group of sessions in the rail. A session is a project: each project is in exactly one workspace. */
+/** A session with its cage, as the UI shows them: one row per session. */
+export interface SessionCage {
+  session: SessionView;
+  cage: CageView;
+}
+
+/** A group of sessions in the rail. Each session is in exactly one workspace. */
 export interface Workspace {
   id: string;
   name: string;
-  /** Project ids, in rail order. */
+  /** Session ids, in rail order. */
   sessions: string[];
 }
 

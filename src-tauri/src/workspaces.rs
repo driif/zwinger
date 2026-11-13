@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::cage::display_name;
 use crate::error::{Error, Result};
 
-/// The store file in the app data dir, next to the projects file.
+/// The store file in the app data dir, next to the sessions file.
 pub const FILE: &str = "workspaces.json";
 /// The name of a new workspace, and of a workspace whose name is cleared.
 pub const DEFAULT_NAME: &str = "Workspace";
 
-/// A named group of sessions in the rail. A session is a project; each
-/// project is in exactly one workspace.
+/// A named group of sessions in the rail. Each session is in exactly one
+/// workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
@@ -85,36 +85,36 @@ impl WorkspaceStore {
     }
 }
 
-/// Makes the stored workspaces match the projects: unknown and repeated
-/// project ids go, missing ones go to the end of the first workspace. With no
-/// stored list, one default workspace holds all projects in their order. The
+/// Makes the stored workspaces match the sessions: unknown and repeated
+/// session ids go, missing ones go to the end of the first workspace. With no
+/// stored list, one default workspace holds all sessions in their order. The
 /// result is never empty.
-pub fn reconcile(stored: Option<Vec<Workspace>>, project_ids: &[String]) -> Vec<Workspace> {
+pub fn reconcile(stored: Option<Vec<Workspace>>, session_ids: &[String]) -> Vec<Workspace> {
     let Some(mut workspaces) = stored.filter(|w| !w.is_empty()) else {
-        return vec![Workspace::new(project_ids.to_vec())];
+        return vec![Workspace::new(session_ids.to_vec())];
     };
-    let known: HashSet<&String> = project_ids.iter().collect();
+    let known: HashSet<&String> = session_ids.iter().collect();
     let mut seen = HashSet::new();
     for workspace in &mut workspaces {
         workspace.sessions.retain(|id| known.contains(id) && seen.insert(id.clone()));
     }
-    let missing = project_ids.iter().filter(|id| !seen.contains(*id)).cloned();
+    let missing = session_ids.iter().filter(|id| !seen.contains(*id)).cloned();
     workspaces[0].sessions.extend(missing);
     workspaces
 }
 
 /// The workspaces in the order of `wanted`, which must name each workspace
-/// and each project exactly once.
-pub fn arrange(workspaces: &[Workspace], wanted: Vec<Arrangement>, project_ids: &[String]) -> Result<Vec<Workspace>> {
+/// and each session exactly once.
+pub fn arrange(workspaces: &[Workspace], wanted: Vec<Arrangement>, session_ids: &[String]) -> Result<Vec<Workspace>> {
     let mut wanted_workspaces: Vec<&String> = wanted.iter().map(|a| &a.id).collect();
     let mut current: Vec<&String> = workspaces.iter().map(|w| &w.id).collect();
     let mut wanted_sessions: Vec<&String> = wanted.iter().flat_map(|a| &a.sessions).collect();
-    let mut projects: Vec<&String> = project_ids.iter().collect();
-    for list in [&mut wanted_workspaces, &mut current, &mut wanted_sessions, &mut projects] {
+    let mut sessions: Vec<&String> = session_ids.iter().collect();
+    for list in [&mut wanted_workspaces, &mut current, &mut wanted_sessions, &mut sessions] {
         list.sort_unstable();
     }
     let unique = |list: &[&String]| list.windows(2).all(|pair| pair[0] != pair[1]);
-    if wanted_workspaces != current || wanted_sessions != projects || !unique(&wanted_workspaces) || !unique(&projects)
+    if wanted_workspaces != current || wanted_sessions != sessions || !unique(&wanted_workspaces) || !unique(&sessions)
     {
         return Err(Error::InvalidOrder);
     }

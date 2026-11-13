@@ -1,7 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package, UserCog } from "lucide-react";
 import { NetEvent, Service } from "../network/api";
-import { AGENT_NAMES, AgentKind, ProjectView } from "../../shared/api";
+import { AGENT_NAMES, AgentKind, CageView, SessionView } from "../../shared/api";
 import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "../network/network";
 
 const HOST_X = 16;
@@ -39,7 +39,7 @@ export interface ItemData extends Record<string, unknown> {
 
 export interface BoundaryData extends Record<string, unknown> {
   name: string;
-  state: ProjectView["status"]["state"];
+  state: CageView["status"]["state"];
 }
 
 export type MapNode = Node<ItemData, "item"> | Node<BoundaryData, "boundary"> | Node<{ label: string }, "caption">;
@@ -47,16 +47,17 @@ export type MapNode = Node<ItemData, "item"> | Node<BoundaryData, "boundary"> | 
 const under = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
 
 /**
- * The map of a project: host paths on the left, the microVM boundary with its
+ * The map of a session and its cage: host paths on the left, the microVM boundary with its
  * folders in the middle, egress on the right. The auto layout uses fixed
- * columns; a position in `project.layout` replaces it. Child positions are
+ * columns; a position in `session.layout` replaces it. Child positions are
  * relative to the boundary.
  */
-export function mapLayout(project: ProjectView, folders: string[], events: NetEvent[], catalog: Service[], now: number) {
-  const { harness, network } = project;
+export function mapLayout(session: SessionView, cage: CageView, folders: string[], events: NetEvent[], catalog: Service[], now: number) {
+  const { harness } = session;
+  const { network } = cage;
   const nodes: MapNode[] = [];
   const edges: Edge[] = [];
-  const at = (id: string, x: number, y: number) => project.layout[id] ?? { x, y };
+  const at = (id: string, x: number, y: number) => session.layout[id] ?? { x, y };
 
   const recent = (event: NetEvent, ms: number) => now - event.at < ms;
   const active = (reason: string) => events.some((e) => e.allowed && e.reason === reason && recent(e, ACTIVE_MS));
@@ -78,7 +79,7 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
     edges.push({ id: `${source}>${target}`, source, target, className: blocked ? "blocked" : undefined });
 
   const allFolderPaths = folders.map((f) => `/workspace/${f}`);
-  const guests = project.mounts.map((m) => m.guest);
+  const guests = cage.mounts.map((m) => m.guest);
   // The deepest mount wins, as in the backend; mounts are never below /workspace.
   const harnessAt =
     harness === null
@@ -97,8 +98,8 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
   });
   outer("source:/workspace", HOST_X, y, HOST_W, {
     icon: FolderOpen,
-    label: project.folder,
-    title: project.folder,
+    label: session.folder,
+    title: session.folder,
     badges: [],
     jump: "settings",
   });
@@ -141,8 +142,8 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
     });
   }
 
-  if (project.mounts.length > 0) y += GAP;
-  for (const mount of project.mounts) {
+  if (cage.mounts.length > 0) y += GAP;
+  for (const mount of cage.mounts) {
     y += ROW;
     const isHarness = mount.guest === harnessAt;
     inner(`mount:${mount.guest}`, NODE_X, y, NODE_W, {
@@ -164,19 +165,19 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
   }
   // Not user mounts: zwinger binds its own copy of each agent runtime, and the agent cannot change it.
   y += GAP;
-  const fromMac = (kind: AgentKind) => project.hostAgents.some((a) => a.kind === kind);
+  const fromMac = (kind: AgentKind) => cage.hostAgents.some((a) => a.kind === kind);
   for (const [name, origin] of [
     ["pi", fromMac("pi") ? "from this Mac, or bundled with zwinger if it does not load" : "bundled with zwinger"],
-    ...project.runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
+    ...cage.runtimes.map((r) => [r, r === "gemini" ? "from this Mac" : "downloaded by zwinger"] as const),
   ] as const) {
     y += ROW;
     // pi has no permission prompts; the setting applies to the other agents.
-    const prompts = name === "pi" ? undefined : project.agentsUnprompted ? "no prompts" : "prompts";
+    const prompts = name === "pi" ? undefined : cage.agentsUnprompted ? "no prompts" : "prompts";
     inner(`agent:${name}`, NODE_X, y, NODE_W, {
       icon: Package,
       label: `agent runtime · ${AGENT_NAMES[name]}`,
       title: `/opt/zwinger/${name}, ${AGENT_NAMES[name]} ${origin}, read-only${
-        prompts ? `; it runs ${project.agentsUnprompted ? "without" : "with"} permission prompts` : ""
+        prompts ? `; it runs ${cage.agentsUnprompted ? "without" : "with"} permission prompts` : ""
       }`,
       tone: "muted",
       badges: prompts ? ["ro", prompts] : ["ro"],
@@ -184,7 +185,7 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
     });
   }
   // A host agent's profile is a read-only copy of its config dir on this Mac; its login stays on the Mac.
-  for (const used of project.hostAgents) {
+  for (const used of cage.hostAgents) {
     const name = AGENT_NAMES[used.kind];
     if (used.profile) {
       y += ROW;
@@ -222,8 +223,8 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
     position: at("boundary", BOX_X, BOX_Y),
     width: BOX_W,
     height: y + H + 20 - BOX_Y,
-    ariaLabel: `Cage of ${project.name}, ${project.status.state}`,
-    data: { name: project.name, state: project.status.state },
+    ariaLabel: `Cage of ${session.name}, ${cage.status.state}`,
+    data: { name: session.name, state: cage.status.state },
   });
 
   let ny = TOP;
@@ -249,7 +250,7 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
     closed,
   );
   const loginsOf = (domains: string[]) =>
-    project.logins.filter((l) => l.hosts.some((h) => domains.some((d) => covers(d, h))));
+    cage.logins.filter((l) => l.hosts.some((h) => domains.some((d) => covers(d, h))));
   for (const rule of network.rules) {
     const service = serviceOf(rule.target, catalog);
     const label = ruleLabel(rule, catalog);
@@ -271,7 +272,7 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
   }
   // A host login that no rule names is shown on its own, as nothing else names it.
   const named = network.rules.flatMap((r) => ruleDomains(r, catalog));
-  for (const login of project.logins)
+  for (const login of cage.logins)
     for (const loginHost of login.hosts.filter((h) => !named.some((d) => covers(d, h)))) {
       const ok = decide(network, loginHost, catalog).allowed;
       const agent = AGENT_NAMES[login.origin.agent];
@@ -327,6 +328,6 @@ export function mapLayout(project: ProjectView, folders: string[], events: NetEv
   ] as const)
     nodes.push({ id, type: "caption", position: { x, y: 28 }, draggable: false, selectable: false, focusable: false, data: { label } });
 
-  const hasSecrets = project.logins.length > 0 || network.rules.some((r) => (r.credentials ?? []).length > 0);
+  const hasSecrets = cage.logins.length > 0 || network.rules.some((r) => (r.credentials ?? []).length > 0);
   return { nodes, edges, hasSecrets };
 }

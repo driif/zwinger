@@ -225,16 +225,16 @@ impl fmt::Debug for SecretValue {
 }
 
 /// The vault account of a secret value.
-pub fn account(project_id: &str, name: &str) -> String {
-    format!("{project_id}/{name}")
+pub fn account(cage_id: &str, name: &str) -> String {
+    format!("{cage_id}/{name}")
 }
 
 /// Stores secret values per project.
 pub trait Vault: Send + Sync {
-    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()>;
-    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>>;
+    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()>;
+    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>>;
     /// Deleting an absent value is not an error.
-    fn delete(&self, project_id: &str, name: &str) -> Result<()>;
+    fn delete(&self, cage_id: &str, name: &str) -> Result<()>;
     /// The [`account`]s of all stored values. Returns no values.
     fn accounts(&self) -> Result<Vec<String>>;
 }
@@ -376,22 +376,22 @@ fn vault_io(path: &Path, e: io::Error) -> Error {
 }
 
 impl Vault for FileVault {
-    fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+    fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
         let _lock = self.locked();
         let mut values = self.load()?;
-        values.insert(account(project_id, name), value.expose().to_owned());
+        values.insert(account(cage_id, name), value.expose().to_owned());
         self.save(values)
     }
 
-    fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+    fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
         let _lock = self.locked();
-        Ok(self.load()?.remove(&account(project_id, name)).map(SecretValue::new))
+        Ok(self.load()?.remove(&account(cage_id, name)).map(SecretValue::new))
     }
 
-    fn delete(&self, project_id: &str, name: &str) -> Result<()> {
+    fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
         let _lock = self.locked();
         let mut values = self.load()?;
-        if values.remove(&account(project_id, name)).is_none() {
+        if values.remove(&account(cage_id, name)).is_none() {
             return Ok(());
         }
         self.save(values)
@@ -435,23 +435,23 @@ pub mod fake {
     }
 
     impl Vault for MemoryVault {
-        fn set(&self, project_id: &str, name: &str, value: &SecretValue) -> Result<()> {
+        fn set(&self, cage_id: &str, name: &str, value: &SecretValue) -> Result<()> {
             self.write()?;
-            self.values.lock().unwrap().insert(account(project_id, name), value.clone());
+            self.values.lock().unwrap().insert(account(cage_id, name), value.clone());
             if self.fail_after_write.swap(false, Ordering::SeqCst) {
                 return Err(Error::Vault("folder sync failed".into()));
             }
             Ok(())
         }
 
-        fn get(&self, project_id: &str, name: &str) -> Result<Option<SecretValue>> {
+        fn get(&self, cage_id: &str, name: &str) -> Result<Option<SecretValue>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            Ok(self.values.lock().unwrap().get(&account(project_id, name)).cloned())
+            Ok(self.values.lock().unwrap().get(&account(cage_id, name)).cloned())
         }
 
-        fn delete(&self, project_id: &str, name: &str) -> Result<()> {
+        fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
             self.write()?;
-            self.values.lock().unwrap().remove(&account(project_id, name));
+            self.values.lock().unwrap().remove(&account(cage_id, name));
             Ok(())
         }
 

@@ -6,17 +6,17 @@ export type AgentRecord = { type: string } & Record<string, unknown>;
 
 /** No `id` adds a new task. Resolves to the task id. */
 export const putTask = (
-  id: string,
+  sessionId: string,
   task: Omit<Task, "id" | "slug"> & { id?: string },
-) => call<string>("put_task", { id, task });
+) => call<string>("put_task", { sessionId, task });
 
 /** Also removes its runs. */
-export const removeTask = (id: string, taskId: string) =>
-  call<void>("remove_task", { id, taskId });
+export const removeTask = (sessionId: string, taskId: string) =>
+  call<void>("remove_task", { sessionId, taskId });
 
 /** Resolves to the run name. */
-export const startTaskRun = (projectId: string, taskId: string) =>
-  call<string>("start_task_run", { projectId, taskId });
+export const startTaskRun = (sessionId: string, taskId: string) =>
+  call<string>("start_task_run", { sessionId, taskId });
 
 export type RunControl =
   | { type: "message" | "answer"; text: string }
@@ -24,11 +24,11 @@ export type RunControl =
   | { type: "pickImplementer"; agent: string };
 
 export const controlTaskRun = (
-  projectId: string,
+  sessionId: string,
   taskId: string,
   run: string,
   control: RunControl,
-) => call<void>("control_task_run", { projectId, taskId, run, control });
+) => call<void>("control_task_run", { sessionId, taskId, run, control });
 
 export type RunState =
   "running" | "paused" | "waiting" | "done" | "failed" | "cancelled";
@@ -46,13 +46,13 @@ export interface RunSummary {
   started: string | null;
 }
 
-/** The runs of the project's tasks, oldest first per task. */
-export const listTaskRuns = (projectId: string) =>
-  call<RunSummary[]>("list_task_runs", { projectId });
+/** The runs of the session's tasks, oldest first per task. */
+export const listTaskRuns = (sessionId: string) =>
+  call<RunSummary[]>("list_task_runs", { sessionId });
 
 /** The change of a run: the commits since its start, the status, then the diff from its start. */
-export const runDiff = (projectId: string, taskId: string, run: string) =>
-  call<string>("run_diff", { projectId, taskId, run });
+export const runDiff = (sessionId: string, taskId: string, run: string) =>
+  call<string>("run_diff", { sessionId, taskId, run });
 
 /** True if the folder looks like a duo round, so a drop opens its room. */
 export const isRoundFolder = (path: string) =>
@@ -166,7 +166,7 @@ export interface Room {
 }
 
 export type RoomSource =
-  | { kind: "run"; projectId: string; taskId: string; run: string }
+  | { kind: "run"; sessionId: string; taskId: string; run: string }
   | { kind: "folder"; path: string };
 
 export type RoomEvent =

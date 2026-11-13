@@ -4,7 +4,7 @@ import { Engine, openTerminal } from "./engine";
 import "./terminal.css";
 
 interface Props {
-  sessionId: string;
+  processId: string;
   visible: boolean;
   /** Takes the keyboard focus while it is visible. */
   focused: boolean;
@@ -15,8 +15,8 @@ interface Props {
   onError: (error: unknown) => void;
 }
 
-/** Attaches to the session while it is mounted. An unmount detaches; the session keeps running. */
-export function TerminalView({ sessionId, visible, focused, style, onFocus, onExit, onError }: Props) {
+/** Attaches to the terminal process while it is mounted. An unmount detaches; the process keeps running. */
+export function TerminalView({ processId, visible, focused, style, onFocus, onExit, onError }: Props) {
   const container = useRef<HTMLDivElement>(null);
   const [engine, setEngine] = useState<Engine>();
 
@@ -36,7 +36,7 @@ export function TerminalView({ sessionId, visible, focused, style, onFocus, onEx
     const ack = () => {
       if (disposed) return;
       if (token === undefined) unacked++;
-      else ackSession(sessionId, token).catch(fail);
+      else ackSession(processId, token).catch(fail);
     };
     openTerminal(container.current!)
       .then(async (created) => {
@@ -44,8 +44,8 @@ export function TerminalView({ sessionId, visible, focused, style, onFocus, onEx
         opened = created;
         setEngine(created);
         const { term } = created;
-        term.onData((data) => writeSession(sessionId, data).catch(fail));
-        term.onResize(({ rows, cols }) => resizeSession(sessionId, rows, cols).catch(() => {}));
+        term.onData((data) => writeSession(processId, data).catch(fail));
+        term.onResize(({ rows, cols }) => resizeSession(processId, rows, cols).catch(() => {}));
         const onFrame = (frame: SessionFrame) => {
           if (disposed) return;
           if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) return onExit();
@@ -53,17 +53,17 @@ export function TerminalView({ sessionId, visible, focused, style, onFocus, onEx
           term.write(frame instanceof ArrayBuffer ? new Uint8Array(frame) : Uint8Array.from(frame));
           ack();
         };
-        token = await attachSession(sessionId, onFrame);
-        if (disposed) return detachSession(sessionId, token).catch(() => {});
-        for (; unacked > 0; unacked--) ackSession(sessionId, token).catch(fail);
+        token = await attachSession(processId, onFrame);
+        if (disposed) return detachSession(processId, token).catch(() => {});
+        for (; unacked > 0; unacked--) ackSession(processId, token).catch(fail);
         // After the replay, so the TUI draws itself again at this size. An exited session takes no input.
         created.fit();
-        await resizeSession(sessionId, term.rows, term.cols).catch(() => {});
+        await resizeSession(processId, term.rows, term.cols).catch(() => {});
       })
       .catch(onError);
     return () => {
       disposed = true;
-      if (token !== undefined) detachSession(sessionId, token).catch(() => {});
+      if (token !== undefined) detachSession(processId, token).catch(() => {});
       opened?.dispose();
     };
   }, []);

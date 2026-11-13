@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::cage::{Project, WORKSPACE};
+use crate::cage::{Bound, WORKSPACE};
 use crate::preferences::EditorPrefs;
 
 /// A known editor and the names of its app bundles, the stable one first.
@@ -122,12 +122,12 @@ pub fn view(prefs: &EditorPrefs, detected: Vec<Editor>) -> Editors {
 }
 
 /// The host folder of a guest folder below `/workspace` or a mount of
-/// `project`. `None` for any other path, a path that is gone on the host, or
+/// the session and its cage. `None` for any other path, a path that is gone on the host, or
 /// a path whose `..` or link leads out of its host folder.
-pub fn map_guest(guest: &str, project: &Project) -> Option<PathBuf> {
+pub fn map_guest(guest: &str, bound: Bound<'_>) -> Option<PathBuf> {
     let below = |root: &str| guest.strip_prefix(root).filter(|rest| rest.is_empty() || rest.starts_with('/'));
-    let (host, rest) = std::iter::once((project.folder.as_path(), WORKSPACE))
-        .chain(project.mounts.iter().map(|m| (m.host.as_path(), m.guest.as_str())))
+    let (host, rest) = std::iter::once((bound.session.folder.as_path(), WORKSPACE))
+        .chain(bound.cage.mounts.iter().map(|m| (m.host.as_path(), m.guest.as_str())))
         .filter_map(|(host, root)| Some((host, root.len(), below(root)?)))
         .max_by_key(|(_, len, _)| *len)
         .map(|(host, _, rest)| (host, rest))?;
@@ -139,7 +139,8 @@ pub fn map_guest(guest: &str, project: &Project) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cage::Mount;
+    use crate::cage::{Cage, Mount};
+    use crate::session::Session;
 
     fn temp() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-editor-{}", uuid::Uuid::new_v4()));
@@ -227,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_paths_map_to_the_project_folder_or_a_mount_and_never_out() {
+    fn guest_paths_map_to_the_session_folder_or_a_mount_and_never_out() {
         let root = temp();
         let folder = root.join("project");
         let data = root.join("data");
@@ -237,10 +238,11 @@ mod tests {
         std::os::unix::fs::symlink(root.join("secret"), folder.join("link")).unwrap();
         std::os::unix::fs::symlink(folder.join("src"), folder.join("inside")).unwrap();
         std::fs::write(folder.join("file"), "").unwrap();
-        let mut project = Project::new(folder.to_str().unwrap()).unwrap();
-        project.mounts.push(Mount { host: data.clone(), id: None, guest: "/data".into(), readonly: true });
+        let session = Session::new(folder.to_str().unwrap(), "c", []).unwrap();
+        let mut cage = Cage::new("c".into(), session.name.clone());
+        cage.mounts.push(Mount { host: data.clone(), id: None, guest: "/data".into(), readonly: true });
 
-        let map = |guest: &str| map_guest(guest, &project);
+        let map = |guest: &str| map_guest(guest, Bound { session: &session, cage: &cage });
         assert_eq!(map("/workspace"), Some(folder.clone()));
         assert_eq!(map("/workspace/"), Some(folder.clone()));
         assert_eq!(map("/workspace/src/deep"), Some(folder.join("src/deep")));

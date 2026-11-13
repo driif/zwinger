@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::agent::AgentKind;
 use crate::cage::manager::{State, Vm, lock};
 
-/// Gets the project id, the phase that begins, and the ms since the start began.
+/// Gets the cage id, the phase that begins, and the ms since the start began.
 pub type ProgressSink = Box<dyn Fn(&str, &Phase, u64) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -94,7 +94,7 @@ pub(crate) fn ms(took: Duration) -> u64 {
     u64::try_from(took.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Marks the phase that a start begins: in the project's status and through the sink.
+/// Marks the phase that a start begins: in the cage's status and through the sink.
 pub(crate) struct Progress<V> {
     pub(crate) id: String,
     pub(crate) started: Instant,

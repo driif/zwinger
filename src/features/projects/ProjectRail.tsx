@@ -36,12 +36,14 @@ import {
   X,
 } from "lucide-react";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
-import { arrangeWorkspaces, createWorkspace, deleteWorkspace, renameProject, renameWorkspace } from "./api";
+import { arrangeWorkspaces, createWorkspace, deleteWorkspace, renameSession, renameWorkspace } from "./api";
 import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
-  SessionKind,
-  ProjectView,
+  CageView,
+  SessionCage,
+  SessionView,
+  TerminalKind,
   INVALID_ORDER,
   Workspace,
 } from "../../shared/api";
@@ -66,11 +68,11 @@ const GROUPS: { group: Group; label: string }[] = [
   { group: "tasks", label: "Tasks" },
 ];
 
-const kindName = (kind: SessionKind) =>
+const kindName = (kind: TerminalKind) =>
   kind.type === "host" ? "Mac shell" : kind.type === "shell" ? "VM shell" : AGENT_NAMES[kind.agent];
 
 /** Where a terminal runs: on this Mac, or in the cage. An agent always runs in the VM. */
-export function KindIcon({ kind }: { kind: SessionKind }) {
+export function KindIcon({ kind }: { kind: TerminalKind }) {
   if (kind.type === "agent") {
     const Icon = AGENT_ICONS[kind.agent];
     return <Icon size={14} aria-label="In the VM" />;
@@ -78,9 +80,9 @@ export function KindIcon({ kind }: { kind: SessionKind }) {
   return kind.type === "host" ? <Laptop size={14} aria-label="On this Mac" /> : <Box size={14} aria-label="In the VM" />;
 }
 
-/** The name of a terminal: its kind, and its number among the project's terminals of that kind. */
+/** The name of a terminal: its kind, and its number among the session's terminals of that kind. */
 export function paneName(pane: Pane, panes: Pane[]) {
-  const same = panes.filter((p) => p.projectId === pane.projectId && kindName(p.kind) === kindName(pane.kind));
+  const same = panes.filter((p) => p.sessionId === pane.sessionId && kindName(p.kind) === kindName(pane.kind));
   return `${kindName(pane.kind)} ${same.indexOf(pane) + 1}`;
 }
 
@@ -94,12 +96,12 @@ function runBadge(run: RunSummary | undefined) {
 
 /**
  * What dnd-kit carries per row. `container` is "workspaces" for a workspace, the workspace id for a session and
- * `<project id>|terminals` for a terminal. A `drop` is the header of a collapsed or empty workspace.
+ * `<session id>|terminals` for a terminal. A `drop` is the header of a collapsed or empty workspace.
  */
 interface DragData {
   kind: "workspace" | "session" | "terminal" | "drop";
   container: string;
-  projectId?: string;
+  sessionId?: string;
   entity: string;
   label: string;
 }
@@ -124,7 +126,7 @@ interface RowProps {
   selected: boolean;
   tabStop: boolean;
   className?: string;
-  projectDrop?: string;
+  sessionDrop?: string;
   /** The workspace that a folder dropped from Finder on this row goes to. */
   workspaceDrop?: string;
   /** Makes the row itself a drop target for sessions. */
@@ -140,7 +142,7 @@ interface RowProps {
 
 /** A treeitem. A sortable one is dragged by its own row only, so a drag in a child list does not move the parent. */
 function TreeRow(props: RowProps) {
-  const { id, level, drag, expanded, selected, tabStop, className, projectDrop, workspaceDrop, drop, row, onOpen, onMenu, onRename, children } =
+  const { id, level, drag, expanded, selected, tabStop, className, sessionDrop, workspaceDrop, drop, row, onOpen, onMenu, onRename, children } =
     props;
   const sortable = useSortable({ id, data: drag, disabled: !drag });
   const droppable = useDroppable({ id: `d|${id}`, data: drop, disabled: !drop });
@@ -154,7 +156,7 @@ function TreeRow(props: RowProps) {
       aria-describedby={drag && sortable.attributes["aria-describedby"]}
       tabIndex={tabStop ? 0 : -1}
       data-tree-id={id}
-      data-project-drop={projectDrop}
+      data-session-drop={sessionDrop}
       data-workspace-drop={workspaceDrop}
       className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""} ${droppable.isOver ? "drop-target" : ""}`}
       style={{ transform: CSS.Translate.toString(sortable.transform), transition: sortable.transition }}
@@ -219,26 +221,26 @@ function NameField({ name, onDone }: { name: string; onDone: (name: string | und
 }
 
 interface Props {
-  projects: ProjectView[];
-  /** Each project is in exactly one workspace. */
+  sessions: SessionCage[];
+  /** Each session is in exactly one workspace. */
   workspaces: Workspace[];
   selectedId?: string;
   view: View;
-  /** Per project, the blocked events that the Network tab has not shown yet. */
+  /** Per session, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
-  /** Per project, the runs of its tasks. */
+  /** Per session, the runs of its tasks. */
   runs: Record<string, RunSummary[]>;
   panes: Pane[];
   run: Run;
-  onOpen: (projectId: string, view: View) => void;
-  onRunsChange: (projectId: string) => void;
-  onToggle: (project: ProjectView) => void;
-  onNewSession: (projectId: string, kind: SessionKind) => void;
+  onOpen: (sessionId: string, view: View) => void;
+  onRunsChange: (sessionId: string) => void;
+  onToggle: (cage: CageView) => void;
+  onNewSession: (sessionId: string, kind: TerminalKind) => void;
   onClosePane: (key: string) => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
-  /** Saves the order of all terminals of the project. */
-  onMoveTerminals: (projectId: string, ids: string[]) => void;
+  /** Saves the order of all terminals of the session. */
+  onMoveTerminals: (sessionId: string, ids: string[]) => void;
   onNew: () => void;
   /** Opens the app settings. */
   onSettings: () => void;
@@ -247,14 +249,14 @@ interface Props {
   editors?: Editors;
   /** The home folder, shown as `~`. */
   home?: string;
-  onLaunch: (projectId: string, action: LaunchAction) => void;
+  onLaunch: (sessionId: string, action: LaunchAction) => void;
   onDropDone: (create: boolean) => void;
   children: ReactNode;
 }
 
-/** The sessions as a tree: workspace → session → Terminals / Tasks → items. A session is a project. */
+/** The sessions as a tree: workspace → session → Terminals / Tasks → items. */
 export function ProjectRail({
-  projects,
+  sessions,
   workspaces,
   selectedId,
   view,
@@ -321,15 +323,15 @@ export function ProjectRail({
       return next;
     });
 
-  function leaves(project: ProjectView, group: Group): Leaf[] {
-    const sid = project.id;
+  function leaves(session: SessionView, cage: CageView, group: Group): Leaf[] {
+    const sid = session.id;
     if (group === "terminals")
       return panes
-        .filter((p) => p.projectId === sid)
+        .filter((p) => p.sessionId === sid)
         .map((pane) => {
           const { kind } = pane;
-          const session = project.sessions.find((s) => s.terminalId === pane.key);
-          const state = !session ? "dormant" : session.exitCode !== null ? `exited ${session.exitCode}` : undefined;
+          const process = session.processes.find((s) => s.terminalId === pane.key);
+          const state = !process ? "dormant" : process.exitCode !== null ? `exited ${process.exitCode}` : undefined;
           const name = paneName(pane, panes);
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
           const open: MenuAction[] = state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : [];
@@ -358,8 +360,8 @@ export function ProjectRail({
                 : [...open, close],
           };
         });
-    const cageRunning = project.status.state === "running";
-    return project.tasks.map((task) => {
+    const cageRunning = cage.status.state === "running";
+    return session.tasks.map((task) => {
       const taskRuns = (runs[sid] ?? []).filter((r) => r.taskId === task.id);
       const latest = taskRuns[taskRuns.length - 1];
       const live = taskRuns.some((r) => isLive(r.state));
@@ -402,7 +404,7 @@ export function ProjectRail({
   }
 
   const shown = draft ?? workspaces;
-  const byId = new Map(projects.map((p) => [p.id, p]));
+  const byId = new Map(sessions.map((s) => [s.session.id, s]));
 
   // The rows in tree order, for the arrow keys, and each row's parent.
   const visible: string[] = [];
@@ -412,23 +414,23 @@ export function ProjectRail({
     const workspaceRow = `w|${workspace.id}`;
     visible.push(workspaceRow);
     const workspaceOpen = !collapsed.has(workspaceRow);
-    const sessions = workspace.sessions.flatMap((id) => byId.get(id) ?? []).map((project) => {
-      const sid = project.id;
-      const projectRow = `s|${sid}`;
-      const sessionOpen = workspaceOpen && !collapsed.has(projectRow);
+    const sessions = workspace.sessions.flatMap((id) => byId.get(id) ?? []).map(({ session, cage }) => {
+      const sid = session.id;
+      const sessionRow = `s|${sid}`;
+      const sessionOpen = workspaceOpen && !collapsed.has(sessionRow);
       if (workspaceOpen) {
-        visible.push(projectRow);
-        parentOf[projectRow] = workspaceRow;
+        visible.push(sessionRow);
+        parentOf[sessionRow] = workspaceRow;
       }
       const groups = GROUPS.map(({ group, label }) => {
         const id = `g|${sid}|${group}`;
         const container = `${sid}|${group}`;
-        const items = leaves(project, group);
+        const items = leaves(session, cage, group);
         lists[container] = items.map((i) => i.entity);
         const open = items.length > 0 && !collapsed.has(id);
         if (sessionOpen) {
           visible.push(id);
-          parentOf[id] = projectRow;
+          parentOf[id] = sessionRow;
           if (open)
             for (const item of items) {
               visible.push(`i|${container}|${item.entity}`);
@@ -437,7 +439,7 @@ export function ProjectRail({
         }
         return { group, label, id, container, items, open };
       });
-      return { project, projectRow, groups };
+      return { session, cage, sessionRow, groups };
     });
     return { workspace, workspaceRow, workspaceOpen, sessions };
   });
@@ -577,11 +579,11 @@ export function ProjectRail({
     if (data.kind !== "terminal" || !rect) return;
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-project-drop]") ?? [])].find((el) => {
+    const target = [...(tree.current?.querySelectorAll<HTMLElement>("[data-session-drop]") ?? [])].find((el) => {
       const r = el.getBoundingClientRect();
       return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-    })?.dataset.projectDrop;
-    const next = target && target !== data.projectId ? target : undefined;
+    })?.dataset.sessionDrop;
+    const next = target && target !== data.sessionId ? target : undefined;
     if (next === forbidden) return;
     setForbidden(next);
     if (next) setAnnouncement(FORBIDDEN);
@@ -616,7 +618,7 @@ export function ProjectRail({
       }
       if (!over || over.id === active.id) return;
       const list = lists[data.container];
-      onMoveTerminals(data.projectId!, arrayMove(list, list.indexOf(data.entity), list.indexOf(dataOf(over).entity)));
+      onMoveTerminals(data.sessionId!, arrayMove(list, list.indexOf(data.entity), list.indexOf(dataOf(over).entity)));
       return;
     }
     let next = draft ?? workspaces;
@@ -674,12 +676,12 @@ export function ProjectRail({
     ];
   }
 
-  function groupAction(project: ProjectView, group: Group) {
-    const id = `g|${project.id}|terminals`;
+  function groupAction(session: SessionView, group: Group) {
+    const id = `g|${session.id}|terminals`;
     const [label, action] =
       group === "terminals"
-        ? ["New Mac shell", () => onNewSession(project.id, { type: "host" })]
-        : ["New task", () => onOpen(project.id, { kind: "taskEdit" })];
+        ? ["New Mac shell", () => onNewSession(session.id, { type: "host" })]
+        : ["New task", () => onOpen(session.id, { kind: "taskEdit" })];
     return (
       <>
         <IconButton
@@ -830,92 +832,92 @@ export function ProjectRail({
                   )}
                   {workspaceOpen && (
                     <ul role="group">
-                      <SortableContext items={sessions.map((s) => s.projectRow)} strategy={verticalListSortingStrategy}>
-                        {sessions.map(({ project, projectRow, groups }) => {
-                          const projectOpen = !collapsed.has(projectRow);
-                          const running = project.status.state === "running";
+                      <SortableContext items={sessions.map((s) => s.sessionRow)} strategy={verticalListSortingStrategy}>
+                        {sessions.map(({ session, cage, sessionRow, groups }) => {
+                          const sessionExpanded = !collapsed.has(sessionRow);
+                          const running = cage.status.state === "running";
                           return (
                             <TreeRow
-                              key={project.id}
-                              id={projectRow}
+                              key={session.id}
+                              id={sessionRow}
                               level={2}
                               drag={{
                                 kind: "session",
                                 container: workspace.id,
-                                projectId: project.id,
-                                entity: project.id,
-                                label: project.name,
+                                sessionId: session.id,
+                                entity: session.id,
+                                label: session.name,
                               }}
-                              expanded={projectOpen}
-                              selected={selectedRow === projectRow}
-                              tabStop={tabStop === projectRow}
-                              className={`tree-project ${project.id === selectedId ? "current" : ""} ${forbidden === project.id ? "forbidden-target" : ""}`}
-                              projectDrop={project.id}
+                              expanded={sessionExpanded}
+                              selected={selectedRow === sessionRow}
+                              tabStop={tabStop === sessionRow}
+                              className={`tree-project ${session.id === selectedId ? "current" : ""} ${forbidden === session.id ? "forbidden-target" : ""}`}
+                              sessionDrop={session.id}
                               workspaceDrop={workspace.id}
-                              onOpen={() => onOpen(project.id, { kind: "terminal" })}
-                              onMenu={() => setMenu(projectRow)}
-                              onRename={() => setEditing(projectRow)}
+                              onOpen={() => onOpen(session.id, { kind: "terminal" })}
+                              onMenu={() => setMenu(sessionRow)}
+                              onRename={() => setEditing(sessionRow)}
                               row={
                                 <>
                                   <IconButton
-                                    icon={<ChevronRight size={14} className={projectOpen ? "tree-chevron open" : "tree-chevron"} />}
-                                    label={projectOpen ? `Collapse ${project.name}` : `Expand ${project.name}`}
+                                    icon={<ChevronRight size={14} className={sessionExpanded ? "tree-chevron open" : "tree-chevron"} />}
+                                    label={sessionExpanded ? `Collapse ${session.name}` : `Expand ${session.name}`}
                                     tabIndex={-1}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      toggle(projectRow);
+                                      toggle(sessionRow);
                                     }}
                                   />
-                                  <span className={`dot ${project.status.state}`} aria-label={project.status.state} />
-                                  {editing === projectRow ? (
-                                    nameField(projectRow, project.name, (name) => renameProject(project.id, name))
+                                  <span className={`dot ${cage.status.state}`} aria-label={cage.status.state} />
+                                  {editing === sessionRow ? (
+                                    nameField(sessionRow, session.name, (name) => renameSession(session.id, name))
                                   ) : (
                                     <span
                                       className="grow tree-name"
-                                      title={project.status.state === "error" ? project.status.message : project.folder}
+                                      title={cage.status.state === "error" ? cage.status.message : session.folder}
                                     >
-                                      {project.name}
-                                      {project.status.state === "starting" ? (
+                                      {session.name}
+                                      {cage.status.state === "starting" ? (
                                         <span className="tree-path muted">
-                                          <StartProgress phase={project.status.phase} />
+                                          <StartProgress phase={cage.status.phase} />
                                         </span>
                                       ) : (
-                                        <span className="tree-path muted" title={project.folder}>
-                                          {truncateMiddle(tildePath(project.folder, home), 32)}
+                                        <span className="tree-path muted" title={session.folder}>
+                                          {truncateMiddle(tildePath(session.folder, home), 32)}
                                         </span>
                                       )}
                                     </span>
                                   )}
-                                  {blocked[project.id] > 0 && (
+                                  {blocked[session.id] > 0 && (
                                     <span className="rail-blocked" title="Blocked network events since you last saw them">
-                                      {blocked[project.id]}
+                                      {blocked[session.id]}
                                     </span>
                                   )}
                                   <IconButton
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
-                                    label={running ? `Stop ${project.name} cage` : `Start ${project.name} cage`}
+                                    label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}
                                     tabIndex={-1}
-                                    disabled={project.status.state === "starting" || project.status.state === "stopping"}
+                                    disabled={cage.status.state === "starting" || cage.status.state === "stopping"}
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      onToggle(project);
+                                      onToggle(cage);
                                     }}
                                   />
-                                  {menuButton(projectRow, project.name)}
+                                  {menuButton(sessionRow, session.name)}
                                 </>
                               }
                             >
-                              {menu === projectRow && (
+                              {menu === sessionRow && (
                                 <ActionMenu
-                                  label={`Actions for ${project.name}`}
+                                  label={`Actions for ${session.name}`}
                                   actions={[
-                                    ...launchMenu(launchActions(project, editors), (action) => onLaunch(project.id, action)),
-                                    renameAction(projectRow),
+                                    ...launchMenu(launchActions(cage, editors), (action) => onLaunch(session.id, action)),
+                                    renameAction(sessionRow),
                                   ]}
                                   onClose={closeMenu}
                                 />
                               )}
-                              {projectOpen && (
+                              {sessionExpanded && (
                                 <ul role="group">
                                   {groups.map(({ group, label, id, container, items, open }) => (
                                     <TreeRow
@@ -935,7 +937,7 @@ export function ProjectRail({
                                           />
                                           <span className="grow">{label}</span>
                                           <span className="muted tree-state">{items.length}</span>
-                                          {groupAction(project, group)}
+                                          {groupAction(session, group)}
                                         </>
                                       }
                                     >
@@ -943,8 +945,8 @@ export function ProjectRail({
                                         <ActionMenu
                                           label="New terminal"
                                           actions={launchMenu(
-                                            launchActions(project, editors).filter((a) => a.type === "session"),
-                                            (action) => onLaunch(project.id, action),
+                                            launchActions(cage, editors).filter((a) => a.type === "session"),
+                                            (action) => onLaunch(session.id, action),
                                           )}
                                           onClose={closeMenu}
                                         />
@@ -966,11 +968,11 @@ export function ProjectRail({
                                                   drag={
                                                     group === "tasks"
                                                       ? undefined
-                                                      : { kind: "terminal", container, projectId: project.id, entity: item.entity, label: item.name }
+                                                      : { kind: "terminal", container, sessionId: session.id, entity: item.entity, label: item.name }
                                                   }
                                                   selected={selectedRow === rowId}
                                                   tabStop={tabStop === rowId}
-                                                  onOpen={() => onOpen(project.id, item.view)}
+                                                  onOpen={() => onOpen(session.id, item.view)}
                                                   onMenu={() => setMenu(rowId)}
                                                   row={
                                                     <>

@@ -16,7 +16,7 @@ import {
   StorageView,
 } from "./api";
 import { checkUpdate, UpdateInfo } from "../updates/api";
-import { AGENT_NAMES, ProjectView } from "../../shared/api";
+import { AGENT_NAMES, SessionCage } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
 import { HostAgentsSettings } from "./HostAgentsSettings";
@@ -247,13 +247,13 @@ interface Props {
   /** Looks for the editors again. */
   onDetectEditors: () => void;
   detection?: Detection;
-  projects: ProjectView[];
+  sessions: SessionCage[];
   runtimes: Runtimes;
   run: Run;
   /** Detects the agents on this Mac again. */
   onRefresh: () => void;
   /** Opens the project's Add agent step for this agent. */
-  onUse: (projectId: string, agent: HostAgent) => void;
+  onUse: (sessionId: string, agent: HostAgent) => void;
   prefs: Prefs;
   onPrefs: (prefs: Prefs) => Promise<void>;
   update?: UpdateInfo;
@@ -268,7 +268,7 @@ export function AppSettings({
   editors,
   onDetectEditors,
   detection,
-  projects,
+  sessions,
   runtimes,
   run,
   onRefresh,
@@ -300,7 +300,7 @@ export function AppSettings({
           agents: (
             <HostAgentsSettings
               detection={detection}
-              projects={projects}
+              sessions={sessions}
               runtimes={runtimes}
               run={run}
               onRefresh={onRefresh}
