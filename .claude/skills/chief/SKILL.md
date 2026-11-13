@@ -12,14 +12,20 @@ Each task uses the same loop.
 
 ## Loop
 
-1. **Triage.** For a typo, a one-line fix or a question, do the task immediately. For all other tasks, do steps 2–8.
+1. **Triage.** Select one route. Write the route and the reason in `task.md` under *Chosen here*.
+   - *Direct*: a typo, a one-line fix or a question. Do the task immediately. Skip steps 2–8.
+   - *Subagent*: one area, a clear spec, no new design, no security change, no data-model change.
+     Example: a CSS bug, a removal, a docs page. In step 3, one Opus subagent implements from `task.md`.
+   - *Duo*: all other tasks. Example: a new design, a migration, security, or changes in more than one area.
+   For more tasks at a time: run tasks in parallel only if their files do not overlap.
+   Make one commit per task, and stage only the paths of that task.
 2. **Brief.** Make a slug for the task. Write `docs/tasks/<slug>/task.md` with these sections:
    - *Asked for*: the words of the user.
    - *Chosen here*: your decisions. Other agents can challenge them.
    - *Done*: the necessary behaviour and the gates.
 
    Install the necessary dependencies now. Codex has no network access.
-3. **Pair.** Use the `duo` skill. Run `.claude/skills/duo/scripts/duo-round.sh <slug> 01` in the background.
+3. **Pair.** For the *Subagent* route, start the subagent and go to step 4. For the *Duo* route, use the `duo` skill. Run `.claude/skills/duo/scripts/duo-round.sh <slug> 01` in the background.
    - On exit 3, answer the open questions from the code and `AGENTS.md`.
    - Ask the user only about product decisions.
    - Then run the round again with a new round name.
@@ -28,7 +34,7 @@ Each task uses the same loop.
    It also checks that a change to user-visible behaviour updates `site/src/content/docs/`.
 5. **Fix once.** If the review has findings, do these steps:
    1. Add the findings to `task.md` in the section *Review findings*.
-   2. Run one more duo round (`02-fix`).
+   2. Run one more round on the same route: a duo round `02-fix`, or the subagent again.
    3. Stop the loop. Do not do more fix rounds.
 6. **Ship.** Run the gates yourself. If all gates pass, do these steps:
    1. Commit with a Conventional Commit message.
