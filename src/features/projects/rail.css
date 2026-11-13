@@ -1,11 +1,18 @@
 .rail {
+  --zw-rail-pad: calc(var(--motiv-space) * 3);
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: var(--zw-gap);
-  padding: calc(var(--motiv-space) * 3);
+  padding: var(--zw-rail-pad);
   border-right: 1px solid var(--motiv-color-border);
-  overflow-x: hidden;
+  overflow: clip;
+}
+
+/* The command bar is the first item in the rail. Its open menu fits below it in the window and scrolls. */
+.rail .motiv-command-menu__menu {
+  max-height: calc(100dvh - var(--zw-rail-pad) * 2 - var(--zw-control-height) - 8px);
   overflow-y: auto;
 }
 
@@ -42,9 +49,15 @@
   padding: 0;
 }
 
+/* Only the tree scrolls. The rail clips: the command bar keeps its closed menu in the DOM, and a scrolling rail scrolled by that menu's height. */
 .rail-tree {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  margin-inline: calc(var(--zw-rail-pad) * -1);
+  padding-inline: var(--zw-rail-pad);
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: var(--zw-gap);
