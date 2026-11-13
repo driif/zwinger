@@ -31,3 +31,7 @@ src-tauri/resources/pi/
 site/.astro
 site/dist
 .wrangler
+
+# Agent worktrees and a local pnpm store
+.claude/worktrees/
+.pnpm-store/
