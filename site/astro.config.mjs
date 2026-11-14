@@ -27,6 +27,7 @@ export default defineConfig({
         "network",
         "tasks",
         "shortcuts",
+        "appearance",
         "updates",
       ],
     }),

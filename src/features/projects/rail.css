@@ -38,7 +38,7 @@
   border-radius: var(--motiv-radius-full);
   background: var(--motiv-color-danger);
   color: var(--motiv-color-surface);
-  font-size: 0.75rem;
+  font-size: var(--zw-text-sm);
   font-weight: 600;
 }
 
@@ -88,6 +88,7 @@
   min-height: var(--zw-rail-row);
   padding-right: var(--motiv-space);
   border-radius: var(--motiv-radius-md);
+  font-size: var(--zw-text-body);
   white-space: nowrap;
   cursor: pointer;
   touch-action: none;
@@ -104,7 +105,6 @@
 .tree-row.level-1 {
   padding-left: var(--motiv-space);
   color: var(--motiv-color-text-muted);
-  font-size: 0.75rem;
   font-weight: 600;
 }
 
@@ -115,7 +115,6 @@
 .tree-row.level-3 {
   padding-left: calc(var(--motiv-space) * 8);
   color: var(--motiv-color-text-muted);
-  font-size: 0.75rem;
 }
 
 .tree-row.level-4 {
@@ -144,7 +143,7 @@
 .tree-path {
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 0.75rem;
+  font-size: var(--zw-text-sm);
   font-weight: 400;
 }
 
@@ -167,17 +166,38 @@
 
 .tree-state {
   flex-shrink: 0;
-  font-size: 0.75rem;
+  font-size: var(--zw-text-sm);
 }
 
-/* The name input of a row in rename. It keeps the row height: motiv has no compact TextField yet (backlog). */
+/* The agent status Badge keeps its size in a narrow row. */
+.agent-status {
+  flex-shrink: 0;
+}
+
+/*
+ * The name input of a row in rename. It keeps the row height: motiv has no compact TextField yet
+ * (docs/designs/ui-text-scale-audit.md `--motiv-control-height`). The hidden label leaves the grid, so the input
+ * fills the control.
+ */
 .tree-edit {
   min-width: 0;
   --motiv-text-field-radius: var(--motiv-radius-md);
 }
 
+.tree-edit .motiv-float__control {
+  min-height: 0;
+  height: calc(var(--zw-rail-row) - var(--motiv-space));
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.tree-edit .motiv-float__label {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+}
+
 .tree-edit .motiv-float__input {
-  height: calc(var(--zw-rail-row) - 4px);
+  grid-area: 1 / 1;
   padding: 0 calc(var(--motiv-space) * 1.5);
   font-size: inherit;
 }

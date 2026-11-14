@@ -36,5 +36,5 @@ body {
 .features {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
-  gap: 1rem;
+  gap: calc(var(--motiv-space) * 4);
 }

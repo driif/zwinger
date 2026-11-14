@@ -18,7 +18,7 @@
 
 .md code {
   font-family: var(--zw-font-mono);
-  font-size: 0.75rem;
+  font-size: var(--zw-text-sm);
 }
 
 .md-code {
@@ -35,7 +35,7 @@
 
 .md-heading.h1,
 .md-heading.h2 {
-  font-size: 1rem;
+  font-size: var(--zw-text-lg);
 }
 
 .md a {

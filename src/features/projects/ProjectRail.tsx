@@ -1,4 +1,4 @@
-import { Button, Card, IconButton, Select, TextField } from "@driif/motiv";
+import { Badge, Button, Card, IconButton, Select, TextField } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -105,12 +105,11 @@ function AgentStatusGlyph({ state }: { state: AgentState | null }) {
     done: "Agent done: waiting for a new prompt",
   }[state];
   const Icon = { blocked: CircleAlert, active: CirclePlay, done: CircleCheck }[state];
-  // The classes set --motiv-color-warning/success/text-muted. A motiv Badge replaces this after the motiv upgrade (backlog).
-  const color = { blocked: "warn", active: "ok", done: "muted" }[state];
+  const tone = ({ blocked: "warning", active: "success", done: "neutral" } as const)[state];
   return (
-    <span role="img" aria-label={label} title={label} className={color}>
-      <Icon size={14} aria-hidden="true" />
-    </span>
+    <Badge tone={tone} size="sm" role="img" aria-label={label} title={label} className="agent-status">
+      <Icon size={12} aria-hidden="true" />
+    </Badge>
   );
 }
 

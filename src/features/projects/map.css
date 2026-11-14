@@ -1,4 +1,5 @@
 /* React Flow takes its colours from the tokens, so the map follows the theme. */
+/* missing: docs/designs/ui-text-scale-audit.md `Map canvas`. The pixel sizes in this file match the pixel layout in mapLayout.ts and CHAR in ProjectMap.tsx. */
 .map {
   flex: 1;
   min-height: 20rem;

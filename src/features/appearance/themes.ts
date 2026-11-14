@@ -73,7 +73,7 @@ export const BUILT_INS: Theme[] = [
       "--motiv-color-success": "#4ade80",
       "--motiv-color-warning": "#fbbf24",
       "--motiv-radius": "0.25rem",
-      "--motiv-font-size": "0.875rem",
+      "--motiv-font-size": "0.8125rem",
     },
     terminal: { background: "#000000", foreground: "#ffffff", cursor: "#ffd60a", selection: "#404040", ansi: XTERM_ANSI },
   },
