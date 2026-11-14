@@ -149,11 +149,11 @@ impl<R: SandboxRuntime> Manager<R> {
             });
         }
         let argv = kind.vm_argv().ok_or(Error::NotRunning)?;
-        let (cage_id, vm, cwd) = {
+        let (key, vm, cwd) = {
             let state = lock(&self.state);
             state.session(session_id)?;
             match state.vm_of(session_id) {
-                Some((cage_id, Vm::Running { vm, applied, runtimes, host, .. })) => {
+                Some((key, Vm::Running { vm, applied, runtimes, host, .. })) => {
                     let (member, folder, _) = task_guest_folder(&applied.0, session_id).ok_or(Error::NotRunning)?;
                     let cwd = match kind {
                         TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
@@ -162,15 +162,15 @@ impl<R: SandboxRuntime> Manager<R> {
                         TerminalKind::Agent { .. } => member.harness.as_deref(),
                         TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
                     };
-                    (cage_id.to_owned(), vm.clone(), cwd.map_or(folder.clone(), |h| in_guest_folder(&folder, h)))
+                    (key.to_owned(), vm.clone(), cwd.map_or(folder.clone(), |h| in_guest_folder(&folder, h)))
                 }
                 _ => return Err(Error::NotRunning),
             }
         };
         let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
-        // The cage may have stopped, or stopped and started again, while
+        // The VM may have stopped, or stopped and started again, while
         // the process opened. Its stop did not see this process, so kill it.
-        self.register(session_id, terminal_id, kind, |state| match state.vms.get(&cage_id) {
+        self.register(session_id, terminal_id, kind, |state| match state.vms.get(&key) {
             Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
             _ => {
                 let _ = pty.input.send(PtyInput::Kill);
@@ -416,7 +416,7 @@ mod tests {
         assert!(matches!(manager.open_session(&id, TerminalKind::Shell, 24, 80).await, Err(Error::NotRunning)));
 
         manager.start(&id).await.unwrap();
-        assert_eq!(manager.list().cages[0].status, Status::Running);
+        assert_eq!(manager.list().cages[0].shared().status, Status::Running);
 
         let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         let (_, mut rx) = attach(&manager, &session);
@@ -439,7 +439,7 @@ mod tests {
         assert!(matches!(manager.write(&session, b"x".to_vec()), Err(Error::ProcessNotFound)));
 
         manager.stop(&id, None).await.unwrap();
-        assert_eq!(manager.list().cages[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), "kill".into(), format!("stop {id}")]);
     }
 
@@ -530,7 +530,7 @@ mod tests {
         );
         manager.set_pane_layout(&id, Some(layout.clone())).unwrap();
         assert_eq!(manager.list().sessions[0].session.pane_layout, Some(layout));
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
 
         let invalid = |layout| matches!(manager.set_pane_layout(&id, Some(layout)), Err(Error::InvalidPaneLayout(_)));
         assert!(invalid(split(SplitDirection::Row, 0.5, leaf(&t[0]), leaf(&t[0]))));
@@ -559,7 +559,7 @@ mod tests {
         host_sh();
         let (manager, runtime, id) = manager();
         let session = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
-        assert_eq!(manager.list().cages[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
         assert_eq!(manager.list().sessions[0].session.terminals[0].kind, TerminalKind::Host);
         let (_, mut rx) = attach(&manager, &session);
         manager.write(&session, b"echo hi-$((40+2))\n".to_vec()).unwrap();
@@ -710,7 +710,7 @@ mod tests {
         std::fs::create_dir(folder.join("agent")).unwrap();
         manager.start(&id).await.unwrap();
         manager.set_harness(&id, Some("/workspace/agent")).unwrap();
-        assert!(manager.list().cages[0].pending_restart);
+        assert!(manager.list().cages[0].shared().pending_restart);
         manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
 
         manager.stop(&id, None).await.unwrap();
@@ -733,7 +733,7 @@ mod tests {
         let mut ids = terminal_ids(&manager);
         ids.reverse();
         manager.reorder_terminals(&id, &ids).unwrap();
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
         assert!(matches!(manager.reorder_terminals(&id, &ids[1..]), Err(Error::InvalidOrder)));
         manager.close_terminal(&id, &ids[1]).unwrap();
         assert_eq!(terminal_ids(&manager), [ids[0].clone(), ids[2].clone()]);

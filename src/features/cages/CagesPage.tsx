@@ -20,7 +20,7 @@ function inUse(cage: CageView, sessions: SessionView[], workspaces: Workspace[])
   if (session) return `Session ${session.name} uses it.`;
   const workspace = workspaces.find((w) => w.defaultCage === cage.id);
   if (workspace) return `It is the default cage of workspace ${workspace.name}.`;
-  if (cage.status.state !== "stopped" && cage.status.state !== "error") return "Its VM runs.";
+  if (cage.vms.some((v) => v.status.state !== "stopped" && v.status.state !== "error")) return "Its VM runs.";
 }
 
 /** The list of cages: create, rename, edit and delete. */
@@ -52,7 +52,7 @@ export function CagesPage({ cages, sessions, workspaces, runtimes, run }: Props)
           <h1 className="page-title grow">{edited.name}</h1>
         </header>
         <div className="tab-body">
-          <CageSettings cage={edited} vm={edited} runtimes={runtimes} run={run} />
+          <CageSettings cage={edited} vm={{ ...edited, ...edited.vms[0] }} runtimes={runtimes} run={run} />
         </div>
       </section>
     );

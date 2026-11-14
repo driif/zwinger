@@ -20,7 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { NetEvent } from "../network/api";
 import { setLayout } from "./api";
 import { isRoundFolder } from "../tasks/api";
-import { CageView, Pos, SessionView } from "../../shared/api";
+import { CageView, Pos, SessionView, VmCage } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
 import { CageMark } from "../../shared/CageMark";
@@ -96,7 +96,7 @@ interface Props {
   session: SessionView;
   cage: CageView;
   /** The cage of the session's VM. */
-  vmCage: CageView | null;
+  vmCage: VmCage | null;
   /** `undefined` until the folders of this session are listed. */
   folders?: string[];
   /** The cage's network events, oldest first. */

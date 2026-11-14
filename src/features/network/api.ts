@@ -87,14 +87,13 @@ export interface NetEvent {
   note?: string;
 }
 
-/** The events that the backend keeps for the cage, oldest first. */
-export const listNetEvents = (cageId: string) =>
-  call<NetEvent[]>("list_net_events", { cageId });
+/** The events that the backend keeps for the VM, oldest first. */
+export const listNetEvents = (vmKey: string) => call<NetEvent[]>("list_net_events", { vmKey });
 
 /** Resolves to the function that stops the listener. */
 export const onNetEvent = (
-  handler: (cageId: string, event: NetEvent) => void,
+  handler: (vmKey: string, event: NetEvent) => void,
 ) =>
-  listen<{ cageId: string; event: NetEvent }>("net-event", ({ payload }) =>
-    handler(payload.cageId, payload.event),
+  listen<{ vmKey: string; event: NetEvent }>("net-event", ({ payload }) =>
+    handler(payload.vmKey, payload.event),
   );

@@ -86,6 +86,13 @@ export const stopCage = (sessionId: string, confirmed: StopShared | null) =>
 export const restartCage = (sessionId: string, confirmed: StopShared | null) =>
   call<void>("restart_cage", { sessionId, confirmed: confirmedOf(confirmed) });
 
+/**
+ * Puts the session in a VM of its own, or back in the shared VM of its cage. Fails with `StopShared` when its running VM
+ * has other members, unless `confirmed` is that error's detail: the VM then restarts without the session.
+ */
+export const setSessionVm = (sessionId: string, own: boolean, confirmed: StopShared | null) =>
+  call<void>("set_session_vm", { sessionId, own, confirmed: confirmedOf(confirmed) });
+
 /** `null`: the session inherits the default cage of its workspace. */
 export const setSessionCage = (sessionId: string, cageId: string | null) =>
   call<void>("set_session_cage", { sessionId, cageId });
@@ -100,7 +107,7 @@ export const setClaudeToken = (cageId: string, value: string, allow: boolean, pr
   call<void>("set_claude_token", { cageId, value, allow, profile });
 
 /** Resolves to the function that stops the listener. */
-export const onGuestLogin = (handler: (cageId: string) => void) =>
+export const onGuestLogin = (handler: (vmKey: string) => void) =>
   listen<string>("guest-login", ({ payload }) => handler(payload));
 
 /** A live agent process changed state or exited. */
@@ -109,10 +116,10 @@ export const onAgentState = (handler: (processId: string, state: AgentState | nu
     handler(payload.processId, payload.state),
   );
 
-/** Each phase change of a cage start. Resolves to the function that stops the listener. */
-export const onStartProgress = (handler: (cageId: string, phase: StartPhase) => void) =>
-  listen<{ cageId: string; phase: StartPhase; elapsedMs: number }>("cage-start-progress", ({ payload }) =>
-    handler(payload.cageId, payload.phase),
+/** Each phase change of a VM start. Resolves to the function that stops the listener. */
+export const onStartProgress = (handler: (vmKey: string, phase: StartPhase) => void) =>
+  listen<{ vmKey: string; phase: StartPhase; elapsedMs: number }>("cage-start-progress", ({ payload }) =>
+    handler(payload.vmKey, payload.phase),
   );
 
 /** Each notice comes once, such as the VMs that the app start removed. */

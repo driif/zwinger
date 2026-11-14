@@ -197,7 +197,7 @@ mod tests {
     use crate::cage::{Bound, FileId, HostAgentUse, Mount};
     use crate::runtime::TerminalKind;
     use crate::secrets::{Origin, Places};
-    use crate::session::{PaneNode, Pos, SplitDirection, Task, TaskAgent, TerminalRecord};
+    use crate::session::{PaneNode, Pos, SplitDirection, Task, TaskAgent, TerminalRecord, VmChoice};
 
     fn data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
@@ -291,6 +291,7 @@ mod tests {
             folder_id: Some(FileId { dev: 1, ino: 2 }),
             slug: "my-proj".into(),
             cage: Some("p-1".into()),
+            vm: VmChoice::Shared,
             harness: Some("/workspace/agent".into()),
             terminals: vec![
                 TerminalRecord {

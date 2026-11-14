@@ -36,14 +36,14 @@ pub struct NetTest {
 }
 
 impl<R: SandboxRuntime> Manager<R> {
-    pub fn list_net_events(&self, id: &str) -> Result<Vec<Entry>> {
+    /// The network log of VM `key`. It stays after a stop.
+    pub fn list_net_events(&self, key: &str) -> Result<Vec<Entry>> {
         let state = lock(&self.state);
-        state.cage(id)?;
-        Ok(state.net.get(id).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
+        Ok(state.net.get(key).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
     }
 
-    /// Applies `edit` to the network policy and saves it. A running proxy
-    /// uses the new policy from its next request.
+    /// Applies `edit` to the network policy and saves it. Each running
+    /// proxy of the cage uses the new policy from its next request.
     pub(crate) fn edit_network<T>(&self, id: &str, edit: impl FnOnce(&mut NetworkPolicy) -> Result<T>) -> Result<T> {
         let mut out = None;
         self.edit_cage(id, |c, _| {
@@ -54,17 +54,18 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(out.expect("the edit ran"))
     }
 
-    /// Sends the stored policy to the cage's proxy, if it has one, in one
+    /// Sends the stored policy to the proxy of each VM of the cage, in one
     /// step with the new `value` of a credential.
     pub(crate) fn publish(&self, id: &str, value: Option<(&str, SecretValue)>) {
         let state = lock(&self.state);
-        if let Some(live) = state.live.get(id)
-            && let Ok(cage) = state.cage(id)
-        {
+        let Ok(cage) = state.cage(id) else {
+            return;
+        };
+        for live in state.lives_of(id) {
             live.edit(|policy, values| {
                 *policy = cage.network.clone();
-                if let Some((name, value)) = value {
-                    values.insert(name.to_owned(), value);
+                if let Some((name, value)) = &value {
+                    values.insert((*name).to_owned(), value.clone());
                 }
             });
         }
@@ -99,14 +100,14 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Deletes the values of `names` that no credential of the cage uses.
     pub(crate) fn drop_unused<'a>(&self, id: &str, names: impl Iterator<Item = &'a str>) -> Result<()> {
-        let (used, live) = {
+        let (used, lives) = {
             let state = lock(&self.state);
             let used: Vec<String> = state.cage(id)?.network.credentials().into_iter().map(|c| c.name.clone()).collect();
-            (used, state.live.get(id).cloned())
+            (used, state.lives_of(id))
         };
         let mut result = Ok(());
         for name in names.filter(|n| !used.iter().any(|u| u == n)) {
-            if let Some(live) = &live {
+            for live in &lives {
                 live.set_value(name, None);
             }
             match self.vault.delete(id, name) {
@@ -268,16 +269,27 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(names.into_iter().filter(|name| accounts.contains(&secrets::account(id, name))).collect())
     }
 
-    /// Tests the network from inside the running cage: first a TCP connect
-    /// to the proxy, then a request to `host` through it.
+    /// Tests the network from inside a running VM of the cage, the shared
+    /// VM first: first a TCP connect to the proxy, then a request to `host`
+    /// through it. All VMs of a cage have the same policy.
     pub async fn test_network(&self, id: &str, host: &str) -> Result<NetTest> {
         let host = cage::domain(host)?;
         if host.starts_with("*.") {
             return Err(Error::InvalidDomain(host, "test one host, not a wildcard".into()));
         }
-        let vm = match lock(&self.state).vms.get(id) {
-            Some(Vm::Running { vm, .. }) => vm.clone(),
-            _ => return Err(Error::NotRunning),
+        let vm = {
+            let state = lock(&self.state);
+            let running = |(key, vm): (&String, &Vm<R::Vm>)| match vm {
+                Vm::Running { vm, applied, .. } if applied.1.id == id => Some((key != id, vm.clone())),
+                _ => None,
+            };
+            state
+                .vms
+                .iter()
+                .filter_map(running)
+                .min_by_key(|(own, _)| *own)
+                .map(|(_, vm)| vm)
+                .ok_or(Error::NotRunning)?
         };
         let argv = ["node", "-e", NET_TEST, host.as_str()].map(str::to_owned);
         let mut pipe = self.runtime.open_pipe(&vm, &argv, WORKSPACE).await?;
@@ -483,16 +495,16 @@ mod tests {
             (DefaultAction::Allow, true, rule.as_str())
         );
         assert_eq!(policy.rules[0].target, Target::Host { host: "registry.npmjs.org".into() });
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
 
         // A new credential name needs its placeholder variable in the guest.
         manager.set_rule_credential(&id, &rule, "NPM_TOKEN", bearer(), Some(SecretValue::new("t"))).unwrap();
-        assert!(manager.list().cages[0].pending_restart);
+        assert!(manager.list().cages[0].shared().pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["NPM_TOKEN"], SecretValue::new("t"));
         manager.stop(&id, None).await.unwrap();
         assert!(lock(&manager.state).live.is_empty());
         manager.start(&id).await.unwrap();
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("NPM_TOKEN".to_owned(), "$MSB_NPM_TOKEN$".to_owned())));
         assert!(!net.env.iter().any(|(_, v)| v == "t"));
@@ -629,13 +641,13 @@ mod tests {
         manager.start(&id).await.unwrap();
 
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
 
         // The guest still has the placeholder variable of a removed name.
         manager.set_rule_credential(&id, &rule, "KEY", None, None).unwrap();
         assert!(!live(&manager, &id).snapshot().values.contains_key("KEY"));
-        assert!(manager.list().cages[0].pending_restart);
+        assert!(manager.list().cages[0].shared().pending_restart);
     }
 
     #[tokio::test]
@@ -652,14 +664,14 @@ mod tests {
             async move { manager.start(&id).await }
         });
         gate.entered.notified().await;
-        assert!(matches!(manager.list().cages[0].status, Status::Starting { .. }));
+        assert!(matches!(manager.list().cages[0].shared().status, Status::Starting { .. }));
         manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v2")).unwrap();
         gate.release.notify_one();
 
         starting.await.unwrap().unwrap();
         let view = &manager.list().cages[0];
-        assert_eq!(view.status, Status::Running);
-        assert!(!view.pending_restart);
+        assert_eq!(view.shared().status, Status::Running);
+        assert!(!view.shared().pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
     }
 
@@ -697,8 +709,8 @@ mod tests {
 
         assert_eq!(live(&manager, &id).snapshot().values["KEY"], SecretValue::new("v2"));
         let view = &manager.list().cages[0];
-        assert_eq!(view.status, Status::Running);
-        assert!(!view.pending_restart);
+        assert_eq!(view.shared().status, Status::Running);
+        assert!(!view.shared().pending_restart);
     }
 
     #[tokio::test]
@@ -715,7 +727,7 @@ mod tests {
         std::fs::remove_dir_all(manager.store.cages_path()).unwrap();
 
         assert!(matches!(manager.start(&id).await, Err(Error::Vault(_))));
-        assert_eq!(manager.list().cages[0].status, Status::Stopped);
+        assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
         assert!(matches!(manager.set_rule_credential(&id, &new, "KEY", bearer(), value("v3")), Err(Error::Vault(_))));
 
         // The vault works again: the next start restores v1 for the old hosts.

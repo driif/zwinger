@@ -177,6 +177,8 @@ export interface SessionView {
   slug: string;
   /** The id of its attached cage. `null`: it inherits the default cage of its workspace. */
   cage: string | null;
+  /** The shared VM of its cage, or a VM of the session alone with the key `key` of cage `cage`. */
+  vm: { kind: "shared" } | { kind: "own"; key: string; cage: string };
   harness: string | null;
   /** In tree order. */
   terminals: TerminalRecord[];
@@ -196,13 +198,18 @@ export interface SessionView {
    * the old cage until that VM stops.
    */
   vmCage: string | null;
+  /**
+   * The key of that VM: the cage id for the shared VM, `<cage id>-<n>` for an own VM. With no such VM, the key of the VM
+   * that the session uses next, if it has one. The network events are per VM key.
+   */
+  vmKey: string | null;
   /** The session's folder in the running VM: `/workspace`, or `/workspace/<slug>` in a shared VM. `null`: not a member. */
   guestFolder: string | null;
   /** The folder where the session's agents start in the running VM. `null`: not a member. */
   guestHarness: string | null;
 }
 
-/** The sandbox config of a session and the state of its VM. */
+/** The sandbox config of a session and the state of its VMs. */
 export interface CageView {
   id: string;
   name: string;
@@ -212,15 +219,23 @@ export interface CageView {
   hostAgents: HostAgentUse[];
   /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
+  claudeToken: { stored: boolean; expiresAt: number | null } | null;
+  /** The shared VM, also when it is stopped, then the own VMs that start, run, stop or failed. */
+  vms: VmView[];
+}
+
+/** A VM of a cage: the shared VM of its sessions, or the own VM of one session. */
+export interface VmView {
+  key: string;
+  own: boolean;
   status: CageStatus;
-  /** The names of the sessions of the VM that starts, runs or stops. The sessions of a cage share its VM. */
+  /** The names of the sessions of the VM that starts, runs or stops. */
   members: string[];
   pendingRestart: boolean;
   /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
   runtimes: ("claude" | "codex" | "gemini")[];
   /** The earliest expiry of the host logins that the proxy has now, in ms since the epoch. The proxy reads a newer login when it is due. */
   loginExpiresAt: number | null;
-  claudeToken: { stored: boolean; expiresAt: number | null } | null;
   /** What the start did differently for the host agents, such as a fallback. */
   hostNotices: string[];
   /** The agents of the running VM with a login made in the guest: the agent can read its real token. */
@@ -228,6 +243,9 @@ export interface CageView {
   /** The phase durations of the start of the running VM. */
   startTimings: StartTimings | null;
 }
+
+/** A cage with the state of one of its VMs. `id` is the cage id, `key` the VM key. */
+export type VmCage = CageView & VmView;
 
 /** A session with its cages, as the UI shows them: one row per session. */
 export interface SessionCage {
@@ -239,7 +257,7 @@ export interface SessionCage {
    * state, Start/Stop, the network test and the network events read it. `null`: no VM for the session. It differs from
    * `cage` after a cage change, until the VM restarts.
    */
-  vmCage: CageView | null;
+  vmCage: VmCage | null;
 }
 
 /** A group of sessions in the rail. Each session is in exactly one workspace. */

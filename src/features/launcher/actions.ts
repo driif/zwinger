@@ -1,6 +1,6 @@
 import type { CommandMenuItem } from "@driif/motiv";
 import { AGENT_NAMES, type AgentKind } from "../../shared/agents.ts";
-import type { CageView, SessionCage, TerminalKind } from "../../shared/api.ts";
+import type { CageView, SessionCage, TerminalKind, VmCage } from "../../shared/api.ts";
 import { launchCage } from "../cages/sessionCage.ts";
 import type { Detection } from "../settings/api.ts";
 import type { Editor, Editors } from "./api.ts";
@@ -11,10 +11,10 @@ const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
  * The agents of the cage, host agents first. A running cage has pi and its mounted runtimes. A stopped cage
  * lists the agents that a start can mount; Gemini CLI runs only from this Mac.
  */
-export function agentsOf(cage: CageView): AgentKind[] {
+export function agentsOf(cage: CageView | VmCage): AgentKind[] {
   const host = cage.hostAgents.map((a) => a.kind);
   const available: AgentKind[] =
-    cage.status.state === "running" ? ["pi", ...cage.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
+    "status" in cage && cage.status.state === "running" ? ["pi", ...cage.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
   return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
 }
 

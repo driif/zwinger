@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::host_agents::login;
 use crate::network::NetworkPolicy;
 use crate::secrets::{self, Origin, Secret};
-use crate::session::Session;
+use crate::session::{Session, VmChoice};
 
 pub const WORKSPACE: &str = "/workspace";
 /// The credential that holds the Claude Code setup token.
@@ -431,6 +431,37 @@ impl<'a> Members<'a> {
     pub fn check_overlap_with<'b>(&self, others: &[Bound<'b>]) -> Result<()> {
         self.bounds().try_for_each(|b| b.check_overlap_with(others.iter().copied()))
     }
+
+    /// `folders` are the folders of the sessions of the same cage in a
+    /// different VM. Their guest can write each one, so none may nest with a
+    /// path of these members. The mounts are the same in both VMs.
+    pub fn check_folders_with(&self, folders: &[&Path]) -> Result<()> {
+        for bound in self.bounds() {
+            for (a, _) in bound.host_paths() {
+                if let Some(b) = folders.iter().find(|b| a.starts_with(b) || b.starts_with(a)) {
+                    return Err(Error::MountOverlap(a.display().to_string(), b.display().to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The key of the VM that `session` uses in `cage`, its effective cage: the
+/// cage id for the shared VM, the stored key for an own VM. `None`: the own
+/// key belongs to a different cage, so the session needs a new key.
+pub fn vm_key<'a>(session: &'a Session, cage: &'a Cage) -> Option<&'a str> {
+    match &session.vm {
+        VmChoice::Shared => Some(&cage.id),
+        VmChoice::Own { key, cage: of } if *of == cage.id => Some(key),
+        VmChoice::Own { .. } => None,
+    }
+}
+
+/// The lowest own-VM key of cage `cage_id` that is not `taken`:
+/// `<cage id>-<n>` with n >= 2.
+pub fn free_vm_key(cage_id: &str, taken: impl Fn(&str) -> bool) -> String {
+    (2..).map(|n| format!("{cage_id}-{n}")).find(|key| !taken(key)).expect("a free key")
 }
 
 /// Sets a missing `id` from the folder at `path` as it is now, if the path
@@ -845,6 +876,36 @@ mod tests {
         std::fs::rename(root.join("other"), root.join("was")).unwrap();
         std::fs::create_dir(root.join("other")).unwrap();
         assert!(matches!(members.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("other")));
+    }
+
+    #[test]
+    fn the_folders_of_other_vms_of_the_cage_may_not_nest() {
+        let (mut project, root) = project_with_dirs(&["project/inner", "other", "data/sub"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        let sessions = [project.session.clone()];
+        let members = Members { sessions: &sessions, cage: &project.cage };
+        members.check_folders_with(&[&root.join("other")]).unwrap();
+        for nested in ["project/inner", "data/sub", "data"] {
+            let folder = root.join(nested);
+            assert!(matches!(members.check_folders_with(&[&folder]), Err(Error::MountOverlap(..))), "{nested}");
+        }
+    }
+
+    #[test]
+    fn the_vm_key_is_the_cage_id_or_the_own_key_of_the_cage() {
+        let (mut project, _) = project_with_dirs(&["project"]);
+        assert_eq!(vm_key(&project.session, &project.cage), Some("c"));
+        project.session.vm = VmChoice::Own { key: "c-2".into(), cage: "c".into() };
+        assert_eq!(vm_key(&project.session, &project.cage), Some("c-2"));
+        project.session.vm = VmChoice::Own { key: "x-2".into(), cage: "x".into() };
+        assert_eq!(vm_key(&project.session, &project.cage), None);
+    }
+
+    #[test]
+    fn a_free_vm_key_is_the_lowest_unused_number_from_two() {
+        assert_eq!(free_vm_key("a-b", |_| false), "a-b-2");
+        assert_eq!(free_vm_key("a-b", |k| ["a-b-2", "a-b-3"].contains(&k)), "a-b-4");
+        assert_eq!(free_vm_key("a-b", |k| k == "a-b-3"), "a-b-2");
     }
 
     #[test]

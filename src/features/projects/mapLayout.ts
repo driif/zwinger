@@ -1,7 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package, UserCog } from "lucide-react";
 import { NetEvent, Service } from "../network/api";
-import { AGENT_NAMES, AgentKind, CageView, SessionView } from "../../shared/api";
+import { AGENT_NAMES, AgentKind, CageView, SessionView, VmCage } from "../../shared/api";
 import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "../network/network";
 
 const HOST_X = 16;
@@ -39,7 +39,7 @@ export interface ItemData extends Record<string, unknown> {
 
 export interface BoundaryData extends Record<string, unknown> {
   name: string;
-  state: CageView["status"]["state"];
+  state: VmCage["status"]["state"];
 }
 
 export type MapNode = Node<ItemData, "item"> | Node<BoundaryData, "boundary"> | Node<{ label: string }, "caption">;
@@ -55,7 +55,7 @@ const under = (path: string, base: string) => path === base || path.startsWith(`
 export function mapLayout(
   session: SessionView,
   cage: CageView,
-  vm: CageView | null,
+  vm: VmCage | null,
   folders: string[],
   events: NetEvent[],
   catalog: Service[],

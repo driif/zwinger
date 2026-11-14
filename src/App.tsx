@@ -31,6 +31,7 @@ import {
   restartCageToAdd,
   RestartToAdd,
   startCage,
+  setSessionVm,
   stopCage,
   StopShared,
   takeAppNotices,
@@ -121,6 +122,8 @@ export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
 export interface VmControl {
   start: (sessionId: string) => Promise<void>;
   stop: (sessionId: string) => Promise<void>;
+  /** Puts the session in a VM of its own, or back in the shared VM. Asks first when its VM runs. */
+  setOwn: (sessionId: string, own: boolean) => Promise<void>;
 }
 
 /** The user cancelled a confirmation: `run` shows no error. */
@@ -259,11 +262,16 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const refreshes = useRef(0);
   const agentVersion = useRef(0);
   const agentEvents = useRef(new Map<string, { state: AgentState | null; version: number }>());
+  /** Per VM key, the network events. */
   const [net, setNet] = useState<Record<string, NetEvent[]>>({});
-  /** Per cage, the last `seq` that the Network tab showed. */
+  /** Per VM key, the last `seq` that the Network tab showed. */
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
+  /** Per VM key, the count of its releases. A backfill of an older count is dropped. */
+  const netGeneration = useRef(new Map<string, number>());
+  /** The VM keys of the last list. */
+  const vmKeys = useRef(new Set<string>());
   const [runs, setRuns] = useState<Record<string, RunSummary[]>>({});
   /** A duo round folder on the host that the main area shows instead of a session. */
   const [roundFolder, setRoundFolder] = useState<string>();
@@ -381,15 +389,21 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
 
   // The phase of a start that runs. A late event cannot undo a later state, such as running.
   useEffect(() => {
-    const stop = onStartProgress((cageId, phase) =>
+    const stop = onStartProgress((vmKey, phase) =>
+    {
+      // An own VM that the list does not have yet comes with the next list.
+      if (!vmKeys.current.has(vmKey)) refresh();
       setCages((current) =>
-        current.map((c) =>
-          c.id === cageId && ["stopped", "starting", "error"].includes(c.status.state)
-            ? { ...c, status: { state: "starting", phase } }
-            : c,
-        ),
-      ),
-    );
+        current.map((c) => ({
+          ...c,
+          vms: c.vms.map((v) =>
+            v.key === vmKey && ["stopped", "starting", "error"].includes(v.status.state)
+              ? { ...v, status: { state: "starting", phase } }
+              : v,
+          ),
+        })),
+      );
+    });
     return () => {
       stop.then((unlisten) => unlisten());
     };
@@ -422,15 +436,15 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   };
 
   // Merged by seq: the live events and the backfill can overlap.
-  const addNet = (cageId: string, events: NetEvent[]) =>
+  const addNet = (vmKey: string, events: NetEvent[]) =>
     setNet((current) => {
-      const bySeq = new Map((current[cageId] ?? []).map((e) => [e.seq, e]));
+      const bySeq = new Map((current[vmKey] ?? []).map((e) => [e.seq, e]));
       for (const event of events) bySeq.set(event.seq, event);
-      return { ...current, [cageId]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
+      return { ...current, [vmKey]: [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-NET_RING) };
     });
 
   useEffect(() => {
-    const stop = onNetEvent((cageId, event) => addNet(cageId, [event]));
+    const stop = onNetEvent((vmKey, event) => addNet(vmKey, [event]));
     stop.then(() => setListening(true));
     return () => {
       stop.then((unlisten) => unlisten());
@@ -438,14 +452,32 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }, []);
 
   // The backfill starts after the listener, so no event falls between the two.
+  const keys = [...cages.flatMap((c) => c.vms.map((v) => v.key)), ...sessions.flatMap((s) => s.vmKey ?? [])];
+  vmKeys.current = new Set(keys);
   useEffect(() => {
-    if (!listening) return;
-    for (const { id } of cages) {
-      if (backfilled.current.has(id)) continue;
-      backfilled.current.add(id);
-      listNetEvents(id).then((events) => addNet(id, events), () => {});
+    // A released own-VM key can come back for a new VM: the backend cleared its ring, so its seq starts again.
+    const gone = [...backfilled.current].filter((key) => !vmKeys.current.has(key));
+    if (gone.length) {
+      const forget = <T,>(current: Record<string, T>) =>
+        Object.fromEntries(Object.entries(current).filter(([key]) => !gone.includes(key)));
+      for (const key of gone) {
+        backfilled.current.delete(key);
+        netGeneration.current.set(key, (netGeneration.current.get(key) ?? 0) + 1);
+      }
+      setNet(forget);
+      setLastSeen(forget);
     }
-  }, [cages, listening]);
+    if (!listening) return;
+    for (const key of keys) {
+      if (backfilled.current.has(key)) continue;
+      backfilled.current.add(key);
+      const generation = netGeneration.current.get(key);
+      listNetEvents(key).then(
+        (events) => netGeneration.current.get(key) === generation && addNet(key, events),
+        () => {},
+      );
+    }
+  }, [keys.join(" "), listening]);
 
   const reloadRuns = (id: string) =>
     listTaskRuns(id).then((list) => setRuns((current) => ({ ...current, [id]: list })), () => {});
@@ -486,7 +518,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const focused = session && focusedOf(session);
   /** The pane whose folder ⌘⇧E and the command menu open. */
   const here = view.kind === "terminal" && !showSettings ? focused : undefined;
-  const events = (vmCage && net[vmCage.id]) ?? [];
+  const events = (vmCage && net[vmCage.key]) ?? [];
   const defaultCage = cages.find((c) => c.id === workspaces.find((w) => w.sessions.includes(session?.id ?? ""))?.defaultCage);
 
   // A deleted task has no view.
@@ -497,7 +529,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const blocked = Object.fromEntries(
     joined.map(({ session, vmCage }) => [
       session.id,
-      vmCage ? (net[vmCage.id] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[vmCage.id] ?? 0)).length : 0,
+      vmCage ? (net[vmCage.key] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[vmCage.key] ?? 0)).length : 0,
     ]),
   );
 
@@ -774,6 +806,24 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         "Stop",
         (confirmed) => stopCage(sessionId, confirmed),
       ),
+    async setOwn(sessionId, own) {
+      const target = joined.find((j) => j.session.id === sessionId);
+      const name = target?.session.name ?? "this project";
+      const change = () =>
+        confirmShared(
+          (others) => `It restarts without ${name}. The terminals of ${others} reopen; their running tasks are cancelled.`,
+          "Restart",
+          (confirmed) => setSessionVm(sessionId, own, confirmed).finally(pullNotices),
+        );
+      // A VM with other members asks in `change`.
+      if (target?.vmCage?.status.state === "running" && target.vmCage.members.length <= 1)
+        await confirmFirst(
+          `Stop the VM of ${name}? Its VM terminals and running tasks end. Its next start uses ${own ? "a VM of its own" : "the shared VM of its cage"}.`,
+          "Stop",
+          change,
+        );
+      else await change();
+    },
   };
 
   /**
@@ -1024,7 +1074,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             onView={setView}
             intent={intent}
             onIntentDone={() => setIntent(undefined)}
-            onNetSeen={(seq) => vmCage && setLastSeen((current) => ({ ...current, [vmCage.id]: seq }))}
+            onNetSeen={(seq) => vmCage && setLastSeen((current) => ({ ...current, [vmCage.key]: seq }))}
             onDropFolder={dropMount}
             runtimes={runtimes}
             detection={detection}

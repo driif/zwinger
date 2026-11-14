@@ -35,6 +35,9 @@ pub struct Session {
     /// default cage of its workspace, if it has one.
     #[serde(default)]
     pub cage: Option<String>,
+    /// The VM of its effective cage that the session runs in.
+    #[serde(default)]
+    pub vm: VmChoice,
     /// The guest folder where agent terminals start: below `/workspace` or a mount.
     #[serde(default)]
     pub harness: Option<String>,
@@ -50,6 +53,18 @@ pub struct Session {
     /// The map positions that the user dragged, by node id.
     #[serde(default)]
     pub layout: BTreeMap<String, Pos>,
+}
+
+/// The shared VM of the cage, or a VM of the session alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum VmChoice {
+    /// The VM that the sessions of the cage share. Its key is the cage id.
+    #[default]
+    Shared,
+    /// A VM of this session alone. `key` is reserved for cage `cage`: the
+    /// key is never parsed, because a cage id can contain `-`.
+    Own { key: String, cage: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -181,6 +196,7 @@ impl Session {
             folder,
             folder_id: Some(folder_id),
             cage,
+            vm: VmChoice::Shared,
             harness: None,
             terminals: Vec::new(),
             pane_layout: None,

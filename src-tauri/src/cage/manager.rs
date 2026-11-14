@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -20,26 +20,26 @@ use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, TerminalKind};
 use crate::secrets::{self, Vault, VaultEntry};
-use crate::session::{Pos, Session};
+use crate::session::{Pos, Session, VmChoice};
 use crate::store::{self, Store};
 use crate::task_runs;
 use crate::terminal::{AgentState, Terminal, TerminalView};
 use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
-/// The network log entries kept per cage.
+/// The network log entries kept per VM.
 pub(crate) const NET_RING: usize = 2000;
 
 /// The dir of the per-VM agent state. It keeps its name from before the
 /// rename to projects, so the agent state of existing cages stays.
 pub(crate) const LEGACY_STATE_DIR: &str = "shields";
 
-/// Gets each new network log entry with its cage id.
+/// Gets each new network log entry with its VM key.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
 
 /// Gets the process id and the new agent state of a terminal.
 pub type AgentSink = Box<dyn Fn(&str, Option<AgentState>) + Send + Sync>;
 
-/// Gets the id of a cage whose guest logins changed.
+/// Gets the key of a VM whose guest logins changed.
 pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Owns the sessions and cages, the running VMs and their terminals.
@@ -47,8 +47,8 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) runtime: R,
     pub(crate) store: Store,
     pub(crate) workspace_store: WorkspaceStore,
-    /// The app data dir. It holds the agent runtimes, `shields/<id>`, the
-    /// agent state of each VM, and `bin/<id>`, the host-only agent
+    /// The app data dir. It holds the agent runtimes, `shields/<key>`, the
+    /// agent state of each VM, and `bin/<key>`, the host-only agent
     /// wrappers of each VM.
     pub(crate) data: PathBuf,
     /// The canonical dirs that no session folder or mount may nest with:
@@ -87,14 +87,15 @@ pub(crate) struct State<V> {
     pub(crate) cages: Vec<Cage>,
     /// Each session is in exactly one workspace, and there is at least one.
     pub(crate) workspaces: Vec<Workspace>,
-    /// Per cage id: one VM per cage. The sessions of the cage share it as
-    /// its members. A member keeps it after its cage changes, until it stops.
+    /// Per VM key: the shared VM of a cage has the cage id, an own VM of a
+    /// session has its stored key. The sessions of the VM are its members. A
+    /// member keeps it after its cage or its VM choice changes, until it stops.
     pub(crate) vms: HashMap<String, Vm<V>>,
     pub(crate) terminals: Vec<Terminal>,
-    /// Per cage that starts or runs, the policy and the credential values
-    /// of its proxy. An edit changes them at once.
+    /// Per VM that starts or runs, the policy and the credential values
+    /// of its proxy. An edit of its cage changes them at once.
     pub(crate) live: HashMap<String, Arc<Live>>,
-    /// Per cage, the last network log entries. They stay after a stop, so
+    /// Per VM key, the last network log entries. They stay after a stop, so
     /// the user can still allow a blocked host.
     pub(crate) net: HashMap<String, VecDeque<Entry>>,
     /// The generation of the last VM that started. A stop names the
@@ -105,9 +106,10 @@ pub(crate) struct State<V> {
     pub(crate) joining: HashSet<String>,
 }
 
+/// A VM of cage `cage`. A running VM has its cage in `applied`.
 pub(crate) enum Vm<V> {
     /// The phase that the start for the `members` runs now.
-    Starting { members: Vec<String>, phase: Phase },
+    Starting { cage: String, members: Vec<String>, phase: Phase },
     /// `applied` is the member sessions and the cage the VM booted with; they differ
     /// from the stored config after an edit, until the next start. `proxy`
     /// is the cage's proxy; a drop stops it. `net` follows the VM's network
@@ -125,9 +127,18 @@ pub(crate) enum Vm<V> {
     },
     /// Shutdown is in progress. If it fails, the VM goes back to `Running`.
     /// It still belongs to the `members` until the shutdown succeeds.
-    Stopping { members: Vec<String> },
+    Stopping { cage: String, members: Vec<String> },
     /// The start for `session` failed with `message`.
-    Failed { session: String, message: String },
+    Failed { cage: String, session: String, message: String },
+}
+
+impl<V> Vm<V> {
+    pub(crate) fn cage(&self) -> &str {
+        match self {
+            Vm::Starting { cage, .. } | Vm::Stopping { cage, .. } | Vm::Failed { cage, .. } => cage,
+            Vm::Running { applied, .. } => &applied.1.id,
+        }
+    }
 }
 
 /// What a start did for the cage's host agents.
@@ -178,6 +189,9 @@ pub struct SessionView {
     /// the session failed. It differs from the effective cage after a cage
     /// change, until that VM stops.
     pub vm_cage: Option<String>,
+    /// The key of that VM. With no such VM, the key of the VM that the
+    /// session uses next, if it has one: its network log stays after a stop.
+    pub vm_key: Option<String>,
     /// The session's folder in the running VM, if the session is a member.
     pub guest_folder: Option<String>,
     /// The folder where the session's agents start in the running VM, if
@@ -208,6 +222,19 @@ pub(crate) fn effective(session: &Session, workspaces: &[Workspace]) -> Option<E
 pub struct CageView {
     #[serde(flatten)]
     pub cage: Cage,
+    pub claude_token: Option<ClaudeTokenView>,
+    /// The shared VM of the cage, also when it is stopped, then by key the
+    /// own VMs that a session stores, also when they are stopped, and the
+    /// own VMs that start, run, stop or failed.
+    pub vms: Vec<VmView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VmView {
+    pub key: String,
+    /// The VM of one session alone, not the shared VM of the cage.
+    pub own: bool,
     pub status: Status,
     /// The names of the member sessions of the VM that starts, runs or stops.
     pub members: Vec<String>,
@@ -218,7 +245,6 @@ pub struct CageView {
     /// The earliest expiry of the host logins that the proxy of the running
     /// VM has now, in ms. The proxy reads a newer login when it is due.
     pub login_expires_at: Option<i64>,
-    pub claude_token: Option<ClaudeTokenView>,
     /// What the start of the running VM did differently for the host
     /// agents, such as a fallback.
     pub host_notices: Vec<String>,
@@ -236,7 +262,7 @@ pub struct ClaudeTokenView {
     pub expires_at: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum Status {
     Stopped,
@@ -309,18 +335,38 @@ impl<V> State<V> {
         self.sessions.iter().filter(uses).collect()
     }
 
-    /// The cage id and the VM that starts, runs or stops with the session as
-    /// a member. A session is a member of at most one VM: after a cage
-    /// change it stays a member of the VM of its old cage until that stops.
+    /// The key and the VM that starts, runs or stops with the session as a
+    /// member. A session is a member of at most one VM: after a change of
+    /// its cage or VM choice it stays a member of the old VM until that stops.
     pub(crate) fn vm_of(&self, session_id: &str) -> Option<(&str, &Vm<V>)> {
         self.vms
             .iter()
             .find(|(_, vm)| match vm {
-                Vm::Starting { members, .. } | Vm::Stopping { members } => members.iter().any(|m| m == session_id),
+                Vm::Starting { members, .. } | Vm::Stopping { members, .. } => members.iter().any(|m| m == session_id),
                 Vm::Running { applied, .. } => applied.0.iter().any(|m| m.id == session_id),
                 Vm::Failed { .. } => false,
             })
             .map(|(id, vm)| (id.as_str(), vm))
+    }
+
+    /// The key of the VM that the session uses in its effective cage.
+    /// `None`: no cage, or an own key of a different cage.
+    pub(crate) fn planned_key(&self, session_id: &str) -> Option<String> {
+        self.bound(session_id).ok().and_then(|b| cage::vm_key(b.session, b.cage).map(str::to_owned))
+    }
+
+    /// The proxy values of each VM of the cage that starts or runs.
+    pub(crate) fn lives_of(&self, cage_id: &str) -> Vec<Arc<Live>> {
+        let of_cage = |key: &String| self.vms.get(key).is_some_and(|vm| vm.cage() == cage_id);
+        self.live.iter().filter(|(key, _)| of_cage(key)).map(|(_, live)| live.clone()).collect()
+    }
+
+    /// A key is taken while a session stores it, a VM has it, or a cage has
+    /// it as its id.
+    pub(crate) fn key_taken(&self, key: &str) -> bool {
+        self.vms.contains_key(key)
+            || self.cages.iter().any(|c| c.id == key)
+            || self.sessions.iter().any(|s| matches!(&s.vm, VmChoice::Own { key: k, .. } if k == key))
     }
 
     /// Each member id with the current name of its session.
@@ -330,9 +376,9 @@ impl<V> State<V> {
             .collect()
     }
 
-    /// Numbers the entry and adds it to the cage's ring.
-    pub(crate) fn push_net(&mut self, cage_id: &str, mut event: Entry) -> Entry {
-        let ring = self.net.entry(cage_id.to_owned()).or_default();
+    /// Numbers the entry and adds it to the VM's ring.
+    pub(crate) fn push_net(&mut self, key: &str, mut event: Entry) -> Entry {
+        let ring = self.net.entry(key.to_owned()).or_default();
         event.seq = ring.back().map_or(1, |last| last.seq + 1);
         if ring.len() == NET_RING {
             ring.pop_front();
@@ -462,7 +508,15 @@ impl<R: SandboxRuntime> Manager<R> {
             .sessions
             .iter()
             .map(|session| {
-                let guest = match state.vm_of(&session.id) {
+                // A failed start shows on the session that started it.
+                let vm = state.vm_of(&session.id).or_else(|| {
+                    state
+                        .vms
+                        .iter()
+                        .find(|(_, vm)| matches!(vm, Vm::Failed { session: s, .. } if *s == session.id))
+                        .map(|(key, vm)| (key.as_str(), vm))
+                });
+                let guest = match vm {
                     Some((_, Vm::Running { applied, .. })) => task_guest_folder(&applied.0, &session.id),
                     _ => None,
                 };
@@ -476,14 +530,8 @@ impl<R: SandboxRuntime> Manager<R> {
                     guest_harness,
                     agent_needs: state.bound(&session.id).map_or_else(|_| Vec::new(), network::agent_needs),
                     effective_cage: effective(session, &state.workspaces),
-                    vm_cage: state.vm_of(&session.id).map(|(id, _)| id.to_owned()).or_else(|| {
-                        // A failed start shows on the session that started it.
-                        state
-                            .vms
-                            .iter()
-                            .find(|(_, vm)| matches!(vm, Vm::Failed { session: s, .. } if *s == session.id))
-                            .map(|(id, _)| id.clone())
-                    }),
+                    vm_cage: vm.map(|(_, vm)| vm.cage().to_owned()),
+                    vm_key: vm.map(|(key, _)| key.to_owned()).or_else(|| state.planned_key(&session.id)),
                     processes: state
                         .terminals
                         .iter()
@@ -509,17 +557,54 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The host-only dir of the VM's agent wrappers, bound read-only at
     /// [`launch::BIN_DIR`]. It is not in the state dir: the guest can write that.
-    pub(crate) fn bin_dir(&self, id: &str) -> PathBuf {
-        bin_dir(&self.data, id)
+    pub(crate) fn bin_dir(&self, key: &str) -> PathBuf {
+        bin_dir(&self.data, key)
     }
 
-    pub(crate) fn state_dir(&self, id: &str) -> PathBuf {
-        self.data.join(LEGACY_STATE_DIR).join(id)
+    pub(crate) fn state_dir(&self, key: &str) -> PathBuf {
+        self.data.join(LEGACY_STATE_DIR).join(key)
     }
 
     /// The host-owned profile snapshots of the VM's host agents.
-    pub(crate) fn profile_dir(&self, id: &str) -> PathBuf {
-        self.data.join("profiles").join(id)
+    pub(crate) fn profile_dir(&self, key: &str) -> PathBuf {
+        self.data.join("profiles").join(key)
+    }
+
+    /// Deletes all that is left of the VM `key`: its agent state, its
+    /// wrappers, its profiles, its network log and a failed start. Under the
+    /// state lock, so no start can take the key meanwhile. The VM must not
+    /// start, run or stop.
+    pub(crate) fn wipe_vm(&self, state: &mut State<R::Vm>, key: &str) -> Result<()> {
+        if state.vms.get(key).is_some_and(|vm| !matches!(vm, Vm::Failed { .. })) {
+            return Err(Error::AlreadyStarted);
+        }
+        state.vms.remove(key);
+        state.live.remove(key);
+        state.net.remove(key);
+        self.remove_vm_dirs(key)
+    }
+
+    /// Deletes the agent state, the wrappers and the profiles of VM `key`.
+    /// It tries each dir and returns the first error.
+    pub(crate) fn remove_vm_dirs(&self, key: &str) -> Result<()> {
+        let mut result = Ok(());
+        for dir in [self.state_dir(key), self.bin_dir(key), self.profile_dir(key)] {
+            if let Err(source) = std::fs::remove_dir_all(&dir)
+                && source.kind() != std::io::ErrorKind::NotFound
+                && result.is_ok()
+            {
+                result = Err(Error::VmStateLeft { key: key.to_owned(), path: dir.display().to_string(), source });
+            }
+        }
+        result
+    }
+
+    /// Reserves a new own-VM key of cage `cage_id` with an empty state. A
+    /// key whose old state cannot be deleted is not handed out.
+    pub(crate) fn new_vm_key(&self, state: &mut State<R::Vm>, cage_id: &str) -> Result<String> {
+        let key = cage::free_vm_key(cage_id, |key| state.key_taken(key));
+        self.wipe_vm(state, &key)?;
+        Ok(key)
     }
 
     /// Adds a session of `folder` at the end of `workspace`, or of the
@@ -704,12 +789,14 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Only a cage that no session uses, that is no workspace default and
-    /// whose VM does not run. Also deletes its secret values, its agent
-    /// state, its wrappers, its old chats and its profiles. The first error
-    /// is returned after all deletes ran.
+    /// whose VMs do not run. Also deletes its secret values, its old chats,
+    /// and the agent state, the wrappers and the profiles of its VMs. A
+    /// session that kept an own VM of the cage after a cage change goes
+    /// back to the shared choice. The first error is returned after all
+    /// deletes ran.
     pub fn delete_cage(&self, id: &str) -> Result<()> {
         let _edit = lock(&self.secret_edit);
-        let cage = {
+        let (cage, own_keys) = {
             let mut state = lock(&self.state);
             let cage = state.cage(id)?.clone();
             let in_use = |reason: String| Err(Error::CageInUse(cage.name.clone(), reason));
@@ -719,16 +806,37 @@ impl<R: SandboxRuntime> Manager<R> {
             if let Some(w) = state.workspaces.iter().find(|w| w.default_cage.as_deref() == Some(id)) {
                 return in_use(format!("it is the default cage of workspace {}", w.name));
             }
-            if state.vms.get(id).is_some_and(|vm| !matches!(vm, Vm::Failed { .. })) {
+            if state.vms.values().any(|vm| vm.cage() == id && !matches!(vm, Vm::Failed { .. })) {
                 return in_use("its VM runs".into());
+            }
+            // The sessions are saved first: a failed cage save then leaves only free keys.
+            let mut sessions = state.sessions.clone();
+            let mut own_keys = Vec::new();
+            for session in &mut sessions {
+                if let VmChoice::Own { key, cage } = &session.vm
+                    && cage == id
+                {
+                    own_keys.push(key.clone());
+                    session.vm = VmChoice::Shared;
+                }
+            }
+            if !own_keys.is_empty() {
+                self.store.save_sessions(&sessions)?;
+                state.sessions = sessions;
             }
             let cages: Vec<Cage> = state.cages.iter().filter(|c| c.id != id).cloned().collect();
             self.store.save_cages(&cages)?;
             state.cages = cages;
-            state.vms.remove(id);
-            state.live.remove(id);
-            state.net.remove(id);
-            cage
+            let mut keys: Vec<String> =
+                state.vms.iter().filter(|(_, vm)| vm.cage() == id).map(|(k, _)| k.clone()).collect();
+            keys.push(id.to_owned());
+            keys.extend(own_keys.iter().cloned());
+            for key in keys {
+                state.vms.remove(&key);
+                state.live.remove(&key);
+                state.net.remove(&key);
+            }
+            (cage, own_keys)
         };
         let mut result = Ok(());
         for credential in cage.network.credentials() {
@@ -738,12 +846,17 @@ impl<R: SandboxRuntime> Manager<R> {
                 result = Err(e);
             }
         }
-        for dir in [self.state_dir(id), self.bin_dir(id), self.data.join("chats").join(id), self.profile_dir(id)] {
-            if let Err(e) = std::fs::remove_dir_all(dir)
-                && e.kind() != std::io::ErrorKind::NotFound
+        if let Err(e) = std::fs::remove_dir_all(self.data.join("chats").join(id))
+            && e.kind() != std::io::ErrorKind::NotFound
+            && result.is_ok()
+        {
+            result = Err(e.into());
+        }
+        for key in std::iter::once(id).chain(own_keys.iter().map(String::as_str)) {
+            if let Err(e) = self.remove_vm_dirs(key)
                 && result.is_ok()
             {
-                result = Err(e.into());
+                result = Err(e);
             }
         }
         result
@@ -915,7 +1028,7 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Needs no restart: a running VM gets new wrappers at once.
+    /// Needs no restart: each running VM of the cage gets new wrappers at once.
     pub fn set_agents_unprompted(&self, cage_id: &str, on: bool) -> Result<()> {
         self.edit_cage(cage_id, |c, _| {
             c.agents_unprompted = on;
@@ -924,8 +1037,12 @@ impl<R: SandboxRuntime> Manager<R> {
         // The stored value, not `on`: a later edit may have won the race to the lock.
         let state = lock(&self.state);
         let unprompted = state.cage(cage_id)?.agents_unprompted;
-        if let Some(Vm::Running { runtimes, host, .. }) = state.vms.get(cage_id) {
-            launch::write(&self.bin_dir(cage_id), &mounted(runtimes), host.found(), unprompted)?;
+        for (key, vm) in &state.vms {
+            if let Vm::Running { runtimes, host, applied, .. } = vm
+                && applied.1.id == cage_id
+            {
+                launch::write(&self.bin_dir(key), &mounted(runtimes), host.found(), unprompted)?;
+            }
         }
         Ok(())
     }
@@ -933,13 +1050,15 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Stops the VM that runs for the session and saves the sessions
     /// without it. The cage stays. Then it deletes the run records of the
     /// session. A VM with other members is not stopped: the delete fails
-    /// with [`Error::StopShared`], and the user stops that VM first.
+    /// with [`Error::StopShared`], and the user stops that VM first. An own
+    /// VM of the session loses its state; if that fails, the delete still
+    /// completes and returns [`Error::VmStateLeft`].
     pub async fn delete(&self, session_id: &str) -> Result<()> {
         self.stop(session_id, None).await.or_else(|e| match e {
             Error::NotRunning | Error::CageNotFound => Ok(()),
             e => Err(e),
         })?;
-        {
+        let wiped = {
             let mut state = lock(&self.state);
             state.session(session_id)?;
             // A start can claim a VM for the session between the stop above and this lock.
@@ -954,9 +1073,17 @@ impl<R: SandboxRuntime> Manager<R> {
             for workspace in &mut workspaces {
                 workspace.sessions.retain(|s| s != session_id);
             }
+            let released = match &state.session(session_id)?.vm {
+                VmChoice::Own { key, .. } => Some(key.clone()),
+                VmChoice::Shared => None,
+            };
             self.save_both(&state.sessions, &sessions, &workspaces)?;
             state.sessions = sessions;
             state.workspaces = workspaces;
+            let wiped = match released {
+                Some(key) => self.wipe_vm(&mut state, &key),
+                None => Ok(()),
+            };
             // Host shells of the session can still run. Each kill waits for
             // the hangup in its own thread, not in this task.
             state.terminals.retain(|t| {
@@ -966,15 +1093,16 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
                 !killed
             });
-        }
+            wiped
+        };
         self.runs.forget(session_id, None);
         match std::fs::remove_dir_all(self.data.join("tasks").join(session_id)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
+            _ => wiped,
         }
     }
 
-    /// The cages whose VM starts, runs or stops. A failed stop leaves the
+    /// The VMs that start, run or stop. A failed stop leaves the
     /// VM running.
     pub fn live(&self) -> usize {
         lock(&self.state).vms.values().filter(|vm| !matches!(vm, Vm::Failed { .. })).count()
@@ -991,28 +1119,37 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 }
 
-/// The cage with the state of its VM.
+/// The cage with the state of its VMs.
 fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
-    let (status, pending_restart, members) = match state.vms.get(&cage.id) {
+    let stored = state.sessions.iter().filter_map(|s| match &s.vm {
+        VmChoice::Own { key, cage: of } if *of == cage.id => Some(key),
+        _ => None,
+    });
+    let tracked = state.vms.iter().filter(|(key, vm)| **key != cage.id && vm.cage() == cage.id).map(|(key, _)| key);
+    let own: BTreeSet<&String> = stored.chain(tracked).collect();
+    let shared = vm_view(state, cage, &cage.id, state.vms.get(&cage.id));
+    let vms = std::iter::once(shared).chain(own.into_iter().map(|key| vm_view(state, cage, key, state.vms.get(key))));
+    CageView { cage: cage.clone(), claude_token: claude_token(cage, vault), vms: vms.collect() }
+}
+
+fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> VmView {
+    let (status, pending_restart, members) = match vm {
         None => (Status::Stopped, false, Vec::new()),
-        Some(Vm::Starting { phase, members }) => (Status::Starting { phase: *phase }, false, members.clone()),
+        Some(Vm::Starting { phase, members, .. }) => (Status::Starting { phase: *phase }, false, members.clone()),
         Some(Vm::Running { applied, .. }) => {
             let (old_members, old_cage) = applied.as_ref();
-            // A member that now uses a different cage, or was deleted, leaves at the next start.
+            // A member that now uses a different cage or VM, or was deleted, leaves at the next start.
             let changed = old_members.iter().any(|old| match state.session(&old.id) {
-                Ok(session) => {
-                    effective(session, &state.workspaces).is_none_or(|c| c.id != cage.id)
-                        || session_changed(old, session)
-                }
+                Ok(session) => state.planned_key(&session.id).is_none_or(|k| k != key) || session_changed(old, session),
                 Err(_) => true,
             });
             (Status::Running, changed || cage_changed(old_cage, cage), ids(old_members))
         }
-        Some(Vm::Stopping { members }) => (Status::Stopping, false, members.clone()),
+        Some(Vm::Stopping { members, .. }) => (Status::Stopping, false, members.clone()),
         Some(Vm::Failed { message, .. }) => (Status::Error { message: message.clone() }, false, Vec::new()),
     };
     let members = state.members(members).into_iter().map(|m| m.name).collect();
-    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) = match state.vms.get(&cage.id) {
+    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) = match vm {
         Some(Vm::Running { runtimes, host, proxy, .. }) => (
             runtimes.clone(),
             proxy.login_expires(),
@@ -1022,17 +1159,25 @@ fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
         ),
         _ => (Vec::new(), None, Vec::new(), Vec::new(), None),
     };
-    CageView {
-        cage: cage.clone(),
+    VmView {
+        key: key.to_owned(),
+        own: key != cage.id,
         status,
         members,
         pending_restart,
         runtimes,
         login_expires_at,
-        claude_token: claude_token(cage, vault),
         host_notices,
         guest_logins,
         start_timings,
+    }
+}
+
+#[cfg(test)]
+impl CageView {
+    /// The view of the shared VM.
+    pub(crate) fn shared(&self) -> VmView {
+        self.vms[0].clone()
     }
 }
 
@@ -1052,7 +1197,7 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
 
 /// A new name, layout, task, terminal list, unprompted setting or network
 /// rule is used at once, so it needs no restart. A change of the session's
-/// cage is not checked here.
+/// cage or VM choice is not checked here.
 fn session_changed(old: &Session, session: &Session) -> bool {
     Session {
         name: session.name.clone(),
@@ -1061,6 +1206,7 @@ fn session_changed(old: &Session, session: &Session) -> bool {
         terminals: session.terminals.clone(),
         pane_layout: session.pane_layout.clone(),
         cage: session.cage.clone(),
+        vm: session.vm.clone(),
         ..old.clone()
     } != *session
 }
@@ -1076,8 +1222,8 @@ fn cage_changed(old: &Cage, cage: &Cage) -> bool {
         || placeholders(&old.network) != placeholders(&cage.network)
 }
 
-pub(crate) fn bin_dir(data: &Path, id: &str) -> PathBuf {
-    data.join("bin").join(id)
+pub(crate) fn bin_dir(data: &Path, key: &str) -> PathBuf {
+    data.join("bin").join(key)
 }
 
 /// Runs file reads off the async workers.
@@ -1091,6 +1237,7 @@ mod tests {
     use crate::cage::lifecycle::Confirmed;
     use crate::cage::testing::*;
     use crate::error::Member;
+    use crate::session::VmChoice;
     use crate::workspaces::{self, Arrangement};
 
     #[test]
@@ -1130,7 +1277,9 @@ mod tests {
     #[tokio::test]
     async fn delete_refuses_a_session_that_is_starting() {
         let (manager, _runtime, id) = manager();
-        lock(&manager.state).vms.insert(id.clone(), Vm::Starting { members: vec![id.clone()], phase: Phase::Vault });
+        lock(&manager.state)
+            .vms
+            .insert(id.clone(), Vm::Starting { cage: id.clone(), members: vec![id.clone()], phase: Phase::Vault });
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().sessions.len(), 1);
     }
@@ -1146,7 +1295,7 @@ mod tests {
         manager.set_agents_unprompted(&id, false).unwrap();
         assert!(!claude().contains("dangerously"));
         assert!(!manager.list().cages[0].cage.agents_unprompted);
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
 
         // Stopped: the next start writes the stored setting.
         manager.stop(&id, None).await.unwrap();
@@ -1256,7 +1405,7 @@ mod tests {
         manager.rename(&id, " api ").unwrap();
         let list = manager.list();
         assert_eq!(list.sessions[0].session.name, "api");
-        assert!(!list.cages[0].pending_restart);
+        assert!(!list.cages[0].shared().pending_restart);
         assert!(matches!(manager.rename(&id, "a\nb"), Err(Error::InvalidName(_))));
         manager.rename(&id, " ").unwrap();
         let session = &manager.list().sessions[0].session;
@@ -1271,7 +1420,7 @@ mod tests {
         let workspace = manager.workspaces()[0].id.clone();
         manager.arrange_workspaces(vec![Arrangement { id: workspace, sessions: vec![id.clone()] }]).unwrap();
         let list = manager.list();
-        assert!(!list.cages[0].pending_restart);
+        assert!(!list.cages[0].shared().pending_restart);
         assert_eq!(list.sessions[0].session.layout.len(), 1);
     }
 
@@ -1601,8 +1750,8 @@ mod tests {
         let vm_cage = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().vm_cage.clone();
         assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(shared.clone()), Some(shared.clone())));
         let view = list.cages.iter().find(|c| c.cage.id == shared).unwrap();
-        assert_eq!(view.members, [sa.name.clone(), sb.name.clone()]);
-        assert!(!view.pending_restart);
+        assert_eq!(view.shared().members, [sa.name.clone(), sb.name.clone()]);
+        assert!(!view.shared().pending_restart);
         assert!(matches!(manager.start(&b).await, Err(Error::AlreadyStarted)));
         assert!(lock(&manager.state).task_cage(&b).unwrap().4);
         let (folder_a, folder_b) = (format!("{WORKSPACE}/{}", sa.slug), format!("{WORKSPACE}/{}", sb.slug));
@@ -1742,7 +1891,7 @@ mod tests {
         // `a` moves to its own cage: the VM waits for a restart, and the restart drops it.
         manager.set_session_cage(&a, Some(&a)).unwrap();
         let pending = |m: &Manager<FakeRuntime>| m.list().cages.into_iter().find(|v| v.cage.id == shared).unwrap();
-        assert!(pending(&manager).pending_restart);
+        assert!(pending(&manager).shared().pending_restart);
         let Err(Error::RestartToAdd { members, generation, .. }) = manager.start(&c).await else {
             panic!("restart to add")
         };
@@ -1752,7 +1901,7 @@ mod tests {
         let folders: Vec<String> = runtime.folders.lock().unwrap().iter().map(|(guest, _)| guest.clone()).collect();
         let slug = |id: &str| manager.list().sessions.into_iter().find(|s| s.session.id == id).unwrap().session.slug;
         assert_eq!(folders, [format!("{WORKSPACE}/{}", slug(&b)), format!("{WORKSPACE}/{}", slug(&c))]);
-        assert!(!pending(&manager).pending_restart);
+        assert!(!pending(&manager).shared().pending_restart);
         assert_eq!(manager.list().sessions.iter().find(|s| s.session.id == a).unwrap().vm_cage, None);
     }
 
@@ -1825,7 +1974,8 @@ mod tests {
         manager.set_workspace_cage(&first, Some(&id)).unwrap();
         manager.set_session_cage(&id, None).unwrap();
         manager.start(&id).await.unwrap();
-        let cage = |list: &Listing, id: &str| list.cages.iter().find(|c| c.cage.id == id).unwrap().pending_restart;
+        let cage =
+            |list: &Listing, id: &str| list.cages.iter().find(|c| c.cage.id == id).unwrap().shared().pending_restart;
 
         let moved = |to: &str| {
             let other = if to == first { &second } else { &first };
@@ -1872,6 +2022,241 @@ mod tests {
         assert!(matches!(manager.arrange_workspaces(wanted), Err(Error::HarnessTarget(_))));
         assert_eq!(manager.workspaces()[0].sessions, std::slice::from_ref(&id));
         assert!(matches!(manager.set_session_cage(&id, Some(&shared)), Err(Error::HarnessTarget(_))));
+    }
+
+    /// A second session `b` of the cage of `a`, in its own VM.
+    fn own_member(manager: &Manager<FakeRuntime>, a: &str, folder: &Path) -> String {
+        let b = manager.create(folder.to_str().unwrap(), None).unwrap();
+        manager.set_session_cage(&b, Some(a)).unwrap();
+        b
+    }
+
+    #[tokio::test]
+    async fn an_own_vm_gets_the_lowest_free_key_and_the_shared_vm_keeps_the_cage_id() {
+        let (manager, _, a) = manager();
+        let b = own_member(&manager, &a, &temp_dir());
+        assert_eq!((vm_key(&manager, &a), vm_key(&manager, &b)), (Some(a.clone()), Some(a.clone())));
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        manager.set_session_vm(&b, true, None).await.unwrap();
+        let (ka, kb) = (format!("{a}-2"), format!("{a}-3"));
+        assert_eq!((vm_key(&manager, &a), vm_key(&manager, &b)), (Some(ka.clone()), Some(kb.clone())));
+        let stored = |id: &str| lock(&manager.state).session(id).unwrap().vm.clone();
+        assert_eq!(stored(&a), VmChoice::Own { key: ka.clone(), cage: a.clone() });
+        // A free key is used again; a choice that does not change is no error.
+        manager.set_session_vm(&a, false, None).await.unwrap();
+        manager.set_session_vm(&a, false, None).await.unwrap();
+        assert_eq!(stored(&a), VmChoice::Shared);
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        assert_eq!(vm_key(&manager, &a), Some(ka));
+        // The choice persists.
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.store.dir().to_owned()),
+            vault(),
+            temp_dir(),
+            host(),
+        )
+        .unwrap();
+        assert_eq!(vm_key(&reloaded, &b), Some(kb));
+    }
+
+    #[tokio::test]
+    async fn two_vms_of_one_cage_run_at_once() {
+        let (manager, runtime, a) = manager();
+        let b = own_member(&manager, &a, &temp_dir());
+        manager.set_session_vm(&b, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        manager.start(&a).await.unwrap();
+        manager.start(&b).await.unwrap();
+        assert_eq!(vm_states(&manager, &a), [(a.clone(), Status::Running), (own.clone(), Status::Running)]);
+        let starts: Vec<String> = runtime.log.lock().unwrap().clone();
+        assert_eq!(starts, [format!("start {a}"), format!("start {own}")]);
+        assert!(manager.state_dir(&a).is_dir() && manager.state_dir(&own).is_dir());
+        assert_ne!(manager.state_dir(&a), manager.state_dir(&own));
+        let list = manager.list();
+        let vm_cage = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().vm_cage.clone();
+        assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(a.clone()), Some(a.clone())));
+        assert_eq!(list.cages[0].vms[1].members, [list.sessions[1].session.name.clone()]);
+        assert!(list.cages[0].vms[1].own && !list.cages[0].vms[0].own);
+
+        // A policy edit reaches both proxies; a mount edit waits for both restarts.
+        let rule = allow(&manager, &a, "a.io");
+        for key in [&a, &own] {
+            assert_eq!(live(&manager, key).snapshot().policy.rules[0].id, rule);
+        }
+        manager.add_mount(&a, temp_dir().to_str().unwrap(), "/mnt/data", true).unwrap();
+        assert!(manager.list().cages[0].vms.iter().all(|v| v.pending_restart));
+
+        // A stop of one VM keeps the other.
+        manager.stop(&a, None).await.unwrap();
+        assert_eq!(vm_states(&manager, &a), [(a.clone(), Status::Stopped), (own.clone(), Status::Running)]);
+        manager.stop(&b, None).await.unwrap();
+        assert!(matches!(manager.delete_cage(&a), Err(Error::CageInUse(..))));
+    }
+
+    #[tokio::test]
+    async fn the_folders_of_a_cage_may_not_nest_across_its_vms() {
+        let (manager, _, a) = manager();
+        let inner = manager.list().sessions[0].session.folder.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        let b = own_member(&manager, &a, &inner);
+        manager.set_session_vm(&b, true, None).await.unwrap();
+        assert!(matches!(manager.start(&a).await, Err(Error::MountOverlap(..))));
+        assert!(matches!(manager.start(&b).await, Err(Error::MountOverlap(..))));
+    }
+
+    #[tokio::test]
+    async fn a_switch_of_a_running_session_leaves_its_vm() {
+        let (manager, runtime, a) = manager();
+        let b = two_members(&manager, &a).await;
+        let shared = vm_key(&manager, &a).unwrap();
+        manager.open_session(&a, TerminalKind::Shell, 24, 80).await.unwrap();
+        manager.open_session(&b, TerminalKind::Shell, 24, 80).await.unwrap();
+        let Err(Error::StopShared { members, generation, .. }) = manager.set_session_vm(&b, true, None).await else {
+            panic!("a switch out of a shared VM asks first");
+        };
+        assert_eq!(members.into_iter().map(|m| m.id).collect::<Vec<_>>(), std::slice::from_ref(&a));
+        let stale = Confirmed { members: vec![a.clone()], generation: generation + 1 };
+        assert!(matches!(manager.set_session_vm(&b, true, Some(&stale)).await, Err(Error::StaleRestart)));
+        let confirmed = Confirmed { members: vec![a.clone()], generation };
+        manager.set_session_vm(&b, true, Some(&confirmed)).await.unwrap();
+
+        // The shared VM runs again with `a` alone and its shell; `b` runs no VM.
+        let own = format!("{shared}-2");
+        let list = manager.list();
+        let view = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap();
+        assert_eq!((view(&a).vm_key.clone(), view(&b).vm_key.clone()), (Some(shared.clone()), Some(own.clone())));
+        assert_eq!(view(&b).vm_cage, None);
+        assert!(view(&b).processes.is_empty());
+        assert_eq!(view(&a).processes.len(), 1);
+        assert_eq!(*runtime.folders.lock().unwrap(), [(WORKSPACE.to_owned(), view(&a).session.folder.clone())]);
+        assert!(manager.take_app_notices().is_empty());
+
+        // Back to the shared VM: the own VM stops and its state goes.
+        manager.start(&b).await.unwrap();
+        assert!(manager.state_dir(&own).is_dir());
+        manager.set_session_vm(&b, false, None).await.unwrap();
+        assert!(!manager.state_dir(&own).exists());
+        assert_eq!(vm_key(&manager, &b), Some(shared.clone()));
+        assert_eq!(vm_states(&manager, &shared), [(shared, Status::Running)]);
+    }
+
+    #[tokio::test]
+    async fn a_reused_key_gets_an_empty_state() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        manager.start(&a).await.unwrap();
+        let login = put_codex_login(&manager, &own);
+        lock(&manager.state).push_net(
+            &own,
+            Entry::direct(&crate::netlog::parse(&dns_denied("2999-01-01T00:00:00Z", "a.io")).unwrap()).unwrap(),
+        );
+        manager.stop(&a, None).await.unwrap();
+        assert!(login.exists() && !manager.list_net_events(&own).unwrap().is_empty());
+        manager.set_session_vm(&a, false, None).await.unwrap();
+        assert!(!manager.state_dir(&own).exists());
+        assert!(manager.list_net_events(&own).unwrap().is_empty());
+
+        // A folder that a failed delete left is gone before the key is handed out again.
+        put_codex_login(&manager, &own);
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        assert_eq!(vm_key(&manager, &a), Some(own.clone()));
+        assert!(!manager.state_dir(&own).exists());
+    }
+
+    #[tokio::test]
+    async fn an_own_key_of_an_old_cage_is_replaced_at_the_start() {
+        let (manager, runtime, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let old = format!("{a}-2");
+        manager.start(&a).await.unwrap();
+        let login = put_codex_login(&manager, &old);
+        manager.stop(&a, None).await.unwrap();
+        let other = manager.create_cage("other").unwrap();
+        manager.set_session_cage(&a, Some(&other)).unwrap();
+        // No key of the new cage yet: the session has no planned VM.
+        assert_eq!(vm_key(&manager, &a), None);
+        manager.start(&a).await.unwrap();
+        let new = format!("{other}-2");
+        assert_eq!(vm_key(&manager, &a), Some(new.clone()));
+        assert!(!login.exists() && !manager.state_dir(&old).exists());
+        assert_eq!(runtime.log.lock().unwrap().last(), Some(&format!("start {new}")));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_state_of_the_own_vm() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        manager.start(&a).await.unwrap();
+        assert!(manager.state_dir(&own).is_dir());
+        manager.delete(&a).await.unwrap();
+        assert!(!manager.state_dir(&own).exists() && !manager.bin_dir(&own).exists());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_own_vm_is_listed_with_its_key() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        assert_eq!(vm_states(&manager, &a), [(a.clone(), Status::Stopped), (own.clone(), Status::Stopped)]);
+        manager.start(&a).await.unwrap();
+        manager.stop(&a, None).await.unwrap();
+        assert_eq!(vm_states(&manager, &a), [(a.clone(), Status::Stopped), (own.clone(), Status::Stopped)]);
+        assert!(manager.list().cages[0].vms[1].own);
+    }
+
+    /// Puts a file where the agent state dir of VM `key` goes, so its delete fails.
+    fn block_state_delete(manager: &Manager<FakeRuntime>, key: &str) {
+        let dir = manager.state_dir(key);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(dir, "x").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_state_delete_is_an_error_and_the_key_is_not_handed_out() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        block_state_delete(&manager, &own);
+        let Err(e @ Error::VmStateLeft { .. }) = manager.set_session_vm(&a, false, None).await else {
+            panic!("a failed delete is an error");
+        };
+        let path = manager.state_dir(&own).display().to_string();
+        assert_eq!(
+            e.message(),
+            format!("Could not delete the agent state of VM {own} at {path} (Not a directory (os error 20)); delete it by hand.")
+        );
+        assert_eq!(vm_key(&manager, &a), Some(a.clone()));
+        assert!(matches!(manager.set_session_vm(&a, true, None).await, Err(Error::VmStateLeft { .. })));
+        assert_eq!(vm_key(&manager, &a), Some(a.clone()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_state_delete_of_a_deleted_session_is_an_error() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        block_state_delete(&manager, &format!("{a}-2"));
+        assert!(matches!(manager.delete(&a).await, Err(Error::VmStateLeft { .. })));
+        assert!(manager.list().sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cage_delete_removes_the_state_of_own_vms_of_moved_sessions() {
+        let (manager, _, a) = manager();
+        manager.set_session_vm(&a, true, None).await.unwrap();
+        let own = format!("{a}-2");
+        manager.start(&a).await.unwrap();
+        put_codex_login(&manager, &own);
+        manager.stop(&a, None).await.unwrap();
+        let other = manager.create_cage("other").unwrap();
+        manager.set_session_cage(&a, Some(&other)).unwrap();
+        manager.delete_cage(&a).unwrap();
+        for dir in [manager.state_dir(&own), manager.bin_dir(&own), manager.profile_dir(&own)] {
+            assert!(!dir.exists(), "{} is left", dir.display());
+        }
+        assert_eq!(lock(&manager.state).session(&a).unwrap().vm, VmChoice::Shared);
     }
 
     #[test]

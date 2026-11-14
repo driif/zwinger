@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { addMount, removeMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
-import { AGENT_NAMES, CageView } from "../../shared/api";
+import { AGENT_NAMES, CageView, VmCage } from "../../shared/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -32,7 +32,7 @@ interface MountDraft {
 interface Props {
   cage: CageView;
   /** The cage whose VM the runtime state and the last start come from. */
-  vm: CageView | null;
+  vm: VmCage | null;
   runtimes: Runtimes;
   run: Run;
   /** Only a `mount` intent applies here. The caller marks each intent done. */

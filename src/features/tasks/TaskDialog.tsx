@@ -33,10 +33,10 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const sameKind = agents[0].kind === agents[1].kind;
+  const vm = session.vmCage === cage.id ? cage.vms.find((v) => v.key === session.vmKey) : undefined;
   // Names need not be unique: drop only one entry for this session.
-  const own = cage.members.indexOf(session.name);
-  const others =
-    session.vmCage === cage.id && cage.status.state === "running" ? cage.members.filter((_, index) => index !== own) : [];
+  const own = vm?.members.indexOf(session.name);
+  const others = vm?.status.state === "running" ? vm.members.filter((_, index) => index !== own) : [];
 
   const setAgent = (index: 0 | 1, change: Partial<TaskAgent>) =>
     setAgents((current) => {

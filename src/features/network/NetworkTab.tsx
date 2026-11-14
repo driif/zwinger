@@ -35,6 +35,7 @@ import {
   DefaultAction,
   Rule,
   CageView,
+  VmCage,
   SessionView,
   Target,
 } from "../../shared/api";
@@ -79,7 +80,7 @@ interface Props {
   /** The effective cage: the rules that the tab edits. `null`: the session has no cage. */
   cage: CageView | null;
   /** The cage of the session's VM: the test and the activity apply to it. */
-  vmCage: CageView | null;
+  vmCage: VmCage | null;
   /** Shows in place of the rules when `cage` is null. */
   noCage: ReactNode;
   /** The network events of the session's VM. */

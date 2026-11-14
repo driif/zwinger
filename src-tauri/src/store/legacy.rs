@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::cage::{Cage, FileId, HostAgentUse, Mount, fill_id};
 use crate::network::NetworkPolicy;
 use crate::secrets::Secret;
-use crate::session::{PaneNode, Pos, Session, Task, TerminalRecord, folder_slug};
+use crate::session::{PaneNode, Pos, Session, Task, TerminalRecord, VmChoice, folder_slug};
 
 /// Unknown fields, such as the `apps` of older builds, are dropped.
 #[derive(Deserialize)]
@@ -78,6 +78,7 @@ impl Project {
             folder_id: self.folder_id,
             slug,
             cage: Some(self.id.clone()),
+            vm: VmChoice::Shared,
             harness: self.harness,
             terminals: self.terminals,
             pane_layout: self.pane_layout,

@@ -31,10 +31,11 @@ use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 
 use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
-use crate::cage::manager::Manager;
+use crate::cage::manager::{Manager, SessionView};
 use crate::host_agents::HostAgents;
 use crate::runtime::{Microsandbox, SandboxRuntime};
 use crate::secrets::Vault;
+use crate::session::VmChoice;
 
 pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
 /// The open files that the app asks for. Each cage's proxy holds guest and
@@ -125,14 +126,17 @@ fn boot<R: SandboxRuntime>(
         return Ok(manager);
     };
     if !reaped.is_empty() {
-        let cages = manager.list().cages;
-        let names: Vec<String> = reaped
-            .iter()
-            .map(|vm| {
-                let cage = runtime::cage_id(vm).and_then(|id| cages.iter().find(|v| v.cage.id == id));
-                cage.map_or_else(|| vm.clone(), |v| v.cage.name.clone())
+        let listing = manager.list();
+        // The shared VM has the name of its cage, an own VM the name of its session.
+        let name = |key: &str| {
+            let cage = listing.cages.iter().find(|v| v.cage.id == key).map(|v| v.cage.name.clone());
+            cage.or_else(|| {
+                let own = |s: &&SessionView| matches!(&s.session.vm, VmChoice::Own { key: k, .. } if k == key);
+                listing.sessions.iter().find(own).map(|s| s.session.name.clone())
             })
-            .collect();
+        };
+        let names: Vec<String> =
+            reaped.iter().map(|vm| runtime::vm_key(vm).and_then(name).unwrap_or_else(|| vm.clone())).collect();
         manager
             .add_app_notice(format!("zwinger stopped the VMs that the last run left running: {}.", names.join(", ")));
     }
@@ -163,20 +167,20 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     // One app-wide event, so the rail and the map update while the
     // Network tab is closed.
     let handle = app.clone();
-    manager.set_net_sink(Box::new(move |cage_id, event| {
-        let _ = handle.emit("net-event", serde_json::json!({ "cageId": cage_id, "event": event }));
+    manager.set_net_sink(Box::new(move |vm_key, event| {
+        let _ = handle.emit("net-event", serde_json::json!({ "vmKey": vm_key, "event": event }));
     }));
     let handle = app.clone();
     manager.set_agent_sink(Box::new(move |process_id, state| {
         let _ = handle.emit("agent-state", serde_json::json!({ "processId": process_id, "state": state }));
     }));
     let handle = app.clone();
-    manager.set_guest_sink(Box::new(move |cage_id| {
-        let _ = handle.emit("guest-login", cage_id);
+    manager.set_guest_sink(Box::new(move |vm_key| {
+        let _ = handle.emit("guest-login", vm_key);
     }));
     let handle = app.clone();
-    manager.set_progress_sink(Box::new(move |cage_id, phase, elapsed_ms| {
-        let payload = serde_json::json!({ "cageId": cage_id, "phase": phase, "elapsedMs": elapsed_ms });
+    manager.set_progress_sink(Box::new(move |vm_key, phase, elapsed_ms| {
+        let payload = serde_json::json!({ "vmKey": vm_key, "phase": phase, "elapsedMs": elapsed_ms });
         let _ = handle.emit("cage-start-progress", payload);
     }));
 }
@@ -302,6 +306,7 @@ pub fn run() {
             commands::cages::rename_cage,
             commands::cages::delete_cage,
             commands::cages::set_session_cage,
+            commands::cages::set_session_vm,
             commands::cages::set_workspace_cage,
             commands::terminal::open_session,
             commands::terminal::reopen_terminal,
@@ -486,7 +491,7 @@ mod tests {
             assert!(e.to_string().contains("the VMs of the last app run are not stopped: reap failed"), "{e}");
         }
         assert_eq!(*runtime.log.lock().unwrap(), ["reap", "reap", "reap"]);
-        assert_eq!(manager.list().cages[0].status, cage::manager::Status::Stopped);
+        assert_eq!(manager.list().cages[0].shared().status, cage::manager::Status::Stopped);
     }
 
     #[test]

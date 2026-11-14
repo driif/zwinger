@@ -19,6 +19,7 @@ import {
   AgentKind,
   PaneNode,
   CageView,
+  VmCage,
   SessionView,
   TerminalKind,
 } from "../../shared/api";
@@ -180,7 +181,7 @@ interface Props {
   /** The effective cage: the config that the page edits. `null`: no cage. */
   cage: CageView | null;
   /** The cage of the session's VM: the page shows its state. */
-  vmCage: CageView | null;
+  vmCage: VmCage | null;
   /** All cages. */
   cages: CageView[];
   /** The default cage of the session's workspace. */
@@ -428,7 +429,7 @@ export function ProjectPage({
               icon={<TriangleAlert size={14} className="warn" />}
               actions={
                 <>
-                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(vmCage.id, agent).then(onRefresh))}>
+                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(vmCage.key, agent).then(onRefresh))}>
                     Remove it
                   </Button>
                   <Button size="sm" variant="outline" onClick={onHostAgents}>

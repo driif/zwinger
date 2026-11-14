@@ -106,8 +106,8 @@ export const setAgentsUnprompted = (cageId: string, on: boolean) =>
   call<void>("set_agents_unprompted", { cageId, on });
 
 /** Deletes the agent's login that was made in the guest. */
-export const removeGuestLogin = (cageId: string, agent: AgentKind) =>
-  call<void>("remove_guest_login", { cageId, agent });
+export const removeGuestLogin = (vmKey: string, agent: AgentKind) =>
+  call<void>("remove_guest_login", { vmKey, agent });
 
 /** Stops the download. The install then fails with a cancel error. */
 export const cancelRuntimeInstall = (name: RuntimeName) =>

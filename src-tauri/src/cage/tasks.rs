@@ -309,7 +309,7 @@ mod tests {
         assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::RuntimeMissing(name)) if name == "claude"));
         // A task edit needs no restart.
         manager.put_task(&id, task_draft(Some(task_id.clone()), "Again", kinds)).unwrap();
-        assert!(!manager.list().cages[0].pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
 
         manager.stop(&id, None).await.unwrap();
         manager.set_mount_readonly(&id, "/mnt/ro", false).unwrap();

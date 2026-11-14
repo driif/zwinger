@@ -53,6 +53,7 @@ import { isLive, removeTask, RunSummary, startTaskRun } from "../tasks/api";
 import {
   AGENT_NAMES,
   CageView,
+  VmCage,
   SessionCage,
   SessionView,
   TerminalKind,
@@ -386,7 +387,7 @@ export function ProjectRail({
     });
 
   /** `vmCage`: the cage of the session's VM. */
-  function leaves(session: SessionView, vmCage: CageView | null, group: Group): Leaf[] {
+  function leaves(session: SessionView, vmCage: VmCage | null, group: Group): Leaf[] {
     const sid = session.id;
     if (group === "terminals")
       return panes
@@ -722,7 +723,7 @@ export function ProjectRail({
   function drop(next: Workspace[], data: DragData) {
     const moved = data.kind === "session" ? byId.get(data.entity) : undefined;
     const vm = moved?.vmCage?.status.state;
-    const to = moved && vm && vm !== "error" ? cageAfterMove(moved.session, next) : undefined;
+    const to = moved && vm && vm !== "error" && vm !== "stopped" ? cageAfterMove(moved.session, next) : undefined;
     if (!moved || to === undefined) return save(next);
     setDraft(next);
     setMoving({ session: moved.session, next, to });
@@ -1035,14 +1036,22 @@ export function ProjectRail({
                                       )}
                                     </span>
                                   )}
+                                  {session.vm.kind === "own" && (
+                                    <span className="muted" title={`This session runs in a VM of its own: ${session.vmKey ?? "a new key at the next start"}`}>
+                                      <Box size={12} aria-label="Own VM" />
+                                    </span>
+                                  )}
                                   {shared ? (
-                                    <span className="muted" title={`One VM of cage ${shared.name} runs ${shared.members.join(", ")}`}>
+                                    <span className="muted" title={`Shared VM of cage ${shared.name} with ${shared.members.length} sessions: ${shared.members.join(", ")}`}>
                                       <Fence size={12} aria-label={`Shared VM of cage ${shared.name}`} />
                                       {shared.members.length}
                                     </span>
                                   ) : (
                                     effective && (
-                                      <span className="muted" title={`${cageName(effective.id)}${effective.inherited ? " (inherited)" : ""}`}>
+                                      <span
+                                        className="muted"
+                                        title={`${cageName(effective.id)}${effective.inherited ? " (inherited)" : ""}, ${session.vm.kind === "own" ? "own VM" : "shared VM"}`}
+                                      >
                                         <Fence size={12} aria-label={`Cage ${cageName(effective.id)}`} />
                                       </span>
                                     )
@@ -1075,6 +1084,13 @@ export function ProjectRail({
                                   actions={[
                                     ...launchMenu(launch, (action) => onLaunch(session.id, action)),
                                     renameAction(sessionRow),
+                                    ...(effective
+                                      ? [
+                                          session.vm.kind === "own"
+                                            ? { label: "Use shared VM", icon: <Fence size={14} />, run: () => run(() => vm.setOwn(session.id, false)) }
+                                            : { label: "Use own VM", icon: <Box size={14} />, run: () => run(() => vm.setOwn(session.id, true)) },
+                                        ]
+                                      : []),
                                   ]}
                                   onClose={closeMenu}
                                 />

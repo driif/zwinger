@@ -33,8 +33,8 @@ pub fn wildcard_for(host: String) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn list_net_events(manager: Managed<'_>, cage_id: String) -> Result<Vec<Entry>> {
-    manager.list_net_events(&cage_id)
+pub fn list_net_events(manager: Managed<'_>, vm_key: String) -> Result<Vec<Entry>> {
+    manager.list_net_events(&vm_key)
 }
 
 // The credential commands are async, so the vault file I/O does not block the main thread.

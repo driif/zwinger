@@ -55,6 +55,19 @@ pub async fn restart_cage(manager: Managed<'_>, session_id: String, confirmed: O
     manager.restart(&session_id, confirmed.as_ref()).await
 }
 
+/// Puts the session in a VM of its own, or back in the shared VM of its
+/// cage. A VM with other members fails with `StopShared` unless `confirmed`
+/// has the members and the generation of that error.
+#[tauri::command]
+pub async fn set_session_vm(
+    manager: Managed<'_>,
+    session_id: String,
+    own: bool,
+    confirmed: Option<Confirmed>,
+) -> Result<()> {
+    manager.set_session_vm(&session_id, own, confirmed.as_ref()).await
+}
+
 #[tauri::command]
 pub fn create_cage(manager: Managed<'_>, name: String) -> Result<String> {
     manager.create_cage(&name)
@@ -108,8 +121,8 @@ pub fn remove_host_agent(manager: Managed<'_>, cage_id: String, agent: AgentKind
 }
 
 #[tauri::command]
-pub fn remove_guest_login(manager: Managed<'_>, cage_id: String, agent: AgentKind) -> Result<()> {
-    manager.remove_guest_login(&cage_id, agent)
+pub fn remove_guest_login(manager: Managed<'_>, vm_key: String, agent: AgentKind) -> Result<()> {
+    manager.remove_guest_login(&vm_key, agent)
 }
 
 #[tauri::command]

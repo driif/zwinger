@@ -143,14 +143,15 @@ pub struct Pipe {
 pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     type Vm: Send + Sync + 'static;
 
-    /// Boots the VM of the cage with each member folder at its guest folder
-    /// ([`task_guest_folder`]), with workdir `/workspace`.
+    /// Boots the VM `key` of the cage with each member folder at its guest
+    /// folder ([`task_guest_folder`]), with workdir `/workspace`.
     /// The VM reaches only `net.port` on the host. `state` is the host dir
     /// of the VM's agent state. Each runtime in `runtimes` is mounted
     /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
     /// its guest path.
     fn start(
         &self,
+        key: &str,
         members: Members<'_>,
         net: &GuestNet,
         state: &Path,
@@ -191,8 +192,8 @@ pub fn sandbox_policy(port: u16) -> Result<microsandbox::NetworkPolicy> {
 const LABEL: (&str, &str) = ("app", "zwinger");
 const NAME_PREFIX: &str = "zwinger-";
 
-/// The cage id of a VM name that [`Microsandbox`] gave.
-pub fn cage_id(vm_name: &str) -> Option<&str> {
+/// The VM key of a VM name that [`Microsandbox`] gave.
+pub fn vm_key(vm_name: &str) -> Option<&str> {
     vm_name.strip_prefix(NAME_PREFIX)
 }
 
@@ -250,6 +251,7 @@ impl SandboxRuntime for Microsandbox {
 
     async fn start(
         &self,
+        key: &str,
         members: Members<'_>,
         net: &GuestNet,
         state: &Path,
@@ -257,7 +259,7 @@ impl SandboxRuntime for Microsandbox {
         binds: &[Bind],
     ) -> Result<Sandbox> {
         let policy = sandbox_policy(net.port)?;
-        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{}", members.cage.id))
+        let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{key}"))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
             .deployment_profile(DeploymentProfile::SingleTenant)
@@ -520,7 +522,7 @@ pub mod fake {
     }
 
     pub struct FakeVm {
-        pub cage_id: String,
+        pub key: String,
     }
 
     impl SandboxRuntime for FakeRuntime {
@@ -528,6 +530,7 @@ pub mod fake {
 
         async fn start(
             &self,
+            key: &str,
             members: Members<'_>,
             net: &GuestNet,
             _: &Path,
@@ -541,14 +544,14 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
-            self.log.lock().unwrap().push(format!("start {}", members.cage.id));
+            self.log.lock().unwrap().push(format!("start {key}"));
             *self.net.lock().unwrap() = Some(net.clone());
             *self.folders.lock().unwrap() = members
                 .sessions
                 .iter()
                 .map(|s| (task_guest_folder(members.sessions, &s.id).expect("a member").1, s.folder.clone()))
                 .collect();
-            Ok(FakeVm { cage_id: members.cage.id.clone() })
+            Ok(FakeVm { key: key.to_owned() })
         }
 
         async fn stop(&self, vm: &FakeVm) -> Result<()> {
@@ -567,7 +570,7 @@ pub mod fake {
                 tokio::time::sleep(delay).await;
             }
             self.stopping.fetch_sub(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push(format!("stop {}", vm.cage_id));
+            self.log.lock().unwrap().push(format!("stop {}", vm.key));
             Ok(())
         }
 

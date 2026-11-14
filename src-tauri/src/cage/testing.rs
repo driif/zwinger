@@ -334,3 +334,14 @@ pub(crate) async fn sh<R: SandboxRuntime>(manager: &Manager<R>, vm: &R::Vm, scri
     }
     (code, String::from_utf8_lossy(&out).trim().to_owned())
 }
+
+/// The VM key of the session in the listing.
+pub(crate) fn vm_key(manager: &Manager<FakeRuntime>, session: &str) -> Option<String> {
+    manager.list().sessions.into_iter().find(|s| s.session.id == session).and_then(|s| s.vm_key)
+}
+
+/// The keys and states of the VMs of the cage, the shared VM first.
+pub(crate) fn vm_states(manager: &Manager<FakeRuntime>, cage: &str) -> Vec<(String, Status)> {
+    let view = manager.list().cages.into_iter().find(|c| c.cage.id == cage).expect("the cage");
+    view.vms.into_iter().map(|v| (v.key, v.status)).collect()
+}

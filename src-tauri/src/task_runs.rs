@@ -1668,7 +1668,7 @@ mod tests {
             run: "01".into(),
             exec: Exec {
                 runtime,
-                vm: Arc::new(FakeVm { cage_id: "s".into() }),
+                vm: Arc::new(FakeVm { key: "s".into() }),
                 cwd: "/workspace".into(),
                 scope: "/workspace".into(),
                 artifacts: Some("/workspace/.zwinger/tasks/fix/01".into()),

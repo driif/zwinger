@@ -30,7 +30,9 @@ workspace. The tree is workspace → session → Terminals and Tasks.
 - You can delete only an empty workspace. The last workspace cannot be deleted.
 - **Default cage…** in the menu of a workspace sets the cage of the sessions in it that inherit their cage. A session
   row shows a cage icon when the session has a cage. Its tooltip names the cage, with "(inherited)" if the cage comes
-  from the workspace.
+  from the workspace, and says if the session uses the shared VM of the cage or its own VM.
+- **Use own VM** in the menu of a session runs it in a VM of its own, with the same cage. **Use shared VM** puts it
+  back in the shared VM of its cage. If its VM runs, zwinger asks first. See [Own VM](/cages/#own-vm).
 - Drag a workspace to change the order of the workspaces. Drag a session to change its place or to move it to a
   different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
 - A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,

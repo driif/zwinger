@@ -121,6 +121,8 @@ pub enum Error {
     NotRunning,
     #[error("cage is already started")]
     AlreadyStarted,
+    #[error("could not delete the agent state of VM {key} at {path} ({source}); delete it by hand")]
+    VmStateLeft { key: String, path: String, source: std::io::Error },
     #[error("cage is starting")]
     Starting,
     #[error("cage is stopping")]

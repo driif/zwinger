@@ -14,8 +14,9 @@ Hypervisor.framework). The VM is the unit of isolation.
 - **Create cage** adds a cage with no mounts, rules or agents.
 - **Rename** changes the name of the cage. The projects keep their names.
 - **Edit** shows the mounts and the agent settings of the cage.
-- **Delete** removes the cage, its credential values and its agent state. You cannot delete a cage that a project uses,
-  that is the default cage of a workspace, or whose VM runs. The button then shows the reason as a tooltip.
+- **Delete** removes the cage, its credential values and the agent state of all its VMs. A project that kept an own VM
+  of the cage after a cage change goes back to the shared VM. You cannot delete a cage that a project uses, that is the
+  default cage of a workspace, or whose VM runs. The button then shows the reason as a tooltip.
 
 ## Attach or inherit
 
@@ -55,12 +56,38 @@ in its own cage if it must not see the others.
 - **Checks.** The start checks each project folder: it must not overlap a mount or a different project folder of the
   VM, it must be the same folder that you added, and it must not overlap the zwinger data folder.
 - **Hot mount.** A project cannot join a running VM with no restart yet.
+- **Checks across VMs.** A project folder also must not overlap the folder of a project of the same cage that runs in
+  a different VM, such as its own VM.
 
 A start of a stopped VM boots it with only the project that starts it. A project that you delete must not run in a
 VM with other projects: stop that VM first.
 
 The project row in the sidebar shows the cage icon with the number of projects of a shared VM. Its tooltip names
 them.
+
+## Own VM
+
+A project can run in a VM of its own instead of the shared VM of its cage. Use **Use own VM** in the menu of the
+project row. **Use shared VM** puts it back. The own VM uses the same cage: the same mounts, network policy,
+credentials and agents. A cage edit goes to all VMs of the cage. A network edit reaches each running VM at once, and a
+mount or agent edit waits for the restart of each VM.
+
+- **Names.** The shared VM has the id of its cage as its key. An own VM gets the key `<cage id>-<n>`, with the lowest
+  free number from 2. The VM name is `zwinger-<key>`. The network events, the start progress and the guest logins
+  are per VM.
+- **Agent state.** An own VM has its own agent state: its agents do not see the history or the guest logins of the
+  shared VM. The state stays while the project keeps its own VM. **Use shared VM**, and a delete of the project,
+  delete the state of the own VM. If zwinger cannot delete it, you see the folder: delete it by hand. zwinger does not
+  give that key to a new own VM while the folder is there. A new own VM always starts with an empty state.
+- **Stopped VM.** A stopped own VM keeps its network log until the project leaves it.
+- **Running VM.** If the VM of the project runs, the change asks first. A VM with this project only stops. A shared VM
+  with other projects restarts without this project: their VM terminals open again, and their running tasks are
+  cancelled. The new VM starts with the next start of the project.
+- **Cage change.** A project with its own VM keeps it after a change of its cage. At the next start, it gets a new key
+  of the new cage, and the state of the old own VM is deleted.
+
+The project row shows a box icon when the project has its own VM. The tooltip of the cage icon says "shared VM" or
+"own VM".
 
 ## What the cage sees
 
@@ -89,7 +116,7 @@ including the vault file. See [Agents with no cage](/agents/#agents-with-no-cage
 
 ## Start and stop
 
-You start and stop the cage of a project. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
+You start and stop the VM of a project: the shared VM of its cage, or its own VM. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
 status of a starting cage names the current phase. **Settings > Last start** of the project shows the time of each
 phase.
 
