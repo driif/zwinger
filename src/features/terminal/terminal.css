@@ -50,15 +50,15 @@
 }
 
 .pane-divider.row {
-  width: 6px;
-  margin-left: -3px;
+  width: calc(var(--motiv-space) * 1.5);
+  transform: translateX(-50%);
   cursor: col-resize;
   background: linear-gradient(var(--motiv-color-border), var(--motiv-color-border)) center / 1px 100% no-repeat;
 }
 
 .pane-divider.column {
-  height: 6px;
-  margin-top: -3px;
+  height: calc(var(--motiv-space) * 1.5);
+  transform: translateY(-50%);
   cursor: row-resize;
   background: linear-gradient(var(--motiv-color-border), var(--motiv-color-border)) center / 100% 1px no-repeat;
 }
@@ -77,7 +77,7 @@
   padding: 0 var(--motiv-space);
   border-bottom: 1px solid var(--motiv-color-border);
   color: var(--motiv-color-text-muted);
-  font-size: var(--zw-text-sm);
+  font-size: var(--motiv-font-size-sm);
   white-space: nowrap;
 }
 

@@ -1,6 +1,6 @@
 ---
 title: Appearance
-description: Themes, the text size and what waits for the UI library.
+description: Themes, text size, density, and sidebar font size.
 ---
 
 Open **Settings > Appearance** (⌘,) to select the look of zwinger.
@@ -20,15 +20,16 @@ zwinger keeps each custom theme as one JSON file in the `themes` folder of its a
 
 ## Text size
 
-All built-in themes use one body text size: `0.8125rem`. The text of zwinger's own views and the rows of the sidebar
-use the body size. Secondary labels and headings are fixed steps below or above it. When a custom theme changes
-**Font size**, these sizes change with it.
+The **Font size** of a custom theme sets the body text size. Text in labels, headings, controls, rail rows and the project
+map scales with it. Built-in themes use `0.8125rem`.
 
-Controls from the UI library, for example buttons, fields, menus and selects, keep their own fixed sizes. They do not
-change with **Font size** yet.
+## Density
 
-The project map keeps its own fixed size, because it places its boxes in pixels.
+In **Settings > Appearance > Layout**, choose **Default** or **Compact**. Compact reduces spacing and the height of rows
+and controls throughout the app, including the project map. The change applies at once and persists after a restart.
 
-## Not available yet
+## Sidebar font size
 
-zwinger has no density setting and no separate sidebar font size. Both need support in the UI library first.
+Choose **Theme default** or **12**, **13**, **14**, or **15 px** in **Settings > Appearance > Layout**. Theme default follows
+the selected theme's body size. A set size changes the rail text and its controls without changing the rest of the app.
+The change applies at once and persists after a restart.

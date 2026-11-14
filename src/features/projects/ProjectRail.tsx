@@ -40,7 +40,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { CSSProperties, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
   arrangeWorkspaces,
   createWorkspace,
@@ -269,6 +269,8 @@ function NameField({ name, onDone }: { name: string; onDone: (name: string | und
 }
 
 interface Props {
+  density: "default" | "compact";
+  sidebarFontSize: number | null;
   sessions: SessionCage[];
   /** All cages. */
   cages: CageView[];
@@ -310,6 +312,8 @@ interface Props {
 
 /** The sessions as a tree: workspace → session → Terminals / Tasks → items. */
 export function ProjectRail({
+  density,
+  sidebarFontSize,
   sessions,
   cages,
   workspaces,
@@ -819,7 +823,11 @@ export function ProjectRail({
   const cageName = (id: string | null) => cages.find((c) => c.id === id)?.name ?? "no cage";
 
   return (
-    <aside className={forbidden ? "rail forbidden" : "rail"}>
+    <aside
+      className={forbidden ? "rail forbidden" : "rail"}
+      data-density={density}
+      style={sidebarFontSize === null ? undefined : { "--motiv-font-size": `${sidebarFontSize}px` } as CSSProperties}
+    >
       {children}
       <div className="rail-tree" data-drop="rail">
         {dropFolder && (

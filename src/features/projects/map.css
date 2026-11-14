@@ -1,11 +1,13 @@
 /* React Flow takes its colours from the tokens, so the map follows the theme. */
-/* missing: docs/designs/ui-text-scale-audit.md `Map canvas`. The pixel sizes in this file match the pixel layout in mapLayout.ts and CHAR in ProjectMap.tsx. */
 .map {
   flex: 1;
   min-height: 20rem;
   border: 1px solid var(--motiv-color-border);
   border-radius: var(--motiv-radius-lg);
   overflow: hidden;
+  /* ProjectMap.tsx measures 1ch of this font for the labels. */
+  font-family: var(--zw-font-mono);
+  font-size: var(--motiv-font-size-sm);
 }
 
 .map .react-flow {
@@ -22,8 +24,6 @@
   --xy-handle-background-color: transparent;
   --xy-handle-border-color: transparent;
   --xy-attribution-background-color: transparent;
-  font-family: var(--zw-font-mono);
-  font-size: 12px;
 }
 
 .map .react-flow__attribution a {
@@ -42,7 +42,7 @@
 
 .map-node {
   position: relative;
-  height: 28px;
+  height: var(--motiv-row-height);
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -111,10 +111,10 @@
 
 .map-activity {
   position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 6px;
-  height: 6px;
+  top: var(--motiv-space);
+  right: var(--motiv-space);
+  width: calc(var(--motiv-space) * 1.5);
+  height: calc(var(--motiv-space) * 1.5);
   border-radius: var(--motiv-radius-full);
   background: var(--zw-status-running);
 }
@@ -123,8 +123,8 @@
   padding: 0 calc(var(--motiv-space) * 1.5);
   border-radius: var(--motiv-radius-full);
   background: var(--zw-map-badge);
-  font-size: 10px;
-  line-height: 16px;
+  font-size: var(--motiv-font-size-xs);
+  line-height: var(--motiv-line-height);
 }
 
 .map-badge.rw {
@@ -171,22 +171,22 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--motiv-font-title);
-  font-size: 14px;
+  font-size: var(--motiv-font-size);
   font-weight: 600;
 }
 
 .map-state,
 .map-caption {
   color: var(--motiv-color-text-muted);
-  font-size: 11px;
+  font-size: var(--motiv-font-size-sm);
   letter-spacing: 0.04em;
 }
 
 /* The point where the egress edges leave the microVM. */
 .map .map-gateway {
-  top: 70px;
-  width: 22px;
-  height: 22px;
+  top: calc(var(--motiv-row-height) * 2.5);
+  width: calc(var(--motiv-space) * 5.5);
+  height: calc(var(--motiv-space) * 5.5);
   display: grid;
   place-items: center;
   border: 1.5px solid var(--zw-map-boundary);
@@ -206,7 +206,7 @@
   border-radius: var(--motiv-radius-md);
   background: var(--motiv-color-surface);
   color: var(--motiv-color-text-muted);
-  font-size: 11px;
+  font-size: var(--motiv-font-size-sm);
 }
 
 .map-legend .map-badge {
@@ -214,7 +214,7 @@
 }
 
 .map-swatch {
-  width: 14px;
-  height: 14px;
+  width: calc(var(--motiv-space) * 3.5);
+  height: calc(var(--motiv-space) * 3.5);
   padding: 0;
 }

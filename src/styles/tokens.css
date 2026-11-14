@@ -3,15 +3,9 @@
   --zw-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   --zw-gap: calc(var(--motiv-space) * 2);
   --zw-page-pad: calc(var(--motiv-space) * 4);
-  /* The text scale: the motiv body size times the factors that motiv's own CSS uses. */
-  --zw-text-sm: calc(var(--motiv-font-size) * 0.875);
-  --zw-text-body: var(--motiv-font-size);
-  --zw-text-lg: calc(var(--motiv-font-size) * 1.25);
   --zw-rail-width: 16rem;
-  --zw-rail-row: calc(var(--motiv-space) * 7);
   --zw-icon-button: calc(var(--motiv-space) * 6);
   --zw-icon: calc(var(--motiv-space) * 3.5);
-  --zw-control-height: calc(var(--motiv-space) * 8);
 
   --zw-status-idle: var(--motiv-color-border);
   --zw-status-running: var(--motiv-color-success);

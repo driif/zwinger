@@ -126,6 +126,9 @@ export interface Prefs {
   darkTheme: string;
   /** The width of the project rail, in px. */
   railWidth: number;
+  density: "default" | "compact";
+  /** `null` follows the theme body size. */
+  sidebarFontSize: number | null;
   terminal: TerminalPrefs;
   editors: EditorPrefs;
 }

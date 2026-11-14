@@ -16,7 +16,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Maximize, Minus, Network, Plus } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { NetEvent } from "../network/api";
 import { setLayout } from "./api";
 import { isRoundFolder } from "../tasks/api";
@@ -24,15 +24,16 @@ import { CageView, Pos, SessionView, VmCage } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
 import { CageMark } from "../../shared/CageMark";
-import { BoundaryData, ItemData, Jump, MapNode, mapLayout } from "./mapLayout";
+import { BoundaryData, ItemData, Jump, MapMetrics, MapNode, mapLayout } from "./mapLayout";
 import "./map.css";
 
-const CHAR = 7.2;
 const BLOCKED_MS = 60_000;
 
 /** Keeps the end of a path, which is the part that tells folders apart. */
-function fit(text: string, width: number) {
-  const max = Math.floor(width / CHAR);
+function fit(text: string, width: number, charWidth: number) {
+  if (charWidth === 0) return text;
+  const max = Math.floor(width / charWidth);
+  if (max <= 1) return "…";
   return text.length > max ? `…${text.slice(-(max - 1))}` : text;
 }
 
@@ -42,7 +43,7 @@ function ItemNode({ data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
     <div className={`map-node ${data.tone ?? ""}`} title={data.title}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <Icon size={14} />
-      <span className="map-label">{fit(data.label, width - 36 - data.badges.length * 44)}</span>
+      <span className="map-label">{fit(data.label, width - 36 - data.badges.length * 44, data.charWidth ?? 0)}</span>
       {data.badges.map((badge) => (
         <span key={badge} className={`map-badge ${badge}`}>
           {badge}
@@ -117,9 +118,62 @@ export function ProjectMap(props: Props) {
   );
 }
 
-function MapCanvas({ session, cage, vmCage, folders, events, visible, run, onJump, onDropFolder }: Props) {
-  const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
+/** Measures the motiv tokens in the box. The map is laid out only when it knows them. */
+function MapCanvas(props: Props) {
   const container = useRef<HTMLDivElement>(null);
+  const [metrics, setMetrics] = useState<MapMetrics>();
+
+  useLayoutEffect(() => {
+    if (!props.visible) return;
+    const box = container.current!;
+    const measure = () => {
+      const probe = document.createElement("span");
+      probe.style.cssText =
+        "position:absolute;visibility:hidden;width:var(--motiv-space);height:var(--motiv-row-height)";
+      const character = document.createElement("span");
+      character.style.cssText = "position:absolute;visibility:hidden;width:1ch";
+      box.append(probe, character);
+      const next = {
+        rowHeight: parseFloat(getComputedStyle(probe).height),
+        space: parseFloat(getComputedStyle(probe).width),
+        charWidth: parseFloat(getComputedStyle(character).width),
+      };
+      probe.remove();
+      character.remove();
+      if (!(next.rowHeight > 0 && next.space > 0 && next.charWidth > 0)) return;
+      setMetrics((current) =>
+        current?.rowHeight === next.rowHeight && current.space === next.space && current.charWidth === next.charWidth
+          ? current
+          : next,
+      );
+    };
+    measure();
+    const observer = new MutationObserver(measure);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-density", "data-theme", "style"] });
+    return () => observer.disconnect();
+  }, [props.visible]);
+
+  return (
+    <div ref={container} className="map" role="group" aria-label={`Map of project ${props.session.name}`}>
+      {metrics && <MapFlow {...props} metrics={metrics} container={container} />}
+    </div>
+  );
+}
+
+function MapFlow({
+  session,
+  cage,
+  vmCage,
+  folders,
+  events,
+  visible,
+  run,
+  onJump,
+  onDropFolder,
+  metrics,
+  container,
+}: Props & { metrics: MapMetrics; container: RefObject<HTMLDivElement | null> }) {
+  const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
   const catalog = useCatalog();
@@ -140,8 +194,8 @@ function MapCanvas({ session, cage, vmCage, folders, events, visible, run, onJum
   }, [latest]);
 
   const map = useMemo(
-    () => mapLayout({ ...session, layout }, cage, vmCage, folders ?? [], events, catalog, now),
-    [session, cage, vmCage, layout, folders, events, catalog, now],
+    () => mapLayout({ ...session, layout }, cage, vmCage, folders ?? [], events, catalog, now, metrics),
+    [session, cage, vmCage, layout, folders, events, catalog, now, metrics],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
 
@@ -235,46 +289,44 @@ function MapCanvas({ session, cage, vmCage, folders, events, visible, run, onJum
   const jump = (node?: MapNode) => node?.type === "item" && node.data.jump && onJump(node.data.jump);
 
   return (
-    <div ref={container} className="map" role="group" aria-label={`Map of project ${session.name}`}>
-      <ReactFlow<MapNode>
-        nodes={nodes}
-        edges={map.edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onNodeDragStop={(_, __, dragged) =>
-          save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
-        }
-        onNodeClick={(_, node) => jump(node)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter") return;
-          const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
-          jump(nodes.find((n) => n.id === id));
-        }}
-        nodesConnectable={false}
-        elementsSelectable={false}
-        deleteKeyCode={null}
-        minZoom={0.3}
-        fitView
-      >
-        <Background variant={BackgroundVariant.Dots} />
-        <Panel position="bottom-left">
-          <MapControls />
+    <ReactFlow<MapNode>
+      nodes={nodes}
+      edges={map.edges}
+      nodeTypes={nodeTypes}
+      onNodesChange={onNodesChange}
+      onNodeDragStop={(_, __, dragged) =>
+        save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
+      }
+      onNodeClick={(_, node) => jump(node)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter") return;
+        const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
+        jump(nodes.find((n) => n.id === id));
+      }}
+      nodesConnectable={false}
+      elementsSelectable={false}
+      deleteKeyCode={null}
+      minZoom={0.3}
+      fitView
+    >
+      <Background variant={BackgroundVariant.Dots} />
+      <Panel position="bottom-left">
+        <MapControls />
+      </Panel>
+      <Panel position="top-right">
+        <Button size="sm" variant="outline" disabled={Object.keys(layout).length === 0} onClick={() => save(null)}>
+          Reset layout
+        </Button>
+      </Panel>
+      {map.hasSecrets && (
+        <Panel position="bottom-right" className="map-legend">
+          <p className="row">
+            <span className="map-badge key">key</span> gets a credential
+            <span className="map-node warn map-swatch" /> login host that the rules block
+          </p>
+          <p>The agent sees $MSB_…, the proxy adds the real value.</p>
         </Panel>
-        <Panel position="top-right">
-          <Button size="sm" variant="outline" disabled={Object.keys(layout).length === 0} onClick={() => save(null)}>
-            Reset layout
-          </Button>
-        </Panel>
-        {map.hasSecrets && (
-          <Panel position="bottom-right" className="map-legend">
-            <p className="row">
-              <span className="map-badge key">key</span> gets a credential
-              <span className="map-node warn map-swatch" /> login host that the rules block
-            </p>
-            <p>The agent sees $MSB_…, the proxy adds the real value.</p>
-          </Panel>
-        )}
-      </ReactFlow>
-    </div>
+      )}
+    </ReactFlow>
   );
 }

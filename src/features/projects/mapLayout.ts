@@ -15,10 +15,6 @@ const FOLDER_X = 44;
 const FOLDER_W = 236;
 const NET_X = 660;
 const NET_W = 224;
-const TOP = 72;
-const ROW = 36;
-const GAP = 12;
-const H = 28;
 const CAP = 6;
 const ACTIVE_MS = 10_000;
 const BLOCKED_MS = 60_000;
@@ -27,6 +23,7 @@ const BLOCKED_CAP = 5;
 export type Jump = "settings" | "network";
 
 export interface ItemData extends Record<string, unknown> {
+  charWidth?: number;
   icon: LucideIcon;
   label: string;
   title: string;
@@ -44,6 +41,12 @@ export interface BoundaryData extends Record<string, unknown> {
 
 export type MapNode = Node<ItemData, "item"> | Node<BoundaryData, "boundary"> | Node<{ label: string }, "caption">;
 
+export interface MapMetrics {
+  rowHeight: number;
+  space: number;
+  charWidth: number;
+}
+
 const under = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
 
 /**
@@ -60,7 +63,12 @@ export function mapLayout(
   events: NetEvent[],
   catalog: Service[],
   now: number,
+  metrics: MapMetrics,
 ) {
+  const H = metrics.rowHeight;
+  const ROW = H + metrics.space * 2;
+  const GAP = metrics.space * 3;
+  const TOP = BOX_Y + H * 2;
   const { harness } = session;
   // In a running VM, the paths that the guest sees. `harness` stays the stored path, which the folders match.
   const guestFolder = session.guestFolder ?? "/workspace";
@@ -85,10 +93,10 @@ export function mapLayout(
       position: at(id, x, y - BOX_Y),
       width,
       ariaLabel: data.title,
-      data,
+      data: { ...data, charWidth: metrics.charWidth },
     });
   const outer = (id: string, x: number, y: number, width: number, data: ItemData) =>
-    nodes.push({ id, type: "item", position: at(id, x, y), width, ariaLabel: data.title, data });
+    nodes.push({ id, type: "item", position: at(id, x, y), width, ariaLabel: data.title, data: { ...data, charWidth: metrics.charWidth } });
   const edge = (source: string, target: string, blocked?: boolean) =>
     edges.push({ id: `${source}>${target}`, source, target, className: blocked ? "blocked" : undefined });
 
@@ -236,7 +244,7 @@ export function mapLayout(
     type: "boundary",
     position: at("boundary", BOX_X, BOX_Y),
     width: BOX_W,
-    height: y + H + 20 - BOX_Y,
+    height: y + H + metrics.space * 5 - BOX_Y,
     ariaLabel: `Cage of ${session.name}, ${state}`,
     data: { name: session.name, state },
   });
@@ -340,7 +348,7 @@ export function mapLayout(
     ["caption:host", "HOST", HOST_X],
     ["caption:network", "NETWORK", NET_X],
   ] as const)
-    nodes.push({ id, type: "caption", position: { x, y: 28 }, draggable: false, selectable: false, focusable: false, data: { label } });
+    nodes.push({ id, type: "caption", position: { x, y: H }, draggable: false, selectable: false, focusable: false, data: { label } });
 
   const hasSecrets = cage.logins.length > 0 || network.rules.some((r) => (r.credentials ?? []).length > 0);
   return { nodes, edges, hasSecrets };

@@ -22,8 +22,21 @@ pub struct Prefs {
     pub dark_theme: String,
     /// The width of the project rail, in CSS pixels.
     pub rail_width: u32,
+    #[serde(default)]
+    pub density: Density,
+    /// None follows the theme body size.
+    #[serde(default)]
+    pub sidebar_font_size: Option<u32>,
     pub terminal: TerminalPrefs,
     pub editors: EditorPrefs,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    #[default]
+    Default,
+    Compact,
 }
 
 /// The editors that the launchers offer.
@@ -65,6 +78,7 @@ pub const FONT_SIZE: RangeInclusive<f64> = 8.0..=32.0;
 pub const LINE_HEIGHT: RangeInclusive<f64> = 1.0..=2.0;
 pub const PADDING: RangeInclusive<u32> = 0..=32;
 pub const SCROLLBACK: RangeInclusive<u32> = 1000..=100_000;
+pub const SIDEBAR_FONT_SIZE: RangeInclusive<u32> = 11..=16;
 
 impl TerminalPrefs {
     /// The prefs with each number in its range. A non-finite number gives the
@@ -119,6 +133,8 @@ impl Default for Prefs {
             light_theme: "zwinger-light".into(),
             dark_theme: "zwinger-dark".into(),
             rail_width: 256,
+            density: Density::Default,
+            sidebar_font_size: None,
             terminal: TerminalPrefs::default(),
             editors: EditorPrefs::default(),
         }
@@ -137,6 +153,7 @@ impl Preferences {
         let mut current: Prefs =
             std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         current.terminal = current.terminal.clamped();
+        current.sidebar_font_size = current.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         Self { path, current: Mutex::new(current) }
     }
 
@@ -147,6 +164,7 @@ impl Preferences {
     /// Writes a temp file and renames it, so a crash keeps the old file.
     pub fn set(&self, mut prefs: Prefs) -> Result<()> {
         prefs.terminal = prefs.terminal.clamped();
+        prefs.sidebar_font_size = prefs.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -211,6 +229,8 @@ mod tests {
             ("zwinger-dark", false, "zwinger-light", "zwinger-dark")
         );
         assert_eq!(prefs.rail_width, 256);
+        assert_eq!(prefs.density, Density::Default);
+        assert_eq!(prefs.sidebar_font_size, None);
         assert_eq!(prefs.terminal, TerminalPrefs::default());
         assert_eq!(prefs.editors, EditorPrefs { enabled: None, default: None });
     }
@@ -266,6 +286,27 @@ mod tests {
     }
 
     #[test]
+    fn layout_preferences_survive_a_restart() {
+        let path = path();
+        let prefs = Preferences::load(path.clone());
+        let changed = Prefs { density: Density::Compact, sidebar_font_size: Some(14), ..Prefs::default() };
+        prefs.set(changed.clone()).unwrap();
+        assert_eq!(Preferences::load(path).get(), changed);
+    }
+
+    #[test]
+    fn sidebar_font_size_is_clamped_on_load_and_set() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"sidebarFontSize":0}"#).unwrap();
+        let prefs = Preferences::load(path.clone());
+        assert_eq!(prefs.get().sidebar_font_size, Some(11));
+        prefs.set(Prefs { sidebar_font_size: Some(100), ..Prefs::default() }).unwrap();
+        assert_eq!(prefs.get().sidebar_font_size, Some(16));
+        assert_eq!(Preferences::load(path).get().sidebar_font_size, Some(16));
+    }
+
+    #[test]
     fn the_new_fields_have_camel_case_names() {
         let json = serde_json::to_value(Prefs::default()).unwrap();
         assert_eq!(
@@ -278,6 +319,8 @@ mod tests {
                 "lightTheme": "zwinger-light",
                 "darkTheme": "zwinger-dark",
                 "railWidth": 256,
+                "density": "default",
+                "sidebarFontSize": null,
                 "terminal": {
                     "fontFamily": TerminalPrefs::default().font_family,
                     "fontSize": 13.0,

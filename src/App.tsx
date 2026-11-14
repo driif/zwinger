@@ -175,6 +175,10 @@ export default function App() {
   const [updateLater, setUpdateLater] = useState(false);
   const lost = useBackendLost();
   const appearance = useAppearance(prefs);
+  useEffect(() => {
+    if (prefs?.density === "compact") document.documentElement.dataset.density = "compact";
+    else delete document.documentElement.dataset.density;
+  }, [prefs?.density]);
   /** The start needs both of its first calls, so one failure that is not a backend error shows Reload. */
   const [startLost, setStartLost] = useState(false);
 
@@ -901,6 +905,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   return (
     <div className="app" style={{ "--zw-rail-width": `${railWidth}px` } as CSSProperties}>
       <ProjectRail
+        density={prefs.density}
+        sidebarFontSize={prefs.sidebarFontSize}
         sessions={joined}
         cages={cages}
         workspaces={workspaces}

@@ -2,8 +2,7 @@
   display: grid;
   gap: var(--zw-gap);
   max-width: 48rem;
-  /* missing: docs/designs/ui-text-scale-audit.md `--motiv-line-height`. */
-  line-height: 1.5;
+  line-height: var(--motiv-line-height);
 }
 
 .msg.user {
@@ -18,7 +17,7 @@
   max-height: 20rem;
   overflow: auto;
   white-space: pre-wrap;
-  font-size: var(--zw-text-sm);
+  font-size: var(--motiv-font-size-sm);
 }
 
 .room {
@@ -45,7 +44,7 @@
 }
 
 .room-heading {
-  font-size: var(--zw-text-body);
+  font-size: var(--motiv-font-size);
   font-weight: 600;
 }
 
@@ -71,7 +70,7 @@
   border-radius: var(--motiv-radius-full);
   background: var(--motiv-color-surface);
   color: var(--motiv-color-text-muted);
-  font-size: var(--zw-text-sm);
+  font-size: var(--motiv-font-size-sm);
   white-space: nowrap;
 }
 

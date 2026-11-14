@@ -16,7 +16,7 @@ body {
   background: var(--motiv-color-bg);
   color: var(--motiv-color-text);
   font-family: var(--motiv-font-body);
-  font-size: var(--zw-text-body);
+  font-size: var(--motiv-font-size);
 }
 
 h1,
@@ -39,7 +39,7 @@ p {
 
 /* The same for the launcher of motiv's CommandMenu: the command bar and the agent pickers. */
 .motiv-command-menu__launcher {
-  min-height: var(--zw-control-height);
+  min-height: var(--motiv-control-height);
   font-size: inherit;
 }
 
@@ -207,7 +207,7 @@ p {
 
 .page-title {
   font-family: var(--motiv-font-title);
-  font-size: var(--zw-text-lg);
+  font-size: var(--motiv-font-size-lg);
 }
 
 /* Layout only: the tab panels fill the page and scroll on their own. */
@@ -258,7 +258,7 @@ p {
 
 .facts dt {
   color: var(--motiv-color-text-muted);
-  font-size: var(--zw-text-sm);
+  font-size: var(--motiv-font-size-sm);
 }
 
 .facts dd {

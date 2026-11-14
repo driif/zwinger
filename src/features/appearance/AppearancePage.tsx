@@ -1,4 +1,4 @@
-import { Button, Card, CardBody, CardHeader, LiquidSwitch } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, LiquidSwitch, SegmentedControl, Select } from "@driif/motiv";
 import { Check, Copy, Pencil, Trash2, TriangleAlert } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Prefs } from "../settings/api";
@@ -72,6 +72,23 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
           These theme files are not valid and were skipped: <span className="mono">{skipped.join(", ")}</span>
         </Notice>
       )}
+      <Card variant="outlined" padding="md">
+        <CardHeader title="Layout" titleAs="h2" description="Changes apply at once." />
+        <CardBody className="stack">
+          <SegmentedControl
+            label="Density"
+            options={[{ value: "default", label: "Default" }, { value: "compact", label: "Compact" }]}
+            value={prefs.density}
+            onChange={(density) => run(() => onPrefs({ ...prefs, density: density as Prefs["density"] }))}
+          />
+          <Select
+            label="Sidebar font size"
+            options={[{ value: "", label: "Theme default" }, ...[12, 13, 14, 15].map((size) => ({ value: String(size), label: `${size} px` }))]}
+            value={prefs.sidebarFontSize === null ? "" : String(prefs.sidebarFontSize)}
+            onChange={(size) => run(() => onPrefs({ ...prefs, sidebarFontSize: size ? Number(size) : null }))}
+          />
+        </CardBody>
+      </Card>
       <Card variant="outlined" padding="md">
         <CardHeader
           title="Theme"
