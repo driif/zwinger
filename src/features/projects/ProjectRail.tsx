@@ -596,6 +596,8 @@ export function ProjectRail({
     setMenu(undefined);
   }
 
+  const toggleMenu = (id: string) => (menu === id ? closeMenu(true) : setMenu(id));
+
   /** The name input of row `id`. A changed name is saved; a blank one goes to the backend, which applies its rules. */
   function nameField(id: string, name: string, save: (name: string) => Promise<unknown>) {
     return (
@@ -808,7 +810,7 @@ export function ProjectRail({
             tabIndex={-1}
             onClick={(e) => {
               e.stopPropagation();
-              setMenu(id);
+              toggleMenu(id);
             }}
           />
         )}
@@ -825,7 +827,7 @@ export function ProjectRail({
       tabIndex={-1}
       onClick={(e) => {
         e.stopPropagation();
-        setMenu(id);
+        toggleMenu(id);
       }}
     />
   );

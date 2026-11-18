@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
 import { Button, Card } from "@driif/motiv";
-import { Plus, RotateCw, ShieldOff, TriangleAlert } from "lucide-react";
+import { Check, Plus, RotateCw, ShieldOff, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
 import {
@@ -267,6 +267,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>();
   const [appNotices, setAppNotices] = useState<string[]>([]);
+  /** The confirmation of the last copied path. An object, so that a second copy of the same path starts a new timer. */
+  const [copied, setCopied] = useState<{ text: string }>();
+  /** The number of the last copy request. Only that request can show its confirmation or error. */
+  const copies = useRef(0);
   const [ask, setAsk] = useState<Ask>();
   const [intent, setIntent] = useState<Intent>();
   const commandBar = useRef<HTMLDivElement>(null);
@@ -360,6 +364,12 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   };
 
   const loadEditors = () => detectEditors().then(setEditors, (e) => setError(errorMessage(e)));
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(undefined), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
 
   useEffect(() => {
     reloadRuntimes();
@@ -747,8 +757,21 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         return run(() => newSession(action.kind, target));
       case "editor":
         return run(() => openEditor(target.session, action.editor.id, terminalId));
-      case "copyPath":
-        return run(() => navigator.clipboard.writeText(target.session.folder));
+      case "copyPath": {
+        const request = ++copies.current;
+        setCopied(undefined);
+        return run(() =>
+          navigator.clipboard.writeText(target.session.folder).then(
+            () => {
+              if (request === copies.current) setCopied({ text: `Copied ${tildePath(target.session.folder, home)} for ${target.session.name}.` });
+            },
+            // A newer copy owns the result.
+            (e) => {
+              if (request === copies.current) throw e;
+            },
+          ),
+        );
+      }
       case "reveal":
         return run(() => revealSession(target.session.id));
     }
@@ -1085,6 +1108,11 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
                 </Button>
               </div>
             </Card>
+          )}
+          {copied && (
+            <Notice icon={<Check size={14} />} onDismiss={() => setCopied(undefined)}>
+              {copied.text}
+            </Notice>
           )}
           {appNotices.map((notice) => (
             <Notice

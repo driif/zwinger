@@ -11,6 +11,8 @@ interface Props {
   visible: boolean;
   /** Takes the keyboard focus while it is visible. */
   focused: boolean;
+  /** Each change gives the keyboard focus to the focused terminal again. */
+  focusRequest: number;
   /** The place in the pane layout. No style fills the parent. */
   style?: CSSProperties;
   onFocus?: () => void;
@@ -19,7 +21,7 @@ interface Props {
 }
 
 /** Attaches to the terminal process while it is mounted. An unmount detaches; the process keeps running. */
-export function TerminalView({ processId, visible, focused, style, onFocus, onExit, onError }: Props) {
+export function TerminalView({ processId, visible, focused, focusRequest, style, onFocus, onExit, onError }: Props) {
   const pane = useRef<HTMLDivElement>(null);
   const container = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
@@ -92,7 +94,7 @@ export function TerminalView({ processId, visible, focused, style, onFocus, onEx
   useEffect(() => {
     // A click in the search field of this pane focuses the pane: the field keeps the focus.
     if (visible && focused && !pane.current!.contains(document.activeElement)) engine?.term.focus();
-  }, [engine, visible, focused]);
+  }, [engine, visible, focused, focusRequest]);
 
   useEffect(() => {
     if (!engine) return;

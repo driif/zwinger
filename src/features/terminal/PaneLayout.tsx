@@ -70,6 +70,7 @@ export function PaneLayout({
   const area = useRef<HTMLDivElement>(null);
   const titles = useTerminalTitles();
   const [actionsFor, setActionsFor] = useState<string>();
+  const [focusRequest, setFocusRequest] = useState(0);
   const [drag, setDrag] = useState<{ path: Path; ratio: number }>();
   const shown = layout && drag ? setRatio(layout, drag.path, drag.ratio) : layout;
   const { panes: places, splits } = shown ? place(shown) : { panes: [], splits: [] };
@@ -94,6 +95,7 @@ export function PaneLayout({
               processId={pane.processId}
               visible={visible && rect !== undefined}
               focused={pane.key === focused}
+              focusRequest={focusRequest}
               style={rect && body(rect)}
               onFocus={() => onFocus(pane.key)}
               onExit={onPaneExit}
@@ -138,6 +140,12 @@ export function PaneLayout({
             key={`header-${terminal}`}
             className={terminal === focused ? "pane-header focused" : "pane-header"}
             style={{ ...at(rect), height: "var(--zw-pane-header)" }}
+            onClick={(event) => {
+              // The buttons and the action dialog in the header do their own work.
+              if ((event.target as Element).closest("button, dialog")) return;
+              onFocus(terminal);
+              setFocusRequest((n) => n + 1);
+            }}
           >
             <KindIcon kind={pane.kind} />
             <Badge>{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>

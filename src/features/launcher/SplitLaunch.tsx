@@ -42,6 +42,10 @@ interface Props {
 export function SplitLaunch({ label, icon, onClick, menuLabel, menu }: Props) {
   const [open, setOpen] = useState(false);
   const chevron = useRef<HTMLButtonElement>(null);
+  function close(refocus: boolean) {
+    setOpen(false);
+    if (refocus) chevron.current?.focus();
+  }
   return (
     <div className="split-launch">
       <Button size="sm" variant="outline" iconLeft={icon} disabled={!onClick} onClick={onClick}>
@@ -53,18 +57,9 @@ export function SplitLaunch({ label, icon, onClick, menuLabel, menu }: Props) {
         label={menuLabel}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen(true)}
+        onClick={() => (open ? close(true) : setOpen(true))}
       />
-      {open && (
-        <ActionMenu
-          label={menuLabel}
-          actions={menu}
-          onClose={(refocus) => {
-            setOpen(false);
-            if (refocus) chevron.current?.focus();
-          }}
-        />
-      )}
+      {open && <ActionMenu label={menuLabel} actions={menu} onClose={close} />}
     </div>
   );
 }

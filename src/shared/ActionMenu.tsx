@@ -12,8 +12,15 @@ export interface MenuAction {
   confirm?: string;
 }
 
+/** True for a target in the menu or on its open opener. The opener is in the element before the menu. */
+function inside(menu: HTMLElement | null, target: Element) {
+  const opener = target.closest("[aria-haspopup=menu][aria-expanded=true]");
+  return menu?.contains(target) || (opener !== null && menu?.previousElementSibling?.contains(opener));
+}
+
 /**
- * A popover of actions below its positioned parent. Arrow keys move between them; Escape and a click outside close it.
+ * A popover of actions below its positioned parent. Arrow keys move between them. Escape, a click outside and focus that
+ * moves outside close it. The opener does not count as outside: the opener closes the menu itself.
  * `onClose(true)` asks the caller to focus its opener again.
  */
 export function ActionMenu({ label, actions, onClose }: { label: string; actions: MenuAction[]; onClose: (refocus: boolean) => void }) {
@@ -27,9 +34,15 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
   }, [step]);
 
   useEffect(() => {
-    const outside = (event: PointerEvent) => !card.current?.contains(event.target as Node) && close.current(false);
+    const outside = (event: Event) => {
+      if (event.target instanceof Element && !inside(card.current, event.target)) close.current(false);
+    };
     document.addEventListener("pointerdown", outside);
-    return () => document.removeEventListener("pointerdown", outside);
+    document.addEventListener("focusin", outside);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("focusin", outside);
+    };
   }, []);
 
   function onKeyDown(event: KeyboardEvent) {
@@ -53,7 +66,7 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
   }
 
   return (
-    <Card ref={card} padding="sm" className="action-menu" onKeyDown={onKeyDown}>
+    <Card ref={card} padding="sm" className="action-menu" tabIndex={-1} onKeyDown={onKeyDown}>
       {!step ? (
         <div role="menu" aria-label={label} className="stack">
           {actions.map((action) => (

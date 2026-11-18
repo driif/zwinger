@@ -28,6 +28,11 @@ visible rows. A ring marks the row that has keyboard focus.
 - To rename a workspace or a session, double-click its row, or use **Rename** in its menu (right-click or the **…**
   button). The name becomes a field in the row. Press Enter or click outside the field to save the name. Press Escape
   to cancel. An empty name gives a workspace the name "Workspace" again.
+- A menu closes when you select its **…** or chevron button again, press Escape, click outside it, or move the focus
+  out of it, for example with Tab. Escape and the button put the focus back on the row or button that opened the menu.
+- **Copy path** in a session menu, a launch menu or the command menu copies the project folder. A short message
+  names the project and the path, and goes away after two seconds. If the copy fails, the error shows instead. A new
+  copy removes the message of the earlier copy. Only the result of the last copy shows.
 - You can delete only an empty workspace. The last workspace cannot be deleted.
 - **Default cage…** in the menu of a workspace sets the cage of the sessions in it that inherit their cage. A session
   row shows a cage icon when the session has a cage. Its tooltip names the cage, with "(inherited)" if the cage comes
@@ -105,6 +110,9 @@ shell in the same folder. Any kinds of terminal can be in the same layout. zwing
 restores it after a restart. Each pane header shows where its terminal runs. **Mac** means the shell or agent runs
 directly on your Mac. **VM** means it runs inside the cage. The badge also appears when the terminal is dormant.
 In a narrow pane, select **…** in its header to split the pane, open its folder in your editor, or hide the pane.
+Click a pane header, for example its name or badge, to focus that pane. The keys then go to its terminal, and the
+editor commands and pane shortcuts use that pane. The buttons in the header do their own action and do not move the
+focus.
 
 After the name or title, the pane header shows the current folder of the terminal. A Mac folder below your home folder
 starts with `~`. A VM terminal shows its folder in the VM, for example `/workspace/src`. A long folder is shortened in
