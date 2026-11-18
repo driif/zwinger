@@ -647,6 +647,34 @@ impl<R: SandboxRuntime> Actor<R> {
         }
     }
 
+    async fn run_gates(&mut self, stage: &str) -> std::result::Result<String, Stop> {
+        self.stage(stage, stage)?;
+        let io = &self.io;
+        let mut results = Vec::new();
+        for gate in &io.task.gates {
+            let mut cancel = io.cancel.clone();
+            let shell =
+                during(&mut self.book, &mut self.control, &io.names, io.exec.sh(gate, io.config.limits, &mut cancel))
+                    .await
+                    .map_err(|_| Stop::Cancelled)?;
+            results.push(json!({ "command": gate, "code": shell.code, "output": shell.output }));
+        }
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let passed = results.iter().filter(|r| r["code"] == 0).count();
+        let total = results.len();
+        let results = Value::Array(results);
+        self.book.writer.write_json(&format!("{stage}.json"), &results);
+        self.book.writer.event("gates", &format!("{passed} of {total} passed"));
+        self.boundary().await?;
+        Ok(if total == 0 {
+            "The task has no gates.".to_owned()
+        } else {
+            format!("```json\n{}\n```", serde_json::to_string_pretty(&results).unwrap_or_default())
+        })
+    }
+
     /// Starts a stage: its event, its status, and a clean live stream.
     fn stage(&mut self, detail: &str, id: &str) -> std::result::Result<(), Stop> {
         if self.book.cancelled() {
@@ -990,30 +1018,7 @@ impl<R: SandboxRuntime> Actor<R> {
         self.boundary().await?;
 
         // 5. Gates.
-        self.stage("gates", "gates")?;
-        let gates = self.io.task.gates.clone();
-        let mut results = Vec::new();
-        for gate in &gates {
-            let io = &self.io;
-            let mut cancel = io.cancel.clone();
-            let ran =
-                during(&mut self.book, &mut self.control, &io.names, io.exec.sh(gate, io.config.limits, &mut cancel))
-                    .await;
-            let Ok(shell) = ran else {
-                return Err(Stop::Cancelled);
-            };
-            results.push(json!({ "command": gate, "code": shell.code, "output": shell.output }));
-        }
-        let passed = results.iter().filter(|r| r["code"] == 0).count();
-        let gates_json = Value::Array(results);
-        self.book.writer.write_json("gates.json", &gates_json);
-        self.book.writer.event("gates", &format!("{passed} of {} passed", gates.len()));
-        let gates_text = if gates.is_empty() {
-            "The task has no gates.".to_owned()
-        } else {
-            format!("```json\n{}\n```", serde_json::to_string_pretty(&gates_json).unwrap_or_default())
-        };
-        self.boundary().await?;
+        let mut gates_text = self.run_gates("gates").await?;
 
         // 6. Cross review.
         self.stage(&format!("crossreview by {peer}"), "crossreview")?;
@@ -1059,7 +1064,6 @@ impl<R: SandboxRuntime> Actor<R> {
 
         // 7. Revise, once.
         let mut revision = None;
-        let mut revised = false;
         if verdict == "revise" {
             self.stage("revise", "revise")?;
             let review_text = format!("```json\n{}\n```", serde_json::to_string_pretty(&review).unwrap_or_default());
@@ -1086,7 +1090,6 @@ impl<R: SandboxRuntime> Actor<R> {
             )
             .await;
             revision = self.record(implementer, "revise", "revision", reply);
-            revised = true;
             if self.book.cancelled() {
                 return Err(Stop::Cancelled);
             }
@@ -1095,14 +1098,17 @@ impl<R: SandboxRuntime> Actor<R> {
             }
             self.book.writer.event("agent_done", &format!("revised by {me}"));
             self.boundary().await?;
+            // The write stage can change files even if it returns no report.
+            if !self.io.task.gates.is_empty() {
+                gates_text = self.run_gates("revision-gates").await?;
+            }
         }
 
         // 8. Blind final reviews, in parallel.
         self.stage("final review", "final")?;
         let history = history(review.as_ref(), revision.as_ref());
         self.book.writer.write("history.md", history.as_bytes());
-        // A revision that returned no JSON can still have changed files.
-        let change = if revised { self.io.change(base.as_deref()).await } else { change };
+        let change = if verdict == "revise" { self.io.change(base.as_deref()).await } else { change };
         let prompts = [0, 1].map(|i| {
             fit(
                 FINAL,
@@ -1764,8 +1770,11 @@ mod tests {
         // The plans are blind; the exchange sees both.
         assert!(!plan.prompt.contains("Plan that claude builds."));
         assert!(calls_of(&run, Stage::Exchange)[0].prompt.contains("### codex — opening plan"));
-        // The cross review gets the gates.
+        // Accepted work uses one gate run for both reviews.
+        assert_eq!(run.shells.lock().unwrap().iter().filter(|argv| argv[2].contains("pnpm build")).count(), 1);
+        assert!(!run.dir.join("revision-gates.json").exists());
         assert!(calls_of(&run, Stage::Crossreview)[0].prompt.contains("pnpm build"));
+        assert!(calls_of(&run, Stage::Final).iter().all(|c| c.prompt.contains("pnpm build")));
         // Each later stage gets the brokered transcript.
         for stage in [Stage::Implement, Stage::Crossreview, Stage::Final] {
             let prompt = &calls_of(&run, stage)[0].prompt;
@@ -1845,6 +1854,53 @@ mod tests {
         assert!(run.dir.join("revision.json").is_file());
         assert!(calls_of(&run, Stage::Final)[0].prompt.contains("fixed: Bug. → Fixed."));
         assert!(states(&run.dir).contains(&("revise".to_owned(), "done")));
+    }
+
+    #[tokio::test]
+    async fn final_reviewers_get_the_revision_gate_results_even_without_a_revision_report() {
+        for report in [true, false] {
+            let calls = AtomicUsize::new(0);
+            let run = start_full(
+                Duration::from_secs(5),
+                move |script| {
+                    if !script.contains("pnpm build") {
+                        return no_git(script);
+                    }
+                    match calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => Fake::Exit(37),
+                        1 => Fake::Reply("revision build passed".into()),
+                        _ => panic!("extra gate run"),
+                    }
+                },
+                move |agent, stage, prompt| match stage {
+                    Stage::Crossreview => review("revise"),
+                    Stage::Revise if !report => Fake::Reply("No structured revision report.".into()),
+                    _ => happy(agent, stage, prompt),
+                },
+            );
+            settled(&run).await;
+            let cross = &calls_of(&run, Stage::Crossreview)[0].prompt;
+            assert!(cross.contains("\"code\": 37"));
+            assert!(!cross.contains("revision build passed"));
+            let finals = calls_of(&run, Stage::Final);
+            assert_eq!(finals.len(), 2);
+            for call in finals {
+                assert!(call.prompt.contains("revision build passed"), "{}", call.agent);
+                assert!(!call.prompt.contains("\"code\": 37"), "{}", call.agent);
+            }
+            assert_eq!(run.dir.join("revision.json").exists(), report);
+            let room = read_room(&run.mirror);
+            assert_eq!(room.gates[0].output, "revision build passed");
+            assert_eq!(room.gates[0].code, Some(0));
+            let history: Vec<_> = room
+                .messages
+                .iter()
+                .filter(|m| m.kind == "gates")
+                .map(|m| (m.stage.as_str(), m.summary.as_str()))
+                .collect();
+            assert_eq!(history, [("gates", "0 of 1 gates passed"), ("revision-gates", "1 of 1 gates passed")]);
+            assert!(states(&run.dir).contains(&("revision-gates".to_owned(), "done")));
+        }
     }
 
     #[tokio::test]
@@ -2156,6 +2212,38 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(3), settled(&run)).await.expect("the cancel is at once");
         assert_eq!(manifest["stopped"], "cancelled by the user");
         assert!(!run.dir.join("gates.json").exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_revision_gate_leaves_only_the_initial_record() {
+        let calls = AtomicUsize::new(0);
+        let running = Arc::new(Notify::new());
+        let started = running.clone();
+        let run = start_full(
+            Duration::from_secs(5),
+            move |script| {
+                if script.contains("pnpm build") && calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    started.notify_one();
+                    Fake::Hang
+                } else {
+                    no_git(script)
+                }
+            },
+            |agent, stage, prompt| {
+                if stage == Stage::Crossreview { review("revise") } else { happy(agent, stage, prompt) }
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), running.notified()).await.unwrap();
+        run.handle.control(Control::Cancel { reason: None }).unwrap();
+        let manifest = tokio::time::timeout(Duration::from_secs(3), settled(&run)).await.unwrap();
+        assert_eq!(manifest["stopped"], "cancelled by the user");
+        assert!(run.dir.join("gates.json").is_file());
+        assert!(!run.dir.join("revision-gates.json").exists());
+        let room = read_room(&run.dir);
+        assert!(room.gates.is_empty());
+        assert_eq!(room.messages.iter().filter(|m| m.kind == "gates").count(), 1);
+        assert!(states(&run.dir).contains(&("revision-gates".to_owned(), "stopped")));
+        assert!(calls_of(&run, Stage::Final).is_empty());
     }
 
     #[tokio::test]

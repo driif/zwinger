@@ -28,10 +28,10 @@ A run is one execution of a task. It has these stages:
 2. Up to 2 turns where the agents compare their plans.
 3. A tiebreak by the first agent, if the agents do not agree.
 4. The implementation.
-5. The gates.
-6. A cross review by the other agent.
-7. One revision, if the review says `revise`.
-8. Two final reviews in parallel. The result is `ship` only if the two reviewers say so.
+5. The run executes the gates.
+6. The other agent reviews the implementation and the gate results.
+7. If the review says `revise`, the implementer gets one revision. The run then executes the gates again.
+8. The two agents review the change in parallel, each with the latest gate results. The result is `ship` only if both reviewers say so.
 
 If an agent fails, the run continues in a degraded mode, and the room shows it. A degraded result is never shown as an
 agreement.
@@ -57,6 +57,8 @@ verdicts and the degraded agents. During a run you can:
 - select the implementer before the implementation starts.
 - answer open questions. The run waits for the answers.
 - cancel the run.
+
+**Gates** shows the latest command output and exit codes. The timeline keeps a summary of each completed gate run.
 
 A cage stop cancels its runs. A run does not continue after an app restart.
 

@@ -1,6 +1,6 @@
 //! The files of a round, in the duo shape: `events.jsonl`, `turns/plan-*.json`,
 //! `turns/t<n>-*.json`, `tiebreak.json`, `implementation.json`, `gates.json`,
-//! `crossreview.json`, `revision.json`, `final-*.json`, `manifest.json`.
+//! `crossreview.json`, `revision.json`, `revision-gates.json`, `final-*.json`, `manifest.json`.
 //!
 //! One reader projects a round folder into a typed [`Room`], for in-app runs
 //! and for duo rounds that run outside the app. A round folder can be written
@@ -45,7 +45,8 @@ pub const TURNS: u32 = 2;
 const TURNS_DIR: &str = "turns";
 
 /// The order of the stages. `exchange` repeats once per turn.
-const STAGES: [&str; 8] = ["plan", "exchange", "tiebreak", "implement", "gates", "crossreview", "revise", "final"];
+const STAGES: [&str; 9] =
+    ["plan", "exchange", "tiebreak", "implement", "gates", "crossreview", "revise", "revision-gates", "final"];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,7 +267,7 @@ fn read_at(dir: &OwnedFd, name: &str) -> Option<Vec<u8>> {
 /// `Some(true)` reads it, `Some(false)` only keeps its name (a plan prompt
 /// names its agent), `None` skips it.
 fn known(key: &str) -> Option<bool> {
-    const ROOT: [&str; 9] = [
+    const ROOT: [&str; 10] = [
         "events.jsonl",
         "messages.jsonl",
         "manifest.json",
@@ -275,6 +276,7 @@ fn known(key: &str) -> Option<bool> {
         "gates.json",
         "crossreview.json",
         "revision.json",
+        "revision-gates.json",
         "open-questions.txt",
     ];
     let agent = |rest: &str| !rest.is_empty() && !rest.starts_with('.') && !rest.contains('/');
@@ -468,6 +470,7 @@ fn stage_label(id: &str) -> String {
         Some(turn) => format!("Exchange {turn}"),
         None => match id {
             "crossreview" => "Cross review".to_owned(),
+            "revision-gates" => "Revision gates".to_owned(),
             "final" => "Final review".to_owned(),
             other => {
                 let mut label = other.to_owned();
@@ -596,7 +599,10 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             .into_iter()
             .map(|n| format!("exchange-{n}")),
     );
-    ids.extend(STAGES[2..].iter().map(|s| (*s).to_owned()));
+    // Older rounds have no second gate stage. Show it when a round starts it.
+    let revision_gates =
+        started.iter().any(|(id, _)| id == "revision-gates") || files.contains_key("revision-gates.json");
+    ids.extend(STAGES[2..].iter().copied().filter(|id| *id != "revision-gates" || revision_gates).map(str::to_owned));
     let last = started.iter().map(|(s, _)| s).max_by_key(|s| stage_key(s)).cloned();
     let stages = ids
         .iter()
@@ -808,23 +814,30 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         );
     }
 
-    let gates: Vec<Gate> = files
-        .get("gates.json")
-        .and_then(|(_, b)| serde_json::from_slice::<Value>((*b)?).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .map(|g| Gate { command: text(&g["command"]), code: g["code"].as_i64(), output: text(&g["output"]) })
-        .collect();
-    if !gates.is_empty() {
-        let passed = gates.iter().filter(|g| g.code == Some(0)).count();
-        let line = format!("{passed} of {} gates passed", gates.len());
-        let body = gates
+    let mut gates = Vec::new();
+    for (stage, file) in [("gates", "gates.json"), ("revision-gates", "revision-gates.json")] {
+        if stage == "revision-gates" && !revision_gates {
+            continue;
+        }
+        gates = files
+            .get(file)
+            .and_then(|(_, b)| serde_json::from_slice::<Vec<Value>>((*b)?).ok())
+            .unwrap_or_default()
             .iter()
-            .map(|g| format!("- `{}` → {}", g.command, g.code.map_or("no exit".to_owned(), |c| format!("exit {c}"))))
-            .collect::<Vec<_>>()
-            .join("\n");
-        message("run", "all".to_owned(), "gates", "gates", mtime("gates.json"), &line, format!("{line}.\n\n{body}"));
+            .map(|g| Gate { command: text(&g["command"]), code: g["code"].as_i64(), output: text(&g["output"]) })
+            .collect();
+        if !gates.is_empty() {
+            let passed = gates.iter().filter(|g| g.code == Some(0)).count();
+            let line = format!("{passed} of {} gates passed", gates.len());
+            let body = gates
+                .iter()
+                .map(|g| {
+                    format!("- `{}` → {}", g.command, g.code.map_or("no exit".to_owned(), |c| format!("exit {c}")))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            message("run", "all".to_owned(), "gates", stage, mtime(file), &line, format!("{line}.\n\n{body}"));
+        }
     }
 
     let reviewer = manifest
