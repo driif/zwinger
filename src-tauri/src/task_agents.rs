@@ -35,18 +35,61 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// The start of each git script. `$1` is the folder that the check covers, `$2` is
 /// the run copy to skip, and `$3` is the base commit.
 const GIT_PRELUDE: &str = r#"scope=$1 art=$2 base=$3
-[ -d "$scope" ] || exit 3
-scope=$(cd "$scope" && pwd -P) || exit 3
-cd "$scope" || exit 3
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 3
+cd "$scope" || exit 4
+scope=$(pwd -P) || exit 4
+inside=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1) || {
+  case "$inside" in
+    "fatal: not a git repository (or any of the parent directories): .git"|"fatal: not a git repository (or any parent up to mount point "*) exit 3 ;;
+  esac
+  printf '%s\n' "$inside" >&2
+  exit 4
+}
+case "$inside" in true) ;; false) exit 3 ;; *) exit 4 ;; esac
 top=$(git rev-parse --show-toplevel) && cd "$top" || exit 4
 [ -n "$art" ] && art=$(cd "$art" 2>/dev/null && pwd -P)
 case "$scope" in
   "$top") set -- . ;;
   "$top"/*) set -- ":(literal)${scope#"$top"/}" ;;
-  *) exit 3 ;;
+  *) exit 4 ;;
 esac
 case "$art" in "$top"/?*) set -- "$@" ":(exclude,literal)${art#"$top"/}" ;; esac
+"#;
+/// The diff script after `GIT_PRELUDE`. It ends with code 4 when a git command
+/// fails. `diff --no-index` ends with 1 when the files differ, so that is not a failure.
+const DIFF_SCRIPT: &str = r#"q='-c core.quotepath=off'
+if [ -n "$base" ]; then
+  echo 'Commits since the start of the run:'
+  empty=$(git hash-object -t tree /dev/null) || exit 4
+  if [ "$base" = "$empty" ]; then
+    if git rev-parse -q --verify HEAD >/dev/null; then
+      git $q log --oneline HEAD -- "$@" || exit 4
+    else
+      [ "$?" -eq 1 ] || exit 4
+    fi
+  else
+    git $q log --oneline "$base..HEAD" -- "$@" || exit 4
+  fi
+  echo
+fi
+git $q status --short -uall -- "$@" || exit 4
+echo
+if [ -n "$base" ]; then
+  git $q diff --no-color "$base" -- "$@" || exit 4
+else
+  git $q diff --no-color -- "$@" || exit 4
+  git $q diff --cached --no-color -- "$@" || exit 4
+fi
+tmp=$(mktemp -d /tmp/zwinger-diff.XXXXXX) || exit 4
+trap 'rm -rf "$tmp"' EXIT
+# Keep the list NUL-delimited and check its producer before consuming it.
+git ls-files -o --exclude-standard -z -- "$@" > "$tmp/paths" || exit 4
+xargs -0 -r -n1 sh -c '
+  LC_ALL=C git -c core.quotepath=off diff --no-color --no-index -- /dev/null "$2" 2>"$1"
+  [ "$?" -le 1 ] || exit 1
+  # A vanished path also gives exit 1, with an error. Conversion warnings are harmless.
+  grep -Eq "^(error|fatal):" "$1"
+  [ "$?" -eq 1 ]
+' _ "$tmp/error" < "$tmp/paths" || exit 4
 "#;
 const RETRY: &str = "\n\n---\n\nYour last reply had no valid JSON object. Do not do the work again. \
 Return only the JSON object that the Output section asks for, in a fenced ```json block.";
@@ -292,7 +335,7 @@ pub struct Snapshot {
 /// Why a snapshot has no state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
-    /// The working dir is not in a git work tree, or git is missing.
+    /// The working dir is not in a git work tree.
     NotGit,
     Failed(String),
 }
@@ -583,37 +626,21 @@ impl<R: SandboxRuntime> Exec<R> {
 
     /// The change since `base`: the new commits, the status, the diff from
     /// `base` and the new files as diffs from nothing. With no base: the
-    /// uncommitted change. `None` if it is not a git work tree.
-    pub async fn diff(&self, base: Option<&str>, cancel: &mut watch::Receiver<bool>) -> Option<String> {
+    /// uncommitted change. `NotGit` if it is not a git work tree.
+    pub async fn diff(&self, base: Option<&str>, cancel: &mut watch::Receiver<bool>) -> Result<String, SnapshotError> {
         let base = base.filter(|b| is_commit(b));
-        let script = format!(
-            "q='-c core.quotepath=off'\n\
-             if [ -n \"$base\" ]; then\n\
-               echo 'Commits since the start of the run:'\n\
-               if [ \"$base\" = {EMPTY_TREE} ]; then git $q log --oneline HEAD -- \"$@\" 2>/dev/null; else git $q log --oneline \"$base..HEAD\" -- \"$@\"; fi\n\
-               echo\n\
-             fi\n\
-             git $q status --short -uall -- \"$@\"\n\
-             echo\n\
-             if [ -n \"$base\" ]; then\n\
-               git $q diff --no-color \"$base\" -- \"$@\"\n\
-             else\n\
-               git $q diff --no-color -- \"$@\"\n\
-               git $q diff --cached --no-color -- \"$@\"\n\
-             fi\n\
-             git ls-files -o --exclude-standard -z -- \"$@\" | xargs -0 -r -n1 git $q diff --no-color --no-index -- /dev/null\n\
-             exit 0"
-        );
         let mut out = Vec::new();
         let ran = self
-            .drive(&self.git_argv(script, base), b"", GIT_LIMIT, cancel, |bytes| {
+            .drive(&self.git_argv(DIFF_SCRIPT.to_owned(), base), b"", GIT_LIMIT, cancel, |bytes| {
                 let room = DIFF_LIMIT.saturating_sub(out.len());
                 out.extend_from_slice(&bytes[..bytes.len().min(room)]);
             })
             .await;
         match ran {
-            Ok((0, _)) => Some(String::from_utf8_lossy(&out).into_owned()),
-            _ => None,
+            Ok((0, _)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+            Ok((3, _)) => Err(SnapshotError::NotGit),
+            Ok((code, _)) => Err(SnapshotError::Failed(format!("git ended with code {code}"))),
+            Err(failure) => Err(SnapshotError::Failed(format!("git {failure}"))),
         }
     }
 }
@@ -739,6 +766,115 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "?? session/code.txt\n");
+    }
+
+    fn diff_command(repo: &std::path::Path, base: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(format!("{GIT_PRELUDE}{DIFF_SCRIPT}")).arg("zwinger").arg(repo).arg("").arg(base);
+        command
+    }
+
+    fn temp_repo(name: &str) -> std::path::PathBuf {
+        let repo = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+        repo
+    }
+
+    #[test]
+    fn the_diff_fails_when_git_fails() {
+        let repo = temp_repo("diff-missing-base");
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        let output = diff_command(&repo, &"1".repeat(40)).output().unwrap();
+        assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn git_discovery_distinguishes_no_work_tree_from_operational_errors() {
+        let repo = temp_repo("discovery");
+        assert_eq!(diff_command(&repo.join("missing"), "").output().unwrap().status.code(), Some(4));
+        assert_eq!(diff_command(&repo, "").env("PATH", repo.join("missing")).output().unwrap().status.code(), Some(4));
+        std::fs::write(repo.join(".git/config"), "[broken").unwrap();
+        assert_eq!(diff_command(&repo, "").output().unwrap().status.code(), Some(4));
+        std::fs::remove_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(
+            diff_command(&repo, "")
+                .env("GIT_CEILING_DIRECTORIES", repo.parent().unwrap())
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn the_diff_rejects_a_failed_listing_or_a_vanished_untracked_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = temp_repo("diff-list");
+        let bin = repo.join(".git/bin");
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("git");
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+if [ "$1" = ls-files ]; then
+  echo listed >> .git/list-calls
+  case " $* " in
+    *" -z "*)
+      PATH=$ORIGINAL_PATH git "$@" || exit 2
+      if [ "$MODE" = vanish ]; then rm vanished; else exit 1; fi
+      exit 0 ;;
+  esac
+fi
+PATH=$ORIGINAL_PATH exec git "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(repo.join("present"), "present").unwrap();
+        let original = std::env::var_os("PATH").unwrap();
+        let path = std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&original))).unwrap();
+        for mode in ["fail", "vanish"] {
+            std::fs::write(repo.join("vanished"), "about to disappear").unwrap();
+            let output = diff_command(&repo, "")
+                .env("PATH", &path)
+                .env("ORIGINAL_PATH", &original)
+                .env("MODE", mode)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(4), "{mode}");
+            assert_eq!(std::fs::read_to_string(repo.join(".git/list-calls")).unwrap(), "listed\n");
+            std::fs::remove_file(repo.join(".git/list-calls")).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_diff_of_an_unborn_repository_shows_the_new_files() {
+        let repo = temp_repo("diff-unborn");
+        let output = diff_command(&repo, EMPTY_TREE).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+        let empty = diff_command(&repo, "").output().unwrap();
+        assert!(empty.status.success() && empty.stdout.iter().all(u8::is_ascii_whitespace));
+        assert!(
+            std::process::Command::new("git")
+                .args(["config", "core.autocrlf", "true"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+        std::fs::write(repo.join("-new path\nline"), "unusual name").unwrap();
+        std::os::unix::fs::symlink("missing target", repo.join("link")).unwrap();
+        let output = diff_command(&repo, EMPTY_TREE).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("?? new.txt"), "{text}");
+        assert!(text.contains("new file mode") && text.contains("+hello"), "{text}");
+        assert!(text.contains("+unusual name") && text.contains("+missing target"), "{text}");
     }
 
     fn found(pi_host: bool, gemini: Option<&str>) -> launch::Found<'_> {

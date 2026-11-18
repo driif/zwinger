@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
 use crate::session::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
-use crate::task_artifacts::{RoundWriter, TURNS};
+use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, TURNS};
 
 const PLAN: &str = include_str!("task_runs/prompts/plan.md");
 const EXCHANGE: &str = include_str!("task_runs/prompts/exchange.md");
@@ -392,6 +392,8 @@ struct Round {
     detection: Option<bool>,
     /// `HEAD` before the first stage that can write.
     base: Option<String>,
+    /// The last diff that the run saved.
+    diff: Option<String>,
 }
 
 struct Actor<R: SandboxRuntime> {
@@ -580,13 +582,18 @@ impl<R: SandboxRuntime> Io<R> {
     /// The change since `base`, for the review prompts.
     async fn change(&self, base: Option<&str>) -> String {
         match self.exec.diff(base, &mut self.cancel.clone()).await {
-            Some(diff) => {
+            Ok(diff) => {
                 let since = base.map_or("Only the uncommitted change is known.".to_owned(), |b| {
                     format!("The run started at commit `{b}`.")
                 });
                 format!("{since} Read it again with `git log` and `git diff`.\n\n````diff\n{diff}\n````")
             }
-            None => "The working dir is not a git work tree, so the run cannot show the change.".to_owned(),
+            Err(SnapshotError::NotGit) => {
+                "The working dir is not a git work tree, so the run cannot show the change.".to_owned()
+            }
+            Err(SnapshotError::Failed(why)) => {
+                format!("The app could not read the change ({why}). Read it with `git log` and `git diff`.")
+            }
         }
     }
 }
@@ -1015,6 +1022,7 @@ impl<R: SandboxRuntime> Actor<R> {
             self.book.writer.event("agent_degraded", "implementer returned no structured result");
         }
         self.book.writer.event("agent_done", &format!("implement by {me}"));
+        self.save_diff("the implementation").await;
         self.boundary().await?;
 
         // 5. Gates.
@@ -1097,6 +1105,7 @@ impl<R: SandboxRuntime> Actor<R> {
                 self.book.writer.event("agent_degraded", "revision returned no structured result");
             }
             self.book.writer.event("agent_done", &format!("revised by {me}"));
+            self.save_diff("the revision").await;
             self.boundary().await?;
             // The write stage can change files even if it returns no report.
             if !self.io.task.gates.is_empty() {
@@ -1140,6 +1149,31 @@ impl<R: SandboxRuntime> Actor<R> {
             return Err(Stop::Cancelled);
         }
         Ok(())
+    }
+
+    /// Saves the change of the run after `stage`, so the room can show it
+    /// with no VM. A failed read says so and keeps the last saved diff.
+    async fn save_diff(&mut self, stage: &str) {
+        let diff = self.io.exec.diff(self.run.base.as_deref(), &mut self.io.cancel.clone()).await;
+        if self.book.cancelled() {
+            return;
+        }
+        let text = match diff {
+            Ok(diff) => {
+                self.run.diff = Some(diff.clone());
+                diff
+            }
+            Err(SnapshotError::NotGit) => NO_GIT_DIFF.to_owned(),
+            Err(SnapshotError::Failed(why)) => {
+                self.book.writer.event("diff_failed", &format!("after {stage}: {why}"));
+                let failed = format!("The app could not save the diff after {stage} ({why}).");
+                match &self.run.diff {
+                    Some(last) => format!("{failed} This is the last saved diff.\n\n{last}"),
+                    None => failed,
+                }
+            }
+        };
+        self.book.writer.write("diff.txt", text.as_bytes());
     }
 
     /// The user's pick, if it is an agent with a plan.
@@ -1412,7 +1446,7 @@ mod tests {
     use crate::runtime::{PipeEvent, PipeInput};
     use crate::session::TaskAgent;
     use crate::task_agents::{claude_result_line, codex_result_lines};
-    use crate::task_artifacts::{Mirror, read_room};
+    use crate::task_artifacts::{Mirror, read_diff, read_room};
 
     /// What the fake agent does for one call.
     enum Fake {
@@ -2291,6 +2325,112 @@ mod tests {
         gate.notify_waiters();
         run.handle.control(Control::Cancel { reason: None }).unwrap();
         settled(&run).await;
+    }
+
+    fn is_diff(script: &str) -> bool {
+        script.contains("Commits since")
+    }
+
+    /// A run whose diff tells how many write stages ran.
+    fn counted_diff(verdict: &'static str) -> Started {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let seen = writes.clone();
+        start_full(
+            Duration::from_secs(5),
+            move |script| match script {
+                s if is_diff(s) => Fake::Reply(format!("diff after {}", seen.load(Ordering::SeqCst))),
+                s => no_git(s),
+            },
+            move |agent, stage, prompt| match stage {
+                Stage::Implement | Stage::Revise => {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    happy(agent, stage, prompt)
+                }
+                Stage::Crossreview => review(verdict),
+                _ => happy(agent, stage, prompt),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_implementation_saves_its_diff() {
+        let run = counted_diff("accept");
+        settled(&run).await;
+        assert_eq!(std::fs::read_to_string(run.dir.join("diff.txt")).unwrap(), "diff after 1");
+        assert_eq!(read_diff(&run.dir).as_deref(), Some("diff after 1"));
+    }
+
+    #[tokio::test]
+    async fn the_revision_replaces_the_saved_diff() {
+        let run = counted_diff("revise");
+        settled(&run).await;
+        assert_eq!(std::fs::read_to_string(run.dir.join("diff.txt")).unwrap(), "diff after 2");
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_after_the_revision_keeps_the_last_diff() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let seen = writes.clone();
+        let run = start_full(
+            Duration::from_secs(5),
+            move |script| match script {
+                s if is_diff(s) && seen.load(Ordering::SeqCst) > 1 => Fake::Exit(5),
+                s if is_diff(s) => Fake::Reply("the first diff".into()),
+                s => no_git(s),
+            },
+            move |agent, stage, prompt| match stage {
+                Stage::Implement | Stage::Revise => {
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    happy(agent, stage, prompt)
+                }
+                Stage::Crossreview => review("revise"),
+                _ => happy(agent, stage, prompt),
+            },
+        );
+        settled(&run).await;
+        let saved = std::fs::read_to_string(run.dir.join("diff.txt")).unwrap();
+        assert!(saved.starts_with("The app could not save the diff after the revision (git ended with code 5)."));
+        assert!(saved.ends_with("This is the last saved diff.\n\nthe first diff"));
+        assert!(!saved.contains(NO_GIT_DIFF));
+    }
+
+    #[tokio::test]
+    async fn an_empty_diff_saves_an_empty_file() {
+        let run = start_full(
+            Duration::from_secs(5),
+            |script| if is_diff(script) { Fake::Reply(String::new()) } else { no_git(script) },
+            happy,
+        );
+        settled(&run).await;
+        assert_eq!(std::fs::read_to_string(run.dir.join("diff.txt")).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn outside_git_the_saved_diff_says_so() {
+        let run = start(happy);
+        settled(&run).await;
+        assert_eq!(std::fs::read_to_string(run.dir.join("diff.txt")).unwrap(), NO_GIT_DIFF);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_diff_saves_no_diff() {
+        let run = start_full(
+            Duration::from_secs(5),
+            |script| if is_diff(script) { Fake::Hang } else { no_git(script) },
+            happy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !run.shells.lock().unwrap().iter().any(|argv| is_diff(&argv[2])) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        run.handle.control(Control::Cancel { reason: None }).unwrap();
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["stopped"], "cancelled by the user");
+        assert!(!run.dir.join("diff.txt").exists());
+        assert!(!run.mirror.join("diff.txt").exists());
     }
 
     #[test]

@@ -425,6 +425,15 @@ impl Default for Room {
     }
 }
 
+/// The text of `diff.txt` when the working dir is not a git work tree.
+pub const NO_GIT_DIFF: &str = "The working dir is not a git work tree, so the app cannot show its change.";
+
+/// The diff that the run saved after its last write stage.
+pub fn read_diff(dir: &Path) -> Option<String> {
+    let bytes = read_at(&nofollow_dir(dir)?, "diff.txt")?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// True if `dir` looks like a round folder.
 pub fn is_round(dir: &Path) -> bool {
     let Some(fd) = nofollow_dir(dir) else {

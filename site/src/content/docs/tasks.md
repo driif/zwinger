@@ -60,6 +60,11 @@ verdicts and the degraded agents. During a run you can:
 
 **Gates** shows the latest command output and exit codes. The timeline keeps a summary of each completed gate run.
 
+**Show the diff** shows the change of the run: the commits since the run started, then the diff. During a run, it
+reads the working dir in the VM. After the implementation and after the revision, the run saves the change as
+`diff.txt` in its round. When the run has ended, the room shows this saved diff, also when the cage is stopped. A
+cancelled stage saves no diff. If git fails after the revision, `diff.txt` says so and keeps the last saved diff. For a run with no saved diff, the room reads the working dir if the cage runs.
+
 A cage stop cancels its runs. A run does not continue after an app restart.
 
 **Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it.

@@ -1,6 +1,6 @@
 import { Button, Card, SegmentedControl, StepProgress, Textarea } from "@driif/motiv";
 import { ArrowUp, FileDiff, Pause, Pencil, Play, Square } from "lucide-react";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   controlTaskRun,
   isLive,
@@ -16,6 +16,7 @@ import {
 } from "./api";
 import { SessionView, Task } from "../../shared/api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
+import { latestRequest } from "./diffRequest";
 import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
 import { errorMessage } from "../../shared/errorMessage";
 
@@ -55,6 +56,7 @@ export function TaskRoom(props: Props) {
   const [error, setError] = useState<string>();
   const [draft, setDraft] = useState("");
   const [diff, setDiff] = useState<string>();
+  const diffRequests = useRef(latestRequest()).current;
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -62,6 +64,7 @@ export function TaskRoom(props: Props) {
     setStatus(null);
     setLive({});
     setDiff(undefined);
+    diffRequests.drop();
     setError(undefined);
     if (!source) return;
     let token: number | undefined;
@@ -107,6 +110,14 @@ export function TaskRoom(props: Props) {
     work().then(
       () => inApp?.onRunsChange(),
       (e) => setError(errorMessage(e)),
+    );
+  };
+  const readDiff = (sessionId: string, taskId: string, run: string) => {
+    const isCurrent = diffRequests.next();
+    setError(undefined);
+    runDiff(sessionId, taskId, run).then(
+      (text) => isCurrent() && setDiff(text),
+      (e) => isCurrent() && setError(errorMessage(e)),
     );
   };
   const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.session.id, inApp.task.id, run, c));
@@ -303,9 +314,9 @@ export function TaskRoom(props: Props) {
                   size="sm"
                   variant="outline"
                   iconLeft={<FileDiff size={14} />}
-                  disabled={!cageRunning}
-                  title={cageRunning ? undefined : "Start the cage to read the working dir"}
-                  onClick={() => run && act(() => runDiff(inApp.session.id, inApp.task.id, run).then(setDiff))}
+                  disabled={!cageRunning && liveRun}
+                  title={cageRunning || !liveRun ? undefined : "Start the cage to read the working dir"}
+                  onClick={() => run && readDiff(inApp.session.id, inApp.task.id, run)}
                 >
                   {diff === undefined ? "Show the diff" : "Read the diff again"}
                 </Button>

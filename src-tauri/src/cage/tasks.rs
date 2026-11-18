@@ -9,7 +9,7 @@ use crate::cage::manager::{Manager, Vm, blocking, in_guest_folder, lock};
 use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
 use crate::session::{Task, TaskDraft};
-use crate::task_agents::Exec;
+use crate::task_agents::{Exec, SnapshotError};
 use crate::task_artifacts::{self, Mirror, RoundWriter};
 use crate::task_runs::{self, Control, RunHandle, RunState};
 
@@ -168,17 +168,37 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// The change of a run: the commits since its start, then the diff from
     /// its start. A run with no known start shows the uncommitted change.
+    /// A live run reads the VM. An ended run shows the diff that it saved.
     pub async fn run_diff(&self, id: &str, task_id: &str, run: &str) -> Result<String> {
         let dir = self.round_dir(id, task_id, run)?;
-        let base = match self.runs.find(id, task_id, run) {
-            Some(handle) => handle.status().base,
-            None => blocking(move || Ok(task_artifacts::read_room(&dir).outcome.and_then(|o| o.base))).await?,
+        let status = self.runs.find(id, task_id, run).map(|handle| handle.status());
+        let live = status.as_ref().is_some_and(|s| s.state.is_live());
+        let (saved, base) = match status {
+            Some(status) if live => (None, status.base),
+            status => {
+                blocking(move || {
+                    let base = match status {
+                        Some(status) => status.base,
+                        None => task_artifacts::read_room(&dir).outcome.and_then(|o| o.base),
+                    };
+                    Ok((task_artifacts::read_diff(&dir), base))
+                })
+                .await?
+            }
         };
+        if let Some(saved) = saved {
+            return Ok(saved);
+        }
         let (task, vm, folder, scope) = {
             let state = lock(&self.state);
             let session = state.session(id)?;
             let mut task = session.task(task_id)?.clone();
-            let (_, cage, running, folder, _) = state.task_cage(id)?;
+            let (_, cage, running, folder, _) = match state.task_cage(id) {
+                Err(Error::NotRunning) if !live => {
+                    return Ok("This run saved no diff. Start the cage to read the working dir.".to_owned());
+                }
+                found => found?,
+            };
             task.workdir = in_guest_folder(&folder, &task.workdir);
             let Vm::Running { vm, .. } = running else { unreachable!("task_cage returns a running VM") };
             let scope = git_scope(&task, &folder, &cage.mounts)?;
@@ -196,10 +216,12 @@ impl<R: SandboxRuntime> Manager<R> {
             proxy: None,
         };
         let (_, mut cancel) = tokio::sync::watch::channel(false);
-        Ok(exec
-            .diff(base.as_deref(), &mut cancel)
-            .await
-            .unwrap_or_else(|| "The working dir is not a git work tree, so the app cannot show its change.".to_owned()))
+        let diff = match exec.diff(base.as_deref(), &mut cancel).await {
+            Ok(diff) => diff,
+            Err(SnapshotError::NotGit) => task_artifacts::NO_GIT_DIFF.to_owned(),
+            Err(SnapshotError::Failed(why)) => format!("The app could not read the diff ({why})."),
+        };
+        Ok(if live { diff } else { format!("This run saved no diff. This is the current working dir.\n\n{diff}") })
     }
 }
 
@@ -321,6 +343,24 @@ mod tests {
 
         manager.remove_task(&id, &task_id).unwrap();
         assert_eq!(manager.list().sessions[0].session.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ended_run_shows_its_saved_diff_with_a_stopped_vm() {
+        let (manager, _runtime, id) = manager();
+        let task_id = manager.put_task(&id, task_draft(None, "Fix", [AgentKind::Pi, AgentKind::Claude])).unwrap();
+        let round = manager.task_dir(&id, "fix").join("01");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("events.jsonl"), "{\"at\":\"t\",\"kind\":\"done\",\"detail\":\"ship=true\"}\n")
+            .unwrap();
+        std::fs::write(round.join("diff.txt"), "the saved diff").unwrap();
+        assert_eq!(manager.run_diff(&id, &task_id, "01").await.unwrap(), "the saved diff");
+
+        std::fs::remove_file(round.join("diff.txt")).unwrap();
+        assert_eq!(
+            manager.run_diff(&id, &task_id, "01").await.unwrap(),
+            "This run saved no diff. Start the cage to read the working dir."
+        );
     }
 
     #[tokio::test]
