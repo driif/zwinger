@@ -256,7 +256,7 @@ impl<R: SandboxRuntime> Manager<R> {
             let key = key.clone();
             timed(blocking(move || prepare(&host, &data, &cage, &key, &|phase| progress.begin(phase)))).await
         };
-        let Prepared { mut binds, wanted, mut run, tokens, profiles, tui_probe } = match prepared {
+        let Prepared { mut binds, wanted, mut run, tokens, profiles, probes } = match prepared {
             Ok(prepared) => prepared,
             Err(e) => return fail(e, &mut timings),
         };
@@ -309,7 +309,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 progress.begin(Phase::Guest);
                 let at = Instant::now();
                 let set_up = match bound.verify_paths() {
-                    Ok(()) => self.set_up_guest(&vm, tui_probe.as_deref(), &mut run, &mut names, &mut timings).await,
+                    Ok(()) => self.set_up_guest(&vm, &probes, &mut run, &mut names, &mut timings).await,
                     Err(e) => Err(e),
                 };
                 timings.add(Phase::Guest, at.elapsed());
@@ -385,11 +385,10 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The checks and the setup in the booted VM. They run at once, each
     /// with its own timing. A Node check that fails fails the start; else
     /// the results apply in a fixed order, so the notices do too.
-    /// `tui_probe` is the cache key of the host pi's TUI probe, if it must run.
     async fn set_up_guest(
         &self,
         vm: &R::Vm,
-        tui_probe: Option<&str>,
+        probes: &HostProbes,
         run: &mut HostRun,
         names: &mut Vec<&'static str>,
         timings: &mut Timings,
@@ -400,15 +399,15 @@ impl<R: SandboxRuntime> Manager<R> {
         let ((node, node_took), tui, gemini, (profile, profile_took), (trust, trust_took)) = tokio::join!(
             timed(self.check_node(vm)),
             async {
-                match tui_probe {
-                    Some(_) => Some(timed(self.probe_tui(vm, proxy.as_deref())).await),
-                    None => None,
+                match probes.pi {
+                    Probe::Run(_) => Some(timed(self.probe_tui(vm, proxy.as_deref())).await),
+                    Probe::Skip => None,
                 }
             },
             async {
-                match &gemini {
-                    Some(argv) => Some(timed(self.probe(vm, argv)).await),
-                    None => None,
+                match (&probes.gemini, &gemini) {
+                    (Probe::Run(_), Some(argv)) => Some(timed(self.probe(vm, argv)).await),
+                    _ => None,
                 }
             },
             // Before any session starts, so each login shell has the agent commands.
@@ -427,9 +426,9 @@ impl<R: SandboxRuntime> Manager<R> {
         timings.add(Phase::Setup, profile_took);
         timings.add(Phase::Trust, trust_took);
         node?;
-        match (tui, tui_probe) {
-            (Some(Ok(())), Some(key)) => cache_tui(&self.data, key).await,
-            (Some(Err(e)), _) => {
+        match tui {
+            Some(Ok(())) => probes.pi.save().await,
+            Some(Err(e)) => {
                 run.pi_host = false;
                 run.notices.push(format!(
                     "The pi of this Mac does not start in the cage ({e}), so the bundled pi runs. It can be a different version."
@@ -438,12 +437,15 @@ impl<R: SandboxRuntime> Manager<R> {
             _ => {}
         }
         match gemini {
-            Some(Ok(())) => names.push(AgentKind::Gemini.name()),
+            Some(Ok(())) => probes.gemini.save().await,
             Some(Err(e)) => {
                 run.gemini = None;
                 run.failed.push((AgentKind::Gemini, e));
             }
             None => {}
+        }
+        if run.gemini.is_some() {
+            names.push(AgentKind::Gemini.name());
         }
         for (kind, why) in &run.failed {
             run.notices.push(format!("{} from this Mac does not run in the cage: {why}", kind.label()));
@@ -1066,8 +1068,7 @@ pub(crate) struct Prepared {
     pub(crate) run: HostRun,
     /// How long the copy of each profile took.
     pub(crate) profiles: Vec<(AgentKind, Duration)>,
-    /// The cache key of the host pi's TUI probe, if the probe must run.
-    pub(crate) tui_probe: Option<String>,
+    probes: HostProbes,
 }
 
 /// Copies the profiles and links them into the agents' state, reads the
@@ -1103,7 +1104,8 @@ pub(crate) fn prepare(
     let home = host.home();
     let mut binds = vec![Bind { guest: launch::BIN_DIR.to_owned(), host: bin }];
     let mut wanted = HashMap::new();
-    let (mut profiles, mut tui_probe) = (Vec::new(), None);
+    let mut profiles = Vec::new();
+    let mut probes = HostProbes::default();
     for kind in host_agents::KINDS {
         let used = cage.host_agent(kind);
         let snapshot_dir = data.join("profiles").join(key).join(kind.name());
@@ -1148,13 +1150,13 @@ pub(crate) fn prepare(
             (AgentKind::Pi, Some(package), _) => {
                 // The detection can be older than an update of pi.
                 let pi = host.package_version(&package).unwrap_or_else(|| found.version.clone());
-                // A host pi whose TUI loaded with the same pi, image and runtime is not probed again.
-                let key = format!("{package:?} {pi:?} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
-                tui_probe = Some(key).filter(|key| !tui_cached(data, key));
+                probes.pi = Probe::check(data.join(TUI_CACHE), &package, Some(pi), None);
                 binds.push(Bind { guest: pi::HOST_DIR.to_owned(), host: package });
                 run.pi_host = true;
             }
             (AgentKind::Gemini, Some(package), Some(entry)) => {
+                probes.gemini =
+                    Probe::check(data.join(GEMINI_CACHE), &package, host.package_version(&package), Some(entry));
                 binds.push(Bind { guest: gemini::DIR.to_owned(), host: package });
                 run.gemini = Some(format!("{}/{entry}", gemini::DIR));
             }
@@ -1200,7 +1202,7 @@ pub(crate) fn prepare(
             login::GITHUB_API
         ));
     }
-    Ok(Prepared { tokens, binds, wanted, run, profiles, tui_probe })
+    Ok(Prepared { tokens, binds, wanted, run, profiles, probes })
 }
 
 /// Runs `work` and measures it.
@@ -1213,24 +1215,51 @@ async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
 /// The last successful TUI probe for the single host pi selected by detection.
 pub(crate) const TUI_CACHE: &str = "tui-probes";
 
-fn tui_cached(data: &Path, key: &str) -> bool {
-    std::fs::read_to_string(data.join(TUI_CACHE)).is_ok_and(|text| text == key)
+const GEMINI_CACHE: &str = "gemini-probe";
+
+#[derive(Default)]
+struct HostProbes {
+    pi: Probe,
+    gemini: Probe,
 }
 
-/// A lost write only costs one more probe.
-async fn cache_tui(data: &Path, key: &str) {
-    let (path, key) = (data.join(TUI_CACHE), key.to_owned());
-    let written = blocking(move || {
-        let tmp = path.with_extension(uuid::Uuid::new_v4().to_string());
-        let result = std::fs::write(&tmp, key).and_then(|()| std::fs::rename(&tmp, path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(tmp);
+#[derive(Default)]
+enum Probe {
+    #[default]
+    Skip,
+    /// A package without a readable version must be checked on every start.
+    Run(Option<(std::path::PathBuf, String)>),
+}
+
+impl Probe {
+    fn check(path: std::path::PathBuf, package: &Path, version: Option<String>, entry: Option<&str>) -> Self {
+        let Some(version) = version else { return Self::Run(None) };
+        let mut key = format!("{package:?} {version:?} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
+        if let Some(entry) = entry {
+            key.push_str(&format!(" {entry:?}"));
         }
-        Ok(result?)
-    })
-    .await;
-    if let Err(e) = written {
-        eprintln!("the TUI probe of pi is not cached: {e}");
+        if std::fs::read_to_string(&path).is_ok_and(|text| text == key) {
+            Self::Skip
+        } else {
+            Self::Run(Some((path, key)))
+        }
+    }
+
+    async fn save(&self) {
+        let Self::Run(Some((path, key))) = self else { return };
+        let (path, key) = (path.clone(), key.clone());
+        let written = blocking(move || {
+            let tmp = path.with_extension(uuid::Uuid::new_v4().to_string());
+            let result = std::fs::write(&tmp, key).and_then(|()| std::fs::rename(&tmp, path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(tmp);
+            }
+            Ok(result?)
+        })
+        .await;
+        if let Err(e) = written {
+            eprintln!("could not cache the host agent probe: {e}");
+        }
     }
 }
 
@@ -1675,8 +1704,9 @@ mod tests {
         manager.stop(&id, None).await.unwrap();
 
         // A darwin-only native module: pi falls back to the bundle, Gemini CLI has none.
-        // The TUI probe passed above, so its cache must go for it to run again.
+        // Both probes passed above. Force a fresh check of both packages.
         std::fs::remove_file(manager.data.join(super::TUI_CACHE)).unwrap();
+        std::fs::remove_file(manager.data.join(super::GEMINI_CACHE)).unwrap();
         *runtime.probe_fail.lock().unwrap() =
             vec!["/opt/zwinger/host/pi/dist/cli.js".into(), "/opt/zwinger/host/gemini/bundle/gemini.js".into()];
         manager.start(&id).await.unwrap();
@@ -1765,6 +1795,34 @@ mod tests {
         manager.host.detect();
         manager.start(&id).await.unwrap();
         assert_eq!(tui_probes(&runtime), 4);
+    }
+
+    #[tokio::test]
+    async fn gemini_probes_each_new_version_until_it_passes() {
+        let dir = temp_dir();
+        let fs = Arc::new(mac(&temp_dir()));
+        let runtime = FakeRuntime::default();
+        let host = host_with(fs.clone(), FakeLogins::default(), NOW);
+        let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault(), temp_dir(), host).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
+        manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
+        let manifest = "/usr/local/lib/node_modules/@google/gemini-cli/package.json";
+        for (version, fail, available) in [
+            ("1.0.0", false, true),
+            ("1.0.0", true, true),
+            ("1.1.0", true, false),
+            ("1.1.0", false, true),
+            ("1.1.0", true, true),
+        ] {
+            fs.file(manifest, &format!(r#"{{"version":"{version}"}}"#));
+            *runtime.probe_fail.lock().unwrap() =
+                if fail { vec!["/opt/zwinger/host/gemini/bundle/gemini.js".into()] } else { vec![] };
+            manager.start(&id).await.unwrap();
+            assert_eq!(manager.list().cages[0].shared().runtimes.contains(&"gemini"), available);
+            assert_eq!(tui_probes(&runtime), 1);
+            manager.stop(&id, None).await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -81,7 +81,8 @@ zwinger finds the agents that are installed on your Mac. A project can use them 
 agent per kind on the project page. The change applies at the next cage start.
 
 When you use pi from your Mac, the cage checks that its terminal interface starts. It repeats the check if the pi
-installation path, pi version, guest image or VM runtime changes.
+installation path, pi version, guest image or VM runtime changes. Gemini CLI uses a version check with the same
+rules. It also repeats the check when its entry point changes. A failed check is retried at the next start.
 
 For Claude Code, run `claude setup-token` on your Mac. In **Add agent**, paste the token into the password field and save it. The cage stores the token in its vault. The guest sees only a placeholder in `CLAUDE_CODE_OAUTH_TOKEN`; the proxy sets `authorization: Bearer <token>` only for `api.anthropic.com`. Under default Block, use **Allow api.anthropic.com** before saving. A Block rule can still override that Allow rule.
 
