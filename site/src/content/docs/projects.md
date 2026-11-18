@@ -103,6 +103,20 @@ In a narrow pane, select **…** in its header to split the pane, open its folde
 When you close a pane, the terminal is hidden but continues to run. A hidden terminal releases its WebGL context.
 When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tree.
 
+## Search in a terminal
+
+Press ⌘F in a terminal to search its output, including the scrollback. The search field opens at the top right of
+that pane. The keys do not go to the shell, and the other panes do not change. The search ignores case.
+
+- Type to find the matches. All matches get an outline, and the current match is selected.
+- Press Enter, or select the down arrow, to go to the next match. Press ⇧Enter, or select the up arrow, to go to the
+  previous match.
+- The field shows the number of the current match and the number of matches, for example "2 of 5". It shows
+  "No matches" when there are none. At 1000 or more matches, it shows "1000+". New output updates the count.
+- Press Escape in the search, or select **×**, to close the search. The outlines and the selected match go away and
+  the focus goes back to the terminal.
+- In a narrow pane, the search controls go on more than one line.
+
 ## Editors
 
 zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/Applications`, `~/Applications` and

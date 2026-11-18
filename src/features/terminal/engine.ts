@@ -1,4 +1,5 @@
 import type { ITheme, Terminal } from "@xterm/xterm";
+import type { ISearchOptions, SearchAddon } from "@xterm/addon-search";
 import type { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TerminalColors } from "../appearance/api";
@@ -13,6 +14,7 @@ interface Look {
 /** An xterm in its element. A visible one draws with WebGL. */
 export interface Engine {
   term: Terminal;
+  search: SearchAddon;
   /** Fits the terminal to its element. A hidden element keeps the size. */
   fit: () => void;
   /** Only a visible terminal holds a WebGL context: a webview has about 16. */
@@ -85,10 +87,26 @@ export function setLook(prefs: TerminalPrefs, colors: TerminalColors) {
   }
 }
 
+/** Outlines the matches in the terminal colors. The search addon reports its match count only with decorations. */
+export function searchOptions(): ISearchOptions {
+  const { foreground, cursor } = look!.colors;
+  return {
+    decorations: {
+      matchBorder: foreground,
+      matchOverviewRuler: foreground,
+      activeMatchBorder: cursor,
+      activeMatchColorOverviewRuler: cursor,
+    },
+  };
+}
+
 let xterm: Promise<typeof import("./xterm")> | undefined;
 
-/** Opens an xterm in `el`. It fits itself when `el` changes size. xterm.js loads on the first terminal. */
-export async function openTerminal(el: HTMLElement): Promise<Engine> {
+/**
+ * Opens an xterm in `el`. It fits itself when `el` changes size. xterm.js loads on the first terminal.
+ * ⌘F in the terminal calls `onFind` and does not go to the shell.
+ */
+export async function openTerminal(el: HTMLElement, onFind: () => void): Promise<Engine> {
   xterm ??= import("./xterm");
   const { Terminal, FitAddon, SearchAddon, Unicode11Addon, WebLinksAddon, WebglAddon } = await xterm;
   // The workspace sets the look as it renders, before its terminals mount.
@@ -103,11 +121,19 @@ export async function openTerminal(el: HTMLElement): Promise<Engine> {
   term.loadAddon(fit);
   term.loadAddon(new Unicode11Addon());
   term.unicode.activeVersion = "11";
-  term.loadAddon(new SearchAddon());
+  const search = new SearchAddon();
+  term.loadAddon(search);
   // The webview does not open windows; the system browser opens the link.
   term.loadAddon(new WebLinksAddon((_, uri) => openUrl(uri)));
   // Shift+Enter is ESC CR: a new line in the prompt of an agent TUI.
   term.attachCustomKeyEventHandler((event) => {
+    if (event.key.toLowerCase() === "f" && event.metaKey && !event.shiftKey && !event.altKey && !event.ctrlKey) {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        onFind();
+      }
+      return false;
+    }
     if (event.key !== "Enter" || !event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return true;
     if (event.type === "keydown") term.input("\x1b\r");
     return false;
@@ -137,6 +163,7 @@ export async function openTerminal(el: HTMLElement): Promise<Engine> {
   }
   return {
     term,
+    search,
     fit: fitNow,
     setVisible(visible) {
       if (visible && !webgl) {

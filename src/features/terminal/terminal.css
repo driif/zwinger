@@ -20,16 +20,56 @@
   display: none;
 }
 
+.terminal-pane {
+  position: absolute;
+  inset: 0;
+}
+
+.terminal-pane[hidden] {
+  display: none;
+}
+
 /* The padding and the background come from the terminal settings, so the pane is the terminal edge to edge. */
 .terminal {
   position: absolute;
   inset: 0;
   box-sizing: border-box;
   overflow: hidden;
+  /* xterm stacks its layers up to z-index 11. They stay below the search bar of the pane. */
+  isolation: isolate;
 }
 
-.terminal[hidden] {
-  display: none;
+/* A narrow pane wraps the bar. The bar stays inside its pane. */
+.terminal-search {
+  position: absolute;
+  top: var(--motiv-space);
+  right: calc(var(--motiv-space) * 4);
+  z-index: 1;
+  box-sizing: border-box;
+  max-width: calc(100% - var(--motiv-space) * 5);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--motiv-space);
+  padding: var(--motiv-space) calc(var(--motiv-space) * 2);
+  border: 1px solid var(--motiv-color-border);
+  border-radius: var(--motiv-radius);
+  background: var(--motiv-color-surface);
+  box-shadow: var(--motiv-shadow-md);
+  color: var(--motiv-color-text);
+  font-size: var(--motiv-font-size-sm);
+}
+
+.terminal-search .motiv-float {
+  flex: 1 1 10rem;
+  min-width: 0;
+}
+
+.terminal-search-count {
+  min-width: 8ch;
+  white-space: nowrap;
+  color: var(--motiv-color-text-muted);
 }
 
 .pane-dormant {

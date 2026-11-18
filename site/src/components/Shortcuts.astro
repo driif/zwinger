@@ -25,11 +25,15 @@ const DESCRIPTIONS: Record<ShortcutAction, string> = {
   focusDown: "Move the focus to the pane below.",
 };
 
-const rows = SHORTCUTS.map((s) => {
-  const description = DESCRIPTIONS[s.action];
-  if (!description) throw new Error(`Shortcuts.astro: no description for the shortcut action "${s.action}".`);
-  return { label: s.label, description, terminal: "terminal" in s && s.terminal };
-});
+const rows = [
+  ...SHORTCUTS.map((s) => {
+    const description = DESCRIPTIONS[s.action];
+    if (!description) throw new Error(`Shortcuts.astro: no description for the shortcut action "${s.action}".`);
+    return { label: s.label, description, terminal: "terminal" in s && s.terminal };
+  }),
+  // The terminal itself handles ⌘F (src/features/terminal/engine.ts), not the app shortcuts.
+  { label: "⌘F", description: "Search the output of the terminal.", terminal: true },
+];
 
 const groups = [
   { title: "Everywhere", rows: rows.filter((r) => !r.terminal) },
