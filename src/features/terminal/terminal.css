@@ -20,9 +20,12 @@
   display: none;
 }
 
+/* The exit bar sits below the terminal and does not cover its lines. */
 .terminal-pane {
   position: absolute;
   inset: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .terminal-pane[hidden] {
@@ -31,12 +34,37 @@
 
 /* The padding and the background come from the terminal settings, so the pane is the terminal edge to edge. */
 .terminal {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  flex: 1;
+  min-height: 0;
   box-sizing: border-box;
   overflow: hidden;
   /* xterm stacks its layers up to z-index 11. They stay below the search bar of the pane. */
   isolation: isolate;
+}
+
+/* An exited process keeps its grid. A smaller pane scrolls it and does not cut rows off. */
+.terminal.frozen {
+  overflow: auto;
+}
+
+.terminal.frozen .xterm {
+  width: max-content;
+}
+
+/* Scrollbars that take their own space: an overlay scrollbar catches the drag over the last row. */
+.terminal.frozen::-webkit-scrollbar {
+  width: calc(var(--motiv-space) * 2);
+  height: calc(var(--motiv-space) * 2);
+}
+
+.terminal.frozen::-webkit-scrollbar-thumb {
+  border-radius: var(--motiv-radius);
+  background: var(--motiv-color-border);
+}
+
+.terminal.frozen::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* A narrow pane wraps the bar. The bar stays inside its pane. */
@@ -70,6 +98,17 @@
   min-width: 8ch;
   white-space: nowrap;
   color: var(--motiv-color-text-muted);
+}
+
+.terminal-exit {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: var(--zw-gap);
+  padding: var(--motiv-space);
+  border-top: 1px solid var(--motiv-color-border);
+  font-size: var(--motiv-font-size-sm);
 }
 
 .pane-dormant {

@@ -113,12 +113,15 @@ export type View =
   /** No `taskId` adds a task. */
   | { kind: "taskEdit"; taskId?: string };
 
-/** A terminal of a session. `key` is the terminal id. No `processId`: the terminal is dormant or has exited. */
+/** A terminal of a session. `key` is the terminal id. No `processId`: the terminal is dormant. */
 export interface Pane {
   key: string;
   sessionId: string;
   kind: TerminalKind;
+  /** The live or exited process, while the backend keeps it. */
   processId?: string;
+  /** `null`: the process runs, or there is none. */
+  exitCode: number | null;
   /** The folder of the live process. `null`: no live process, or the folder is unknown. */
   folder: TerminalFolder | null;
 }
@@ -549,12 +552,13 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   );
   const panes: Pane[] = joined.flatMap(({ session }) =>
     session.terminals.map((t) => {
-      const process = liveProcess(session, t.id);
+      const process = session.processes.find((p) => p.terminalId === t.id);
       return {
         key: t.id,
         sessionId: session.id,
         kind: t.kind,
         processId: process?.id,
+        exitCode: process?.exitCode ?? null,
         folder: process ? terminalFolders.folderOf(process) : null,
       };
     }),

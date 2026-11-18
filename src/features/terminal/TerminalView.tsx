@@ -1,13 +1,18 @@
-import { IconButton, TextField } from "@driif/motiv";
-import { ChevronDown, ChevronUp, X } from "lucide-react";
+import { Button, IconButton, TextField } from "@driif/motiv";
+import { ChevronDown, ChevronUp, Play, X } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { ackSession, attachSession, detachSession, resizeSession, SessionFrame, writeSession } from "./api";
 import { Engine, openTerminal, searchOptions } from "./engine";
 import { followTitle } from "./titles";
 import "./terminal.css";
 
+/** Turns off the VT mouse reports, so a drag selects text again. The screen and its styles stay. */
+const RELEASE_MOUSE = "\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l";
+
 interface Props {
   processId: string;
+  /** The exit code that the listing knows. `null`: the process runs, or the listing does not show its exit yet. */
+  exitCode: number | null;
   visible: boolean;
   /** Takes the keyboard focus while it is visible. */
   focused: boolean;
@@ -17,11 +22,16 @@ interface Props {
   style?: CSSProperties;
   onFocus?: () => void;
   onExit: (processId: string, code: number) => void;
+  /** Starts a new process in place of the exited one. */
+  onReopen: () => void;
   onError: (error: unknown) => void;
 }
 
-/** Attaches to the terminal process while it is mounted. An unmount detaches; the process keeps running. */
-export function TerminalView({ processId, visible, focused, focusRequest, style, onFocus, onExit, onError }: Props) {
+/**
+ * Attaches to the terminal process while it is mounted. An unmount detaches; the process keeps running.
+ * After the exit it shows the last screen read-only, with the exit code.
+ */
+export function TerminalView({ processId, exitCode, visible, focused, focusRequest, style, onFocus, onExit, onReopen, onError }: Props) {
   const pane = useRef<HTMLDivElement>(null);
   const container = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
@@ -30,6 +40,12 @@ export function TerminalView({ processId, visible, focused, focusRequest, style,
   const [finding, setFinding] = useState(0);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<{ resultIndex: number; resultCount: number }>();
+  const [exitFrame, setExitFrame] = useState<number>();
+  const exit = exitFrame ?? exitCode;
+  /** Read in the xterm listeners: an exited process takes no input, resize or reply, also before a refresh. */
+  const exited = useRef(exit !== null);
+  /** Makes the open terminal a read-only record of the exited process. It can run again. */
+  const settle = useRef<() => void>(undefined);
 
   useEffect(() => {
     let disposed = false;
@@ -41,7 +57,7 @@ export function TerminalView({ processId, visible, focused, focusRequest, style,
     // Input that does not arrive is reported once, not at each key.
     let reported = false;
     const fail = (e: unknown) => {
-      if (reported || disposed) return;
+      if (reported || disposed || exited.current) return;
       reported = true;
       onError(e);
     };
@@ -56,27 +72,47 @@ export function TerminalView({ processId, visible, focused, focusRequest, style,
         opened = created;
         setEngine(created);
         const { term } = created;
-        const endTitle = followTitle(term, processId);
-        unfollow = endTitle;
-        term.onData((data) => writeSession(processId, data).catch(fail));
-        term.onResize(({ rows, cols }) => resizeSession(processId, rows, cols).catch(() => {}));
+        // A process that the listing shows as exited can replay its old title. Only a live process sets one.
+        if (!exited.current) unfollow = followTitle(term, processId);
+        settle.current = () => {
+          // The listing can arrive later. Retire the live title as soon as the process exits.
+          unfollow?.();
+          exited.current = true;
+          created.freeze();
+          term.write(RELEASE_MOUSE);
+        };
+        term.onData((data) => {
+          if (!disposed && !exited.current) writeSession(processId, data).catch(fail);
+        });
+        term.onResize(({ rows, cols }) => {
+          if (!disposed && !exited.current) resizeSession(processId, rows, cols).catch(() => {});
+        });
         const onFrame = (frame: SessionFrame) => {
           if (disposed) return;
           if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) {
-            // The refresh that removes the pane can come late or fail. Late output must not name the exited process.
-            endTitle();
+            settle.current!();
+            setExitFrame(frame.exit);
             return onExit(processId, frame.exit);
           }
-          // The parse is synchronous. The write callback waits for an animation frame, which a hidden window does not get.
+          // No write callback: it waits for an animation frame, which a hidden window does not get.
           term.write(frame instanceof ArrayBuffer ? new Uint8Array(frame) : Uint8Array.from(frame));
+          // In order after the output: the last output of the process can turn the mouse reports on again.
+          if (exited.current) term.write(RELEASE_MOUSE);
           ack();
         };
+        if (exited.current) {
+          // The replay waits for the size of the pane: a smaller grid would drop the top rows of a full-screen program.
+          created.fit();
+          await created.sized;
+          if (disposed) return;
+          settle.current();
+        }
         token = await attachSession(processId, onFrame);
         if (disposed) return detachSession(processId, token).catch(() => {});
         for (; unacked > 0; unacked--) ackSession(processId, token).catch(fail);
-        // After the replay, so the TUI draws itself again at this size. An exited session takes no input.
+        // After the replay, so the TUI draws itself again at this size.
         created.fit();
-        await resizeSession(processId, term.rows, term.cols).catch(() => {});
+        if (!exited.current) await resizeSession(processId, term.rows, term.cols).catch(() => {});
       })
       .catch(onError);
     return () => {
@@ -86,6 +122,12 @@ export function TerminalView({ processId, visible, focused, focusRequest, style,
       opened?.dispose();
     };
   }, []);
+
+  useEffect(() => {
+    if (exit === null) return;
+    exited.current = true;
+    settle.current?.();
+  }, [exit]);
 
   useEffect(() => {
     engine?.setVisible(visible);
@@ -129,6 +171,14 @@ export function TerminalView({ processId, visible, focused, focusRequest, style,
   return (
     <div ref={pane} className="terminal-pane" hidden={!visible} style={style} onFocus={onFocus}>
       <div ref={container} className="terminal" />
+      {exit !== null && (
+        <div className="terminal-exit">
+          <span className="muted">Exited with code {exit}</span>
+          <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={onReopen}>
+            Open
+          </Button>
+        </div>
+      )}
       {finding > 0 && (
         <div
           className="terminal-search"

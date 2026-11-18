@@ -93,12 +93,14 @@ export function PaneLayout({
             <TerminalView
               key={pane.processId}
               processId={pane.processId}
+              exitCode={pane.exitCode}
               visible={visible && rect !== undefined}
               focused={pane.key === focused}
               focusRequest={focusRequest}
               style={rect && body(rect)}
               onFocus={() => onFocus(pane.key)}
               onExit={onPaneExit}
+              onReopen={() => onReopen(pane)}
               onError={onPaneError}
             />
           )

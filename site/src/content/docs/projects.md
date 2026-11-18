@@ -91,6 +91,10 @@ the order.
 
 - A terminal that has no process is **dormant**. This occurs after a cage stop or an app restart. **Open** starts a
   new process in the same place.
+- When a process exits, its terminal keeps the last screen and shows the exit code next to **Open**.
+  You can scroll, select and copy the output. If the pane gets smaller, scroll to see the full screen.
+  **Open** starts a new process with an empty screen. After an app restart, the terminal is dormant again.
+  Stopping the cage also makes a VM terminal dormant.
 - A cage stop does not end a Mac shell. A project delete and the app exit end it.
 - Only **Close** in the tree removes a terminal and ends its process.
 

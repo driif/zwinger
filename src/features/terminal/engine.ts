@@ -17,6 +17,10 @@ export interface Engine {
   search: SearchAddon;
   /** Fits the terminal to its element. A hidden element keeps the size. */
   fit: () => void;
+  /** Resolves at the first fit, when the element is visible. */
+  sized: Promise<void>;
+  /** Keeps the size from now on. A process that has stopped cannot draw its screen again at a new size. */
+  freeze: () => void;
   /** Only a visible terminal holds a WebGL context: a webview has about 16. */
   setVisible: (visible: boolean) => void;
   dispose: () => void;
@@ -139,9 +143,29 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
     return false;
   });
   term.open(el);
+  let frozen = false;
+  // A frozen grid can be larger than its pane. The wheel scrolls the pane first, before xterm takes it.
+  const scrollPane = (event: WheelEvent) => {
+    if (!frozen) return;
+    const { deltaX, deltaY } = event;
+    const down = deltaY > 0 && el.scrollTop + el.clientHeight < el.scrollHeight;
+    const up = deltaY < 0 && el.scrollTop > 0;
+    const right = deltaX > 0 && el.scrollLeft + el.clientWidth < el.scrollWidth;
+    const left = deltaX < 0 && el.scrollLeft > 0;
+    if (!(down || up || right || left)) return;
+    // A line or page delta is rare. A cell is about 16 pixels.
+    const unit = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL ? 1 : event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : el.clientHeight;
+    el.scrollBy(deltaX * unit, deltaY * unit);
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  el.addEventListener("wheel", scrollPane, { capture: true, passive: false });
+  let markSized!: () => void;
+  const sized = new Promise<void>((resolve) => (markSized = resolve));
   const fitNow = () => {
-    if (el.offsetParent === null) return;
+    if (el.offsetParent === null || frozen) return;
     fit.fit();
+    markSized();
     fitted = { rows: term.rows, cols: term.cols };
   };
   const entry: Live = { term, el, fit: fitNow };
@@ -165,6 +189,11 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
     term,
     search,
     fit: fitNow,
+    sized,
+    freeze() {
+      frozen = true;
+      el.classList.add("frozen");
+    },
     setVisible(visible) {
       if (visible && !webgl) {
         try {
@@ -179,7 +208,9 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
       }
     },
     dispose() {
+      markSized();
       observer.disconnect();
+      el.removeEventListener("wheel", scrollPane, { capture: true });
       live.delete(entry);
       releaseWebgl();
       term.dispose();
