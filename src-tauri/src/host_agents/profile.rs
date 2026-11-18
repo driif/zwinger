@@ -44,9 +44,15 @@ pub fn entries(kind: AgentKind) -> &'static [&'static str] {
 }
 
 /// Names that are never copied, at any depth, also through a link: logins,
-/// history, sessions and the data of other projects. Compared in lowercase,
+/// history, sessions, Git metadata and the data of other projects. Compared in lowercase,
 /// as the Mac's filesystem ignores case.
-fn is_denied(name: &str) -> bool {
+fn is_denied(name: &str, package_dir: bool) -> bool {
+    if name.eq_ignore_ascii_case(".git") {
+        return true;
+    }
+    if package_dir {
+        return false;
+    }
     let name = name.to_ascii_lowercase();
     matches!(
         name.as_str(),
@@ -71,7 +77,7 @@ fn refused(rel: &Path, last_is_dir: bool) -> bool {
     let mut package = false;
     for (i, part) in parts.iter().enumerate() {
         let dir = i + 1 < parts.len() || last_is_dir;
-        if is_denied(part) && !(package && dir) {
+        if is_denied(part, package && dir) {
             return true;
         }
         package |= part == "node_modules";
@@ -160,7 +166,7 @@ fn copy_entries(kind: AgentKind, home: &Path, dest: &Path) -> io::Result<Snapsho
             Err(e) => return Err(e),
         };
         let inside = top.strip_prefix(&copy.root).ok().filter(|rel| !rel.as_os_str().is_empty());
-        if inside.is_none_or(|rel| rel.iter().any(|part| is_denied(&part.to_string_lossy()))) {
+        if inside.is_none_or(|rel| rel.iter().any(|part| is_denied(&part.to_string_lossy(), false))) {
             copy.skipped.push(src.display().to_string());
             continue;
         }
@@ -747,16 +753,37 @@ name = "n"
     }
 
     #[test]
+    fn skips_git_metadata_and_prunes_old_marketplace_copies() {
+        let home = temp_dir();
+        let marketplace = Path::new("plugins/marketplaces/example");
+        let source = home.join(".claude").join(marketplace);
+        let git = source.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::write(git.join("objects/pack"), "pack").unwrap();
+        fs::write(source.join("plugin.json"), "{}").unwrap();
+        symlink(git.join("objects/pack"), source.join("linked-pack")).unwrap();
+
+        let dest = temp_dir();
+        let copied = dest.join(marketplace);
+        fs::create_dir_all(copied.join(".git")).unwrap();
+        fs::write(copied.join(".git/config"), "old").unwrap();
+
+        let result = snapshot(AgentKind::Claude, &home, &dest).unwrap();
+        assert_eq!(result.skipped, [git.display().to_string(), source.join("linked-pack").display().to_string()]);
+        assert_eq!(names(&copied), ["plugin.json"]);
+    }
+
+    #[test]
     fn package_code_keeps_its_names() {
         let home = temp_dir();
         let npm = home.join(".pi/agent/npm/node_modules/history");
-        fs::create_dir_all(&npm).unwrap();
+        fs::create_dir_all(npm.join(".git")).unwrap();
         fs::write(npm.join("index.js"), "x").unwrap();
         fs::write(home.join(".pi/agent/auth.json"), "secret").unwrap();
         let dest = temp_dir().join("pi");
         let copied = snapshot(AgentKind::Pi, &home, &dest).unwrap();
         assert_eq!(copied.entries, ["npm"]);
-        assert!(dest.join("npm/node_modules/history/index.js").is_file());
+        assert_eq!(names(&dest.join("npm/node_modules/history")), ["index.js"]);
     }
 
     #[test]

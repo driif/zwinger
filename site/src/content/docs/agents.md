@@ -88,7 +88,8 @@ Codex, pi and Gemini CLI use their login files on your Mac. The agent in the cag
 
 The **profile** is optional, per project and agent. It gives the agent a read-only copy of your configuration, for
 example the settings, `CLAUDE.md`, skills, commands, agents and plugins of `~/.claude`. Logins, history, sessions and
-projects are never copied. The agent cannot change the profile. The map shows it as `profile (ro)`.
+projects are never copied. The profile also skips Git metadata (`.git`) in plugins and other folders.
+The agent cannot change the profile. The map shows it as `profile (ro)`.
 
 Gemini CLI runs only as an agent from your Mac. zwinger detects Antigravity but does not support it.
 
