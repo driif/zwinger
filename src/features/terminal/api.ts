@@ -1,6 +1,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import { call, FolderReport, PaneNode, TerminalKind } from "../../shared/api";
 import type { CursorStyle } from "../settings/api";
+import type { NumberSetting } from "./settings";
 
 /** Saves the split tree of the session's terminal view. */
 export const setPaneLayout = (sessionId: string, layout: PaneNode | null) =>
@@ -29,6 +30,8 @@ export interface GhosttyImport {
   }>;
   palette: GhosttyPalette | null;
   ignored: string[];
+  /** The settings whose applied config value was out of range: the config line and the limit that the setting got. */
+  adjusted: { setting: NumberSetting; input: string; value: number }[];
 }
 
 /** Reads the user's Ghostty config files. Fails if there is none. */

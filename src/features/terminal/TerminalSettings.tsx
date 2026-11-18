@@ -6,7 +6,7 @@ import { saveTheme } from "../appearance/api";
 import { Appearance } from "../appearance/themes";
 import { CursorStyle, Prefs, TerminalPrefs } from "../settings/api";
 import { importGhosttyConfig } from "./api";
-import { ghosttyTheme } from "./settings";
+import { adjustmentNote, clampNumber, ghosttyTheme, NUMBERS, NumberSetting } from "./settings";
 
 const CURSORS = [
   { value: "bar", label: "Bar" },
@@ -14,31 +14,44 @@ const CURSORS = [
   { value: "underline", label: "Underline" },
 ];
 
-/** A text field that saves on blur. A number out of `min`–`max` is clamped; the backend uses the same limits. */
-function Field({ label, value, min, max, step, onSave }: {
-  label: string;
-  value: string | number;
-  min?: number;
-  max?: number;
-  step?: number;
-  onSave: (value: string) => void;
-}) {
+/** A text field that saves on blur. An empty value is not saved. */
+function Field({ label, value, onSave }: { label: string; value: string; onSave: (value: string) => void }) {
   const [draft, setDraft] = useState<string>();
-  const numeric = typeof value === "number";
-  const clean = (text: string) =>
-    numeric ? String(Math.min(max!, Math.max(min!, Number(text)))) : text.trim();
-  const valid = (text: string) => text.trim() !== "" && (!numeric || Number.isFinite(Number(text)));
   return (
     <TextField
       label={label}
-      type={numeric ? "number" : "text"}
+      value={draft ?? value}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        if (draft !== undefined && draft.trim() !== "" && draft.trim() !== value) onSave(draft.trim());
+        setDraft(undefined);
+      }}
+    />
+  );
+}
+
+/** A number field that saves on blur. A number out of range is clamped and gives a note, also when the limit is already saved. */
+function NumberField({ setting, value, onSave }: {
+  setting: NumberSetting;
+  value: number;
+  onSave: (value: number, note?: string) => void;
+}) {
+  const [draft, setDraft] = useState<string>();
+  const { label, min, max, step } = NUMBERS[setting];
+  return (
+    <TextField
+      label={label}
+      type="number"
       min={min}
       max={max}
       step={step}
       value={draft ?? value}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={() => {
-        if (draft !== undefined && valid(draft) && clean(draft) !== String(value)) onSave(clean(draft));
+        if (draft !== undefined && draft.trim() !== "" && Number.isFinite(Number(draft))) {
+          const clamped = clampNumber(setting, Number(draft));
+          if (clamped.note || clamped.value !== value) onSave(clamped.value, clamped.note);
+        }
         setDraft(undefined);
       }}
     />
@@ -55,12 +68,17 @@ interface Props {
 /** The look and keys of all terminals, and the import of a Ghostty config. */
 export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
   const terminal = prefs.terminal;
-  const [note, setNote] = useState<string>();
+  const [notes, setNotes] = useState<string[]>([]);
   const save = (change: Partial<TerminalPrefs>) => run(() => onPrefs({ ...prefs, terminal: { ...terminal, ...change } }));
+  const saveNumber = (setting: NumberSetting) => (value: number, note?: string) =>
+    run(async () => {
+      if (value !== terminal[setting]) await onPrefs({ ...prefs, terminal: { ...terminal, [setting]: value } });
+      setNotes(note ? [note] : []);
+    });
 
   const importGhostty = () =>
     run(async () => {
-      setNote(undefined);
+      setNotes([]);
       const found = await importGhosttyConfig();
       const next = { ...terminal, ...found.settings };
       if (found.palette) {
@@ -70,7 +88,10 @@ export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
         next.themeId = theme.id;
       }
       await onPrefs({ ...prefs, terminal: next });
-      setNote(found.ignored.length > 0 ? `Imported. Not used: ${found.ignored.join(", ")}.` : "Imported.");
+      setNotes([
+        found.ignored.length > 0 ? `Imported. Not used: ${found.ignored.join(", ")}.` : "Imported.",
+        ...found.adjusted.map((a) => adjustmentNote(a.setting, `Ghostty ${a.input}`, a.value)),
+      ]);
     });
 
   return (
@@ -87,13 +108,14 @@ export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
           }
         />
         <CardBody className="stack">
-          {note && <p className="muted">{note}</p>}
+          <div className="terminal-notes stack" role="status">
+            {notes.map((note) => <p key={note} className="muted">{note}</p>)}
+          </div>
           <Field label="Font family" value={terminal.fontFamily} onSave={(fontFamily) => save({ fontFamily })} />
           <div className="row">
-            <Field label="Font size" value={terminal.fontSize} min={8} max={32} step={0.5} onSave={(v) => save({ fontSize: Number(v) })} />
-            <Field label="Line height" value={terminal.lineHeight} min={1} max={2} step={0.05} onSave={(v) => save({ lineHeight: Number(v) })} />
-            <Field label="Padding" value={terminal.padding} min={0} max={32} step={1} onSave={(v) => save({ padding: Number(v) })} />
-            <Field label="Scrollback lines" value={terminal.scrollback} min={1000} max={100000} step={1000} onSave={(v) => save({ scrollback: Number(v) })} />
+            {(Object.keys(NUMBERS) as NumberSetting[]).map((setting) => (
+              <NumberField key={setting} setting={setting} value={terminal[setting]} onSave={saveNumber(setting)} />
+            ))}
           </div>
           <SegmentedControl
             label="Cursor"

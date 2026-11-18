@@ -101,6 +101,11 @@ p {
   gap: calc(var(--motiv-space) * 3);
 }
 
+/* An empty status region stays in the page for screen readers but takes no gap. */
+.terminal-notes:empty {
+  margin-block-end: calc(var(--motiv-space) * -3);
+}
+
 .grow {
   flex: 1;
   min-width: 0;

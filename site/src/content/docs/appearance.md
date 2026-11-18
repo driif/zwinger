@@ -1,6 +1,6 @@
 ---
 title: Appearance
-description: Themes, text size, density, and sidebar font size.
+description: Themes, text size, density, sidebar font size, and terminal settings.
 ---
 
 Open **Settings > Appearance** (⌘,) to select the look of zwinger.
@@ -33,3 +33,27 @@ and controls throughout the app, including the project map. The change applies a
 Choose **Theme default** or **12**, **13**, **14**, or **15 px** in **Settings > Appearance > Layout**. Theme default follows
 the selected theme's body size. A set size changes the rail text and its controls without changing the rest of the app.
 The change applies at once and persists after a restart.
+
+## Terminal
+
+**Settings > Terminal** sets the font, cursor, colors and keys of all terminals. Changes apply at once.
+
+The numeric settings have these limits:
+
+| Setting | Minimum | Maximum |
+| --- | --- | --- |
+| Font size | 8 | 32 |
+| Line height | 1 | 2 |
+| Padding | 0 | 32 |
+| Scrollback lines | 1000 | 100000 |
+
+If you type a value out of range, zwinger sets the nearest limit and shows a note, for example
+`Font size: 64 is more than the maximum. Set to 32.`
+
+**Import from Ghostty** reads the Ghostty config files and applies the settings and colors that they set. The note
+shows the keys that zwinger does not use. It also shows each Ghostty value that was out of range, with its config line
+and the value that the setting got, for example
+`Scrollback lines: Ghostty scrollback-limit = 50000000 is more than the maximum. Set to 100000.` Ghostty uses
+different units for some keys: `adjust-cell-height` is a percent that is added to a line height of 1, and
+`scrollback-limit` is bytes, at 100 bytes for each line. If a key occurs more than one time, only the value that
+applies gives a note.

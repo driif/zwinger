@@ -23,3 +23,26 @@ export function ghosttyTheme(current: Theme, palette: GhosttyPalette, themes: Th
     },
   };
 }
+
+export type NumberSetting = "fontSize" | "lineHeight" | "padding" | "scrollback";
+
+/** The labels and limits of the numeric terminal settings. The backend uses the same limits. */
+export const NUMBERS: Record<NumberSetting, { label: string; min: number; max: number; step: number }> = {
+  fontSize: { label: "Font size", min: 8, max: 32, step: 0.5 },
+  lineHeight: { label: "Line height", min: 1, max: 2, step: 0.05 },
+  padding: { label: "Padding", min: 0, max: 32, step: 1 },
+  scrollback: { label: "Scrollback lines", min: 1000, max: 100000, step: 1000 },
+};
+
+/** `value` clamped to the limits of `setting`, and a note if it was out of range. */
+export function clampNumber(setting: NumberSetting, value: number) {
+  const { min, max } = NUMBERS[setting];
+  const clamped = Math.min(max, Math.max(min, value));
+  return { value: clamped, note: clamped === value ? undefined : adjustmentNote(setting, String(value), clamped) };
+}
+
+/** The note for an `input` out of range that `setting` got as the limit `value`. */
+export function adjustmentNote(setting: NumberSetting, input: string, value: number) {
+  const { label, max } = NUMBERS[setting];
+  return `${label}: ${input} is ${value === max ? "more than the maximum" : "less than the minimum"}. Set to ${value}.`;
+}

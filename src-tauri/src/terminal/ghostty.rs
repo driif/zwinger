@@ -1,5 +1,6 @@
 //! Reads the terminal settings and colors of a Ghostty config.
 
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -53,6 +54,19 @@ pub struct Import {
     pub palette: Option<Palette>,
     /// The keys that zwinger does not use, each once, in file order.
     pub ignored: Vec<String>,
+    /// The numeric settings whose applied config value was out of range, in file order.
+    pub adjusted: Vec<Adjustment>,
+}
+
+/// A config value that was out of range. `setting` is the camelCase name of the setting.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Adjustment {
+    pub setting: &'static str,
+    /// The config line as `key = value`.
+    pub input: String,
+    /// The limit that the setting got.
+    pub value: f64,
 }
 
 /// The config files, in the order that Ghostty reads them: a later file wins.
@@ -104,6 +118,7 @@ fn parse_files<'a>(texts: impl IntoIterator<Item = &'a str>) -> Import {
             };
             let (key, value) = (key.trim(), unquote(value.trim()));
             let settings = &mut import.settings;
+            let adjusted = &mut import.adjusted;
             let used = match key {
                 "config-file" => true,
                 "font-family" => {
@@ -116,21 +131,21 @@ fn parse_files<'a>(texts: impl IntoIterator<Item = &'a str>) -> Import {
                     }
                     true
                 }
-                "font-size" => set(
+                "font-size" => set_number(
                     &mut settings.font_size,
-                    value
-                        .parse::<f64>()
-                        .ok()
-                        .filter(|s| s.is_finite() && *s > 0.0)
-                        .map(|s| s.clamp(*FONT_SIZE.start(), *FONT_SIZE.end())),
+                    value.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0),
+                    &FONT_SIZE,
+                    Note { setting: "fontSize", key, value, adjusted },
                 ),
-                "adjust-cell-height" => set(
+                "adjust-cell-height" => set_number(
                     &mut settings.line_height,
                     value
                         .strip_suffix('%')
                         .and_then(|p| p.trim().parse::<f64>().ok())
                         .filter(|p| p.is_finite())
-                        .map(|p| (1.0 + p / 100.0).clamp(*LINE_HEIGHT.start(), *LINE_HEIGHT.end())),
+                        .map(|p| 1.0 + p / 100.0),
+                    &LINE_HEIGHT,
+                    Note { setting: "lineHeight", key, value, adjusted },
                 ),
                 "cursor-style" => set(
                     &mut settings.cursor_style,
@@ -142,15 +157,17 @@ fn parse_files<'a>(texts: impl IntoIterator<Item = &'a str>) -> Import {
                     },
                 ),
                 "cursor-style-blink" => set(&mut settings.cursor_blink, value.parse().ok()),
-                "scrollback-limit" => set(
+                "scrollback-limit" => set_number(
                     &mut settings.scrollback,
-                    value.parse::<u64>().ok().map(|bytes| {
-                        (bytes / 100).clamp(u64::from(*SCROLLBACK.start()), u64::from(*SCROLLBACK.end())) as u32
-                    }),
+                    value.parse::<u64>().ok().map(|bytes| u32::try_from(bytes / 100).unwrap_or(u32::MAX)),
+                    &SCROLLBACK,
+                    Note { setting: "scrollback", key, value, adjusted },
                 ),
-                "window-padding-x" => set(
+                "window-padding-x" => set_number(
                     &mut settings.padding,
-                    value.split(',').next().and_then(|x| x.trim().parse::<u32>().ok()).map(|x| x.min(*PADDING.end())),
+                    value.split(',').next().and_then(|x| x.trim().parse::<u32>().ok()),
+                    &PADDING,
+                    Note { setting: "padding", key, value, adjusted },
                 ),
                 "macos-option-as-alt" => set(
                     &mut settings.option_as_meta,
@@ -201,6 +218,44 @@ fn set<T>(field: &mut Option<T>, value: Option<T>) -> bool {
         *field = value;
     }
     valid
+}
+
+/// Where `set_number` notes a clamp.
+struct Note<'a> {
+    setting: &'static str,
+    key: &'a str,
+    value: &'a str,
+    adjusted: &'a mut Vec<Adjustment>,
+}
+
+/// Sets `field` to a valid value clamped to `range`. The note of an earlier value of the same setting goes, because this
+/// value replaces it. Returns if the value was valid.
+fn set_number<T: Copy + PartialOrd + Into<f64>>(
+    field: &mut Option<T>,
+    value: Option<T>,
+    range: &RangeInclusive<T>,
+    note: Note,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let applied = if value < *range.start() {
+        *range.start()
+    } else if value > *range.end() {
+        *range.end()
+    } else {
+        value
+    };
+    note.adjusted.retain(|a| a.setting != note.setting);
+    if applied != value {
+        note.adjusted.push(Adjustment {
+            setting: note.setting,
+            input: format!("{} = {}", note.key, note.value),
+            value: applied.into(),
+        });
+    }
+    *field = Some(applied);
+    true
 }
 
 fn unquote(value: &str) -> &str {
@@ -284,6 +339,68 @@ config-file = other
             Settings { font_size: Some(32.0), line_height: Some(1.0), padding: Some(32), ..Settings::default() }
         );
         assert_eq!(parse("adjust-cell-height = 300%\n").settings.line_height, Some(2.0));
+    }
+
+    fn adjusted(text: &str) -> Vec<(&'static str, String, f64)> {
+        parse(text).adjusted.into_iter().map(|a| (a.setting, a.input, a.value)).collect()
+    }
+
+    #[test]
+    fn notes_each_clamped_value_with_its_config_line() {
+        assert_eq!(
+            adjusted(
+                "font-size = 64\nadjust-cell-height = -40%\nwindow-padding-x = 80,2\nscrollback-limit = 50000000\n"
+            ),
+            [
+                ("fontSize", "font-size = 64".into(), 32.0),
+                ("lineHeight", "adjust-cell-height = -40%".into(), 1.0),
+                ("padding", "window-padding-x = 80,2".into(), 32.0),
+                ("scrollback", "scrollback-limit = 50000000".into(), 100_000.0),
+            ]
+        );
+        assert_eq!(
+            adjusted("font-size = 4\nadjust-cell-height = 300%\nscrollback-limit = 99999\n"),
+            [
+                ("fontSize", "font-size = 4".into(), 8.0),
+                ("lineHeight", "adjust-cell-height = 300%".into(), 2.0),
+                ("scrollback", "scrollback-limit = 99999".into(), 1000.0),
+            ]
+        );
+        assert_eq!(
+            adjusted("scrollback-limit = 18446744073709551615\n"),
+            [("scrollback", "scrollback-limit = 18446744073709551615".into(), 100_000.0)]
+        );
+    }
+
+    #[test]
+    fn boundaries_in_range_and_bad_values_are_not_noted() {
+        let text = "font-size = 8\nfont-size = 32\nadjust-cell-height = 0%\nadjust-cell-height = 100%\nwindow-padding-x = 0\n\
+                    window-padding-x = 32\nscrollback-limit = 100000\nscrollback-limit = 10000000\nfont-size = 13\n\
+                    font-size = 0\nfont-size = big\nadjust-cell-height = 2\nwindow-padding-x = -4\nscrollback-limit = -1\n";
+        let import = parse(text);
+        assert_eq!(import.adjusted, []);
+        assert_eq!(
+            import.settings,
+            Settings {
+                font_size: Some(13.0),
+                line_height: Some(2.0),
+                padding: Some(32),
+                scrollback: Some(100_000),
+                ..Settings::default()
+            }
+        );
+        assert_eq!(import.ignored, ["font-size", "adjust-cell-height", "window-padding-x", "scrollback-limit"]);
+    }
+
+    #[test]
+    fn only_the_applied_value_is_noted() {
+        // A later value replaces the note of an earlier one; a later bad value keeps it.
+        assert_eq!(adjusted("font-size = 64\nfont-size = 14\n"), []);
+        assert_eq!(adjusted("font-size = 64\nfont-size = 4\n"), [("fontSize", "font-size = 4".into(), 8.0)]);
+        assert_eq!(adjusted("font-size = 64\nfont-size = big\n"), [("fontSize", "font-size = 64".into(), 32.0)]);
+        let files = parse_files(["window-padding-x = 80\nfont-size = 2\n", "window-padding-x = 4\n"]);
+        assert_eq!(files.settings.padding, Some(4));
+        assert_eq!(files.adjusted, [Adjustment { setting: "fontSize", input: "font-size = 2".into(), value: 8.0 }]);
     }
 
     #[test]
