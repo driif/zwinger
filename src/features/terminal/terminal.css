@@ -69,6 +69,7 @@
 }
 
 .pane-header {
+  container-type: inline-size;
   position: absolute;
   box-sizing: border-box;
   display: flex;
@@ -89,4 +90,18 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.pane-actions-trigger {
+  display: none;
+}
+
+@container (max-width: 14rem) {
+  .pane-actions {
+    display: none;
+  }
+
+  .pane-actions-trigger {
+    display: inline-grid;
+  }
 }

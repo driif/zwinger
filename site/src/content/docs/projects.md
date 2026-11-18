@@ -95,7 +95,9 @@ reload, you see that output.
 
 The terminal view of a project can show terminals side by side. A split goes right (⌘D) or down (⌘⇧D) and opens a Mac
 shell in the same folder. Any kinds of terminal can be in the same layout. zwinger saves the layout per project and
-restores it after a restart.
+restores it after a restart. Each pane header shows where its terminal runs. **Mac** means the shell or agent runs
+directly on your Mac. **VM** means it runs inside the cage. The badge also appears when the terminal is dormant.
+In a narrow pane, select **…** in its header to split the pane, open its folder in your editor, or hide the pane.
 
 When you close a pane, the terminal is hidden but continues to run. To end its process, use **Close** in the tree.
 

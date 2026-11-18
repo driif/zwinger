@@ -1,5 +1,5 @@
-import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
-import { Code, Columns2, Play, Rows2, X } from "lucide-react";
+import { Badge, Button, Dialog, IconButton, IconButtonGroup } from "@driif/motiv";
+import { Code, Columns2, Ellipsis, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, PointerEvent, useRef, useState } from "react";
 import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
@@ -63,6 +63,7 @@ export function PaneLayout({
   onHide,
 }: Props) {
   const area = useRef<HTMLDivElement>(null);
+  const [actionsFor, setActionsFor] = useState<string>();
   const [drag, setDrag] = useState<{ path: Path; ratio: number }>();
   const shown = layout && drag ? setRatio(layout, drag.path, drag.ratio) : layout;
   const { panes: places, splits } = shown ? place(shown) : { panes: [], splits: [] };
@@ -117,30 +118,48 @@ export function PaneLayout({
       })}
       {places.map(({ terminal, rect }) => {
         const pane = panes.find((p) => p.key === terminal);
-        const name = pane && paneName(pane, panes);
+        if (!pane) return null;
+        const name = paneName(pane, panes);
+        const actions = [
+          { label: "Split right with a Mac shell", icon: <Columns2 size={12} />, run: () => onSplit(terminal, "row") },
+          { label: "Split down with a Mac shell", icon: <Rows2 size={12} />, run: () => onSplit(terminal, "column") },
+          ...(editor ? [{ label: `Open the folder of ${name} in ${editor}`, icon: <Code size={12} />, run: () => onOpenEditor(terminal) }] : []),
+          { label: "Hide pane", icon: <X size={12} />, run: () => onHide(terminal) },
+        ];
         return (
-          pane && (
-            <div
-              key={`header-${terminal}`}
-              className={terminal === focused ? "pane-header focused" : "pane-header"}
-              style={{ ...at(rect), height: "var(--zw-pane-header)" }}
-            >
-              <KindIcon kind={pane.kind} />
-              <span className="grow pane-name">{name}</span>
-              <IconButtonGroup label={`Actions for ${name}`}>
-                <IconButton icon={<Columns2 size={12} />} label="Split right with a Mac shell" onClick={() => onSplit(terminal, "row")} />
-                <IconButton icon={<Rows2 size={12} />} label="Split down with a Mac shell" onClick={() => onSplit(terminal, "column")} />
-                {editor && (
-                  <IconButton
-                    icon={<Code size={12} />}
-                    label={`Open the folder of ${name} in ${editor}`}
-                    onClick={() => onOpenEditor(terminal)}
-                  />
-                )}
-                <IconButton icon={<X size={12} />} label="Hide pane" onClick={() => onHide(terminal)} />
-              </IconButtonGroup>
-            </div>
-          )
+          <div
+            key={`header-${terminal}`}
+            className={terminal === focused ? "pane-header focused" : "pane-header"}
+            style={{ ...at(rect), height: "var(--zw-pane-header)" }}
+          >
+            <KindIcon kind={pane.kind} />
+            <Badge>{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>
+            <span className="grow pane-name">{name}</span>
+            <IconButtonGroup className="pane-actions" label={`Actions for ${name}`}>
+              {actions.map((action) => <IconButton key={action.label} label={action.label} icon={action.icon} onClick={action.run} />)}
+            </IconButtonGroup>
+            <IconButton
+              className="pane-actions-trigger"
+              label={`Actions for ${name}`}
+              icon={<Ellipsis size={14} />}
+              aria-haspopup="dialog"
+              onClick={() => setActionsFor(terminal)}
+            />
+            {visible && actionsFor === terminal && (
+              <Dialog open title={`Actions for ${name}`} onClose={() => setActionsFor(undefined)}>
+                <div className="stack">
+                  {actions.map((action) => (
+                    <Button key={action.label} iconLeft={action.icon} variant="ghost" onClick={() => {
+                      setActionsFor(undefined);
+                      action.run();
+                    }}>
+                      {action.label}
+                    </Button>
+                  ))}
+                </div>
+              </Dialog>
+            )}
+          </div>
         );
       })}
       {splits.map(({ path, direction, ratio, rect }) => {
