@@ -1,9 +1,12 @@
+use std::process::{Command, Stdio};
+
 use serde::Serialize;
 use tauri::{AppHandle, Manager as _};
 use tauri_plugin_updater::UpdaterExt as _;
 
 use crate::cage::manager::Manager;
 use crate::error::{Error, Result};
+use crate::instance::{self, InstanceLock};
 use crate::runtime::Microsandbox;
 
 #[derive(Serialize)]
@@ -48,5 +51,25 @@ pub async fn install_update(app: AppHandle, stop_cages: bool) -> Result<()> {
         manager.stop_all(crate::STOP_ALL_LIMIT).await;
     }
     restart_guard(live(&app))?;
-    app.restart()
+    let exe = std::env::current_exe().map_err(|e| Error::Update(format!("could not find the updated app: {e}")))?;
+    let bundle = instance::bundle_path(&exe).map_err(|e| Error::Update(e.to_string()))?;
+    let helper_exe = instance::bundle_executable(bundle).unwrap_or_else(|_| exe.clone());
+    let mut helper = Command::new(&helper_exe)
+        .arg(instance::UPDATE_HELPER_ARG)
+        .arg(app.state::<InstanceLock>().path())
+        .arg(bundle)
+        .args(std::env::args_os().skip(1))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error::Update(format!("could not start the update helper: {e}")))?;
+    let Some(writer) = helper.stdin.take() else {
+        let _ = helper.kill();
+        return Err(Error::Update("the update helper has no handoff pipe".into()));
+    };
+    // The helper sees EOF only when this process exits, after its cleanup.
+    std::mem::forget(writer);
+    app.exit(0);
+    Ok(())
 }

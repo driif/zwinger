@@ -6,6 +6,7 @@ mod commands;
 mod editor;
 mod error;
 mod host_agents;
+mod instance;
 mod netlog;
 mod network;
 mod preferences;
@@ -22,7 +23,7 @@ mod terminal;
 mod updates;
 mod workspaces;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -33,9 +34,12 @@ use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
 use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
 use crate::cage::manager::{Manager, SessionView};
 use crate::host_agents::HostAgents;
+use crate::instance::InstanceLock;
 use crate::runtime::{Microsandbox, SandboxRuntime};
 use crate::secrets::Vault;
 use crate::session::VmChoice;
+
+pub use instance::run_update_helper;
 
 pub(crate) const REAP_LIMIT: Duration = Duration::from_secs(10);
 /// The open files that the app asks for. Each cage's proxy holds guest and
@@ -185,6 +189,15 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     }));
 }
 
+/// Makes the app data folder and locks it. The path is canonical, like the
+/// host paths of the sessions it is compared with.
+fn open_data(dir: &Path) -> std::io::Result<(PathBuf, Option<InstanceLock>)> {
+    std::fs::create_dir_all(dir)?;
+    let data = dir.canonicalize()?;
+    let lock = instance::acquire(&data)?;
+    Ok((data, lock))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -193,14 +206,27 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
         .setup(|app| {
+            // Must stay first: a second instance must not touch the data or
+            // reap the VMs of the first.
+            let (data, lock) = open_data(&app.path().app_data_dir()?)?;
+            let Some(lock) = lock else {
+                use tauri_plugin_dialog::DialogExt as _;
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+                let handle = app.handle().clone();
+                app.dialog()
+                    .message("zwinger is already open with the same app data. Use the open window, or quit it first.")
+                    .title("zwinger")
+                    .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                    .show(move |_| handle.exit(0));
+                return Ok(());
+            };
+            app.manage(lock);
             report_panics(app.handle().clone());
             if let Err(e) = raise_open_files() {
                 eprintln!("the open file limit could not be raised: {e}");
             }
-            let data = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data)?;
-            // Canonical, like the host paths of the sessions it is compared with.
-            let data = data.canonicalize()?;
             let pi = agent::pi::install_pi(&app.path().resource_dir()?.join("pi"), &data.join("runtime"))?;
             let runtime = Microsandbox { pi };
             let data_dir = data.clone();
@@ -396,6 +422,15 @@ mod tests {
     use crate::runtime::fake::FakeRuntime;
     use crate::secrets::fake::MemoryVault;
     use std::path::PathBuf;
+
+    #[test]
+    fn open_data_makes_the_folder_and_takes_the_lock() {
+        let dir = std::env::temp_dir().join(format!("zwinger-open-{}", uuid::Uuid::new_v4())).join("data");
+        let (data, lock) = open_data(&dir).unwrap();
+        assert_eq!(data, dir.canonicalize().unwrap());
+        assert!(lock.is_some());
+        assert!(instance::acquire(&data).unwrap().is_none());
+    }
 
     /// A plain test: `boot` makes its own runtime context, as in the app's setup.
     #[test]

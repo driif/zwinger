@@ -9218,6 +9218,7 @@ dependencies = [
  "libc",
  "lru",
  "microsandbox",
+ "plist",
  "portable-pty",
  "psl",
  "rcgen",

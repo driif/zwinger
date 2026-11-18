@@ -19,4 +19,6 @@ When an update is available, zwinger shows the version. Select **Restart to upda
 If a cage runs, zwinger asks first, because the restart ends the VMs and the work of their agents. Select **Stop cages
 and restart** to continue. If a cage does not stop, the update applies at the next start.
 
+After the update installs, zwinger closes and restarts by itself.
+
 After an update, you do not have to open the app with **Open Anyway** again.
