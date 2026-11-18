@@ -2,7 +2,7 @@ import { Button, Card, CardHeader, FloatingField } from "@driif/motiv";
 import { ArrowLeft, Pencil, Plus, Settings, Trash2 } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { createCage, deleteCage, renameCage } from "./api";
-import { CageSettings } from "./CageSettings";
+import { CageSettings, StartDiagnostics } from "./CageSettings";
 import { CageView, SessionView, Workspace } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
 
@@ -42,7 +42,8 @@ export function CagesPage({ cages, sessions, workspaces, runtimes, run }: Props)
     run(() => renameCage(renaming.id, renaming.name).then(() => setRenaming(undefined)));
   }
 
-  if (edited)
+  if (edited) {
+    const editedVm = { ...edited, ...edited.vms[0] };
     return (
       <section className="page">
         <header className="page-header row">
@@ -52,10 +53,12 @@ export function CagesPage({ cages, sessions, workspaces, runtimes, run }: Props)
           <h1 className="page-title grow">{edited.name}</h1>
         </header>
         <div className="tab-body">
-          <CageSettings cage={edited} vm={{ ...edited, ...edited.vms[0] }} runtimes={runtimes} run={run} />
+          <CageSettings cage={edited} vm={editedVm} runtimes={runtimes} run={run} />
+          <StartDiagnostics vm={editedVm} startHistory={editedVm.startHistory} />
         </div>
       </section>
     );
+  }
 
   return (
     <section className="page">

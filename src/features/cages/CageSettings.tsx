@@ -1,13 +1,14 @@
-import { Button, Card, CardBody, CardHeader, FloatingField, LiquidSwitch, SegmentedControl } from "@driif/motiv";
+import { Badge, Button, Card, CardBody, CardHeader, FloatingField, LiquidSwitch, SegmentedControl } from "@driif/motiv";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { addMount, removeMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
-import { AGENT_NAMES, CageView, VmCage } from "../../shared/api";
+import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
 import { phaseName } from "../projects/StartProgress";
+import { direction, duration, trendSummary } from "./startTrend";
 
 export const WORKSPACE = "/workspace";
 
@@ -31,7 +32,7 @@ interface MountDraft {
 
 interface Props {
   cage: CageView;
-  /** The cage whose VM the runtime state and the last start come from. */
+  /** The cage whose VM the runtime state comes from. */
   vm: VmCage | null;
   runtimes: Runtimes;
   run: Run;
@@ -39,7 +40,7 @@ interface Props {
   intent?: Intent;
 }
 
-/** The settings of a cage: its mounts, its agent runtimes and its last start. All sessions of the cage share them. */
+/** The settings of a cage: its mounts and its agent runtimes. All sessions of the cage share them. */
 export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
   const [draft, setDraft] = useState<MountDraft>();
 
@@ -197,7 +198,14 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
           </ul>
         </CardBody>
       </Card>
+    </>
+  );
+}
 
+/** The last start and the start trend of a VM. They do not depend on the cage that the project uses next. */
+export function StartDiagnostics({ vm, startHistory }: { vm: VmCage | null; startHistory: StartRecord[] }) {
+  return (
+    <>
       {vm?.startTimings && (
         <Card variant="outlined" padding="md">
           <CardHeader
@@ -218,6 +226,25 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
         </Card>
       )}
 
+      {startHistory.length > 0 && (
+        <Card variant="outlined" padding="md">
+          <CardHeader title="Start trend" titleAs="h2" description={trendSummary(startHistory)} />
+          <CardBody>
+            <ol className="list">
+              {startHistory.map(({ at, totalMs }, i) => (
+                <li key={i} className="row">
+                  <span className="grow">
+                    Start {i + 1} of {startHistory.length}
+                    <span className="muted"> · {new Date(at).toLocaleString()}</span>
+                  </span>
+                  <span className="muted mono">{duration(totalMs)}</span>
+                  {i > 0 && <Badge>{direction(startHistory[i - 1].totalMs, totalMs)}</Badge>}
+                </li>
+              ))}
+            </ol>
+          </CardBody>
+        </Card>
+      )}
     </>
   );
 }

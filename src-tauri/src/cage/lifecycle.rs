@@ -11,6 +11,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
+use crate::cage::history::StartRecord;
 use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, State, Vm, bin_dir, blocking, ids, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
@@ -73,10 +74,12 @@ impl<R: SandboxRuntime> Manager<R> {
         let started = Instant::now();
         let claimed = {
             let _edit = lock(&self.secret_edit);
-            let (key, members, cage) = self.claim_start(session_id)?;
-            self.begin(started, key, members, cage)
+            let claim = self.claim_start(session_id);
+            claim.map(|(key, members, cage)| self.begin(started, key, members, cage))
         };
-        self.boot(session_id, started, claimed).await
+        // A renewed own key wiped the history of the old key.
+        self.save_history();
+        self.boot(session_id, started, claimed?).await
     }
 
     /// Restarts the running VM of the session's effective cage with the
@@ -342,7 +345,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Err(_) => None,
         };
 
-        {
+        let line = {
             let mut state = lock(&self.state);
             match result {
                 Ok(vm) => {
@@ -356,6 +359,11 @@ impl<R: SandboxRuntime> Manager<R> {
                     run.guest_watch = Some(self.watch_guest_logins(id, &vm));
                     state.generation += 1;
                     let generation = state.generation;
+                    // In the same lock as the insert, so a stop cannot part the record from its start.
+                    timings.finish(started);
+                    run.timings = timings;
+                    state.history.push(id, StartRecord::now(run.timings.total_ms));
+                    let line = run.timings.line(id);
                     state.vms.insert(
                         id.to_owned(),
                         Vm::Running {
@@ -368,6 +376,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             host: Box::new(run),
                         },
                     );
+                    line
                 }
                 Err(e) => {
                     timings.finish(started);
@@ -379,11 +388,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             }
         };
-        timings.finish(started);
-        eprintln!("{}", timings.line(id));
-        if let Some(Vm::Running { host, .. }) = lock(&self.state).vms.get_mut(id) {
-            host.timings = timings;
-        }
+        eprintln!("{line}");
+        self.save_history();
         Ok(())
     }
 
@@ -891,6 +897,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 VmChoice::Shared => Ok(()),
             }
         };
+        self.save_history();
         let restarted = match restart {
             // The other members are the VM's members now: the session left it with the save.
             Some((key, generation, others)) => {

@@ -128,6 +128,13 @@ You start and stop the VM of a project: the shared VM of its cage, or its own VM
 status of a starting cage names the current phase. **Settings > Last start** of the project shows the time of each
 phase. If the guest Node check fails, zwinger cancels the remaining guest checks and stops the VM.
 
+**Settings > Start trend** shows the total time of the last 10 successful starts of the VM, oldest first, also when
+the VM is stopped. Each start shows if it was slower, faster or the same as the start before. Failed and cancelled
+starts are not kept. The trend is per VM: projects that share a VM share its trend, and an own VM has its own trend.
+The trend stays after you quit zwinger. Each total shows to the millisecond. **Cages > Edit** shows the trend of the
+shared VM of the cage. If you remove the cage of a project while its VM runs, Settings still shows the last start and
+the trend of that VM.
+
 A start mounts the [agent runtimes](/agents/#runtimes) that are installed at that time. If you install a runtime
 later, restart the cage.
 

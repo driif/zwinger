@@ -135,12 +135,12 @@ fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
 }
 
 /// Writes a temp file in the same dir and renames it over the file.
-fn write<T: Serialize>(path: &Path, items: &[T]) -> Result<()> {
+pub(crate) fn write<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(items)?)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }

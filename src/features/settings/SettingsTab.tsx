@@ -7,7 +7,7 @@ import { CageView, SessionView } from "../../shared/api";
 import type { Editors } from "../launcher/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
-import { CageSettings, WORKSPACE } from "../cages/CageSettings";
+import { CageSettings, StartDiagnostics, WORKSPACE } from "../cages/CageSettings";
 import { sessionCage } from "../cages/sessionCage";
 
 interface Props {
@@ -28,6 +28,8 @@ interface Props {
 
 export function SettingsTab({ session, onProjectEditor, cages, defaultCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
   const { cage, vmCage } = sessionCage(session, cages);
+  // By key, not by `vmCage`: that is null for a planned VM, and for a shared VM that runs for other projects.
+  const startHistory = cages.flatMap((c) => c.vms).find((v) => v.key === session.vmKey)?.startHistory ?? [];
   const [name, setName] = useState(session.name);
   const [nameError, setNameError] = useState<string>();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -156,6 +158,8 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
       )}
 
       {cage && <CageSettings cage={cage} vm={vmCage} runtimes={runtimes} run={run} intent={intent} />}
+      {/* Outside the `cage` guard: a running VM keeps its diagnostics when the project has no next cage. */}
+      <StartDiagnostics vm={vmCage} startHistory={startHistory} />
 
       <Card variant="outlined" padding="md">
         <CardHeader

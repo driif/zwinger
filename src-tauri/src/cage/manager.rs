@@ -7,6 +7,7 @@ use serde::Serialize;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, launch};
+use crate::cage::history::{self, StartHistory, StartRecord};
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
@@ -85,6 +86,9 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) guest_sink: Arc<OnceLock<GuestSink>>,
     pub(crate) progress_sink: Arc<OnceLock<ProgressSink>>,
     pub(crate) app_notices: Mutex<Vec<String>>,
+    /// Serializes the saves of the start history, so an older snapshot
+    /// cannot overwrite a newer one. Take it before the state lock.
+    pub(crate) history_save: Mutex<()>,
 }
 
 pub(crate) struct State<V> {
@@ -106,6 +110,8 @@ pub(crate) struct State<V> {
     /// The generation of the last VM that started. A stop names the
     /// generation it resolved, so a delayed stop cannot hit a later VM.
     pub(crate) generation: u64,
+    /// The totals of the last successful starts per VM key.
+    pub(crate) history: StartHistory,
     /// The sessions that a restart to add joins to a VM, from the first
     /// check until the new start claims them. No other start takes them.
     pub(crate) joining: HashSet<String>,
@@ -258,6 +264,8 @@ pub struct VmView {
     pub guest_logins: Vec<AgentKind>,
     /// The phase durations of the start of the running VM.
     pub start_timings: Option<Timings>,
+    /// The last successful starts of the VM, oldest first, also when it is stopped.
+    pub start_history: Vec<StartRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +457,7 @@ impl<R: SandboxRuntime> Manager<R> {
             None
         });
         let workspaces = workspaces::reconcile(stored.clone(), &ids(&sessions));
+        let history = StartHistory::load(&store.dir().join(history::FILE));
         for w in &workspaces {
             if let Some(cage) = &w.default_cage {
                 store::check_cage(&cages, &format!("workspace {} ({})", w.name, w.id), cage)?;
@@ -481,6 +490,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 net: HashMap::new(),
                 generation: 0,
                 joining: HashSet::new(),
+                history,
             })),
             net_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
@@ -492,7 +502,22 @@ impl<R: SandboxRuntime> Manager<R> {
             guest_sink: Arc::new(OnceLock::new()),
             progress_sink: Arc::new(OnceLock::new()),
             app_notices: Mutex::default(),
+            history_save: Mutex::new(()),
         })
+    }
+
+    /// Saves the start history if it changed. Call it without the state
+    /// lock. A failed save only logs: the history stays in memory, and the
+    /// next save writes it again.
+    pub(crate) fn save_history(&self) {
+        let _save = lock(&self.history_save);
+        let Some(records) = lock(&self.state).history.snapshot() else {
+            return;
+        };
+        if let Err(e) = history::write(&self.store.dir().join(history::FILE), &records) {
+            eprintln!("the start history could not be saved: {e}");
+            lock(&self.state).history.unsaved();
+        }
     }
 
     /// Only the first sink counts.
@@ -605,6 +630,8 @@ impl<R: SandboxRuntime> Manager<R> {
         state.vms.remove(key);
         state.live.remove(key);
         state.net.remove(key);
+        // The caller saves it after it releases the state lock.
+        state.history.remove(key);
         self.remove_vm_dirs(key)
     }
 
@@ -859,9 +886,11 @@ impl<R: SandboxRuntime> Manager<R> {
                 state.vms.remove(&key);
                 state.live.remove(&key);
                 state.net.remove(&key);
+                state.history.remove(&key);
             }
             (cage, own_keys)
         };
+        self.save_history();
         let mut result = Ok(());
         // The library values stay for the other cages and for later use.
         for credential in cage.network.credentials().into_iter().filter(|c| c.source.is_local()) {
@@ -1136,6 +1165,7 @@ impl<R: SandboxRuntime> Manager<R> {
             });
             wiped
         };
+        self.save_history();
         self.runs.forget(session_id, None);
         match std::fs::remove_dir_all(self.data.join("tasks").join(session_id)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
@@ -1211,6 +1241,7 @@ fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> V
         host_notices,
         guest_logins,
         start_timings,
+        start_history: state.history.of(key),
     }
 }
 

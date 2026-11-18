@@ -115,6 +115,12 @@ export interface StartTimings {
   totalMs: number;
 }
 
+/** A successful start: when it ended, in ms since the epoch, and its total duration. */
+export interface StartRecord {
+  at: number;
+  totalMs: number;
+}
+
 export type CageStatus =
   | { state: "stopped" }
   | { state: "starting"; phase: StartPhase }
@@ -269,6 +275,8 @@ export interface VmView {
   guestLogins: AgentKind[];
   /** The phase durations of the start of the running VM. */
   startTimings: StartTimings | null;
+  /** The last successful starts of the VM, oldest first, also when it is stopped. */
+  startHistory: StartRecord[];
 }
 
 /** A cage with the state of one of its VMs. `id` is the cage id, `key` the VM key. */
