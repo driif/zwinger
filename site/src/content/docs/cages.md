@@ -118,7 +118,7 @@ including the vault file. See [Agents with no cage](/agents/#agents-with-no-cage
 
 You start and stop the VM of a project: the shared VM of its cage, or its own VM. A start shows its phases: vault, prepare, proxy, boot, guest and wrappers. The
 status of a starting cage names the current phase. **Settings > Last start** of the project shows the time of each
-phase.
+phase. If the guest Node check fails, zwinger cancels the remaining guest checks and stops the VM.
 
 A start mounts the [agent runtimes](/agents/#runtimes) that are installed at that time. If you install a runtime
 later, restart the cage.

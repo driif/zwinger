@@ -472,6 +472,8 @@ pub mod fake {
         pub binds: Arc<Mutex<Vec<Bind>>>,
         /// The guest folder and host folder of each member of the last start.
         pub folders: Arc<Mutex<Vec<(String, std::path::PathBuf)>>>,
+        /// Give the test control of the Node and trust checks during a start.
+        pub manual_guest_checks: Arc<Mutex<Option<UnboundedSender<FakePipe>>>>,
         /// What `node --version` prints. `None` prints a supported version.
         pub node_version: Arc<Mutex<Option<String>>>,
         /// The scripts whose probe fails: `node <script> --version`, or the
@@ -660,6 +662,12 @@ pub mod fake {
         async fn open_pipe(&self, _: &FakeVm, argv: &[String], _: &str) -> Result<Pipe> {
             let (input, stdin) = mpsc::channel(PIPE_QUEUE);
             let (out, events) = mpsc::channel(PIPE_QUEUE);
+            if (argv == ["node", "--version"] || argv == launch::trust_argv())
+                && let Some(checks) = self.manual_guest_checks.lock().unwrap().as_ref()
+            {
+                checks.send(FakePipe { argv: argv.to_vec(), stdin, out }).map_err(|_| Error::SessionClosed)?;
+                return Ok(Pipe { input, events });
+            }
             if argv == ["node", "--version"] {
                 let version = self.node_version.lock().unwrap().clone();
                 let version = version.unwrap_or_else(|| "v22.19.0\n".into());

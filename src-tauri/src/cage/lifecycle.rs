@@ -396,25 +396,32 @@ impl<R: SandboxRuntime> Manager<R> {
         let gemini = run.gemini.clone().map(|entry| ["node".to_owned(), entry, "--version".to_owned()]);
         let (profile, trust) = (launch::profile_argv(), launch::trust_argv());
         let proxy = run.proxy.clone();
-        let ((node, node_took), tui, gemini, (profile, profile_took), (trust, trust_took)) = tokio::join!(
-            timed(self.check_node(vm)),
-            async {
-                match probes.pi {
-                    Probe::Run(_) => Some(timed(self.probe_tui(vm, proxy.as_deref())).await),
-                    Probe::Skip => None,
-                }
-            },
-            async {
-                match (&probes.gemini, &gemini) {
-                    (Probe::Run(_), Some(argv)) => Some(timed(self.probe(vm, argv)).await),
-                    _ => None,
-                }
-            },
-            // Before any session starts, so each login shell has the agent commands.
-            timed(self.probe(vm, &profile)),
-            timed(self.probe(vm, &trust)),
-        );
-        timings.add(Phase::Node, node_took);
+        let node = async {
+            let (result, took) = timed(self.check_node(vm)).await;
+            timings.add(Phase::Node, took);
+            result
+        };
+        // A Node error drops the other checks. The caller then stops the entire VM.
+        let checks = async {
+            Ok(tokio::join!(
+                async {
+                    match probes.pi {
+                        Probe::Run(_) => Some(timed(self.probe_tui(vm, proxy.as_deref())).await),
+                        Probe::Skip => None,
+                    }
+                },
+                async {
+                    match (&probes.gemini, &gemini) {
+                        (Probe::Run(_), Some(argv)) => Some(timed(self.probe(vm, argv)).await),
+                        _ => None,
+                    }
+                },
+                // Before any session starts, so each login shell has the agent commands.
+                timed(self.probe(vm, &profile)),
+                timed(self.probe(vm, &trust)),
+            ))
+        };
+        let ((), (tui, gemini, (profile, profile_took), (trust, trust_took))) = tokio::try_join!(node, checks)?;
         let tui = tui.map(|(tui, took)| {
             timings.add(Phase::Tui, took);
             tui
@@ -425,7 +432,6 @@ impl<R: SandboxRuntime> Manager<R> {
         });
         timings.add(Phase::Setup, profile_took);
         timings.add(Phase::Trust, trust_took);
-        node?;
         match tui {
             Some(Ok(())) => probes.pi.save().await,
             Some(Err(e)) => {
@@ -1823,6 +1829,30 @@ mod tests {
             assert_eq!(tui_probes(&runtime), 1);
             manager.stop(&id, None).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_check_cancels_an_unfinished_trust_check() {
+        let (manager, runtime, id) = manager();
+        let (checks, mut opened) = mpsc::unbounded_channel();
+        *runtime.manual_guest_checks.lock().unwrap() = Some(checks);
+        let guest = async {
+            let first = opened.recv().await.unwrap();
+            let second = opened.recv().await.unwrap();
+            let (node, trust) = if first.argv == ["node", "--version"] { (first, second) } else { (second, first) };
+            assert_eq!(trust.argv, launch::trust_argv());
+            tokio::time::pause();
+            node.out.send(PipeEvent::Stdout(b"v22.12.0".to_vec())).await.unwrap();
+            node.out.send(PipeEvent::Exit(0)).await.unwrap();
+            // The trust process never sends an exit. Its caller must release the pipe.
+            tokio::time::timeout(Duration::from_secs(1), trust.out.closed())
+                .await
+                .expect("the start waited for the unfinished trust check");
+        };
+        let (result, ()) = tokio::join!(manager.start(&id), guest);
+        assert!(matches!(result, Err(Error::NodeTooOld(v)) if v == "v22.12.0"));
+        assert!(matches!(manager.list().cages[0].shared().status, Status::Error { .. }));
+        assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
     }
 
     #[tokio::test]
