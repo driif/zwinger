@@ -259,7 +259,7 @@ fn pi_status() -> String {
 }
 
 /// `text` as one word of `sh`.
-fn quote(text: &str) -> String {
+pub(crate) fn quote(text: &str) -> String {
     if !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-=:".contains(&b)) {
         text.to_owned()
     } else {

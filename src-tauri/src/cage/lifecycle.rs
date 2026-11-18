@@ -26,7 +26,7 @@ use crate::proxy::{self, Live, Proxy};
 use crate::runtime;
 use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, SandboxRuntime, TerminalKind};
 use crate::runtimes;
-use crate::secrets::{self, SecretValue};
+use crate::secrets::{self, CredentialRef, SecretValue};
 use crate::session::{Session, VmChoice};
 
 pub(crate) const NODE_LIMIT: Duration = Duration::from_secs(15);
@@ -524,6 +524,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             }),
             resolver: Arc::new(proxy::dial::System),
+            #[cfg(test)]
+            upstream_root: None,
         };
         Proxy::start(config).await.map_err(|e| Error::Proxy(e.to_string()))
     }
@@ -708,7 +710,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The vault value of each credential. An account whose restore failed
     /// is restored first; if that fails again, the start fails. The Claude
     /// token's date is checked on the entry that is loaded, after that restore.
-    pub(crate) fn vault_values(&self, cage: &Cage) -> Result<HashMap<String, SecretValue>> {
+    /// A missing library value fails the start; a same-name local value never replaces it.
+    pub(crate) fn vault_values(&self, cage: &Cage) -> Result<HashMap<CredentialRef, SecretValue>> {
         let login = cage.host_agent(AgentKind::Claude).is_some_and(|agent| agent.login);
         let bound = cage.claude_token_binding()?;
         if login && !bound {
@@ -716,8 +719,10 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         let mut values = HashMap::new();
         for credential in cage.network.credentials() {
-            self.settle(&cage.id, &credential.name)?;
-            let entry = self.vault.entry(&cage.id, &credential.name)?;
+            let key = credential.key();
+            let owner = key.vault_key(&cage.id);
+            self.settle(&owner, &key.name)?;
+            let entry = self.vault.entry(&owner, &key.name)?;
             if bound && credential.name == CLAUDE_TOKEN {
                 let saved_at = entry.as_ref().and_then(|entry| entry.saved_at).ok_or(Error::ClaudeTokenNeeded)?;
                 if saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms() {
@@ -727,7 +732,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 }
             }
             match entry {
-                Some(entry) => values.insert(credential.name.clone(), entry.value),
+                Some(entry) => values.insert(key, entry.value),
                 None => return Err(Error::SecretMissing(credential.name.clone())),
             };
         }
@@ -1468,7 +1473,7 @@ mod tests {
     async fn start_refuses_a_missing_value() {
         let (manager, runtime, id, vault) = manager_with_vault();
         credential(&manager, &id, "a.io", "KEY", Some("v")).unwrap();
-        vault.delete(&id, "KEY").unwrap();
+        vault.delete(&Owner::cage(&id), "KEY").unwrap();
 
         assert!(matches!(manager.start(&id).await, Err(Error::SecretMissing(n)) if n == "KEY"));
         assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
@@ -1493,7 +1498,7 @@ mod tests {
     async fn a_host_agent_gets_its_login_and_profile_at_start() {
         let logins = FakeLogins::default();
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
-        manager.set_claude_token(&id, SecretValue::new("sk-ant-oat-real"), true, true).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, true).unwrap();
 
         let cage = manager.list().cages.remove(0).cage;
         let rules: Vec<_> = cage.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
@@ -1502,7 +1507,10 @@ mod tests {
         assert_eq!(cage.network.rules[0].credentials[0].name, "CLAUDE_CODE_OAUTH_TOKEN");
 
         manager.start(&id).await.unwrap();
-        assert_eq!(vault.get(&id, "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap().expose(), "sk-ant-oat-real");
+        assert_eq!(
+            vault.get(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap().expose(),
+            "sk-ant-oat-real"
+        );
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "$MSB_CLAUDE_CODE_OAUTH_TOKEN$".to_owned())));
         assert!(!format!("{net:?}").contains("sk-ant-oat-real"));
@@ -1588,10 +1596,10 @@ mod tests {
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         assert!(matches!(manager.start(&id).await, Err(Error::ClaudeTokenNeeded)));
-        manager.set_claude_token(&id, SecretValue::new("t"), true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false).unwrap();
         vault
             .put(
-                &id,
+                &Owner::cage(&id),
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 &secrets::VaultEntry {
                     value: SecretValue::new("t"),
@@ -1618,13 +1626,14 @@ mod tests {
     #[tokio::test]
     async fn an_expired_token_restored_by_settle_fails_the_start() {
         let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
-        manager.set_claude_token(&id, SecretValue::new("fresh"), true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("fresh")), Source::Local, true, false).unwrap();
         // A failed rollback left the prior, expired entry to restore.
         let expired = secrets::VaultEntry {
             value: SecretValue::new("old"),
             saved_at: Some(secrets::now_ms() - 365 * 24 * 60 * 60 * 1000),
         };
-        lock(&manager.unsettled).insert(secrets::account(&id, "CLAUDE_CODE_OAUTH_TOKEN"), Some(expired));
+        lock(&manager.unsettled)
+            .insert((Owner::Cage(id.clone().into()), "CLAUDE_CODE_OAUTH_TOKEN".into()), Some(expired));
         assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
         assert!(runtime.log.lock().unwrap().is_empty());
     }

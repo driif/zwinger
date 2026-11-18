@@ -14,12 +14,12 @@ use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE};
 use crate::error::{Error, Member, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
-use crate::network::{self, Action, RuleDraft, Target};
+use crate::network::{self, Action, RuleDraft, Source, Target};
 use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, TerminalKind};
-use crate::secrets::{self, Vault, VaultEntry};
+use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, VmChoice};
 use crate::store::{self, Store};
 use crate::task_runs;
@@ -67,7 +67,7 @@ pub struct Manager<R: SandboxRuntime> {
     /// Per account, the value that the saved config expects (`None`: no
     /// value) after a restore that did not end. Until the vault is seen to
     /// hold it, starts and edits that use the account fail.
-    pub(crate) unsettled: Mutex<HashMap<String, Option<VaultEntry>>>,
+    pub(crate) unsettled: Mutex<HashMap<Account, Option<VaultEntry>>>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
@@ -259,6 +259,8 @@ pub struct VmView {
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeTokenView {
     pub stored: bool,
+    /// The token comes from the credential library.
+    pub library: bool,
     pub expires_at: Option<i64>,
 }
 
@@ -272,24 +274,23 @@ pub enum Status {
     Error { message: String },
 }
 
-/// Deletes the values that no configured credential uses, such as the
-/// values of a cage whose delete failed. A failure does not stop the app load.
+/// Deletes the local values that no configured credential uses, such as the
+/// values of a cage whose delete failed. A library value stays, also with no
+/// cage that uses it. A failure does not stop the app load.
 pub(crate) fn prune_vault(vault: &dyn Vault, cages: &[Cage]) {
     let accounts = match vault.accounts() {
         Ok(accounts) => accounts,
         Err(e) => return eprintln!("secret prune: cannot list the vault: {e}"),
     };
     // A host login has no value in the vault, so its account is not kept.
-    let configured: HashSet<String> = cages
+    let configured: HashSet<Account> = cages
         .iter()
-        .flat_map(|cage| cage.network.credentials().into_iter().map(|c| secrets::account(&cage.id, &c.name)))
+        .flat_map(|cage| cage.network.credentials().into_iter().map(|c| c.key().account(&cage.id)))
         .collect();
-    for account in accounts.iter().filter(|a| !configured.contains(*a)) {
-        let Some((cage_id, name)) = account.split_once('/') else {
-            continue;
-        };
-        if vault.delete(cage_id, name).is_err() {
-            eprintln!("secret prune: cannot delete {account}");
+    for account in accounts.iter().filter(|a| a.0 != Owner::Library && !configured.contains(*a)) {
+        let (owner, name) = account;
+        if vault.delete(owner, name).is_err() {
+            eprintln!("secret prune: cannot delete {name} of {owner:?}");
         }
     }
 }
@@ -845,8 +846,9 @@ impl<R: SandboxRuntime> Manager<R> {
             (cage, own_keys)
         };
         let mut result = Ok(());
-        for credential in cage.network.credentials() {
-            if let Err(e) = self.vault.delete(id, &credential.name)
+        // The library values stay for the other cages and for later use.
+        for credential in cage.network.credentials().into_iter().filter(|c| c.source.is_local()) {
+            if let Err(e) = self.vault.delete(&Owner::cage(id), &credential.name)
                 && result.is_ok()
             {
                 result = Err(e);
@@ -1020,8 +1022,8 @@ impl<R: SandboxRuntime> Manager<R> {
         })?;
         self.publish(cage_id, None);
         if kind == AgentKind::Claude {
-            // The login off removed the token credential; its value goes too.
-            self.drop_unused(cage_id, std::iter::once(cage::CLAUDE_TOKEN))?;
+            // The login off removed the token credential; its local value goes too.
+            self.drop_unused(cage_id, cage::claude_token_refs())?;
         }
         Ok(())
     }
@@ -1036,7 +1038,7 @@ impl<R: SandboxRuntime> Manager<R> {
         })?;
         self.publish(cage_id, None);
         if kind == AgentKind::Claude {
-            self.drop_unused(cage_id, std::iter::once(cage::CLAUDE_TOKEN))?;
+            self.drop_unused(cage_id, cage::claude_token_refs())?;
         }
         Ok(())
     }
@@ -1200,8 +1202,10 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
     if !login && !cage.network.credentials().iter().any(|c| c.name == cage::CLAUDE_TOKEN) {
         return None;
     }
-    let entry = vault.entry(&cage.id, cage::CLAUDE_TOKEN).ok().flatten();
+    let key = cage.claude_token_ref();
+    let entry = vault.entry(&key.vault_key(&cage.id), &key.name).ok().flatten();
     Some(ClaudeTokenView {
+        library: key.source == Source::Library,
         stored: (!login || cage.claude_token_binding().unwrap_or(false))
             && entry.as_ref().is_some_and(|entry| entry.saved_at.is_some()),
         expires_at: entry.and_then(|entry| entry.saved_at.map(|at| at.saturating_add(365 * 24 * 60 * 60 * 1000))),
@@ -1645,13 +1649,24 @@ mod tests {
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         credential(&manager, &id, "a.io", "KEY", Some("keep")).unwrap();
-        vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
-        vault.set("deleted-project", "KEY", &SecretValue::new("y")).unwrap();
-        vault.set("zwinger", "PROXY_CA_KEY", &SecretValue::new("ca")).unwrap();
+        vault.set(&Owner::cage(&id), "GONE", &SecretValue::new("x")).unwrap();
+        vault.set(&Owner::cage("deleted-project"), "KEY", &SecretValue::new("y")).unwrap();
+        vault.set(&Owner::cage("zwinger"), "PROXY_CA_KEY", &SecretValue::new("ca")).unwrap();
+        // A cage value of a cage with the old id `@library` is a cage value.
+        vault.set(&Owner::cage("@library"), "SHARED", &SecretValue::new("legacy")).unwrap();
+        // A library value with no cage that attaches it stays.
+        vault.set(&Owner::Library, "SHARED", &SecretValue::new("s")).unwrap();
 
         Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
-        assert_eq!(vault.accounts().unwrap(), [secrets::account(&id, "KEY")]);
-        assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "keep");
+        let accounts: std::collections::HashSet<_> = vault.accounts().unwrap().into_iter().collect();
+        assert_eq!(
+            accounts,
+            std::collections::HashSet::from([
+                (Owner::Library, "SHARED".to_owned()),
+                (Owner::Cage(id.clone().into()), "KEY".to_owned())
+            ])
+        );
+        assert_eq!(vault.get(&Owner::cage(&id), "KEY").unwrap().unwrap().expose(), "keep");
     }
 
     #[test]
@@ -1668,7 +1683,7 @@ mod tests {
             panic!("the load must fail");
         };
         assert!(matches!(&e, Error::MissingCage { owner, cage } if owner.contains(&id) && *cage == id));
-        assert_eq!(vault.get(&id, "KEY").unwrap().unwrap().expose(), "keep");
+        assert_eq!(vault.get(&Owner::cage(&id), "KEY").unwrap().unwrap().expose(), "keep");
     }
 
     #[test]
@@ -2342,11 +2357,14 @@ mod tests {
         let manager = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         let rule = allow(&manager, &id, "a.io");
-        manager.set_rule_credential(&id, &rule, "KEY", bearer(), value("v")).unwrap();
-        vault.set(&id, "GONE", &SecretValue::new("x")).unwrap();
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), Source::Local, value("v")).unwrap();
+        vault.set(&Owner::cage(&id), "GONE", &SecretValue::new("x")).unwrap();
         *vault.writes_left.lock().unwrap() = Some(0);
 
-        assert!(matches!(manager.set_rule_credential(&id, &rule, "KEY", None, None), Err(Error::Vault(_))));
+        assert!(matches!(
+            manager.set_rule_credential(&id, &rule, "KEY", None, Source::Local, None),
+            Err(Error::Vault(_))
+        ));
         let reloaded = Manager::new(FakeRuntime::default(), store(), vault.clone(), temp_dir(), host()).unwrap();
         assert_eq!(reloaded.list().sessions.len(), 1);
         assert_eq!(stored(&vault, &id, "GONE").as_deref(), Some("x"));

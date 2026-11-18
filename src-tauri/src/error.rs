@@ -80,9 +80,24 @@ pub enum Error {
     #[error("credential vault: {0}")]
     Vault(String),
     #[error(
-        "the credential vault {path} must have mode {expected} and must not be a symlink; run chmod {expected} {path}"
+        "the credential vault \"{path}\" can be read by other users; in Terminal, run `chmod {expected} {argument}`, then try again",
+        argument = crate::agent::launch::quote(.path)
     )]
     VaultMode { path: String, expected: String },
+    #[error(
+        "the credential vault \"{path}\" belongs to a different user; ask an administrator of this Mac to make you its owner, then try again"
+    )]
+    VaultOwner { path: String },
+    #[error("the credential vault \"{path}\" is a symbolic link; move the link to a different folder, then try again")]
+    VaultLink { path: String },
+    #[error("the credential vault \"{path}\" is not a {kind}; move it to a different folder, then try again")]
+    VaultType { path: String, kind: &'static str },
+    #[error("library credential {0} not found; add it in Settings first")]
+    LibraryCredentialNotFound(String),
+    #[error("library credential {0} already exists; rotate it instead")]
+    LibraryCredentialExists(String),
+    #[error("library credential {name} is attached in {}; detach it there first", .cages.join(", "))]
+    LibraryCredentialInUse { name: String, cages: Vec<String> },
     #[error("project not found")]
     SessionNotFound,
     #[error("the cage of this project is missing")]
@@ -326,6 +341,27 @@ mod tests {
         assert_eq!(sentence("done?"), "Done?");
         assert_eq!(Error::CagesRunning(1).message(), "A cage still runs. Stop it, then restart to update.");
         assert_eq!(Error::CagesRunning(2).message(), "2 cages still run; stop them to restart for the update.");
+    }
+
+    #[test]
+    fn each_vault_problem_quotes_the_path_and_gives_one_step() {
+        let path = "/a b/vault";
+        assert_eq!(
+            Error::VaultMode { path: path.into(), expected: "700".into() }.message(),
+            "The credential vault \"/a b/vault\" can be read by other users; in Terminal, run `chmod 700 '/a b/vault'`, then try again."
+        );
+        assert_eq!(
+            Error::VaultOwner { path: path.into() }.message(),
+            "The credential vault \"/a b/vault\" belongs to a different user; ask an administrator of this Mac to make you its owner, then try again."
+        );
+        assert_eq!(
+            Error::VaultLink { path: path.into() }.message(),
+            "The credential vault \"/a b/vault\" is a symbolic link; move the link to a different folder, then try again."
+        );
+        assert_eq!(
+            Error::VaultType { path: path.into(), kind: "folder" }.message(),
+            "The credential vault \"/a b/vault\" is not a folder; move it to a different folder, then try again."
+        );
     }
 
     #[test]

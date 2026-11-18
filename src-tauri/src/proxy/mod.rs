@@ -55,7 +55,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::agent::AgentKind;
 use crate::host_agents::login::{self, TOKENINFO_HOST, TOKENINFO_PATH};
 use crate::network::{Credential, NetworkPolicy};
-use crate::secrets::SecretValue;
+use crate::secrets::{CredentialRef, SecretValue};
 use ca::Ca;
 use decide::{Context, Decision, Reason, decide};
 use dial::{DialError, Limits, Permits, Resolve};
@@ -103,8 +103,8 @@ type Permit = Arc<OwnedSemaphorePermit>;
 #[derive(Clone)]
 pub struct Snapshot {
     pub policy: Arc<NetworkPolicy>,
-    /// The credential values by name.
-    pub values: Arc<HashMap<String, SecretValue>>,
+    /// The credential values by source and name.
+    pub values: Arc<HashMap<CredentialRef, SecretValue>>,
 }
 
 /// The parts of a cage's proxy that edits change while it runs: the
@@ -115,7 +115,7 @@ pub struct Live {
 }
 
 impl Live {
-    pub fn new(policy: NetworkPolicy, values: HashMap<String, SecretValue>) -> Arc<Self> {
+    pub fn new(policy: NetworkPolicy, values: HashMap<CredentialRef, SecretValue>) -> Arc<Self> {
         Arc::new(Self { snapshot: Mutex::new(Snapshot { policy: Arc::new(policy), values: Arc::new(values) }) })
     }
 
@@ -124,17 +124,17 @@ impl Live {
     }
 
     /// Changes the policy and the values together.
-    pub fn edit(&self, edit: impl FnOnce(&mut NetworkPolicy, &mut HashMap<String, SecretValue>)) {
+    pub fn edit(&self, edit: impl FnOnce(&mut NetworkPolicy, &mut HashMap<CredentialRef, SecretValue>)) {
         let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
         let Snapshot { policy, values } = &mut *snapshot;
         edit(Arc::make_mut(policy), Arc::make_mut(values));
     }
 
-    pub fn set_value(&self, name: &str, value: Option<SecretValue>) {
+    pub fn set_value(&self, key: &CredentialRef, value: Option<SecretValue>) {
         self.edit(|_, values| {
             match value {
-                Some(value) => values.insert(name.to_owned(), value),
-                None => values.remove(name),
+                Some(value) => values.insert(key.clone(), value),
+                None => values.remove(key),
             };
         });
     }
@@ -148,6 +148,10 @@ pub struct Config {
     pub refresh: Vec<&'static str>,
     pub sink: Sink,
     pub resolver: Arc<dyn Resolve>,
+    /// The only root for the upstream TLS in place of the platform roots,
+    /// so a test can run a local TLS recipient.
+    #[cfg(test)]
+    pub upstream_root: Option<rustls::pki_types::CertificateDer<'static>>,
 }
 
 /// A running proxy. A drop stops it and its connections.
@@ -204,8 +208,18 @@ impl Proxy {
             refresh: config.refresh,
             logins: config.logins.clone(),
             sink: config.sink,
-            auto: client(upstreams.clone(), &[b"h2", b"http/1.1"])?,
-            h1: client(upstreams.clone(), &[b"http/1.1"])?,
+            auto: client(
+                upstreams.clone(),
+                &[b"h2", b"http/1.1"],
+                #[cfg(test)]
+                config.upstream_root.as_ref(),
+            )?,
+            h1: client(
+                upstreams.clone(),
+                &[b"http/1.1"],
+                #[cfg(test)]
+                config.upstream_root.as_ref(),
+            )?,
             upstreams,
             shutdown: shutdown_rx,
         });
@@ -262,13 +276,25 @@ impl Proxy {
     }
 }
 
-fn client(upstreams: Arc<Upstreams>, alpn: &[&[u8]]) -> io::Result<Client<Connector, ProxyBody>> {
-    let mut tls = ClientConfig::builder_with_provider(ca::provider())
+fn client(
+    upstreams: Arc<Upstreams>,
+    alpn: &[&[u8]],
+    #[cfg(test)] root: Option<&rustls::pki_types::CertificateDer<'static>>,
+) -> io::Result<Client<Connector, ProxyBody>> {
+    let builder = ClientConfig::builder_with_provider(ca::provider())
         .with_safe_default_protocol_versions()
-        .map_err(io::Error::other)?
-        .with_platform_verifier()
-        .map_err(io::Error::other)?
-        .with_no_client_auth();
+        .map_err(io::Error::other)?;
+    #[cfg(test)]
+    let mut tls = match root {
+        Some(root) => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(root.clone()).map_err(io::Error::other)?;
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        None => builder.with_platform_verifier().map_err(io::Error::other)?.with_no_client_auth(),
+    };
+    #[cfg(not(test))]
+    let mut tls = builder.with_platform_verifier().map_err(io::Error::other)?.with_no_client_auth();
     tls.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Client::builder(TokioExecutor::new())
         .timer(TokioTimer::new())
@@ -661,7 +687,7 @@ async fn forward(
         .iter()
         .filter(|r| r.sends_credentials_to(&origin.host))
         .flat_map(|r| &r.credentials)
-        .filter_map(|c| values.get(&c.name).map(|v| (c.clone(), v.clone())))
+        .filter_map(|c| values.get(&c.key()).map(|v| (c.clone(), v.clone())))
         .collect();
     let logins: Vec<&Arc<Login>> = shared.logins.iter().filter(|l| l.hosts.contains(&origin.host)).collect();
     let mut injected = inject::Injected::default();
@@ -1042,7 +1068,7 @@ mod tests {
 
     use super::*;
     use crate::host_agents::login::{self as host_login};
-    use crate::network::{Action, DefaultAction, Inject, Rule, Target};
+    use crate::network::{Action, DefaultAction, Inject, Rule, Source, Target};
     use dial::fake::FakeResolver;
     use inject::TokenSource;
 
@@ -1103,12 +1129,33 @@ mod tests {
     }
 
     async fn fixture(policy: NetworkPolicy, logins: Vec<Arc<Login>>, refresh: Vec<&'static str>) -> Fixture {
-        let ca = Arc::new(Ca::load(&std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap());
+        let values = [(local("KEY"), SecretValue::new("sk-1"))].into();
+        start(policy, values, logins, refresh, None).await
+    }
+
+    fn local(name: &str) -> CredentialRef {
+        CredentialRef { source: Source::Local, name: name.into() }
+    }
+
+    fn temp_ca() -> Arc<Ca> {
+        Arc::new(Ca::load(&std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap())
+    }
+
+    async fn start(
+        policy: NetworkPolicy,
+        values: HashMap<CredentialRef, SecretValue>,
+        logins: Vec<Arc<Login>>,
+        refresh: Vec<&'static str>,
+        upstream_root: Option<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Fixture {
+        let ca = temp_ca();
         let resolver = FakeResolver { loopback: true, ..FakeResolver::default() };
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        resolver.names.lock().unwrap().insert("api.test".into(), vec![ip("127.0.0.1")]);
+        for host in ["api.test", "a1.test", "a2.test", "c.test"] {
+            resolver.names.lock().unwrap().insert(host.into(), vec![ip("127.0.0.1")]);
+        }
         resolver.names.lock().unwrap().insert("rebind.test".into(), vec![ip("10.0.0.1")]);
-        let live = Live::new(policy, [("KEY".to_owned(), SecretValue::new("sk-1"))].into());
+        let live = Live::new(policy, values);
         let log: Arc<Mutex<Vec<Entry>>> = Arc::default();
         let sink_log = log.clone();
         let config = Config {
@@ -1118,6 +1165,7 @@ mod tests {
             refresh,
             sink: Arc::new(move |entry| sink_log.lock().unwrap().push(entry)),
             resolver: Arc::new(resolver),
+            upstream_root,
         };
         Fixture { proxy: Proxy::start(config).await.unwrap(), ca, live, log }
     }
@@ -1203,6 +1251,7 @@ mod tests {
         allowed.credentials.push(Credential {
             name: "KEY".into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source: Source::Local,
         });
         let policy = NetworkPolicy { default: DefaultAction::Block, offline: false, rules: vec![allowed] };
         let f = fixture(policy, Vec::new(), Vec::new()).await;
@@ -1259,6 +1308,7 @@ mod tests {
         allowed.credentials.push(Credential {
             name: "KEY".into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source: Source::Local,
         });
         let f = fixture(NetworkPolicy { rules: vec![allowed], ..Default::default() }, Vec::new(), Vec::new()).await;
         plain(&f, "http://api.test:443/", Some(f.auth())).await;
@@ -1334,6 +1384,116 @@ mod tests {
         let request = Request::get("/").header(HOST, "api.test:8443").body(Empty::new()).unwrap();
         assert_eq!(send_over(io, request).await.0, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(f.entries().last().unwrap().reason, "misdirected");
+    }
+
+    /// The authorization field of each request at a recipient.
+    type Seen = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// A TLS recipient for `host` on loopback, with a leaf of `ca`. It keeps
+    /// the authorization field of each request and answers without it.
+    async fn tls_recipient(ca: &Ca, host: &str) -> (u16, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = TlsAcceptor::from(ca.server_config(host).await.unwrap());
+        let seen: Seen = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let sink = sink.clone();
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let auth = req.headers().get(AUTHORIZATION).map(|v| v.to_str().unwrap().to_owned());
+                    sink.lock().unwrap().push(auth);
+                    async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from("ok")))) }
+                });
+                tokio::spawn(async move {
+                    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                    let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// Sends the placeholder to `host` through a tunnel. Returns the status.
+    async fn via_tunnel(f: &Fixture, host: &str, port: u16) -> Result<StatusCode, StatusCode> {
+        let authority = format!("{host}:{port}");
+        let io = tunnel(f, &authority).await?;
+        let request = Request::get("/").header(HOST, &authority).header(AUTHORIZATION, "Bearer $MSB_KEY$");
+        let (status, _, body) = send_over(io, request.body(Empty::new()).unwrap()).await;
+        assert!(!body.contains("fixture"), "{body}");
+        Ok(status)
+    }
+
+    fn bound(host: &str, source: Source) -> Rule {
+        let mut rule = rule(host, Action::Allow);
+        rule.credentials.push(Credential {
+            name: "KEY".into(),
+            inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source,
+        });
+        rule
+    }
+
+    /// One cage, one credential name of two sources on two recipients: each
+    /// recipient gets the value of its own rule, in both rule orders. A rule
+    /// with no credential sends the placeholder only. A rotation of the
+    /// library value reaches its recipient alone.
+    #[tokio::test]
+    async fn one_name_of_two_sources_reaches_each_recipient_with_its_own_value() {
+        let recipients = temp_ca();
+        let (a1, seen_a1) = tls_recipient(&recipients, "a1.test").await;
+        let (a2, seen_a2) = tls_recipient(&recipients, "a2.test").await;
+        let (c, seen_c) = tls_recipient(&recipients, "c.test").await;
+        let library = CredentialRef { source: Source::Library, name: "KEY".into() };
+        let last = |seen: &Seen| seen.lock().unwrap().last().cloned().flatten();
+        for reversed in [false, true] {
+            let mut rules =
+                vec![bound("a1.test", Source::Library), bound("a2.test", Source::Local), rule("c.test", Action::Allow)];
+            if reversed {
+                rules.reverse();
+            }
+            let policy = NetworkPolicy { default: DefaultAction::Block, offline: false, rules };
+            policy.check().unwrap();
+            let values = [
+                (library.clone(), SecretValue::new("shared-fixture")),
+                (local("KEY"), SecretValue::new("local-fixture")),
+            ]
+            .into();
+            let f = start(policy, values, Vec::new(), Vec::new(), Some(recipients.der().clone())).await;
+
+            for (host, port) in [("a1.test", a1), ("a2.test", a2), ("c.test", c)] {
+                assert_eq!(via_tunnel(&f, host, port).await, Ok(StatusCode::OK), "{host}");
+            }
+            assert_eq!(last(&seen_a1).as_deref(), Some("Bearer shared-fixture"));
+            assert_eq!(last(&seen_a2).as_deref(), Some("Bearer local-fixture"));
+            assert_eq!(last(&seen_c).as_deref(), Some("Bearer $MSB_KEY$"));
+
+            f.live.set_value(&library, Some(SecretValue::new("rotated-fixture")));
+            via_tunnel(&f, "a1.test", a1).await.unwrap();
+            via_tunnel(&f, "a2.test", a2).await.unwrap();
+            assert_eq!(last(&seen_a1).as_deref(), Some("Bearer rotated-fixture"));
+            assert_eq!(last(&seen_a2).as_deref(), Some("Bearer local-fixture"));
+
+            // A Block rule keeps its credential inactive: nothing reaches the recipient.
+            let count = seen_a1.lock().unwrap().len();
+            f.live.edit(|policy, _| policy.rules.iter_mut().for_each(|r| r.action = Action::Block));
+            assert_eq!(via_tunnel(&f, "a1.test", a1).await, Err(StatusCode::FORBIDDEN));
+            assert_eq!(seen_a1.lock().unwrap().len(), count);
+
+            // A missing library value sends no value, and never the local one.
+            f.live.edit(|policy, values| {
+                policy.rules.iter_mut().for_each(|r| r.action = Action::Allow);
+                values.remove(&library);
+            });
+            via_tunnel(&f, "a1.test", a1).await.unwrap();
+            assert_eq!(last(&seen_a1).as_deref(), Some("Bearer $MSB_KEY$"));
+            let entries = format!("{:?}", f.entries());
+            assert!(!entries.contains("fixture"), "{entries}");
+        }
     }
 
     /// Waits until `f` is true, for at most two seconds.

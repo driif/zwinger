@@ -195,3 +195,23 @@ export const cleanImages = () => call<number | null>("clean_images");
 
 /** The SHA-256 of the proxy CA of this app run, in colon hex. Compare it with the CA in the guest. */
 export const proxyCaFingerprint = () => call<string>("proxy_ca_fingerprint");
+
+/** An entry of the credential library. The UI never gets its value. `savedAt` is in ms since the epoch. */
+export interface LibraryCredential {
+  name: string;
+  savedAt: number | null;
+}
+
+export const libraryCredentials = () =>
+  call<LibraryCredential[]>("library_credentials");
+
+/**
+ * Adds a library value, or with `rotate` replaces one. The backend refuses an add of an existing name and a rotation
+ * of a missing name. It attaches it to no rule. Running cages that attach it use it from the next request.
+ */
+export const setLibraryCredential = (name: string, value: string, rotate: boolean) =>
+  call<void>("set_library_credential", { name, value, rotate });
+
+/** Fails while a rule of a cage attaches the entry; the error names the cages. */
+export const deleteLibraryCredential = (name: string) =>
+  call<void>("delete_library_credential", { name });

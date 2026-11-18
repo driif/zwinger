@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::host_agents::{self, login};
 use crate::proxy::decide::{self, Decision};
 use crate::runtime::TerminalKind;
-use crate::secrets::{self, Origin, Places};
+use crate::secrets::{self, CredentialRef, Origin, Places};
 
 /// The marks of a credential template that the proxy replaces.
 pub const SECRET_MARK: &str = "{secret}";
@@ -72,14 +72,35 @@ pub enum Inject {
     Replace { places: Places },
 }
 
-/// The value is in the vault, at the account `<cage id>/<name>`. Rules can
-/// share a name, and with it one value. The guest gets the placeholder in
-/// the variable `name`.
+/// The value is in the vault, at the account of its [`CredentialRef`]: the
+/// cage's own value, or the library value that all cages can attach. Rules
+/// of one source can share a name, and with it one value. The guest gets
+/// the placeholder in the variable `name`, one for each name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credential {
     pub name: String,
     pub inject: Inject,
+    /// A config from before the library has no source: it is local.
+    #[serde(default, skip_serializing_if = "Source::is_local")]
+    pub source: Source,
+}
+
+/// Where the value of a credential is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Source {
+    /// The value of this cage.
+    #[default]
+    Local,
+    /// The value in the credential library of the app.
+    Library,
+}
+
+impl Source {
+    pub fn is_local(&self) -> bool {
+        *self == Self::Local
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,15 +285,20 @@ impl NetworkPolicy {
         self.rules.iter_mut().find(|r| r.id == rule_id).ok_or(Error::RuleNotFound)
     }
 
-    /// Each credential name once, with its first binding.
+    /// Each credential value once, by source and name, with its first binding.
     pub fn credentials(&self) -> Vec<&Credential> {
         let mut seen: Vec<&Credential> = Vec::new();
         for credential in self.rules.iter().flat_map(|r| &r.credentials) {
-            if !seen.iter().any(|c| c.name == credential.name) {
+            if !seen.iter().any(|c| c.name == credential.name && c.source == credential.source) {
                 seen.push(credential);
             }
         }
         seen
+    }
+
+    /// Whether a credential of the rules uses `key`.
+    pub fn uses(&self, key: &CredentialRef) -> bool {
+        self.rules.iter().flat_map(|r| &r.credentials).any(|c| c.key() == *key)
     }
 
     /// The rules that a stored config must meet.
@@ -293,8 +319,79 @@ impl NetworkPolicy {
                 check_holder(rule, &credential.name)?;
             }
         }
+        self.check_sources()
+    }
+
+    /// One recipient gets one value per placeholder and per set header, so
+    /// the value never depends on the rule or credential order. Allow rules
+    /// whose credential hosts overlap, and one Allow rule, may not bind one
+    /// name, or one `Set` header, to credentials of two sources.
+    fn check_sources(&self) -> Result<()> {
+        let allowed: Vec<&Rule> =
+            self.rules.iter().filter(|r| r.action == Action::Allow && !r.credentials.is_empty()).collect();
+        for (i, rule) in allowed.iter().enumerate() {
+            for other in &allowed[..=i] {
+                let host = if std::ptr::eq(*other, *rule) {
+                    rule.label()
+                } else {
+                    match overlap(&rule.credential_hosts(), &other.credential_hosts()) {
+                        Some(host) => host,
+                        None => continue,
+                    }
+                };
+                for credential in &rule.credentials {
+                    for theirs in other.credentials.iter().filter(|c| c.source != credential.source) {
+                        // One rule has each name once, so a name match is of two rules.
+                        if theirs.name == credential.name {
+                            return Err(Error::InvalidSecret(
+                                credential.name.clone(),
+                                format!(
+                                    "{} and {} both send it to {host}, one from the library and one from this cage; use one source",
+                                    other.label(),
+                                    rule.label()
+                                ),
+                            ));
+                        }
+                        if let Some(header) = set_header(credential).filter(|h| Some(h) == set_header(theirs).as_ref())
+                        {
+                            return Err(Error::InvalidSecret(
+                                credential.name.clone(),
+                                format!(
+                                    "it and {} both set the {header} header for {host}, one from the library and one from this cage; use one source",
+                                    theirs.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// The header that a `Set` credential sets, trimmed and in lowercase.
+fn set_header(credential: &Credential) -> Option<String> {
+    match &credential.inject {
+        Inject::Set { header, .. } => Some(header.trim().to_ascii_lowercase()),
+        Inject::Replace { .. } => None,
+    }
+}
+
+/// A host that both lists cover, if any. A list has exact hosts and `*.x` wildcards.
+fn overlap(a: &[String], b: &[String]) -> Option<String> {
+    let base = |p: &str| p.strip_prefix("*.").unwrap_or(p).to_owned();
+    a.iter().find_map(|x| {
+        b.iter().find_map(|y| {
+            if covers(x, &base(y)) {
+                Some(base(y))
+            } else if covers(y, &base(x)) {
+                Some(base(x))
+            } else {
+                None
+            }
+        })
+    })
 }
 
 /// A credential needs a rule that names where it goes: an exact host, or a
@@ -363,6 +460,10 @@ impl Credential {
 
     pub fn placeholder(&self) -> String {
         secrets::placeholder(&self.name)
+    }
+
+    pub fn key(&self) -> CredentialRef {
+        CredentialRef { source: self.source, name: self.name.clone() }
     }
 }
 
@@ -764,6 +865,7 @@ mod tests {
         let set = |header: &str, template: &str| Credential {
             name: "KEY".into(),
             inject: Inject::Set { header: header.into(), template: template.into() },
+            source: Source::Local,
         };
         assert_eq!(
             set(" Authorization ", "Bearer {secret}").normalize().unwrap().inject,
@@ -776,5 +878,107 @@ mod tests {
             assert!(set(header, template).normalize().is_err(), "{header} {template}");
         }
         assert_eq!(basic_user("Basic {basic:u}!"), Some(("Basic ", "u", "!")));
+    }
+
+    fn with_key(target: Target, source: Source) -> Rule {
+        let mut rule = Rule::new(target, Action::Allow);
+        rule.credentials.push(Credential {
+            name: "KEY".into(),
+            inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source,
+        });
+        rule
+    }
+
+    #[test]
+    fn one_recipient_cannot_get_one_name_from_two_sources() {
+        let openai = || Target::Service { id: "openai".into() };
+        let pairs = [
+            (with_key(host("api.openai.com"), Source::Library), with_key(openai(), Source::Local)),
+            (
+                with_key(host("huggingface.co"), Source::Local),
+                with_key(Target::Service { id: "huggingface".into() }, Source::Library),
+            ),
+        ];
+        for (a, b) in pairs {
+            for rules in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+                let policy = NetworkPolicy { rules, ..Default::default() };
+                assert!(matches!(policy.check(), Err(Error::InvalidSecret(n, _)) if n == "KEY"));
+            }
+            // One source, or a Block rule, is valid.
+            let same = with_key(b.target.clone(), a.credentials[0].source);
+            assert!(NetworkPolicy { rules: vec![a.clone(), same], ..Default::default() }.check().is_ok());
+            let mut blocked = b.clone();
+            blocked.action = Action::Block;
+            assert!(NetworkPolicy { rules: vec![a, blocked], ..Default::default() }.check().is_ok());
+        }
+        // Two recipients may use one name of two sources.
+        let rules = vec![with_key(host("a1.io"), Source::Library), with_key(host("a2.io"), Source::Local)];
+        assert!(NetworkPolicy { rules, ..Default::default() }.check().is_ok());
+        assert_eq!(overlap(&["*.a.io".into()], &["x.a.io".into()]).as_deref(), Some("x.a.io"));
+        assert_eq!(overlap(&["a.io".into()], &["b.a.io".into()]), None);
+    }
+
+    fn keyed(target: Target, credentials: &[(&str, &str, Source)]) -> Rule {
+        let mut rule = Rule::new(target, Action::Allow);
+        for (name, header, source) in credentials {
+            rule.credentials.push(Credential {
+                name: (*name).into(),
+                inject: Inject::Set { header: (*header).into(), template: "Bearer {secret}".into() },
+                source: *source,
+            });
+        }
+        rule
+    }
+
+    /// Two names of two sources that set one header for one recipient are
+    /// refused in each order, also when the header differs in case or space.
+    #[test]
+    fn one_recipient_cannot_get_one_set_header_from_two_sources() {
+        let (local, library) = (Source::Local, Source::Library);
+        let refused = |rules: Vec<Rule>| {
+            let result = NetworkPolicy { rules, ..Default::default() }.check();
+            assert!(
+                matches!(&result, Err(Error::InvalidSecret(_, m)) if m.contains("authorization header")),
+                "{result:?}"
+            );
+        };
+        let ok = |rules: Vec<Rule>| assert!(NetworkPolicy { rules, ..Default::default() }.check().is_ok());
+        for (a, b) in [(local, library), (library, local)] {
+            // One Allow rule.
+            refused(vec![keyed(host("a.io"), &[("A", "authorization", a), ("B", " Authorization ", b)])]);
+            refused(vec![keyed(host("a.io"), &[("B", "AUTHORIZATION", b), ("A", "authorization", a)])]);
+            // Two overlapping Allow rules, in both orders.
+            let first = keyed(host("api.openai.com"), &[("A", "authorization", a)]);
+            let second = keyed(Target::Service { id: "openai".into() }, &[("B", "Authorization", b)]);
+            refused(vec![first.clone(), second.clone()]);
+            refused(vec![second.clone(), first.clone()]);
+            // Separate recipients, other headers, or a Block rule are valid.
+            ok(vec![first.clone(), keyed(host("a2.io"), &[("B", "authorization", b)])]);
+            ok(vec![keyed(host("a.io"), &[("A", "authorization", a), ("B", "x-api-key", b)])]);
+            let mut blocked = second.clone();
+            blocked.action = Action::Block;
+            ok(vec![first, blocked]);
+        }
+        // One source may set one header twice.
+        for source in [local, library] {
+            ok(vec![keyed(host("a.io"), &[("A", "authorization", source), ("B", "authorization", source)])]);
+            ok(vec![
+                keyed(host("api.openai.com"), &[("A", "authorization", source)]),
+                keyed(Target::Service { id: "openai".into() }, &[("B", "authorization", source)]),
+            ]);
+        }
+    }
+
+    #[test]
+    fn a_local_credential_keeps_its_old_json_and_a_library_one_names_its_source() {
+        let old = r#"{"name":"KEY","inject":{"mode":"set","header":"authorization","template":"Bearer {secret}"}}"#;
+        let credential: Credential = serde_json::from_str(old).unwrap();
+        assert_eq!(credential.source, Source::Local);
+        assert_eq!(serde_json::to_string(&credential).unwrap(), old);
+        let library = Credential { source: Source::Library, ..credential };
+        let json = serde_json::to_value(&library).unwrap();
+        assert_eq!(json["source"], "library");
+        assert_eq!(serde_json::from_value::<Credential>(json).unwrap(), library);
     }
 }

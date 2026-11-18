@@ -70,10 +70,15 @@ export type Inject =
   | { mode: "set"; header: string; template: string }
   | { mode: "replace"; places: Places };
 
+/** `local`: the value of this cage. `library`: the shared value in Settings > Credential library. */
+export type CredentialSource = "local" | "library";
+
 /** The value is in the vault file of the app. The UI can write it but never reads it. The guest gets the placeholder in `$name`. */
 export interface Credential {
   name: string;
   inject: Inject;
+  /** Absent means `local`. */
+  source?: CredentialSource;
 }
 
 export interface Rule {
@@ -219,7 +224,8 @@ export interface CageView {
   hostAgents: HostAgentUse[];
   /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
-  claudeToken: { stored: boolean; expiresAt: number | null } | null;
+  /** `library`: the token comes from the credential library. */
+  claudeToken: { stored: boolean; library: boolean; expiresAt: number | null } | null;
   /** The shared VM, also when it is stopped, then the own VMs that start, run, stop or failed. */
   vms: VmView[];
 }

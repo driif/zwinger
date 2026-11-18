@@ -369,11 +369,15 @@ mod tests {
     }
 
     fn set(name: &str, header: &str, template: &str) -> Credential {
-        Credential { name: name.into(), inject: Inject::Set { header: header.into(), template: template.into() } }
+        Credential {
+            name: name.into(),
+            inject: Inject::Set { header: header.into(), template: template.into() },
+            source: crate::network::Source::Local,
+        }
     }
 
     fn replace(name: &str, places: Places) -> Credential {
-        Credential { name: name.into(), inject: Inject::Replace { places } }
+        Credential { name: name.into(), inject: Inject::Replace { places }, source: crate::network::Source::Local }
     }
 
     #[test]

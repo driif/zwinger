@@ -13,13 +13,18 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, AgentKind};
 use crate::error::{Error, Result};
 use crate::host_agents::login;
-use crate::network::NetworkPolicy;
-use crate::secrets::{self, Origin, Secret};
+use crate::network::{NetworkPolicy, Source};
+use crate::secrets::{self, CredentialRef, Origin, Secret};
 use crate::session::{Session, VmChoice};
 
 pub const WORKSPACE: &str = "/workspace";
 /// The credential that holds the Claude Code setup token.
 pub(crate) const CLAUDE_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// The Claude token of each source.
+pub(crate) fn claude_token_refs() -> impl Iterator<Item = CredentialRef> {
+    [Source::Local, Source::Library].into_iter().map(|source| CredentialRef { source, name: CLAUDE_TOKEN.into() })
+}
 const FOLDER_LIMIT: usize = 50;
 
 /// A saved config for a sandbox: mounts, network policy, credentials and
@@ -178,6 +183,18 @@ impl Cage {
         for rule in &mut self.network.rules {
             rule.credentials.retain(|c| c.name != CLAUDE_TOKEN);
         }
+    }
+
+    /// The value of the Claude token credential: the one of the Allow rule
+    /// first. With none, the local value.
+    pub fn claude_token_ref(&self) -> CredentialRef {
+        let mut rules: Vec<&crate::network::Rule> = self.network.rules.iter().collect();
+        rules.sort_by_key(|r| r.action != crate::network::Action::Allow);
+        rules
+            .into_iter()
+            .flat_map(|r| &r.credentials)
+            .find(|c| c.name == CLAUDE_TOKEN)
+            .map_or_else(|| CredentialRef { source: Source::Local, name: CLAUDE_TOKEN.into() }, |c| c.key())
     }
 
     /// Whether an Allow rule injects the Claude token. Fails if one injects
@@ -1199,6 +1216,7 @@ mod tests {
         let token = Credential {
             name: "GITHUB_TOKEN".into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source: crate::network::Source::Local,
         };
         project.cage.network.rule_mut(&rule).unwrap().credentials.push(token.clone());
         let err = project.check().unwrap_err();
@@ -1235,6 +1253,7 @@ mod tests {
         cage.network.rule_mut(&rule).unwrap().credentials.push(Credential {
             name: "CLAUDE_CODE_OAUTH_TOKEN".into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
+            source: crate::network::Source::Local,
         });
         assert!(matches!(cage.check(), Err(Error::InvalidSecret(..))));
         let rule = cage

@@ -1,7 +1,7 @@
 use crate::cage;
-use crate::cage::network::NetTest;
+use crate::cage::network::{LibraryCredential, NetTest};
 use crate::error::Result;
-use crate::network::{self, DefaultAction, Inject, RuleDraft, Service};
+use crate::network::{self, DefaultAction, Inject, RuleDraft, Service, Source};
 use crate::proxy::log::Entry;
 use crate::secrets::SecretValue;
 
@@ -50,7 +50,8 @@ pub async fn remove_rule(manager: Managed<'_>, cage_id: String, rule_id: String)
     manager.remove_rule(&cage_id, &rule_id)
 }
 
-/// `inject` `None` removes the credential. `value` `None` keeps the stored value.
+/// `inject` `None` removes the credential. `value` `None` keeps the stored
+/// value. A library credential takes no value.
 #[tauri::command]
 pub async fn set_rule_credential(
     manager: Managed<'_>,
@@ -58,9 +59,33 @@ pub async fn set_rule_credential(
     rule_id: String,
     name: String,
     inject: Option<Inject>,
+    source: Source,
     value: Option<SecretValue>,
 ) -> Result<()> {
-    manager.set_rule_credential(&cage_id, &rule_id, &name, inject, value)
+    manager.set_rule_credential(&cage_id, &rule_id, &name, inject, source, value)
+}
+
+/// The names and dates of the library entries. Returns no values.
+#[tauri::command]
+pub async fn library_credentials(manager: Managed<'_>) -> Result<Vec<LibraryCredential>> {
+    manager.library_credentials()
+}
+
+/// Adds a library value, or with `rotate` replaces one. It attaches it to no rule.
+#[tauri::command]
+pub async fn set_library_credential(
+    manager: Managed<'_>,
+    name: String,
+    value: SecretValue,
+    rotate: bool,
+) -> Result<()> {
+    manager.set_library_credential(&name, value, rotate)
+}
+
+/// Refused while a rule of a cage attaches the entry.
+#[tauri::command]
+pub async fn delete_library_credential(manager: Managed<'_>, name: String) -> Result<()> {
+    manager.delete_library_credential(&name)
 }
 
 /// The names of the cage's credentials that have a stored value. Returns no values.

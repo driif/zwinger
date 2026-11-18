@@ -1,4 +1,14 @@
-import { Button, Card, CardBody, CardHeader, CopyField, ElasticTabs, FloatingField, SpringCheckbox } from "@driif/motiv";
+import {
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  CopyField,
+  ElasticTabs,
+  FloatingField,
+  SegmentedControl,
+  SpringCheckbox,
+} from "@driif/motiv";
 import { Bot, Code, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
@@ -19,10 +29,12 @@ import {
   AgentKind,
   PaneNode,
   CageView,
+  CredentialSource,
   VmCage,
   SessionView,
   TerminalKind,
 } from "../../shared/api";
+import { libraryCredentials } from "../settings/api";
 import { time } from "../settings/HostAgentsSettings";
 import { decide, ruleMatches, useCatalog } from "../network/network";
 import type { Intent, Pane, Run, Runtimes, TabView, View } from "../../App";
@@ -47,6 +59,8 @@ const LOGIN_HOSTS: Partial<Record<AgentKind, string>> = {
   gemini: "cloudcode-pa.googleapis.com",
 };
 
+const CLAUDE_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN";
+
 /** The step that adds a host agent to the cage, or changes or removes it. */
 function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   cage: CageView;
@@ -66,9 +80,22 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   const blocked = host === undefined || !decide(cage.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
   const [token, setToken] = useState("");
+  const [tokenSource, setTokenSource] = useState<CredentialSource>(cage.claudeToken?.library ? "library" : "local");
+  const [libraryToken, setLibraryToken] = useState<boolean>();
   const claude = kind === "claude";
+  useEffect(() => {
+    if (!claude) return;
+    libraryCredentials().then(
+      (entries) => setLibraryToken(entries.some((e) => e.name === CLAUDE_TOKEN)),
+      () => setLibraryToken(false),
+    );
+  }, [claude]);
+  // A stored library token does not count for the local source: a switch to local needs a pasted token.
   const tokenReady =
-    !!cage.claudeToken?.stored && !!cage.claudeToken.expiresAt && cage.claudeToken.expiresAt > Date.now();
+    !cage.claudeToken?.library &&
+    !!cage.claudeToken?.stored &&
+    !!cage.claudeToken.expiresAt &&
+    cage.claudeToken.expiresAt > Date.now();
   const allowRule = cage.network.rules.some(
     (rule) => rule.action === "allow" && ruleMatches(rule, "api.anthropic.com", catalog),
   );
@@ -84,8 +111,11 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   const name = AGENT_NAMES[kind];
   const save = () =>
     run(() => {
+      if (claude && login && tokenSource === "library") {
+        return setClaudeToken(cage.id, null, "library", false, profile).then(onDone);
+      }
       if (claude && login && token.trim()) {
-        return setClaudeToken(cage.id, token.trim(), false, profile).then(onDone);
+        return setClaudeToken(cage.id, token.trim(), "local", false, profile).then(onDone);
       }
       return putHostAgent(cage.id, { kind, profile, login }, !claude && login && blocked && allow).then(onDone);
     });
@@ -123,9 +153,28 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
         )}
         {login && claude && (
           <>
-            <span className="muted">Run this on your Mac and paste the token below.</span>
-            <CopyField className="mono" value="claude setup-token" />
-            <FloatingField label="Setup token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+            <SegmentedControl
+              label="Setup token"
+              options={[
+                { value: "local", label: "Paste a token for this cage" },
+                { value: "library", label: "Use library token" },
+              ]}
+              value={tokenSource}
+              onChange={(source) => setTokenSource(source as CredentialSource)}
+            />
+            {tokenSource === "library" ? (
+              <span className={libraryToken === false ? "warn" : "muted"}>
+                {libraryToken === false
+                  ? `The library has no ${CLAUDE_TOKEN}. Add it in Settings > Credentials first.`
+                  : `The cage uses ${CLAUDE_TOKEN} from the credential library. A rotation there reaches this cage at once.`}
+              </span>
+            ) : (
+              <>
+                <span className="muted">Run this on your Mac and paste the token below.</span>
+                <CopyField className="mono" value="claude setup-token" />
+                <FloatingField label="Setup token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+              </>
+            )}
             {cage.claudeToken?.expiresAt && (
               <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"}>
                 expires {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
@@ -159,7 +208,15 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
           <Button variant="ghost" onClick={onDone}>
             Cancel
           </Button>
-          <Button onClick={save} disabled={login && claude && (needsAllow || (!token.trim() && !tokenReady))}>
+          <Button
+            onClick={save}
+            disabled={
+              login &&
+              claude &&
+              (needsAllow ||
+                (tokenSource === "library" ? libraryToken !== true : !token.trim() && !tokenReady))
+            }
+          >
             {current ? "Save" : "Add"}
           </Button>
         </div>

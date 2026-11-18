@@ -16,7 +16,8 @@ Hypervisor.framework). The VM is the unit of isolation.
 - **Create cage** adds a cage with no mounts, rules or agents.
 - **Rename** changes the name of the cage. The projects keep their names.
 - **Edit** shows the mounts and the agent settings of the cage.
-- **Delete** removes the cage, its credential values and the agent state of all its VMs. A project that kept an own VM
+- **Delete** removes the cage, its own credential values and the agent state of all its VMs. Values from the
+  [credential library](/network/#shared-credentials) stay. A project that kept an own VM
   of the cage after a cage change goes back to the shared VM. You cannot delete a cage that a project uses, that is the
   default cage of a workspace, or whose VM runs. The button then shows the reason as a tooltip.
 

@@ -1,5 +1,12 @@
 import { listen } from "@tauri-apps/api/event";
-import { call, type Action, type DefaultAction, type Inject, type Target } from "../../shared/api.ts";
+import {
+  call,
+  type Action,
+  type CredentialSource,
+  type DefaultAction,
+  type Inject,
+  type Target,
+} from "../../shared/api.ts";
 
 /** A service of the catalog. */
 export interface Service {
@@ -32,16 +39,20 @@ export const putRule = (
 export const removeRule = (cageId: string, ruleId: string) =>
   call<void>("remove_rule", { cageId, ruleId });
 
-/** `inject` null removes the credential. `value` null keeps the stored value; a new name, or a name with no stored value, needs one. */
+/**
+ * `inject` null removes the credential. `value` null keeps the stored value; a new local name, or a name with no
+ * stored value, needs one. A `library` credential takes no value: the library entry must exist.
+ */
 export const setRuleCredential = (
   cageId: string,
   ruleId: string,
   name: string,
   inject: Inject | null,
+  source: CredentialSource,
   value: string | null,
-) => call<void>("set_rule_credential", { cageId, ruleId, name, inject, value });
+) => call<void>("set_rule_credential", { cageId, ruleId, name, inject, source, value });
 
-/** The names of the cage's credentials that have a stored value. It returns no values. */
+/** The names of the cage's local credentials that have a stored value. It returns no values. */
 export const storedCredentials = (cageId: string) =>
   call<string[]>("stored_credentials", { cageId });
 

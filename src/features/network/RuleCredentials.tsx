@@ -1,13 +1,16 @@
 import {
+  Badge,
   Button,
   FloatingField,
   SegmentedControl,
+  Select,
   SpringCheckbox,
 } from "@driif/motiv";
 import { KeyRound, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { Service, setRuleCredential, storedCredentials } from "./api";
-import { CageView, Credential, Inject, Rule } from "../../shared/api";
+import { CageView, Credential, CredentialSource, Inject, Rule } from "../../shared/api";
+import { libraryCredentials } from "../settings/api";
 import type { Run } from "../../App";
 import { echoHost } from "./echoHost";
 import { errorMessage } from "../../shared/errorMessage";
@@ -33,6 +36,7 @@ const describe = (inject: Inject) =>
 
 interface Draft {
   isNew: boolean;
+  source: CredentialSource;
   name: string;
   mode: Inject["mode"];
   header: string;
@@ -48,6 +52,7 @@ function draftOf(credential: Credential): Draft {
   const { inject } = credential;
   return {
     isNew: false,
+    source: credential.source ?? "local",
     name: credential.name,
     mode: inject.mode,
     header: inject.mode === "set" ? inject.header : "authorization",
@@ -84,12 +89,14 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
   const [removing, setRemoving] = useState<string>();
   // Rules can share a name, and with it one value.
   const [stored, setStored] = useState<Set<string>>();
+  const [library, setLibrary] = useState<Set<string>>();
   const [vaultError, setVaultError] = useState<string>();
 
   useEffect(() => {
-    storedCredentials(cage.id).then(
-      (names) => {
+    Promise.all([storedCredentials(cage.id), libraryCredentials()]).then(
+      ([names, entries]) => {
         setStored(new Set(names));
+        setLibrary(new Set(entries.map((e) => e.name)));
         setVaultError(undefined);
       },
       (e) => setVaultError(errorMessage(e)),
@@ -128,7 +135,8 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
         rule.id,
         name,
         inject,
-        draft.value === "" ? null : draft.value,
+        draft.source,
+        draft.source === "library" || draft.value === "" ? null : draft.value,
       ).then(
         () => setDraft(undefined),
         (e) => setDraft({ ...draft, value: "", error: errorMessage(e) }),
@@ -137,7 +145,10 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
   }
 
   const needsValue =
-    draft !== undefined && !stored?.has(draft.name.trim());
+    draft?.source === "local" &&
+    (!stored?.has(draft.name.trim()) ||
+      // A switch from the library needs a value of this cage.
+      credentials.find((c) => c.name === draft.name)?.source === "library");
   // A host that echoes the query or the body shows the value to the agent.
   const readBack = (places: { query: boolean; body: boolean }) =>
     (places.query || places.body) &&
@@ -186,10 +197,30 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
               >
                 {credential.name}
               </span>
+              <Badge
+                size="sm"
+                tone={credential.source === "library" ? "success" : "neutral"}
+                title={
+                  credential.source === "library"
+                    ? "The shared value from Settings > Credentials"
+                    : "The value of this cage"
+                }
+              >
+                {credential.source === "library" ? "library" : "this cage"}
+              </Badge>
               <span className="grow muted mono">
                 {describe(credential.inject)}
               </span>
-              {stored && !stored.has(credential.name) && (
+              {credential.source === "library" && library && !library.has(credential.name) && (
+                <span
+                  className="warn row"
+                  title="The library has no entry of this name. Add it in Settings > Credentials."
+                >
+                  <TriangleAlert size={14} />
+                  Not in library
+                </span>
+              )}
+              {credential.source !== "library" && stored && !stored.has(credential.name) && (
                 <span
                   className="warn row"
                   title="It has no stored value. Edit it and enter the value again."
@@ -223,6 +254,7 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
                           rule.id,
                           credential.name,
                           null,
+                          credential.source ?? "local",
                           null,
                         ).then(() => setRemoving(undefined)),
                       )
@@ -257,19 +289,51 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
       </ul>
       {draft ? (
         <form className="stack" onSubmit={save}>
-          <FloatingField
-            label="Variable name"
-            className="mono"
-            value={draft.name}
-            disabled={!draft.isNew}
-            onChange={(e) =>
+          <SegmentedControl
+            label="Value from"
+            options={[
+              { value: "local", label: "This cage" },
+              { value: "library", label: "Credential library" },
+            ]}
+            value={draft.source}
+            onChange={(source) =>
               setDraft({
                 ...draft,
-                name: e.target.value.toUpperCase(),
+                source: source as CredentialSource,
+                value: "",
                 error: undefined,
               })
             }
           />
+          {draft.source === "library" && draft.isNew ? (
+            <Select
+              label="Library entry"
+              placeholder={library?.size ? "Pick an entry" : "The library is empty. Add one in Settings > Credentials."}
+              options={[...(library ?? [])].map((name) => ({ value: name, label: name }))}
+              value={draft.name}
+              onChange={(name) => setDraft({ ...draft, name, error: undefined })}
+            />
+          ) : (
+            <FloatingField
+              label={draft.source === "library" ? "Library entry" : "Variable name"}
+              className="mono"
+              value={draft.name}
+              disabled={!draft.isNew}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  name: e.target.value.toUpperCase(),
+                  error: undefined,
+                })
+              }
+            />
+          )}
+          {draft.source === "library" && stored?.has(draft.name) && (
+            <p className="muted">
+              This cage also has its own value of {draft.name}. This rule uses the library value; other rules keep
+              theirs.
+            </p>
+          )}
           <SegmentedControl
             label="How the proxy adds it"
             options={[
@@ -356,25 +420,35 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
               {readBack(draft)}
             </>
           )}
-          <FloatingField
-            label={
-              needsValue ? "Value" : "New value (empty keeps the current value)"
-            }
-            type="password"
-            autoComplete="off"
-            value={draft.value}
-            hint={draft.error}
-            aria-invalid={draft.error !== undefined}
-            showValidity={false}
-            onChange={(e) =>
-              setDraft({ ...draft, value: e.target.value, error: undefined })
-            }
-          />
+          {draft.source === "local" ? (
+            <FloatingField
+              label={
+                needsValue ? "Value" : "New value (empty keeps the current value)"
+              }
+              type="password"
+              autoComplete="off"
+              value={draft.value}
+              hint={draft.error}
+              aria-invalid={draft.error !== undefined}
+              showValidity={false}
+              onChange={(e) =>
+                setDraft({ ...draft, value: e.target.value, error: undefined })
+              }
+            />
+          ) : (
+            <p className={draft.error ? "danger" : "muted"}>
+              {draft.error ??
+                "The value stays in the library. A rotation there reaches this rule at once."}
+            </p>
+          )}
           <div className="row end">
             <Button variant="ghost" onClick={() => setDraft(undefined)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={needsValue && draft.value === ""}>
+            <Button
+              type="submit"
+              disabled={(needsValue && draft.value === "") || (draft.source === "library" && draft.name === "")}
+            >
               Save
             </Button>
           </div>
@@ -388,6 +462,7 @@ export function RuleCredentials({ cage, rule, catalog, run }: Props) {
             onClick={() =>
               setDraft({
                 isNew: true,
+                source: "local",
                 name: "",
                 mode: "set",
                 header,

@@ -18,7 +18,7 @@ pub(crate) use crate::host_agents::HostAgents;
 pub(crate) use crate::host_agents::fake::{FakeClock, FakeFs};
 pub(crate) use crate::host_agents::login;
 pub(crate) use crate::host_agents::login::fake::FakeLogins;
-pub(crate) use crate::network::{Action, DefaultAction, Inject, RuleDraft, Target};
+pub(crate) use crate::network::{Action, DefaultAction, Inject, RuleDraft, Source, Target};
 pub(crate) use crate::proxy::ca::Ca;
 pub(crate) use crate::proxy::log::Entry;
 pub(crate) use crate::proxy::{self, Live};
@@ -27,10 +27,15 @@ pub(crate) use crate::runtime::fake::{FakeRuntime, PtyGate};
 pub(crate) use crate::runtime::{Bind, PipeEvent, PtyEvent, PtyInput, SandboxRuntime, TerminalKind};
 pub(crate) use crate::runtimes;
 pub(crate) use crate::secrets::fake::MemoryVault;
-pub(crate) use crate::secrets::{self, SecretValue, Vault};
+pub(crate) use crate::secrets::{self, CredentialRef, Owner, SecretValue, Vault};
 pub(crate) use crate::session::{self, Pos, TaskDraft};
 pub(crate) use crate::store::Store;
 pub(crate) use crate::terminal::output::*;
+
+/// The key of the cage's own value `name`.
+pub(crate) fn local(name: &str) -> CredentialRef {
+    CredentialRef { source: Source::Local, name: name.into() }
+}
 
 pub(crate) fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zwinger-sessions-{}", uuid::Uuid::new_v4()));
@@ -112,7 +117,7 @@ pub(crate) fn credential<R: SandboxRuntime>(
     value: Option<&str>,
 ) -> Result<()> {
     let rule = allow(manager, id, host);
-    manager.set_rule_credential(id, &rule, name, bearer(), value.map(SecretValue::new))
+    manager.set_rule_credential(id, &rule, name, bearer(), Source::Local, value.map(SecretValue::new))
 }
 
 pub(crate) fn live(manager: &Manager<FakeRuntime>, id: &str) -> Arc<Live> {
@@ -213,7 +218,11 @@ pub(crate) fn value(text: &str) -> Option<SecretValue> {
 }
 
 pub(crate) fn stored(vault: &MemoryVault, id: &str, name: &str) -> Option<String> {
-    vault.get(id, name).unwrap().map(|v| v.expose().to_owned())
+    vault.get(&Owner::cage(id), name).unwrap().map(|v| v.expose().to_owned())
+}
+
+pub(crate) fn in_library(vault: &MemoryVault, name: &str) -> Option<String> {
+    vault.get(&Owner::Library, name).unwrap().map(|v| v.expose().to_owned())
 }
 
 /// Makes the next cage save fail: the store renames onto a non-empty folder.
@@ -231,23 +240,23 @@ pub(crate) struct GatedVault {
 }
 
 impl Vault for GatedVault {
-    fn put(&self, cage_id: &str, name: &str, entry: &crate::secrets::VaultEntry) -> Result<()> {
+    fn put(&self, owner: &Owner, name: &str, entry: &crate::secrets::VaultEntry) -> Result<()> {
         if let Some((entered, release)) = self.gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv().unwrap();
         }
-        self.inner.put(cage_id, name, entry)
+        self.inner.put(owner, name, entry)
     }
 
-    fn entry(&self, cage_id: &str, name: &str) -> Result<Option<crate::secrets::VaultEntry>> {
-        self.inner.entry(cage_id, name)
+    fn entry(&self, owner: &Owner, name: &str) -> Result<Option<crate::secrets::VaultEntry>> {
+        self.inner.entry(owner, name)
     }
 
-    fn delete(&self, cage_id: &str, name: &str) -> Result<()> {
-        self.inner.delete(cage_id, name)
+    fn delete(&self, owner: &Owner, name: &str) -> Result<()> {
+        self.inner.delete(owner, name)
     }
 
-    fn accounts(&self) -> Result<Vec<String>> {
+    fn accounts(&self) -> Result<Vec<secrets::Account>> {
         self.inner.accounts()
     }
 }

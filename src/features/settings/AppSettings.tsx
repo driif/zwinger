@@ -28,12 +28,14 @@ import { Appearance } from "../appearance/themes";
 import { TerminalSettings } from "../terminal";
 import { Editors } from "../launcher/api";
 import { EditorsSettings } from "./EditorsSettings";
+import { LibraryCredentials } from "./LibraryCredentials";
 
 const REPO = "https://github.com/driif/zwinger";
 
 const TABS = [
   { value: "agents", label: "Agents on this Mac" },
   { value: "runtimes", label: "Runtimes" },
+  { value: "credentials", label: "Credentials" },
   { value: "appearance", label: "Appearance" },
   { value: "terminal", label: "Terminal" },
   { value: "editors", label: "Editors" },
@@ -354,6 +356,11 @@ export function AppSettings({
                   </ul>
                 </CardBody>
               </Card>
+            </div>
+          ),
+          credentials: (
+            <div className="tab-body">
+              <LibraryCredentials />
             </div>
           ),
           appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,

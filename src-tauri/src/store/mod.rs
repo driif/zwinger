@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use crate::agent::AgentKind;
 use crate::cage::Cage;
 use crate::error::{Error, Result};
-use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, Rule, Target};
+use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, Rule, Source, Target};
 use crate::secrets::{Origin, Secret};
 use crate::session::Session;
 
@@ -184,6 +184,7 @@ fn migrate_secrets(logins: &mut Vec<Secret>, network: &mut NetworkPolicy) {
                 credentials.push(Credential {
                     name: secret.name.clone(),
                     inject: Inject::Replace { places: secret.places.clone() },
+                    source: Source::Local,
                 });
             }
         }
@@ -509,7 +510,11 @@ mod tests {
             assert_eq!(rule.action, action, "{host}");
             assert_eq!(
                 rule.credentials,
-                [Credential { name: "MAPS_KEY".into(), inject: Inject::Replace { places: maps.clone() } }]
+                [Credential {
+                    name: "MAPS_KEY".into(),
+                    inject: Inject::Replace { places: maps.clone() },
+                    source: Source::Local
+                }]
             );
         }
         cage.check().unwrap_or_else(|e| panic!("{e}"));

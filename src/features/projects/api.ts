@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { AgentState, CageView, call, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
+import { AgentState, CageView, call, CredentialSource, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
 
 export interface Sessions {
   sessions: SessionView[];
@@ -103,8 +103,14 @@ export const setWorkspaceCage = (workspaceId: string, cageId: string | null) =>
 /** The user confirms the folders that are not verified since the update. */
 export const confirmPaths = (sessionId: string) => call<void>("confirm_paths", { sessionId });
 
-export const setClaudeToken = (cageId: string, value: string, allow: boolean, profile: boolean) =>
-  call<void>("set_claude_token", { cageId, value, allow, profile });
+/** A `library` token takes no `value`: it uses the library entry CLAUDE_CODE_OAUTH_TOKEN. */
+export const setClaudeToken = (
+  cageId: string,
+  value: string | null,
+  source: CredentialSource,
+  allow: boolean,
+  profile: boolean,
+) => call<void>("set_claude_token", { cageId, value, source, allow, profile });
 
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (vmKey: string) => void) =>

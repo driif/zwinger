@@ -2,6 +2,7 @@ use crate::agent::AgentKind;
 use crate::cage::HostAgentUse;
 use crate::cage::lifecycle::Confirmed;
 use crate::error::Result;
+use crate::network::Source;
 use crate::secrets::SecretValue;
 
 use super::Managed;
@@ -104,15 +105,17 @@ pub async fn put_host_agent(
     manager.put_host_agent(&cage_id, agent, allow_hosts).await
 }
 
+/// `value` is for a local token only; a library token comes from the library.
 #[tauri::command]
 pub fn set_claude_token(
     manager: Managed<'_>,
     cage_id: String,
-    value: String,
+    value: Option<SecretValue>,
+    source: Source,
     allow: bool,
     profile: bool,
 ) -> Result<()> {
-    manager.set_claude_token(&cage_id, SecretValue::new(value), allow, profile)
+    manager.set_claude_token(&cage_id, value, source, allow, profile)
 }
 
 #[tauri::command]
