@@ -18,6 +18,7 @@ import {
   RuntimeName,
   RuntimeView,
   setPreferences,
+  setProjectEditor,
 } from "./features/settings/api";
 import {
   createSession,
@@ -80,7 +81,8 @@ import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ProjectPage } from "./features/projects/ProjectPage";
 import { ProjectRail } from "./features/projects/ProjectRail";
 import { folderDrop, resolveFolderTarget } from "./features/projects/folderDrop";
-import { agentsOf, LaunchAction, macAgent } from "./features/launcher/actions";
+import { PendingEditorChoices } from "./features/launcher/editorChoices";
+import { agentsOf, EditorCalls, LaunchAction, macAgent, openEditor as openEditorWith } from "./features/launcher/actions";
 import { launchCage, sessionCage } from "./features/cages/sessionCage";
 import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
@@ -299,6 +301,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [showCages, setShowCages] = useState(false);
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
+  const [editorChoices] = useState(() => new PendingEditorChoices());
+  const lastPrefsWrite = useRef<Prefs | undefined>(undefined);
   const [home, setHome] = useState<string>();
   /** Per session, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
@@ -364,9 +368,26 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     homeDir().then(setHome, () => {});
   }, []);
 
+  const writePrefs = async (next: Prefs) => {
+    const previous = lastPrefsWrite.current ?? prefs;
+    editorChoices.preferencesChanged(previous.editors, next.editors);
+    lastPrefsWrite.current = next;
+    try {
+      await onPrefs(next);
+    } catch (error) {
+      if (lastPrefsWrite.current === next) lastPrefsWrite.current = previous;
+      throw error;
+    }
+  };
+
+  const changeProjectEditor = (sessionId: string, editor: string | null) => {
+    editorChoices.projectChanged(sessionId);
+    return setProjectEditor(sessionId, editor);
+  };
+
   /** The editors that are on and the default come from the prefs, so they are read again. */
   const savePrefs = async (next: Prefs) => {
-    await onPrefs(next);
+    await writePrefs(next);
     await loadEditors();
   };
 
@@ -686,29 +707,46 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     } else showPane(terminalId, fresh);
   }
 
-  /** Opens the session folder, or the terminal's current folder, and says where it fell back. No `editorId`: the default. */
+  /** Opens the project or terminal folder. Only a successful named open can change a default. */
   async function openEditor(target: SessionView, editorId?: string, terminalId?: string) {
-    const askedId = editorId ?? editors?.default ?? null;
-    const opened = await openInEditor(target.id, askedId, terminalId ?? null);
-    const asked = editors?.editors.find((e) => e.id === askedId)?.name ?? "The editor";
+    const choice = editorId ? editorChoices.begin(target, editorId) : undefined;
+    const editorCalls: EditorCalls = {
+      open: openInEditor,
+      saved: async (sessionId) => {
+        const [list, now] = await Promise.all([listSessions(), detectEditors()]);
+        return { project: list.sessions.find((s) => s.id === sessionId)?.editor, editors: now };
+      },
+      setProjectEditor: async (sessionId, id) => {
+        if (choice?.current()) await setProjectEditor(sessionId, id);
+      },
+      setAppEditor: async (id) => {
+        const before = lastPrefsWrite.current;
+        const saved = await getPreferences();
+        if (!choice?.current()) return;
+        // A settings edit may have started after the backend took its snapshot.
+        const current = lastPrefsWrite.current && lastPrefsWrite.current !== before ? lastPrefsWrite.current : saved;
+        await savePrefs({ ...current, editors: { ...current.editors, default: id } });
+      },
+    };
+    const { opened, notice, stale } = await openEditorWith(editorCalls, target, editors, editorId, terminalId).catch((e) => {
+      // The open can fail because the editors changed, so they are read again. The error stays as it is.
+      void detectEditors().then(setEditors, () => {});
+      throw e;
+    }).finally(() => choice?.finish());
+    if (stale || opened.editorFellBack) await loadEditors();
     const notes = [
-      opened.editorFellBack && asked !== opened.editor && `${asked} is not available, so ${opened.editor} opened.`,
+      notice,
       opened.folderFellBack && `The folder of the terminal is unknown, so ${opened.editor} opened the project folder ${tildePath(opened.folder, home)}.`,
     ].filter((note): note is string => !!note);
     if (notes.length > 0) setAppNotices((all) => [...all, notes.join(" ")]);
   }
 
-  /** A choice of an editor makes it the default, so the launchers switch to it. */
   function launch(target: SessionCage, action: LaunchAction, terminalId?: string) {
     switch (action.type) {
       case "session":
         return run(() => newSession(action.kind, target));
       case "editor":
-        return run(async () => {
-          if (action.editor.id !== editors?.default)
-            await savePrefs({ ...prefs, editors: { ...prefs.editors, default: action.editor.id } });
-          await openEditor(target.session, action.editor.id, terminalId);
-        });
+        return run(() => openEditor(target.session, action.editor.id, terminalId));
       case "copyPath":
         return run(() => navigator.clipboard.writeText(target.session.folder));
       case "reveal":
@@ -1015,7 +1053,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       <RailHandle
         width={railWidth}
         onResize={setRailWidth}
-        onDone={(width) => onPrefs({ ...prefs, railWidth: width }).catch((e) => setError(errorMessage(e)))}
+        onDone={(width) => writePrefs({ ...prefs, railWidth: width }).catch((e) => setError(errorMessage(e)))}
       />
       <main className="main">
         <div className="notices">
@@ -1151,9 +1189,11 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             editors={editors}
             home={home}
             onLaunch={(action) => launch(selected, action)}
+            onProjectEditor={changeProjectEditor}
             onEditorSettings={() => setSettingsTab("editors")}
             onSplit={(key, direction) => run(() => newSession({ type: "host" }, selected, direction, key))}
             onOpenEditor={(key) => run(() => openEditor(session, undefined, key))}
+            onOpenDefaultEditor={() => run(() => openEditor(session))}
             onHide={hidePane}
             runs={runs[session.id] ?? []}
             onRunsChange={() => reloadRuns(session.id)}

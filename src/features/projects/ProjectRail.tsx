@@ -66,7 +66,7 @@ import type { DroppedFolder, Pane, Run, View, VmControl } from "../../App";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import { tildePath, truncateMiddle } from "../../shared/paths";
-import { LaunchAction, launchActions } from "../launcher/actions";
+import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import type { Detection } from "../settings/api";
 import { launchMenu } from "../launcher/SplitLaunch";
@@ -1002,7 +1002,7 @@ export function ProjectRail({
                         {sessions.map(({ target, session, sessionRow, groups }) => {
                           const sessionExpanded = !collapsed.has(sessionRow);
                           const status = target.vmCage?.status ?? { state: "stopped" as const };
-                          const launch = launchActions(target, detection, editors);
+                          const launch = launchActions(target, detection, projectEditors(editors, session));
                           const running = status.state === "running";
                           const effective = session.effectiveCage;
                           const shared = running && target.vmCage && target.vmCage.members.length > 1 ? target.vmCage : null;

@@ -1,5 +1,6 @@
 //! Editors: the IDEs on this Mac that open a host folder.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -87,15 +88,28 @@ fn default_of<'a>(prefs: &EditorPrefs, detected: &'a [Editor]) -> Option<&'a Edi
         .or_else(|| on.first().copied())
 }
 
-/// The editor to open: `requested` if it is on, else the default. The flag
-/// is true when the user asked for an editor and a different one opens. A
-/// saved default that is off or gone sets no flag: [`view`] already shows
-/// its replacement as the default.
-pub fn resolve(prefs: &EditorPrefs, detected: &[Editor], requested: Option<&str>) -> Option<(Editor, bool)> {
-    if let Some(editor) = requested.and_then(|id| enabled(prefs, detected).into_iter().find(|e| e.id == id)) {
+/// True if `id` is in the [`KNOWN`] table.
+pub fn is_known(id: &str) -> bool {
+    KNOWN.iter().any(|k| k.id == id)
+}
+
+/// The editor to open: `requested` if it is on, else the `project` override
+/// if it is on, else the default. The flag is true when the user asked for
+/// an editor and a different one opens. A saved default or override that is
+/// off or gone sets no flag: the launchers already show its replacement as
+/// the default.
+pub fn resolve(
+    prefs: &EditorPrefs,
+    detected: &[Editor],
+    requested: Option<&str>,
+    project: Option<&str>,
+) -> Option<(Editor, bool)> {
+    let on = enabled(prefs, detected);
+    let find = |id: Option<&str>| on.iter().copied().find(|e| Some(e.id.as_str()) == id);
+    if let Some(editor) = find(requested) {
         return Some((editor.clone(), false));
     }
-    let editor = default_of(prefs, detected)?;
+    let editor = find(project).or_else(|| default_of(prefs, detected))?;
     Some((editor.clone(), requested.is_some_and(|id| id != editor.id)))
 }
 
@@ -113,13 +127,15 @@ pub struct EditorView {
 pub struct Editors {
     pub editors: Vec<EditorView>,
     pub default: Option<String>,
+    /// The name of each known editor, also one that is not installed, so a saved choice shows its name.
+    pub names: BTreeMap<&'static str, &'static str>,
 }
 
 pub fn view(prefs: &EditorPrefs, detected: Vec<Editor>) -> Editors {
     let on: Vec<String> = enabled(prefs, &detected).into_iter().map(|e| e.id.clone()).collect();
     let default = default_of(prefs, &detected).map(|e| e.id.clone());
     let editors = detected.into_iter().map(|editor| EditorView { enabled: on.contains(&editor.id), editor }).collect();
-    Editors { editors, default }
+    Editors { editors, default, names: KNOWN.iter().map(|k| (k.id, k.name)).collect() }
 }
 
 /// The host folder of a guest folder below the guest folder of a member
@@ -205,7 +221,7 @@ mod tests {
         let all = [editor("vscode"), editor("zed")];
         assert_eq!(enabled(&prefs(None, None), &all).len(), 2);
         assert!(enabled(&prefs(Some(&[]), None), &all).is_empty());
-        assert_eq!(resolve(&prefs(Some(&[]), Some("zed")), &all, Some("zed")), None);
+        assert_eq!(resolve(&prefs(Some(&[]), Some("zed")), &all, Some("zed"), Some("zed")), None);
         let view = view(&prefs(Some(&["vscode"]), None), all.to_vec());
         assert_eq!(view.default.as_deref(), Some("vscode"));
         assert_eq!(view.editors.iter().map(|e| e.enabled).collect::<Vec<_>>(), [true, false]);
@@ -214,12 +230,15 @@ mod tests {
             json,
             serde_json::json!({ "id": "vscode", "name": "vscode", "path": "/Applications/vscode.app", "enabled": true })
         );
+        // A known editor that is not installed still has its name.
+        assert_eq!(view.names.get("nova"), Some(&"Nova"));
+        assert_eq!(view.names.len(), KNOWN.len());
     }
 
     #[test]
     fn resolve_falls_back_and_says_so() {
         let all = [editor("vscode"), editor("zed")];
-        let resolved = |p: &EditorPrefs, requested| resolve(p, &all, requested).map(|(e, fell)| (e.id, fell));
+        let resolved = |p: &EditorPrefs, requested| resolve(p, &all, requested, None).map(|(e, fell)| (e.id, fell));
         assert_eq!(resolved(&prefs(None, None), Some("vscode")), Some(("vscode".into(), false)));
         assert_eq!(resolved(&prefs(None, None), None), Some(("zed".into(), false)));
         assert_eq!(resolved(&prefs(None, Some("zed")), None), Some(("zed".into(), false)));
@@ -231,6 +250,48 @@ mod tests {
         assert_eq!(resolved(&prefs(None, None), Some("gone")), Some(("zed".into(), true)));
         // A request for the effective default is no fallback.
         assert_eq!(resolved(&prefs(Some(&["zed"]), Some("vscode")), Some("zed")), Some(("zed".into(), false)));
+    }
+
+    #[test]
+    fn a_project_override_opens_before_the_app_default() {
+        let all = [editor("cursor"), editor("vscode"), editor("zed")];
+        let open =
+            |p: &EditorPrefs, requested, project| resolve(p, &all, requested, project).map(|(e, fell)| (e.id, fell));
+        let app = prefs(None, Some("zed"));
+        // Two projects of one cage with different overrides.
+        assert_eq!(open(&app, None, Some("cursor")), Some(("cursor".into(), false)));
+        assert_eq!(open(&app, None, Some("vscode")), Some(("vscode".into(), false)));
+        assert_eq!(open(&app, None, None), Some(("zed".into(), false)));
+        // An override that is off or not installed gives way to the app default, with no flag.
+        assert_eq!(
+            open(&prefs(Some(&["zed", "vscode"]), Some("zed")), None, Some("cursor")),
+            Some(("zed".into(), false))
+        );
+        assert_eq!(open(&app, None, Some("nova")), Some(("zed".into(), false)));
+        // A changed app default applies to a project with an unavailable override.
+        assert_eq!(open(&prefs(None, Some("vscode")), None, Some("nova")), Some(("vscode".into(), false)));
+        assert_eq!(open(&prefs(None, Some("vscode")), None, Some("cursor")), Some(("cursor".into(), false)));
+        // No editor is on.
+        assert_eq!(open(&prefs(Some(&[]), Some("zed")), None, Some("cursor")), None);
+        // An explicit request wins over the override.
+        assert_eq!(open(&app, Some("vscode"), Some("cursor")), Some(("vscode".into(), false)));
+        // A request that is not on falls back to the override and says so.
+        assert_eq!(open(&app, Some("nova"), Some("cursor")), Some(("cursor".into(), true)));
+        assert_eq!(open(&app, Some("cursor"), Some("cursor")), Some(("cursor".into(), false)));
+    }
+
+    #[test]
+    fn only_known_editors_can_be_a_project_choice() {
+        let dir = temp();
+        let mut session = Session::new(dir.to_str().unwrap(), None, []).unwrap();
+        assert_eq!(session.editor, None);
+        // A known editor is kept also when it is not installed.
+        session.set_editor(Some("nova")).unwrap();
+        assert_eq!(session.editor.as_deref(), Some("nova"));
+        assert!(matches!(session.set_editor(Some("notepad")), Err(crate::error::Error::UnknownEditor(_))));
+        assert_eq!(session.editor.as_deref(), Some("nova"));
+        session.set_editor(None).unwrap();
+        assert_eq!(session.editor, None);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 import type { CommandMenuItem } from "@driif/motiv";
 import { AGENT_NAMES, type AgentKind } from "../../shared/agents.ts";
-import type { CageView, SessionCage, TerminalKind, VmCage } from "../../shared/api.ts";
+import type { CageView, SessionCage, SessionView, TerminalKind, VmCage } from "../../shared/api.ts";
 import { launchCage } from "../cages/sessionCage.ts";
 import type { Detection } from "../settings/api.ts";
-import type { Editor, Editors } from "./api.ts";
+import type { Editor, Editors, Opened } from "./api.ts";
 
 const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
 
@@ -17,6 +17,72 @@ export function agentsOf(cage: CageView | VmCage): AgentKind[] {
     "status" in cage && cage.status.state === "running" ? ["pi", ...cage.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
   return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
 }
+
+/** The editors as `session` sees them: its default is its own editor if that is on, else the app default. */
+export function projectEditors(editors: Editors | undefined, session: SessionView): Editors | undefined {
+  if (!editors) return undefined;
+  const own = editors.editors.find((e) => e.id === session.editor && e.enabled);
+  return { ...editors, default: own?.id ?? editors.default };
+}
+
+/** The backend calls of an editor open. Tests pass fakes. */
+export interface EditorCalls {
+  open: (sessionId: string, editorId: string | null, terminalId: string | null) => Promise<Opened>;
+  setProjectEditor: (sessionId: string, editorId: string) => Promise<void>;
+  /** Sets the app default editor and keeps the other preferences as they are saved now. */
+  setAppEditor: (editorId: string) => Promise<void>;
+  /** The saved choices now: the project's editor (`undefined` if the project is gone) and the editors. */
+  saved: (sessionId: string) => Promise<{ project: string | null | undefined; editors: Editors }>;
+}
+
+/** An editor open, the notice about the editor that opened, and true if the shown editors are out of date. */
+export interface EditorOpen {
+  opened: Opened;
+  notice?: string;
+  stale: boolean;
+}
+
+/**
+ * Opens `session` in an editor. No `editorId`: a default open from the toolbar, a pane, the ⌘K default item or ⌘⇧E.
+ * The backend then picks the project's editor, else the app default, and no choice is saved. An `editorId` from a menu
+ * is a choice: when that editor opened, it becomes the project's editor if the project has one, else the app default.
+ * A fallback or a failed open saves nothing. A settings change during the open wins: see `saveChoice`.
+ */
+export async function openEditor(
+  calls: EditorCalls,
+  session: SessionView,
+  editors: Editors | undefined,
+  editorId?: string,
+  terminalId?: string,
+): Promise<EditorOpen> {
+  const opened = await calls.open(session.id, editorId ?? null, terminalId ?? null);
+  if (editorId && !opened.editorFellBack) await saveChoice(calls, session, editors, editorId);
+  if (editorId) {
+    const asked = editors?.names[editorId] ?? "The editor";
+    const fellBack = opened.editorFellBack && asked !== opened.editor;
+    return { opened, notice: fellBack ? `${asked} is not available, so ${opened.editor} opened.` : undefined, stale: false };
+  }
+  const shown = projectEditors(editors, session)?.default;
+  const expected = shown ? editors?.names[shown] : undefined;
+  const stale = opened.editor !== expected;
+  return { opened, notice: stale && expected ? `The app showed ${expected}. ${opened.editor} opened.` : undefined, stale };
+}
+
+/**
+ * Saves `editorId` in the scope that the menu showed. The saved choices are read again after the open: if the
+ * project's editor or the app default changed, or `editorId` is now off, the newer settings stay and nothing is saved.
+ */
+async function saveChoice(calls: EditorCalls, session: SessionView, editors: Editors | undefined, editorId: string) {
+  if (editorId === (session.editor ?? editors?.default)) return;
+  const now = await calls.saved(session.id);
+  if (now.project !== session.editor || !now.editors.editors.some((e) => e.id === editorId && e.enabled)) return;
+  if (session.editor) await calls.setProjectEditor(session.id, editorId);
+  else if (now.editors.default === editors?.default) await calls.setAppEditor(editorId);
+}
+
+/** True if `action` opens the project's default editor in `editors`, the view of `projectEditors`. */
+export const isDefaultEditor = (action: LaunchAction, editors: Editors | undefined) =>
+  action.type === "editor" && action.editor.id === editors?.default;
 
 /** A thing to start in a cage. Every launcher shows its part of one list. `disabled`: why it cannot start. */
 export type LaunchAction = { id: string; label: string; disabled?: string } & (
@@ -85,6 +151,19 @@ export function macAgent(
   if (!agent) throw new Error("zwinger found no agent on this Mac.");
   return { type: "hostAgent", agent, resume: kind !== "agent" && kind.resume };
 }
+
+/**
+ * A launch action of the project as a command. The project's default editor opens as ⌘⇧E does, with `onOpenDefault`,
+ * so it saves no choice. `editors`: the view of `projectEditors`.
+ */
+export const projectLaunchCommand = (
+  action: LaunchAction,
+  label: string,
+  shortcut: string | undefined,
+  editors: Editors | undefined,
+  onLaunch: (action: LaunchAction) => void,
+  onOpenDefault: () => void,
+): CommandMenuItem => launchCommand(action, label, shortcut, isDefaultEditor(action, editors) ? onOpenDefault : onLaunch);
 
 /** A launch action as a command. The command menu has no disabled item: a disabled action shows why and does nothing. */
 export const launchCommand = (

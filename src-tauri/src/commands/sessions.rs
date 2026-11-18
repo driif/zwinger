@@ -69,6 +69,12 @@ pub fn set_harness(manager: Managed<'_>, session_id: String, harness: Option<Str
     manager.set_harness(&session_id, harness.as_deref())
 }
 
+/// `None` lets the session follow the app default editor.
+#[tauri::command]
+pub fn set_project_editor(manager: Managed<'_>, session_id: String, editor: Option<String>) -> Result<()> {
+    manager.set_editor(&session_id, editor.as_deref())
+}
+
 #[tauri::command]
 pub fn list_folders(manager: Managed<'_>, session_id: String) -> Result<Vec<String>> {
     manager.list_folders(&session_id)

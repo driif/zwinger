@@ -26,7 +26,7 @@ pub fn detect_editors(preferences: State<'_, Preferences>) -> Editors {
 pub struct Opened {
     pub editor: String,
     pub folder: PathBuf,
-    /// The asked editor is off or gone, so the default opened.
+    /// The asked editor is off or gone, so the project or app default opened.
     pub editor_fell_back: bool,
     /// The terminal's folder is unknown, so the project folder opened.
     pub folder_fell_back: bool,
@@ -41,8 +41,8 @@ async fn open(args: &[&OsStr], name: &str) -> Result<()> {
     Err(Error::EditorFailed(name.to_owned(), String::from_utf8_lossy(&out.stderr).trim().to_owned()))
 }
 
-/// Opens the session folder, or the terminal's current folder, in `editor_id`
-/// or the default editor. The folder comes from the backend, never from the UI.
+/// Opens the session folder, or the terminal's current folder, in `editor_id`,
+/// else the session's editor, else the default editor. The folder comes from the backend, never from the UI.
 #[tauri::command]
 pub async fn open_in_editor(
     manager: Managed<'_>,
@@ -52,8 +52,10 @@ pub async fn open_in_editor(
     terminal_id: Option<String>,
 ) -> Result<Opened> {
     let (folder, known) = manager.editor_folder(&session_id, terminal_id.as_deref())?;
+    let project = manager.session_editor(&session_id)?;
     let (editor, editor_fell_back) =
-        editor::resolve(&preferences.get().editors, &detected(), editor_id.as_deref()).ok_or(Error::NoEditor)?;
+        editor::resolve(&preferences.get().editors, &detected(), editor_id.as_deref(), project.as_deref())
+            .ok_or(Error::NoEditor)?;
     open(&["-a".as_ref(), editor.path.as_os_str(), folder.as_os_str()], &editor.name).await?;
     Ok(Opened { editor: editor.name, folder, editor_fell_back, folder_fell_back: !known })
 }

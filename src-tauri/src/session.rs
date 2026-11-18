@@ -41,6 +41,9 @@ pub struct Session {
     /// The guest folder where agent terminals start: below `/workspace` or a mount.
     #[serde(default)]
     pub harness: Option<String>,
+    /// The id of the editor that opens the session. `None`: the app default.
+    #[serde(default)]
+    pub editor: Option<String>,
     /// In tree order. A terminal with no live process is dormant: it opens
     /// again under the same id.
     #[serde(default)]
@@ -198,6 +201,7 @@ impl Session {
             cage,
             vm: VmChoice::Shared,
             harness: None,
+            editor: None,
             terminals: Vec::new(),
             pane_layout: None,
             tasks: Vec::new(),
@@ -262,6 +266,16 @@ impl Session {
             Some(input) => Some(Bound { session: self, cage }.harness(input)?),
         };
         Bound { session: self, cage }.check()
+    }
+
+    /// Accepts each known editor, also one that is off or not installed, so
+    /// the choice stays. `None` clears it.
+    pub fn set_editor(&mut self, editor: Option<&str>) -> Result<()> {
+        if let Some(id) = editor.filter(|id| !crate::editor::is_known(id)) {
+            return Err(Error::UnknownEditor(id.to_owned()));
+        }
+        self.editor = editor.map(str::to_owned);
+        Ok(())
     }
 
     /// Adds the task, or replaces the task with the draft's id. Returns its id.

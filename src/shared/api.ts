@@ -204,6 +204,8 @@ export interface SessionView {
   /** The shared VM of its cage, or a VM of the session alone with the key `key` of cage `cage`. */
   vm: { kind: "shared" } | { kind: "own"; key: string; cage: string };
   harness: string | null;
+  /** The id of the editor that opens the project. `null`: the app default. */
+  editor: string | null;
   /** In tree order. */
   terminals: TerminalRecord[];
   /** `null`: no pane is open. */

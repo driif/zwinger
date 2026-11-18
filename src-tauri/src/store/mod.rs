@@ -237,6 +237,8 @@ mod tests {
         store.save_cages(&[Cage::new("c".into(), "c".into())]).unwrap();
         let (sessions, _) = store.load().unwrap();
         assert_eq!(sessions.iter().map(|s| s.cage.as_deref()).collect::<Vec<_>>(), [Some("c"), None]);
+        // A session saved before project editors follows the app default.
+        assert!(sessions.iter().all(|s| s.editor.is_none()));
 
         store.save_cages(&[]).unwrap();
         assert!(matches!(store.load(), Err(Error::MissingCage { cage, .. }) if cage == "c"));
@@ -294,6 +296,7 @@ mod tests {
             cage: Some("p-1".into()),
             vm: VmChoice::Shared,
             harness: Some("/workspace/agent".into()),
+            editor: None,
             terminals: vec![
                 TerminalRecord {
                     id: "term-1".into(),
@@ -440,6 +443,7 @@ mod tests {
             "mounts": [], "network": { "allowAll": false, "domains": [] } }]));
         let (session, cage) = (&sessions[0], &cages[0]);
         assert_eq!(session.harness, None);
+        assert_eq!(session.editor, None);
         assert!(session.layout.is_empty() && session.tasks.is_empty() && session.terminals.is_empty());
         assert_eq!(session.pane_layout, None);
         assert!(cage.logins.is_empty() && cage.host_agents.is_empty());

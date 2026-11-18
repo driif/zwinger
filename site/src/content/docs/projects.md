@@ -135,6 +135,18 @@ that pane. The keys do not go to the shell, and the other panes do not change. T
 zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/Applications`, `~/Applications` and
 `/Applications/Setapp`. Turn editors on and select a default in **Settings > Editors**.
 
+A project can use a different editor. Select it in the **Editor** field in the project's **Settings** tab. **App
+default** removes the project's editor, and the project then uses the app default. When the project's editor is off or
+not installed, the project uses the app default. The field then shows the editor as **(not available)**, so you can
+see it and remove it. The project keeps the editor, and uses it again when it is available.
+
+**Open in editor**, the editor button, the pane menu and the default item of the command menu open the project's
+default editor. They do not change a saved editor. When you select a specific editor from a menu, it becomes the
+default: in a project with its own editor, for that project only, else for the app. zwinger saves it only when that
+editor opened. If you change the editor settings while the editor opens, your change stays and the selection is not
+saved. If the editor is gone, zwinger opens the default editor, tells you, and keeps the saved editors.
+When the editors on your Mac changed and a different editor opens than the one shown, a notice names the two editors.
+
 **Open in editor** (⌘⇧E) opens the project folder, or the current folder of the current terminal. In a VM shell, a
 folder below a project folder of the VM or below a mount opens as its folder on the Mac. Other folders open the project folder.
 

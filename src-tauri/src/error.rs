@@ -196,6 +196,8 @@ pub enum Error {
     NoEditor,
     #[error("{0} did not open: {1}")]
     EditorFailed(String, String),
+    #[error("unknown editor: {0}")]
+    UnknownEditor(String),
     #[error("invalid theme: {0}")]
     InvalidTheme(String),
     #[error("update: {0}")]

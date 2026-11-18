@@ -44,7 +44,7 @@ import { TaskDialog } from "../tasks/TaskDialog";
 import { TerminalTab } from "../terminal";
 import { Notice } from "../../shared/Notice";
 import { tildePath } from "../../shared/paths";
-import { LaunchAction, launchActions } from "../launcher/actions";
+import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
 
@@ -282,6 +282,8 @@ interface Props {
   onSplit: (key: string, direction: "row" | "column") => void;
   /** Opens the terminal's current folder in the default editor. */
   onOpenEditor: (key: string) => void;
+  /** Opens the project folder in the default editor of the project. It saves no choice. */
+  onOpenDefaultEditor: () => void;
   /** Hides the pane of a terminal. Its process keeps running. */
   onHide: (key: string) => void;
   editors?: Editors;
@@ -289,6 +291,7 @@ interface Props {
   home?: string;
   onLaunch: (action: LaunchAction) => void;
   onEditorSettings: () => void;
+  onProjectEditor: (sessionId: string, editor: string | null) => Promise<void>;
   /** Another screen fills the main area. Only the hidden terminals stay mounted, so their titles stay live. */
   covered: boolean;
 }
@@ -323,6 +326,8 @@ export function ProjectPage({
   home,
   onLaunch,
   onEditorSettings,
+  onProjectEditor,
+  onOpenDefaultEditor,
   covered,
   ...terminal
 }: Props) {
@@ -379,10 +384,11 @@ export function ProjectPage({
     </Notice>
   );
   const task = view.kind === "task" ? session.tasks.find((t) => t.id === view.taskId) : undefined;
-  const actions = launchActions({ session, cage, vmCage }, detection, editors);
+  const ownEditors = projectEditors(editors, session);
+  const actions = launchActions({ session, cage, vmCage }, detection, ownEditors);
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
-  const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
+  const defaultEditor = editorActions.find((a) => a.editor.id === ownEditors?.default);
 
   return (
     <section className="page" hidden={covered}>
@@ -427,7 +433,7 @@ export function ProjectPage({
               <SplitLaunch
                 label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
                 icon={<Code size={14} />}
-                onClick={defaultEditor && (() => onLaunch(defaultEditor))}
+                onClick={defaultEditor && onOpenDefaultEditor}
                 menuLabel="Editors"
                 menu={[
                   ...launchMenu(editorActions, onLaunch),
@@ -618,11 +624,13 @@ export function ProjectPage({
                 ),
                 settings: (
                   <SettingsTab
+                    onProjectEditor={onProjectEditor}
                     key={session.id}
                     session={session}
                     cages={cages}
                     defaultCage={defaultCage}
                     folders={folders ?? []}
+                    editors={editors}
                     runtimes={runtimes}
                     run={edit}
                     intent={tab === "settings" ? intent : undefined}

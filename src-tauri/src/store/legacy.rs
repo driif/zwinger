@@ -80,6 +80,7 @@ impl Project {
             cage: Some(self.id.clone()),
             vm: VmChoice::Shared,
             harness: self.harness,
+            editor: None,
             terminals: self.terminals,
             pane_layout: self.pane_layout,
             tasks: self.tasks,

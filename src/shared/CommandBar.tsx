@@ -10,7 +10,7 @@ import { SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
 import { editorLabel } from "../features/terminal/folders";
-import { LaunchAction, launchActions, launchCommand } from "../features/launcher/actions";
+import { isDefaultEditor, LaunchAction, launchActions, projectEditors, projectLaunchCommand } from "../features/launcher/actions";
 import { Editors } from "../features/launcher/api";
 import type { Detection } from "../features/settings/api";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
@@ -89,11 +89,12 @@ export function CommandBar({
       commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(session.id) });
     commands.push(action("newAgent", "New agent"));
     const herePane = panes.find((p) => p.key === here);
-    for (const launch of launchActions(selected, detection, editors)) {
+    const ownEditors = projectEditors(editors, session);
+    for (const launch of launchActions(selected, detection, ownEditors)) {
       const shortcut =
         launch.type === "session" && (launch.kind.type === "host" || launch.kind.type === "shell")
           ? shortcutLabel(launch.kind.type === "host" ? "newShell" : "newVmShell")
-          : launch.type === "editor" && launch.editor.id === editors?.default
+          : isDefaultEditor(launch, ownEditors)
             ? shortcutLabel("openEditor")
             : undefined;
       const label =
@@ -102,7 +103,7 @@ export function CommandBar({
           : herePane
             ? editorLabel(launch.editor.name, herePane.folder, session.folder, home)
             : `Open ${session.name} in ${launch.editor.name}`;
-      commands.push(launchCommand(launch, label, shortcut, onLaunch));
+      commands.push(projectLaunchCommand(launch, label, shortcut, ownEditors, onLaunch, actions.openEditor));
     }
     panes.forEach((pane) =>
       commands.push({

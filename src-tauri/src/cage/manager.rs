@@ -995,6 +995,15 @@ impl<R: SandboxRuntime> Manager<R> {
         self.edit_session(session_id, |s, c| s.set_harness(c.ok_or(Error::NoCage)?, harness))
     }
 
+    pub fn set_editor(&self, session_id: &str, editor: Option<&str>) -> Result<()> {
+        self.edit_session(session_id, |s, _| s.set_editor(editor))
+    }
+
+    /// The editor override of the session.
+    pub fn session_editor(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(lock(&self.state).session(session_id)?.editor.clone())
+    }
+
     pub fn list_folders(&self, session_id: &str) -> Result<Vec<String>> {
         let folder = lock(&self.state).session(session_id)?.folder.clone();
         cage::list_folders(&folder)
@@ -1229,8 +1238,8 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
     })
 }
 
-/// A new name, layout, task, terminal list, unprompted setting or network
-/// rule is used at once, so it needs no restart. A change of the session's
+/// A new name, layout, task, terminal list, editor, unprompted setting or
+/// network rule is used at once, so it needs no restart. A change of the session's
 /// cage or VM choice is not checked here.
 fn session_changed(old: &Session, session: &Session) -> bool {
     Session {
@@ -1239,6 +1248,7 @@ fn session_changed(old: &Session, session: &Session) -> bool {
         tasks: session.tasks.clone(),
         terminals: session.terminals.clone(),
         pane_layout: session.pane_layout.clone(),
+        editor: session.editor.clone(),
         cage: session.cage.clone(),
         vm: session.vm.clone(),
         ..old.clone()
@@ -1416,6 +1426,28 @@ mod tests {
                 .sessions
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_project_editor_is_set_changed_cleared_and_kept_without_a_restart() {
+        let dir = temp_dir();
+        let store = || Store::new(dir.clone());
+        let manager = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        let id = manager.create(dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(manager.session_editor(&id).unwrap(), None);
+        manager.start(&id).await.unwrap();
+        manager.set_editor(&id, Some("cursor")).unwrap();
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        assert_eq!(manager.list().sessions[0].session.editor.as_deref(), Some("cursor"));
+        manager.set_editor(&id, Some("zed")).unwrap();
+        assert!(matches!(manager.set_editor(&id, Some("notepad")), Err(Error::UnknownEditor(_))));
+        assert!(matches!(manager.set_editor("gone", None), Err(Error::SessionNotFound)));
+
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        assert_eq!(reloaded.session_editor(&id).unwrap().as_deref(), Some("zed"));
+        reloaded.set_editor(&id, None).unwrap();
+        let reloaded = Manager::new(FakeRuntime::default(), store(), vault(), temp_dir(), host()).unwrap();
+        assert_eq!(reloaded.session_editor(&id).unwrap(), None);
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ export interface Editor {
 export interface Editors {
   editors: Editor[];
   default: string | null;
+  /** The name of each known editor by id, also one that is not installed. */
+  names: Record<string, string>;
 }
 
 /** What Open in editor did. A fall back opened the default editor or the session folder instead. */

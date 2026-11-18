@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { setHarness } from "./api";
 import { deleteSession, renameSession, setSessionCage } from "../projects/api";
 import { CageView, SessionView } from "../../shared/api";
+import type { Editors } from "../launcher/api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
 import { CageSettings, WORKSPACE } from "../cages/CageSettings";
@@ -11,18 +12,21 @@ import { sessionCage } from "../cages/sessionCage";
 
 interface Props {
   session: SessionView;
+  onProjectEditor: (sessionId: string, editor: string | null) => Promise<void>;
   /** All cages. */
   cages: CageView[];
   /** The default cage of the session's workspace. */
   defaultCage?: CageView;
   folders: string[];
+  /** `undefined` until the first detection. */
+  editors?: Editors;
   runtimes: Runtimes;
   run: Run;
   intent?: Intent;
   onIntentDone: () => void;
 }
 
-export function SettingsTab({ session, cages, defaultCage, folders, runtimes, run, intent, onIntentDone }: Props) {
+export function SettingsTab({ session, onProjectEditor, cages, defaultCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
   const { cage, vmCage } = sessionCage(session, cages);
   const [name, setName] = useState(session.name);
   const [nameError, setNameError] = useState<string>();
@@ -32,6 +36,14 @@ export function SettingsTab({ session, cages, defaultCage, folders, runtimes, ru
 
   const harnessOptions = [...folders.map((f) => `${WORKSPACE}/${f}`), ...(cage?.mounts ?? []).map((m) => m.guest)];
   if (session.harness && !harnessOptions.includes(session.harness)) harnessOptions.push(session.harness);
+
+  const enabledEditors = editors?.editors.filter((e) => e.enabled) ?? [];
+  const appEditor = editors?.editors.find((e) => e.id === editors.default)?.name ?? "none";
+  // A saved editor that is off or not installed stays visible, so the user can clear it.
+  const lostEditor =
+    session.editor && !enabledEditors.some((e) => e.id === session.editor)
+      ? (editors?.names[session.editor] ?? session.editor)
+      : undefined;
 
   // A blank name reverts to the folder name, as in the backend.
   const nextName = name.trim() || (session.folder.split("/").filter(Boolean).pop() ?? session.folder);
@@ -99,6 +111,24 @@ export function SettingsTab({ session, cages, defaultCage, folders, runtimes, ru
             onChange={(id) => run(() => setSessionCage(session.id, id || null))}
           />
           {!cage && <p className="muted">With no cage, the project opens Mac shells only.</p>}
+          {editors && (
+            <Select
+              label="Editor"
+              options={[
+                { value: "", label: `App default (${appEditor})` },
+                ...enabledEditors.map((e) => ({ value: e.id, label: e.name })),
+                ...(lostEditor && session.editor ? [{ value: session.editor, label: `${lostEditor} (not available)` }] : []),
+              ]}
+              value={session.editor ?? ""}
+              onChange={(id) => run(() => onProjectEditor(session.id, id || null))}
+            />
+          )}
+          {editors && (
+            <p className="muted">
+              An editor that is not available falls back to the app default. If the project has its own editor, an editor
+              that you choose from a menu changes only this project.
+            </p>
+          )}
         </CardBody>
       </Card>
 

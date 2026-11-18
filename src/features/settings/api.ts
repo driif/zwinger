@@ -4,6 +4,10 @@ import { AgentKind, call, HostAgentUse } from "../../shared/api";
 export const setHarness = (sessionId: string, harness: string | null) =>
   call<void>("set_harness", { sessionId, harness });
 
+/** `null` lets the project follow the app default editor. */
+export const setProjectEditor = (sessionId: string, editor: string | null) =>
+  call<void>("set_project_editor", { sessionId, editor });
+
 export const listFolders = (sessionId: string) =>
   call<string[]>("list_folders", { sessionId });
 
