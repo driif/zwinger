@@ -153,7 +153,8 @@ impl Preferences {
         let mut current: Prefs =
             std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         current.terminal = current.terminal.clamped();
-        current.sidebar_font_size = current.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
+        current.sidebar_font_size =
+            current.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         Self { path, current: Mutex::new(current) }
     }
 
@@ -164,7 +165,8 @@ impl Preferences {
     /// Writes a temp file and renames it, so a crash keeps the old file.
     pub fn set(&self, mut prefs: Prefs) -> Result<()> {
         prefs.terminal = prefs.terminal.clamped();
-        prefs.sidebar_font_size = prefs.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
+        prefs.sidebar_font_size =
+            prefs.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;

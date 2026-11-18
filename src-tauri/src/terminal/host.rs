@@ -14,8 +14,8 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::{Error, Result};
 use crate::agent::launch::CA_ENV;
+use crate::error::{Error, Result};
 use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput};
 
 /// How long the exit waits for the last output after the shell exits. A
@@ -58,7 +58,8 @@ pub(crate) fn shell_argv() -> Vec<String> {
 /// `argv` through the login shell, so `node` and `PATH` come from the
 /// user's profile.
 pub(crate) fn login_exec(argv: Vec<String>) -> Vec<String> {
-    let mut all = vec![login_shell(), "-l".to_owned(), "-c".to_owned(), r#"exec "$@""#.to_owned(), "zwinger".to_owned()];
+    let mut all =
+        vec![login_shell(), "-l".to_owned(), "-c".to_owned(), r#"exec "$@""#.to_owned(), "zwinger".to_owned()];
     all.extend(argv);
     all
 }
@@ -67,8 +68,15 @@ pub(crate) fn login_exec(argv: Vec<String>) -> Vec<String> {
 /// Node net env of a cage, and the VM runtime's env. A user profile can set
 /// them again.
 fn scrubbed_env(env: impl IntoIterator<Item = String>) -> Vec<String> {
-    const NAMES: [&str; 7] =
-        ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "NODE_USE_ENV_PROXY", "NODE_OPTIONS"];
+    const NAMES: [&str; 7] = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_USE_ENV_PROXY",
+        "NODE_OPTIONS",
+    ];
     let proxy = |name: &str| ["http_proxy", "https_proxy", "all_proxy", "no_proxy"].contains(&name);
     env.into_iter()
         .filter(|name| {

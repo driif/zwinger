@@ -442,8 +442,10 @@ mod tests {
             bin: bin.map(PathBuf::from),
         };
         let claude = found(AgentKind::Claude, None, None, Some("/Users/me/.local/share/claude/versions/2.1.310"));
-        let codex = found(AgentKind::Codex, Some("/opt/homebrew/lib/node_modules/@openai/codex"), None, Some("/usr/bin/codex"));
-        let pi = found(AgentKind::Pi, Some("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"), None, None);
+        let codex =
+            found(AgentKind::Codex, Some("/opt/homebrew/lib/node_modules/@openai/codex"), None, Some("/usr/bin/codex"));
+        let pi =
+            found(AgentKind::Pi, Some("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"), None, None);
         let gemini = found(AgentKind::Gemini, Some("/opt/gemini"), Some("bundle/gemini.js"), None);
         let cases: [(&HostAgent, bool, &[&str]); 8] = [
             (&claude, false, &["/Users/me/.local/share/claude/versions/2.1.310"]),

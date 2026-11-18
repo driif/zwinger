@@ -2226,7 +2226,9 @@ mod tests {
         let path = manager.state_dir(&own).display().to_string();
         assert_eq!(
             e.message(),
-            format!("Could not delete the agent state of VM {own} at {path} (Not a directory (os error 20)); delete it by hand.")
+            format!(
+                "Could not delete the agent state of VM {own} at {path} (Not a directory (os error 20)); delete it by hand."
+            )
         );
         assert_eq!(vm_key(&manager, &a), Some(a.clone()));
         assert!(matches!(manager.set_session_vm(&a, true, None).await, Err(Error::VmStateLeft { .. })));
