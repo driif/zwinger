@@ -125,31 +125,36 @@ export async function openTerminal(el: HTMLElement): Promise<Engine> {
   observer.observe(el);
 
   let webgl: WebglAddon | undefined;
+  function releaseWebgl() {
+    if (!webgl) return;
+    // xterm appends its WebGL canvas after the 2D link layer. Its addon detaches
+    // that canvas on disposal but leaves the context live until garbage collection.
+    const canvas = el.querySelector<HTMLCanvasElement>(".xterm-screen > canvas:last-of-type");
+    const gl = canvas?.getContext("webgl2");
+    webgl.dispose();
+    webgl = undefined;
+    if (gl && !gl.isContextLost()) gl.getExtension("WEBGL_lose_context")?.loseContext();
+  }
   return {
     term,
     fit: fitNow,
     setVisible(visible) {
       if (visible && !webgl) {
         try {
-          const addon = new WebglAddon();
-          // A lost context goes back to the DOM renderer.
-          addon.onContextLoss(() => {
-            addon.dispose();
-            if (webgl === addon) webgl = undefined;
-          });
-          term.loadAddon(addon);
-          webgl = addon;
+          webgl = new WebglAddon();
+          webgl.onContextLoss(releaseWebgl);
+          term.loadAddon(webgl);
         } catch {
-          // No WebGL: the DOM renderer draws.
+          releaseWebgl();
         }
-      } else if (!visible && webgl) {
-        webgl.dispose();
-        webgl = undefined;
+      } else if (!visible) {
+        releaseWebgl();
       }
     },
     dispose() {
       observer.disconnect();
       live.delete(entry);
+      releaseWebgl();
       term.dispose();
     },
   };

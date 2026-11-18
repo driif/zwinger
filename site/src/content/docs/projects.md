@@ -99,7 +99,8 @@ restores it after a restart. Each pane header shows where its terminal runs. **M
 directly on your Mac. **VM** means it runs inside the cage. The badge also appears when the terminal is dormant.
 In a narrow pane, select **…** in its header to split the pane, open its folder in your editor, or hide the pane.
 
-When you close a pane, the terminal is hidden but continues to run. To end its process, use **Close** in the tree.
+When you close a pane, the terminal is hidden but continues to run. A hidden terminal releases its WebGL context.
+When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tree.
 
 ## Editors
 
