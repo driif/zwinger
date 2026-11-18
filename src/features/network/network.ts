@@ -6,13 +6,13 @@ import {
   Container,
   GitBranch,
   Globe,
-  LucideIcon,
+  type LucideIcon,
   Package,
   Sparkles,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { networkCatalog, Service } from "./api";
-import { NetworkPolicy, Rule, Target } from "../../shared/api";
+import { networkCatalog, type Service } from "./api.ts";
+import type { NetworkPolicy, Rule, Target } from "../../shared/api.ts";
 
 /** The catalog names lucide icons. lucide has no brand icons, so GitHub gets a branch. */
 const ICONS: Record<string, LucideIcon> = {

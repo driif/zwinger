@@ -1,8 +1,8 @@
 import type { Edge, Node } from "@xyflow/react";
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, LucideIcon, Package, UserCog } from "lucide-react";
-import { NetEvent, Service } from "../network/api";
-import { AGENT_NAMES, AgentKind, CageView, SessionView, VmCage } from "../../shared/api";
-import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "../network/network";
+import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, type LucideIcon, Package, UserCog } from "lucide-react";
+import type { NetEvent, Service } from "../network/api.ts";
+import { AGENT_NAMES, type AgentKind, type CageView, type SessionView, type VmCage } from "../../shared/api.ts";
+import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "../network/network.ts";
 
 const HOST_X = 16;
 const HOST_W = 230;

@@ -1,6 +1,6 @@
-import { invoke, InvokeArgs } from "@tauri-apps/api/core";
-import type { AgentKind } from "./agents";
-import { isBackendError } from "./errorMessage";
+import { invoke, type InvokeArgs } from "@tauri-apps/api/core";
+import type { AgentKind } from "./agents.ts";
+import { isBackendError } from "./errorMessage.ts";
 
 /** The window event of a lost backend. The backend also emits it on a panic. */
 export const BACKEND_LOST = "backend-lost";
@@ -281,5 +281,5 @@ export interface AgentNeed {
 /** The code of the backend's `InvalidOrder` error. */
 export const INVALID_ORDER = "InvalidOrder";
 
-export { AGENT_NAMES } from "./agents";
-export type { AgentKind } from "./agents";
+export { AGENT_NAMES } from "./agents.ts";
+export type { AgentKind } from "./agents.ts";

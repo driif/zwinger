@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Prefs } from "../settings/api";
-import { listThemes, Theme, ThemeList } from "./api";
+import type { Prefs } from "../settings/api.ts";
+import { listThemes, type Theme, type ThemeList } from "./api.ts";
 
 const XTERM_ANSI = [
   "#1e293b", "#f87171", "#4ade80", "#facc15", "#60a5fa", "#c084fc", "#22d3ee", "#e5e7eb",

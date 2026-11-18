@@ -1,4 +1,4 @@
-import { call } from "../../shared/api";
+import { call } from "../../shared/api.ts";
 
 /** The colors of the terminal. `ansi` has the 16 ANSI colors in order. */
 export interface TerminalColors {

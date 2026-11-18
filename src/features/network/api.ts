@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { Action, call, DefaultAction, Inject, Target } from "../../shared/api";
+import { call, type Action, type DefaultAction, type Inject, type Target } from "../../shared/api.ts";
 
 /** A service of the catalog. */
 export interface Service {
