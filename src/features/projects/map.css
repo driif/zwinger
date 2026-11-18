@@ -154,6 +154,12 @@
   border-color: var(--zw-status-error);
 }
 
+/* A folder dragged from Finder is over the boundary. */
+.react-flow__node[data-folder-drop] .map-boundary {
+  border-color: var(--motiv-color-primary);
+  background: var(--motiv-color-primary-subtle);
+}
+
 .map-boundary-header {
   display: flex;
   align-items: center;

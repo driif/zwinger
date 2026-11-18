@@ -77,6 +77,7 @@ import { CommandBar } from "./shared/CommandBar";
 import { Onboarding, StartupScreen } from "./features/onboarding/Onboarding";
 import { ProjectPage } from "./features/projects/ProjectPage";
 import { ProjectRail } from "./features/projects/ProjectRail";
+import { folderDrop, resolveFolderTarget } from "./features/projects/folderDrop";
 import { agentsOf, LaunchAction, macAgent } from "./features/launcher/actions";
 import { launchCage, sessionCage } from "./features/cages/sessionCage";
 import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
@@ -712,28 +713,53 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
 
   // A duo round folder dropped anywhere opens its room. Another folder dropped on
   // a workspace or session row, or on empty rail space, creates a project. The map has its own listener.
+  // While a folder that is not a round folder is dragged, folderDrop highlights the target.
   useEffect(() => {
+    // Increments for each enter, leave and drop, so a late check of the entered path is ignored.
+    let drag = 0;
     const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
-      if (payload.type !== "drop" || payload.paths.length === 0) return;
-      const { x, y } = payload.position.toLogical(window.devicePixelRatio);
-      const element = document.elementFromPoint(x, y);
+      if (payload.type === "leave") {
+        drag++;
+        folderDrop.clear();
+        return;
+      }
+      const point = payload.position.toLogical(window.devicePixelRatio);
+      if (payload.type === "over") return folderDrop.over(point);
+      if (payload.type === "enter") {
+        const current = ++drag;
+        folderDrop.enter(point);
+        if (payload.paths.length === 0) return;
+        const entered = payload.paths[0];
+        // A plain file or a missing path is not a project or a mount, so it gets no highlight.
+        const eligible = await isRoundFolder(entered).then(
+          (round) => !round && resolveFolder(entered).then(() => true),
+        ).catch(() => false);
+        if (eligible && current === drag) folderDrop.show();
+        return;
+      }
+      drag++;
+      folderDrop.clear();
+      if (payload.paths.length === 0) return;
+      const target = resolveFolderTarget(point);
       const dropped = payload.paths[0];
       if (await isRoundFolder(dropped)) {
         setRoundFolder(dropped);
         return;
       }
-      if (!element?.closest("[data-drop=rail]")) return;
-      // Only the nearest row counts: a terminal, task or group row inside a session refuses the drop.
-      const row = element.closest<HTMLElement>("[role=treeitem]");
-      if (row && !row.dataset.workspaceDrop) return;
-      const workspace = row?.dataset.workspaceDrop;
+      if (target?.kind !== "rail") return;
+      const workspace = target.workspace;
       setError(undefined);
       resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder, workspace }), (e) => setError(errorMessage(e)));
     });
     return () => {
+      drag++;
+      folderDrop.clear();
       stop.then((unlisten) => unlisten());
     };
   }, []);
+
+  // Tauri sends no `over` event while the pointer does not move, so a page change tests the last point again.
+  useEffect(() => folderDrop.refresh(), [view, settingsTab, showCages, roundFolder, session?.id]);
 
   const dropMount = (dropped: string) =>
     run(async () => {

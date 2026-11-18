@@ -263,9 +263,11 @@ p {
   gap: var(--zw-page-pad);
 }
 
-/* The map takes the height that the other overview parts leave. */
+/* The map takes the height that the other overview parts leave. A definite
+   height lets the React Flow pane resolve its height: 100%. In a short window
+   the parts overflow and the tab panel scrolls. */
 .overview {
-  min-height: 100%;
+  height: 100%;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;

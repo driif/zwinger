@@ -49,7 +49,8 @@ visible rows. A ring marks the row that has keyboard focus.
 - Click a session to open its terminal view.
 - Drop a folder from Finder on a workspace or a session row to create a project in that workspace. A folder dropped
   on empty rail space goes to the first workspace. A Terminals or Tasks row, a terminal row and a task row do not
-  accept a folder.
+  accept a folder. While you drag the folder, a dashed outline shows the row or the rail space that receives it. A file
+  gets no outline. A duo round folder gets no outline either: it opens its room wherever you drop it.
 
 zwinger saves the workspaces in `workspaces.json`, the projects in `sessions.json` and their cage settings in
 `cages.json`, all in the app data folder. A start after an update from an older version converts `projects.json` to
@@ -114,3 +115,7 @@ folder below a project folder of the VM or below a mount opens as its folder on 
 
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You
 can drag the nodes. zwinger saves their positions. **Reset layout** clears them.
+
+Drop a folder from Finder inside the project boundary to start a mount of that folder in the project settings. While
+you drag the folder over the boundary, the boundary is highlighted. Outside the boundary, the map does not accept the
+folder.

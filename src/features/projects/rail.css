@@ -131,6 +131,17 @@
   outline: 1px dashed var(--motiv-color-primary);
 }
 
+/* The target of a folder dragged from Finder. */
+.tree-item[data-folder-drop] > .tree-row,
+.rail-tree[data-folder-drop] {
+  outline: 1px dashed var(--motiv-color-primary);
+}
+
+.rail-tree[data-folder-drop] {
+  /* The rail tree scrolls, so the outline goes inside its edge. */
+  outline-offset: -1px;
+}
+
 .tree-item[aria-selected="true"] > .tree-row {
   background: var(--motiv-color-primary-subtle);
 }

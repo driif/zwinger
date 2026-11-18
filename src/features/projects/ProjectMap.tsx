@@ -20,6 +20,7 @@ import { RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from
 import { NetEvent } from "../network/api";
 import { setLayout } from "./api";
 import { isRoundFolder } from "../tasks/api";
+import { folderDrop, resolveFolderTarget } from "./folderDrop";
 import { CageView, Pos, SessionView, VmCage } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
@@ -154,7 +155,7 @@ function MapCanvas(props: Props) {
   }, [props.visible]);
 
   return (
-    <div ref={container} className="map" role="group" aria-label={`Map of project ${props.session.name}`}>
+    <div ref={container} className="map" data-drop="map" role="group" aria-label={`Map of project ${props.session.name}`}>
       {metrics && <MapFlow {...props} metrics={metrics} container={container} />}
     </div>
   );
@@ -173,7 +174,7 @@ function MapFlow({
   metrics,
   container,
 }: Props & { metrics: MapMetrics; container: RefObject<HTMLDivElement | null> }) {
-  const { fitView, getNode, getNodes, getNodesBounds, getViewport, screenToFlowPosition } = useReactFlow<MapNode>();
+  const { fitView, getNodes, getNodesBounds, getViewport } = useReactFlow<MapNode>();
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
   const catalog = useCatalog();
@@ -263,23 +264,16 @@ function MapFlow({
     };
   }, [visible, auto]);
 
-  // Child nodes cover the boundary, so the drop point is tested against its rect.
   const onDrop = useRef(onDropFolder);
   onDrop.current = onDropFolder;
   useEffect(() => {
     const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
-      const point = payload.position.toLogical(window.devicePixelRatio);
-      if (!container.current?.contains(document.elementFromPoint(point.x, point.y))) return;
+      const target = resolveFolderTarget(payload.position.toLogical(window.devicePixelRatio));
+      if (target?.kind !== "map" || !container.current?.contains(target.element)) return;
       // The App listener opens the room of a round folder.
       if (await isRoundFolder(payload.paths[0])) return;
-      const { x, y } = screenToFlowPosition(point);
-      const box = getNode("boundary");
-      const width = box?.measured?.width ?? box?.width;
-      const height = box?.measured?.height ?? box?.height;
-      if (!box || width === undefined || height === undefined) return;
-      const { x: left, y: top } = box.position;
-      if (x >= left && x <= left + width && y >= top && y <= top + height) onDrop.current(payload.paths[0]);
+      onDrop.current(payload.paths[0]);
     });
     return () => {
       stop.then((unlisten) => unlisten());
@@ -298,6 +292,7 @@ function MapFlow({
         save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
       }
       onNodeClick={(_, node) => jump(node)}
+      onMove={folderDrop.refresh}
       onKeyDown={(event) => {
         if (event.key !== "Enter") return;
         const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
