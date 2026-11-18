@@ -315,6 +315,7 @@ pub fn run() {
             commands::cages::remove_mount,
             commands::cages::set_mount_readonly,
             commands::network::network_catalog,
+            commands::network::proxy_ca_fingerprint,
             commands::network::set_network_default,
             commands::network::set_offline,
             commands::network::put_rule,

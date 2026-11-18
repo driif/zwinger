@@ -76,5 +76,29 @@ only in the memory of the app: no file and no Keychain item holds it. The app wr
 and logs its SHA-256 fingerprint once (`proxy CA sha256 …`). Each cage start puts the current CA in the trust store
 of the cage and removes the CA of an earlier app start.
 
+**Settings > About** shows the SHA-256 fingerprint of the current CA. To compare it with the CA in a cage, run this
+command in the cage. It uses only Node, so it works in the default image (`node:22-slim`):
+
+```sh
+node -e "const fs = require('node:fs'), { X509Certificate } = require('node:crypto'); console.log(new X509Certificate(fs.readFileSync('/opt/zwinger/ca/zwinger-ca.pem')).fingerprint256)"
+```
+
+If openssl is installed, this command gives the same fingerprint after `sha256 Fingerprint=`:
+
+```sh
+openssl x509 -noout -fingerprint -sha256 -in /opt/zwinger/ca/zwinger-ca.pem
+```
+
+The cage start writes the new bundle `/etc/ssl/certs/ca-certificates.crt` to a temp file next to it, and then replaces
+the bundle in one atomic step. A process that reads the bundle sees the complete old bundle or the complete new bundle.
+If the bundle is a symlink, the app replaces the file at the end of the links and keeps the links. The bundle keeps its
+file mode. If a step fails, the old bundle stays as it was and the cage shows a notice.
+
+The cage start does not run `update-ca-certificates`, because Debian's version replaces a symlinked bundle with a
+file. If openssl or `c_rehash` (Alpine `ca-certificates`) is installed, the cage start sets up CApath trust
+automatically: it adds the CA to `/etc/ssl/certs` for clients that read only that folder, as `zwinger-ca.pem` and a hash
+link, with the names that `update-ca-certificates` uses. The link of an earlier app start is removed. An image with
+neither tool (for example `node:22-slim`) trusts the CA only through the bundle file.
+
 At each app start, the app stops the VMs that the last run left running. If this stop fails, the first cage start
 stops them again. While it fails, no cage starts.

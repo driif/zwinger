@@ -192,3 +192,6 @@ export const removeLegacyRuntime = (legacy: Legacy) =>
 
 /** Removes the cached images that no project uses. Resolves to the freed bytes, if known. */
 export const cleanImages = () => call<number | null>("clean_images");
+
+/** The SHA-256 of the proxy CA of this app run, in colon hex. Compare it with the CA in the guest. */
+export const proxyCaFingerprint = () => call<string>("proxy_ca_fingerprint");

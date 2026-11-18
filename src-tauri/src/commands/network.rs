@@ -7,6 +7,12 @@ use crate::secrets::SecretValue;
 
 use super::Managed;
 
+/// The SHA-256 of the proxy CA certificate, as colon hex. Public data only.
+#[tauri::command]
+pub fn proxy_ca_fingerprint(manager: Managed<'_>) -> String {
+    manager.ca.fingerprint()
+}
+
 #[tauri::command]
 pub fn network_catalog() -> &'static [Service] {
     network::CATALOG

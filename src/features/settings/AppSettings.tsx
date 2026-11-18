@@ -11,6 +11,7 @@ import {
   legacyStorage,
   LegacyView,
   Prefs,
+  proxyCaFingerprint,
   removeLegacyRuntime,
   storage,
   StorageView,
@@ -219,6 +220,13 @@ function Storage() {
 }
 
 function About({ version }: { version?: string }) {
+  const [fingerprint, setFingerprint] = useState<string>();
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    proxyCaFingerprint().then(setFingerprint, (e) => setError(errorMessage(e)));
+  }, []);
+
   return (
     <div className="tab-body">
       <Card variant="outlined" padding="md">
@@ -234,6 +242,23 @@ function About({ version }: { version?: string }) {
           <Button size="sm" variant="outline" iconLeft={<ExternalLink size={14} />} onClick={() => openUrl(`${REPO}/blob/main/LICENSE`)}>
             License (Apache 2.0)
           </Button>
+        </CardBody>
+      </Card>
+      <Card variant="outlined" padding="md">
+        <CardHeader
+          title="Proxy CA SHA-256"
+          titleAs="h2"
+          description="Each app start makes a new CA for the proxy. To compare it with the CA in a cage, see Network in the guide."
+        />
+        <CardBody>
+          {fingerprint && (
+            <CopyField
+              value={fingerprint}
+              label="Copy proxy CA SHA-256 fingerprint"
+              display={<span style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>{fingerprint}</span>}
+            />
+          )}
+          {error && <p className="muted">{error}</p>}
         </CardBody>
       </Card>
     </div>

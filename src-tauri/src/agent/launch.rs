@@ -348,6 +348,10 @@ pub fn profile_argv() -> Vec<String> {
 const BEGIN: &str = "# BEGIN zwinger proxy CA";
 const END: &str = "# END zwinger proxy CA";
 
+/// The link to [`LOCAL_CA`] in the dir of [`CA_BUNDLE`], with the name that
+/// `update-ca-certificates` gives it.
+const CA_LINK: &str = "zwinger-ca.pem";
+
 /// Drops the marked block, and each PEM outside it that is equal to the
 /// previous CA (`ARGV[1]`) or the new CA (`ARGV[2]`), from the bundle
 /// (`ARGV[3]`). An updater can copy the previous CA outside the block.
@@ -367,29 +371,120 @@ END { printf "%s", pem }"#;
 /// has a new CA, so the previous CA is removed from the whole bundle and the
 /// marked block holds only the new CA. With no system bundle, the bundle
 /// holds only this CA.
+///
+/// The script writes temp files next to the resolved bundle and the local
+/// copy, and renames them over those files. Readers see the complete old or
+/// new bundle, and a symlink chain to the bundle stays as it is. The script
+/// does not run `update-ca-certificates`: Debian's updater renames its output
+/// over the symlink. Instead, with openssl or c_rehash, it makes the CApath
+/// links that the updater makes. Each error before the bundle rename puts the local copy and
+/// the links back, and the trap removes the temp files.
 pub fn trust_argv() -> Vec<String> {
-    let dir = LOCAL_CA.rsplit_once('/').expect("a dir").0;
+    let local_dir = LOCAL_CA.rsplit_once('/').expect("a dir").0;
     let strip = STRIP.replace("BEGIN_MARK", BEGIN).replace("END_MARK", END);
     let script = [
         "set -e".to_owned(),
+        "prev= tmp= local= keep= swapped= pem= hash_link= stale= stage= done=".to_owned(),
+        format!("certs=$(dirname {CA_BUNDLE})"),
+        "undo() {".to_owned(),
+        "  if [ -n \"$swapped\" ]; then".to_owned(),
+        format!("    if [ -n \"$keep\" ]; then mv -f \"$keep\" {LOCAL_CA}; else rm -f {LOCAL_CA}; fi"),
+        "  fi".to_owned(),
+        "  [ -z \"$hash_link\" ] || rm -f \"$hash_link\"".to_owned(),
+        format!("  [ -z \"$pem\" ] || rm -f \"$certs/{CA_LINK}\""),
+        "  [ -z \"$stale\" ] || for link in \"$stale\"/*; do [ ! -L \"$link\" ] || mv -f \"$link\" \"$certs/\"; done".to_owned(),
+        "}".to_owned(),
+        "trap 'status=$?; set +e; [ -n \"$done\" ] || undo; rm -rf ${prev:+\"$prev\"} ${tmp:+\"$tmp\"} ${local:+\"$local\"} ${keep:+\"$keep\"} ${stale:+\"$stale\"} ${stage:+\"$stage\"}; exit $status' EXIT".to_owned(),
+        // `mv` onto a dir moves the file into it, so each target is a file or
+        // missing.
+        format!("[ ! -e {LOCAL_CA} ] || [ -f {LOCAL_CA} ] || exit 1"),
+        // A fresh image has no bundle and no dir. A dangling link is not
+        // fresh: the dir of its target must exist.
+        format!("[ -e {CA_BUNDLE} ] || [ -L {CA_BUNDLE} ] || mkdir -p \"$certs\""),
+        // Follows the links by hand: `readlink -f` fails on a missing target
+        // in some builds. More than 40 links is a cycle.
+        format!("real={CA_BUNDLE} hops=0"),
+        "while [ -L \"$real\" ]; do".to_owned(),
+        "  hops=$((hops + 1)); [ \"$hops\" -le 40 ] || exit 1".to_owned(),
+        "  link=$(readlink \"$real\")".to_owned(),
+        "  case $link in /*) real=$link ;; *) real=$(dirname \"$real\")/$link ;; esac".to_owned(),
+        "done".to_owned(),
+        "dir=$(cd -P \"$(dirname \"$real\")\" && pwd -P) || exit 1".to_owned(),
+        "real=$dir/$(basename \"$real\")".to_owned(),
+        "[ -w \"$dir\" ] || exit 1".to_owned(),
+        "[ ! -e \"$real\" ] || [ -f \"$real\" ] || exit 1".to_owned(),
+        // OpenSSL clients with only a CApath look up the CA by the hash of its
+        // subject.
+        "hash=".to_owned(),
+        "if command -v openssl >/dev/null 2>&1; then".to_owned(),
+        format!("  hash=$(openssl x509 -noout -subject_hash -in {CA_CERT})"),
+        "  [ -n \"$hash\" ] || exit 1".to_owned(),
+        // Alpine has c_rehash without openssl. Its output is not parsed: the
+        // hash is the name of the one link to the CA in a private dir.
+        "elif command -v c_rehash >/dev/null 2>&1; then".to_owned(),
+        "  stage=$(mktemp -d)".to_owned(),
+        format!("  cat {CA_CERT} > \"$stage/ca.pem\""),
+        "  c_rehash \"$stage\" >/dev/null".to_owned(),
+        "  for link in \"$stage\"/????????.0; do".to_owned(),
+        "    [ -L \"$link\" ] && [ \"$(readlink \"$link\")\" = ca.pem ] || continue".to_owned(),
+        "    name=${link##*/}".to_owned(),
+        "    case ${name%.0} in *[!0-9a-f]*) continue ;; esac".to_owned(),
+        "    [ -z \"$hash\" ] || exit 1".to_owned(),
+        "    hash=${name%.0}".to_owned(),
+        "  done".to_owned(),
+        "  [ -n \"$hash\" ] || exit 1".to_owned(),
+        "fi".to_owned(),
+        format!("[ -z \"$hash\" ] || [ ! -e \"$certs/{CA_LINK}\" ] || [ -L \"$certs/{CA_LINK}\" ] || exit 1"),
         "prev=$(mktemp)".to_owned(),
-        "tmp=$(mktemp)".to_owned(),
-        "trap 'rm -f \"$prev\" \"$tmp\"' EXIT".to_owned(),
         // The local copy of the last run is the previous CA.
         format!("[ ! -f {LOCAL_CA} ] || cat {LOCAL_CA} > \"$prev\""),
-        format!("mkdir -p {dir}"),
-        format!("cp {CA_CERT} {LOCAL_CA}"),
-        "if command -v update-ca-certificates >/dev/null 2>&1; then".to_owned(),
-        "  update-ca-certificates >/dev/null".to_owned(),
-        format!("elif [ ! -f {CA_BUNDLE} ]; then"),
-        // All TLS of the cage goes through the proxy, so a bundle with only
-        // the zwinger CA is complete.
-        format!("  mkdir -p \"$(dirname {CA_BUNDLE})\""),
-        format!("  : > {CA_BUNDLE}"),
+        "tmp=$(mktemp \"$dir/.zwinger-bundle.XXXXXX\")".to_owned(),
+        // `cp -p` keeps the mode and owner of the old bundle. A new bundle is
+        // public. All TLS of the cage goes through the proxy, so a bundle with
+        // only the zwinger CA is complete.
+        "if [ -f \"$real\" ]; then cp -p \"$real\" \"$tmp\"; old=$real; else chmod 0644 \"$tmp\"; old=/dev/null; fi"
+            .to_owned(),
+        format!("awk '{strip}' \"$prev\" {CA_CERT} \"$old\" > \"$tmp\""),
+        format!("{{ echo '{BEGIN}'; cat {CA_CERT}; echo '{END}'; }} >> \"$tmp\""),
+        // The local copy keeps the CA in the store for a later update of the
+        // ca-certificates package. A failed run puts it back: the next run
+        // must know the previous CA.
+        format!("mkdir -p {local_dir}"),
+        format!("local=$(mktemp {local_dir}/.zwinger-ca.XXXXXX)"),
+        format!("cat {CA_CERT} > \"$local\""),
+        "chmod 0644 \"$local\"".to_owned(),
+        format!(
+            "if [ -f {LOCAL_CA} ]; then keep=$(mktemp {local_dir}/.zwinger-keep.XXXXXX); ln -f {LOCAL_CA} \"$keep\"; fi"
+        ),
+        // The CApath links have the names that `update-ca-certificates` gives
+        // them: `zwinger-ca.pem` to the local copy, and the hash link to it.
+        // They follow the local copy, so its rename switches the CApath trust.
+        "if [ -n \"$hash\" ]; then".to_owned(),
+        format!("  [ -L \"$certs/{CA_LINK}\" ] || {{ ln -s {LOCAL_CA} \"$certs/{CA_LINK}\"; pem=1; }}"),
+        "  found=".to_owned(),
+        "  for link in \"$certs/$hash\".*; do".to_owned(),
+        format!("    [ -L \"$link\" ] && [ \"$(readlink \"$link\")\" = {CA_LINK} ] || continue"),
+        "    found=1".to_owned(),
+        "  done".to_owned(),
+        "  if [ -z \"$found\" ]; then".to_owned(),
+        "    n=0".to_owned(),
+        "    while [ -e \"$certs/$hash.$n\" ] || [ -L \"$certs/$hash.$n\" ]; do n=$((n + 1)); done".to_owned(),
+        format!("    ln -s {CA_LINK} \"$certs/$hash.$n\""),
+        "    hash_link=$certs/$hash.$n".to_owned(),
+        "  fi".to_owned(),
+        // A hash link of an older subject moves aside before the swap, so a
+        // failed step puts it back. The trap removes it after the swap.
+        "  for link in \"$certs\"/????????.*; do".to_owned(),
+        format!("    [ -L \"$link\" ] && [ \"$(readlink \"$link\")\" = {CA_LINK} ] || continue"),
+        "    case ${link##*/} in \"$hash\".*) continue ;; esac".to_owned(),
+        "    [ -n \"$stale\" ] || stale=$(mktemp -d \"$certs/.zwinger-stale.XXXXXX\")".to_owned(),
+        "    mv -f \"$link\" \"$stale/\"".to_owned(),
+        "  done".to_owned(),
         "fi".to_owned(),
-        format!("awk '{strip}' \"$prev\" {CA_CERT} {CA_BUNDLE} > \"$tmp\""),
-        // `cat >` writes through a symlinked bundle.
-        format!("{{ cat \"$tmp\"; echo '{BEGIN}'; cat {CA_CERT}; echo '{END}'; }} > {CA_BUNDLE}"),
+        format!("mv -f \"$local\" {LOCAL_CA}"),
+        "swapped=1".to_owned(),
+        "mv -f \"$tmp\" \"$real\"".to_owned(),
+        "done=1".to_owned(),
     ]
     .join("\n");
     ["/bin/sh", "-c", &script].map(str::to_owned).into()
@@ -754,29 +849,42 @@ mod tests {
     /// Runs the trust script with its paths below a temp root. `tools` is a
     /// dir on `PATH` before the system dirs.
     fn trust(root: &Path, tools: &Path) -> std::process::Output {
+        trust_at(root, tools, &root.join("bundle.crt"))
+    }
+
+    /// [`trust`] with the bundle at `bundle`.
+    fn trust_at(root: &Path, tools: &Path, bundle: &Path) -> std::process::Output {
         let script = trust_argv()[2]
             .replace(CA_CERT, &root.join("ca.pem").display().to_string())
             .replace("/usr/local/share", &root.join("local").display().to_string())
-            .replace(CA_BUNDLE, &root.join("bundle.crt").display().to_string());
+            .replace(CA_BUNDLE, &bundle.display().to_string());
         std::process::Command::new("/bin/sh")
             .env_clear()
-            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .env("PATH", format!("{}:{}", tools.display(), root.join("bin").display()))
             .arg("-c")
             .arg(script)
             .output()
             .unwrap()
     }
 
+    /// A temp root with `tools` and `bin`. `bin` has only the commands that
+    /// the trust script needs, so a host openssl or updater is not on `PATH`.
     fn trust_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("zwinger-trust-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("tools")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let commands =
+            ["awk", "basename", "cat", "chmod", "cp", "dirname", "ln", "mkdir", "mktemp", "mv", "readlink", "rm"];
+        for name in commands {
+            let found = ["/usr/bin", "/bin"].map(|dir| Path::new(dir).join(name)).into_iter().find(|p| p.exists());
+            std::os::unix::fs::symlink(found.expect(name), root.join("bin").join(name)).unwrap();
+        }
         root
     }
 
     /// Writes the CA of a run with the key `key`, and runs the trust script.
     fn trust_with(root: &Path, key: &str) -> String {
-        std::fs::write(root.join("ca.pem"), format!("-----BEGIN CERTIFICATE-----\n{key}\n-----END CERTIFICATE-----\n"))
-            .unwrap();
+        std::fs::write(root.join("ca.pem"), pem(key)).unwrap();
         let out = trust(root, &root.join("tools"));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         std::fs::read_to_string(root.join("bundle.crt")).unwrap()
@@ -795,49 +903,452 @@ mod tests {
         assert!(block.ends_with(&format!("{END}\n")), "{bundle}");
     }
 
-    #[test]
-    fn trust_replaces_the_block_in_the_bundle() {
-        let root = trust_root();
-        // A symlinked bundle, as Debian has in some images: it stays a link.
-        std::fs::write(root.join("roots.crt"), "SYSTEM ROOTS").unwrap();
-        std::os::unix::fs::symlink(root.join("roots.crt"), root.join("bundle.crt")).unwrap();
-        trust_with(&root, "KEY1");
-        let bundle = trust_with(&root, "KEY2");
-        assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
-        assert!(!bundle.contains("KEY1"), "{bundle}");
-        assert_one_block(&bundle, "KEY2", "KEY1");
-        assert!(std::fs::symlink_metadata(root.join("bundle.crt")).unwrap().file_type().is_symlink());
-        let local = std::fs::read_to_string(root.join("local/ca-certificates/zwinger-ca.crt")).unwrap();
-        assert!(local.contains("KEY2"));
+    fn pem(key: &str) -> String {
+        format!("-----BEGIN CERTIFICATE-----\n{key}\n-----END CERTIFICATE-----\n")
+    }
+
+    /// The names in `dir` of the temp files of the trust script.
+    fn temp_files(dir: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".zwinger-"))
+            .collect()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn executable(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
-    fn trust_runs_update_ca_certificates_and_replaces_the_block() {
+    fn trust_replaces_the_target_of_relative_symlinks() {
+        for two_hops in [false, true] {
+            let root = trust_root();
+            let roots = root.join("roots");
+            std::fs::create_dir_all(&roots).unwrap();
+            std::fs::write(roots.join("active.crt"), "SYSTEM ROOTS\n").unwrap();
+            if two_hops {
+                std::os::unix::fs::symlink("active.crt", roots.join("middle.crt")).unwrap();
+                std::os::unix::fs::symlink("roots/middle.crt", root.join("bundle.crt")).unwrap();
+            } else {
+                std::os::unix::fs::symlink("roots/active.crt", root.join("bundle.crt")).unwrap();
+            }
+            let links: Vec<_> = [root.join("bundle.crt"), roots.join("middle.crt")]
+                .into_iter()
+                .filter_map(|p| Some((std::fs::read_link(&p).ok()?, p)))
+                .collect();
+            trust_with(&root, "KEY1");
+            let bundle = trust_with(&root, "KEY2");
+            assert!(bundle.starts_with("SYSTEM ROOTS\n"), "{bundle}");
+            assert_one_block(&bundle, "KEY2", "KEY1");
+            for (target, link) in links {
+                assert_eq!(std::fs::read_link(&link).unwrap(), target, "{}", link.display());
+            }
+            assert_eq!(
+                std::fs::canonicalize(root.join("bundle.crt")).unwrap(),
+                std::fs::canonicalize(roots.join("active.crt")).unwrap()
+            );
+            assert_eq!(mode(&roots.join("active.crt")), 0o644);
+            let local = root.join("local/ca-certificates");
+            assert_eq!(std::fs::read_to_string(local.join("zwinger-ca.crt")).unwrap(), pem("KEY2"));
+            assert_eq!(mode(&local.join("zwinger-ca.crt")), 0o644);
+            for dir in [&root, &roots, &local] {
+                assert!(temp_files(dir).is_empty(), "{}", dir.display());
+            }
+        }
+    }
+
+    #[test]
+    fn trust_keeps_the_mode_of_the_bundle() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = trust_root();
-        let tool = root.join("tools/update-ca-certificates");
-        let local = root.join("local/ca-certificates/zwinger-ca.crt");
         let bundle = root.join("bundle.crt");
-        std::fs::write(&tool, format!("#!/bin/sh\ncat {} >> {}\n", local.display(), bundle.display())).unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&bundle, "SYSTEM ROOTS\n").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o640)).unwrap();
         trust_with(&root, "KEY1");
-        let text = trust_with(&root, "KEY2");
-        assert!(text.starts_with("SYSTEM ROOTS\n"), "{text}");
-        assert_one_block(&text, "KEY2", "KEY1");
+        assert_eq!(mode(&bundle), 0o640);
     }
 
     #[test]
     fn trust_makes_a_bundle_with_only_the_ca() {
         let root = trust_root();
-        trust_with(&root, "KEY1");
-        let bundle = trust_with(&root, "KEY2");
-        assert!(bundle.starts_with(BEGIN), "{bundle}");
-        assert!(!bundle.contains("KEY1"), "{bundle}");
-        assert_one_block(&bundle, "KEY2", "KEY1");
+        let bundle = trust_with(&root, "KEY1");
+        assert_eq!(bundle, format!("{BEGIN}\n{}{END}\n", pem("KEY1")));
+        assert_eq!(mode(&root.join("bundle.crt")), 0o644);
         // A later install of ca-certificates picks it up.
         assert!(root.join("local/ca-certificates/zwinger-ca.crt").exists());
+    }
+
+    #[test]
+    fn trust_makes_the_bundle_dir_on_a_fresh_image() {
+        let root = trust_root();
+        let bundle = root.join("etc/ssl/certs/ca-certificates.crt");
+        std::fs::write(root.join("ca.pem"), pem("KEY1")).unwrap();
+        let out = trust_at(&root, &root.join("tools"), &bundle);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), format!("{BEGIN}\n{}{END}\n", pem("KEY1")));
+        assert_eq!(mode(&bundle), 0o644);
+    }
+
+    #[test]
+    fn trust_makes_the_missing_target_of_a_link() {
+        let root = trust_root();
+        std::fs::create_dir_all(root.join("roots")).unwrap();
+        std::os::unix::fs::symlink("roots/active.crt", root.join("bundle.crt")).unwrap();
+        let bundle = trust_with(&root, "KEY1");
+        assert_eq!(bundle, format!("{BEGIN}\n{}{END}\n", pem("KEY1")));
+        assert_eq!(std::fs::read_link(root.join("bundle.crt")).unwrap(), Path::new("roots/active.crt"));
+        assert_eq!(mode(&root.join("roots/active.crt")), 0o644);
+        assert!(temp_files(&root.join("roots")).is_empty());
+    }
+
+    #[test]
+    fn trust_stops_at_a_link_into_a_missing_dir() {
+        let root = trust_root();
+        std::os::unix::fs::symlink("roots/active.crt", root.join("bundle.crt")).unwrap();
+        std::fs::write(root.join("ca.pem"), pem("KEY1")).unwrap();
+        assert!(!trust(&root, &root.join("tools")).status.success());
+        assert!(!root.join("roots").exists());
+        assert!(!root.join("local").exists());
+        assert_eq!(std::fs::read_link(root.join("bundle.crt")).unwrap(), Path::new("roots/active.crt"));
+    }
+
+    #[test]
+    fn trust_stops_when_a_target_is_a_dir() {
+        for target in ["roots/active.crt", "local/ca-certificates/zwinger-ca.crt"] {
+            let root = trust_root();
+            std::fs::create_dir_all(root.join(target)).unwrap();
+            std::fs::create_dir_all(root.join("roots")).unwrap();
+            if !root.join("roots/active.crt").exists() {
+                std::fs::write(root.join("roots/active.crt"), "SYSTEM ROOTS\n").unwrap();
+            }
+            std::os::unix::fs::symlink("roots/active.crt", root.join("bundle.crt")).unwrap();
+            std::fs::write(root.join("ca.pem"), pem("KEY1")).unwrap();
+            assert!(!trust(&root, &root.join("tools")).status.success(), "{target}");
+            assert_eq!(std::fs::read_dir(root.join(target)).unwrap().count(), 0, "{target}");
+            if target.starts_with("local") {
+                assert_eq!(std::fs::read_to_string(root.join("bundle.crt")).unwrap(), "SYSTEM ROOTS\n");
+            }
+        }
+    }
+
+    #[test]
+    fn trust_rotation_keeps_each_root_once_and_one_block() {
+        let root = trust_root();
+        std::fs::write(root.join("bundle.crt"), format!("SYSTEM ROOTS\n{}", pem("OTHER"))).unwrap();
+        trust_with(&root, "KEY1");
+        // An updater copied the local copy outside the block.
+        let mut text = std::fs::read_to_string(root.join("bundle.crt")).unwrap();
+        text.insert_str(0, &pem("KEY1"));
+        std::fs::write(root.join("bundle.crt"), text).unwrap();
+        trust_with(&root, "KEY2");
+        let bundle = trust_with(&root, "KEY3");
+        assert_eq!(bundle.matches("SYSTEM ROOTS").count(), 1, "{bundle}");
+        assert_eq!(bundle.matches("OTHER").count(), 1, "{bundle}");
+        assert!(!bundle.contains("KEY1") && !bundle.contains("KEY2"), "{bundle}");
+        assert_one_block(&bundle, "KEY3", "KEY2");
+    }
+
+    #[test]
+    fn trust_keeps_the_old_text_for_an_open_reader() {
+        use std::io::Read;
+
+        let root = trust_root();
+        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
+        let old = trust_with(&root, "KEY1");
+        let mut reader = std::fs::File::open(root.join("bundle.crt")).unwrap();
+        trust_with(&root, "KEY2");
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        assert_eq!(text, old);
+    }
+
+    #[test]
+    fn trust_error_keeps_the_old_bundle() {
+        let root = trust_root();
+        std::fs::write(root.join("bundle.crt"), "SYSTEM ROOTS\n").unwrap();
+        let old = trust_with(&root, "KEY1");
+        executable(&root.join("tools/awk"), "#!/bin/sh\necho partial\nexit 71\n");
+        std::fs::write(root.join("ca.pem"), pem("KEY2")).unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(!out.status.success());
+        assert_eq!(std::fs::read_to_string(root.join("bundle.crt")).unwrap(), old);
+        assert!(temp_files(&root).is_empty());
+        assert!(temp_files(&root.join("local/ca-certificates")).is_empty());
+    }
+
+    #[test]
+    fn trust_rename_error_keeps_the_previous_local_copy() {
+        let root = trust_root();
+        let bundle = root.join("bundle.crt");
+        let local = root.join("local/ca-certificates/zwinger-ca.crt");
+        // An updater rebuilt the bundle: the previous CA has no block.
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, pem("KEY1")).unwrap();
+        let old = format!("SYSTEM ROOTS\n{}", pem("KEY1"));
+        std::fs::write(&bundle, &old).unwrap();
+        let mv = root.join("tools/mv");
+        executable(
+            &mv,
+            &format!(
+                "#!/bin/sh\nfor last do :; done\n[ \"$last\" -ef '{}' ] && exit 1\nexec /bin/mv \"$@\"\n",
+                bundle.display()
+            ),
+        );
+        std::fs::write(root.join("ca.pem"), pem("KEY2")).unwrap();
+        assert!(!trust(&root, &root.join("tools")).status.success());
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), pem("KEY1"));
+        assert!(temp_files(&root).is_empty());
+        assert!(temp_files(local.parent().unwrap()).is_empty());
+        std::fs::remove_file(mv).unwrap();
+        assert_eq!(trust_with(&root, "KEY2"), format!("SYSTEM ROOTS\n{BEGIN}\n{}{END}\n", pem("KEY2")));
+    }
+
+    /// Runs openssl with `args` in `dir`.
+    fn openssl(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("openssl").current_dir(dir).args(args).output().unwrap()
+    }
+
+    #[test]
+    fn trust_adds_the_ca_to_the_hashed_dir() {
+        if std::process::Command::new("openssl").arg("version").output().is_err() {
+            return;
+        }
+        let root = trust_root();
+        let path = String::from_utf8(
+            std::process::Command::new("sh").args(["-c", "command -v openssl"]).output().unwrap().stdout,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(path.trim(), root.join("tools/openssl")).unwrap();
+        // Each app run has a new key with the same subject. The subject is
+        // unique to this test, so no other trusted CA has it.
+        let subject = format!("/CN=zwinger test CA {}", uuid::Uuid::new_v4());
+        let make_as = |name: &str, subject: &str| {
+            let args = ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "1"];
+            let out = openssl(&root, &[&args[..], &["-subj", subject, "-keyout", "/dev/null", "-out", name]].concat());
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        let make = |name: &str| make_as(name, &subject);
+        let trusted =
+            |name: &str, store: &[&str]| openssl(&root, &[&["verify"][..], store, &[name]].concat()).status.success();
+        // Each check names both trust locations, so no default location is
+        // used. LibreSSL has no `-no-CAfile` or `-no-CApath`.
+        make_as("none.pem", &format!("/CN=no test CA {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(root.join("empty")).unwrap();
+        let capath = ["-CAfile", "none.pem", "-CApath", "."];
+        let cafile = ["-CAfile", "bundle.crt", "-CApath", "empty"];
+        make("ca.pem");
+        let hash = openssl(&root, &["x509", "-noout", "-subject_hash", "-in", "ca.pem"]).stdout;
+        let hash = String::from_utf8(hash).unwrap();
+        let hash = hash.trim();
+        // An unrelated CA has the first link name of this hash.
+        make_as("other.pem", &format!("/CN=unrelated test CA {}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink("other.pem", root.join(format!("{hash}.0"))).unwrap();
+        std::fs::copy(root.join("ca.pem"), root.join("first.pem")).unwrap();
+        assert!(!trusted("first.pem", &capath));
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(trusted("first.pem", &capath));
+        assert!(trusted("first.pem", &cafile));
+
+        // A failed hash keeps the old trust.
+        make("ca.pem");
+        let bundle = std::fs::read(root.join("bundle.crt")).unwrap();
+        std::fs::remove_file(root.join("tools/openssl")).unwrap();
+        executable(&root.join("tools/openssl"), "#!/bin/sh\nexit 73\n");
+        assert!(!trust(&root, &root.join("tools")).status.success());
+        assert_eq!(std::fs::read(root.join("bundle.crt")).unwrap(), bundle);
+        assert!(trusted("first.pem", &capath));
+        assert!(!trusted("ca.pem", &capath));
+
+        std::fs::remove_file(root.join("tools/openssl")).unwrap();
+        std::os::unix::fs::symlink(path.trim(), root.join("tools/openssl")).unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(trusted("ca.pem", &capath));
+        assert!(trusted("ca.pem", &cafile));
+        assert!(!trusted("first.pem", &capath));
+        assert!(!trusted("first.pem", &cafile));
+        assert_eq!(std::fs::read_link(root.join(format!("{hash}.0"))).unwrap(), Path::new("other.pem"));
+        assert_eq!(std::fs::read_link(root.join(format!("{hash}.1"))).unwrap(), Path::new(CA_LINK));
+        assert!(!root.join(format!("{hash}.2")).exists());
+
+        // A new subject: a failed bundle rename keeps the old hash link.
+        std::fs::copy(root.join("ca.pem"), root.join("prev.pem")).unwrap();
+        let subject = format!("/CN=zwinger next CA {}", uuid::Uuid::new_v4());
+        make_as("ca.pem", &subject);
+        std::fs::copy(root.join("ca.pem"), root.join("next.pem")).unwrap();
+        let bundle = std::fs::read(root.join("bundle.crt")).unwrap();
+        let mv = root.join("tools/mv");
+        executable(
+            &mv,
+            &format!(
+                "#!/bin/sh\nfor last do :; done\n[ \"$last\" -ef '{}' ] && exit 1\nexec /bin/mv \"$@\"\n",
+                root.join("bundle.crt").display()
+            ),
+        );
+        assert!(!trust(&root, &root.join("tools")).status.success());
+        assert_eq!(std::fs::read(root.join("bundle.crt")).unwrap(), bundle);
+        assert_eq!(std::fs::read_link(root.join(format!("{hash}.1"))).unwrap(), Path::new(CA_LINK));
+        assert!(temp_files(&root).is_empty());
+        assert!(trusted("prev.pem", &capath));
+        std::fs::remove_file(&mv).unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(trusted("next.pem", &capath));
+        assert!(!root.join(format!("{hash}.1")).exists());
+        assert_eq!(std::fs::read_link(root.join(format!("{hash}.0"))).unwrap(), Path::new("other.pem"));
+        assert!(temp_files(&root).is_empty());
+    }
+
+    #[test]
+    fn trust_adds_the_ca_to_the_hashed_dir_with_c_rehash() {
+        let Ok(out) = std::process::Command::new("sh").args(["-c", "command -v openssl"]).output() else {
+            return;
+        };
+        let path = String::from_utf8(out.stdout).unwrap();
+        if path.trim().is_empty() {
+            return;
+        }
+        let root = trust_root();
+        let staged = root.join("staged");
+        // Alpine's c_rehash: one relative link per cert, and no openssl on
+        // `PATH`.
+        let rehash = format!(
+            "#!/bin/sh\necho \"$1\" > '{}'\nh=$('{}' x509 -noout -subject_hash -in \"$1/ca.pem\") || exit 1\nln -s ca.pem \"$1/$h.0\"\n",
+            staged.display(),
+            path.trim()
+        );
+        executable(&root.join("tools/c_rehash"), &rehash);
+        let make = |name: &str, subject: &str| {
+            let args = ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "1"];
+            let out = openssl(&root, &[&args[..], &["-subj", subject, "-keyout", "/dev/null", "-out", name]].concat());
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        // An unrelated CAfile, so only the CApath can trust the CA.
+        make("none.pem", &format!("/CN=no test CA {}", uuid::Uuid::new_v4()));
+        let trusted =
+            |name: &str| openssl(&root, &["verify", "-CAfile", "none.pem", "-CApath", ".", name]).status.success();
+        let hash_links = || {
+            let mut links: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".0"))
+                .map(|e| (e.file_name(), std::fs::read_link(e.path()).unwrap()))
+                .collect();
+            links.sort();
+            links
+        };
+        let local = root.join("local/ca-certificates");
+        let clean = || {
+            assert!(temp_files(&root).is_empty());
+            assert!(temp_files(&local).is_empty());
+            let stage = std::fs::read_to_string(&staged).unwrap();
+            assert!(!Path::new(stage.trim()).exists(), "{stage}");
+        };
+        let subject = format!("/CN=zwinger test CA {}", uuid::Uuid::new_v4());
+        make("ca.pem", &subject);
+        std::fs::copy(root.join("ca.pem"), root.join("first.pem")).unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(trusted("first.pem"));
+        clean();
+
+        // A rotated CA with the same subject.
+        make("ca.pem", &subject);
+        std::fs::copy(root.join("ca.pem"), root.join("second.pem")).unwrap();
+        let out = trust(&root, &root.join("tools"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(trusted("second.pem"));
+        assert!(!trusted("first.pem"));
+        assert_eq!(hash_links().len(), 1);
+        clean();
+
+        // A failed helper or a helper with no link keeps the old trust.
+        let failing = [
+            "#!/bin/sh\nexit 73\n".to_owned(),
+            format!("#!/bin/sh\necho \"$1\" > '{}'\necho 'ca.pem => 0123abcd.0'\n", staged.display()),
+        ];
+        make("ca.pem", &format!("/CN=zwinger next CA {}", uuid::Uuid::new_v4()));
+        let bundle = std::fs::read(root.join("bundle.crt")).unwrap();
+        let copy = std::fs::read(local.join("zwinger-ca.crt")).unwrap();
+        let links = hash_links();
+        for helper in failing {
+            std::fs::write(&staged, "").unwrap();
+            executable(&root.join("tools/c_rehash"), &helper);
+            assert!(!trust(&root, &root.join("tools")).status.success(), "{helper}");
+            assert_eq!(std::fs::read(root.join("bundle.crt")).unwrap(), bundle);
+            assert_eq!(std::fs::read(local.join("zwinger-ca.crt")).unwrap(), copy);
+            assert_eq!(hash_links(), links);
+            assert!(trusted("second.pem"));
+            assert!(!trusted("ca.pem"));
+            assert!(temp_files(&root).is_empty());
+            assert!(temp_files(&local).is_empty());
+            let stage = std::fs::read_to_string(&staged).unwrap();
+            assert!(stage.trim().is_empty() || !Path::new(stage.trim()).exists(), "{stage}");
+        }
+    }
+
+    #[test]
+    fn trust_does_not_run_update_ca_certificates() {
+        let root = trust_root();
+        let bundle = root.join("bundle.crt");
+        let called = root.join("called");
+        // A harmless updater that appends, and a Debian-style updater that
+        // renames its output over the link.
+        let updaters = [
+            format!(
+                "#!/bin/sh\n: > '{}'\ncat '{}' >> '{}'\n",
+                called.display(),
+                root.join("ca.pem").display(),
+                bundle.display()
+            ),
+            format!(
+                "#!/bin/sh\n: > '{c}'\ncat '{b}' > '{b}.new'\nmv -f '{b}.new' '{b}'\n",
+                c = called.display(),
+                b = bundle.display()
+            ),
+        ];
+        for updater in updaters {
+            let _ = std::fs::remove_file(&bundle);
+            std::fs::write(root.join("roots.crt"), "SYSTEM ROOTS\n").unwrap();
+            std::os::unix::fs::symlink("roots.crt", &bundle).unwrap();
+            executable(&root.join("tools/update-ca-certificates"), &updater);
+            trust_with(&root, "KEY1");
+            let text = trust_with(&root, "KEY2");
+            assert_one_block(&text, "KEY2", "KEY1");
+            assert!(!called.exists());
+            assert_eq!(std::fs::read_link(&bundle).unwrap(), Path::new("roots.crt"));
+        }
+    }
+
+    #[test]
+    fn trust_stops_at_a_symlink_cycle() {
+        let root = trust_root();
+        std::os::unix::fs::symlink("loop.crt", root.join("bundle.crt")).unwrap();
+        std::os::unix::fs::symlink("bundle.crt", root.join("loop.crt")).unwrap();
+        std::fs::write(root.join("ca.pem"), pem("KEY1")).unwrap();
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+            names.sort();
+            names
+        };
+        let before = names();
+        let out = trust(&root, &root.join("tools"));
+        assert!(!out.status.success());
+        assert_eq!(names(), before);
+        assert!(!root.join("local").exists());
+        assert_eq!(std::fs::read_link(root.join("bundle.crt")).unwrap(), Path::new("loop.crt"));
     }
 
     #[test]
