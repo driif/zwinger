@@ -1,0 +1,38 @@
+---
+interface Props {
+  class?: string;
+}
+---
+
+<span data-release-download aria-live="polite">
+  <a href="https://github.com/driif/zwinger/releases" class={Astro.props.class}>Check GitHub Releases</a>
+</span>
+
+<script>
+  interface ReleaseAsset {
+    name: string;
+    state: string;
+    browser_download_url: string;
+  }
+
+  const link = document.querySelector<HTMLAnchorElement>("[data-release-download] a");
+  if (link) {
+    try {
+      const response = await fetch("https://api.github.com/repos/driif/zwinger/releases/latest");
+      if (response.status === 404) {
+        link.replaceWith("No public release yet.");
+      } else if (response.ok) {
+        const release: { assets: ReleaseAsset[] } = await response.json();
+        const dmg = release.assets.find((asset) => asset.state === "uploaded" && asset.name.endsWith("_aarch64.dmg"));
+        if (dmg) {
+          link.href = dmg.browser_download_url;
+          link.textContent = "Download for Apple silicon (.dmg)";
+        } else {
+          link.replaceWith("The latest release has no Apple silicon disk image.");
+        }
+      }
+    } catch {
+      // The releases link still works if the API is unavailable.
+    }
+  }
+</script>

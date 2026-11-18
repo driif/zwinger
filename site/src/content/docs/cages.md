@@ -11,6 +11,8 @@ Hypervisor.framework). The VM is the unit of isolation.
 
 **Cages** at the bottom of the rail shows all cages, with the projects that use each one.
 
+![The cage list shows that Handbook inherits the Documentation cage. Its Delete button is disabled. The unused Experiments cage has an active Delete button.](../../assets/cage-list.png)
+
 - **Create cage** adds a cage with no mounts, rules or agents.
 - **Rename** changes the name of the cage. The projects keep their names.
 - **Edit** shows the mounts and the agent settings of the cage.

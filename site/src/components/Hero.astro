@@ -2,6 +2,7 @@
 import { Icon } from "@astrojs/starlight/components";
 import { buttonClassName } from "@driif/motiv";
 import { Image } from "astro:assets";
+import Download from "./Download.astro";
 
 const { data } = Astro.locals.starlightRoute.entry;
 const { title = data.title, tagline, image, actions = [] } = data.hero || {};
@@ -43,6 +44,7 @@ const VARIANTS = { primary: "primary", secondary: "secondary", minimal: "ghost" 
     {
       actions.length > 0 && (
         <div class="sl-flex actions">
+          <Download class={buttonClassName({ variant: "primary" })} />
           {actions.map(({ attrs, icon, link, text, variant }) => (
             <a {...attrs} href={link} class={buttonClassName({ variant: VARIANTS[variant] })}>
               {text}
@@ -102,6 +104,7 @@ const VARIANTS = { primary: "primary", secondary: "secondary", minimal: "ghost" 
   }
 
   .actions {
+    align-items: center;
     gap: 1rem;
     flex-wrap: wrap;
     justify-content: center;

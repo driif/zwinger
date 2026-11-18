@@ -4,6 +4,7 @@ description: Install zwinger, create a project and open an agent.
 ---
 
 import { STEPS } from "../../../../src/features/onboarding/steps.ts";
+import Download from "../../components/Download.astro";
 
 ## Requirements
 
@@ -14,8 +15,8 @@ zwinger installs its VM runtime itself and updates itself. It does not need Home
 
 ## Install
 
-1. Download the `.dmg` from the [latest release](https://github.com/driif/zwinger/releases/latest).
-2. Drag zwinger to Applications.
+1. <Download />
+2. Open the disk image and drag zwinger to Applications.
 3. Open the app the first time. The app does not have an Apple Developer ID signature yet, so macOS blocks it. Use one
    of these procedures:
    - In Finder, right-click `zwinger.app` in Applications, select **Open**, then select **Open** again.
