@@ -80,6 +80,9 @@ setting applies immediately, also in a running cage.
 zwinger finds the agents that are installed on your Mac. A project can use them in place of its own copy. Turn on one
 agent per kind on the project page. The change applies at the next cage start.
 
+When you use pi from your Mac, the cage checks that its terminal interface starts. It repeats the check if the pi
+installation path, pi version, guest image or VM runtime changes.
+
 For Claude Code, run `claude setup-token` on your Mac. In **Add agent**, paste the token into the password field and save it. The cage stores the token in its vault. The guest sees only a placeholder in `CLAUDE_CODE_OAUTH_TOKEN`; the proxy sets `authorization: Bearer <token>` only for `api.anthropic.com`. Under default Block, use **Allow api.anthropic.com** before saving. A Block rule can still override that Allow rule.
 
 The Claude token has an estimated 365-day lifetime from when you save it. The project shows its expiry and warns during the last 30 days. Run `claude setup-token` again and replace the stored token before it expires. A cage with Claude host login and no valid token does not start. If you turn the Claude login off or remove Claude Code from the cage, zwinger deletes the stored token and its credential.

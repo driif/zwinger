@@ -1149,7 +1149,7 @@ pub(crate) fn prepare(
                 // The detection can be older than an update of pi.
                 let pi = host.package_version(&package).unwrap_or_else(|| found.version.clone());
                 // A host pi whose TUI loaded with the same pi, image and runtime is not probed again.
-                let key = format!("{pi} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
+                let key = format!("{package:?} {pi:?} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
                 tui_probe = Some(key).filter(|key| !tui_cached(data, key));
                 binds.push(Bind { guest: pi::HOST_DIR.to_owned(), host: package });
                 run.pi_host = true;
@@ -1210,21 +1210,23 @@ async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
     (out, at.elapsed())
 }
 
-/// The file of the host pi TUI probes that passed: one key per line.
+/// The last successful TUI probe for the single host pi selected by detection.
 pub(crate) const TUI_CACHE: &str = "tui-probes";
 
 fn tui_cached(data: &Path, key: &str) -> bool {
-    std::fs::read_to_string(data.join(TUI_CACHE)).is_ok_and(|text| text.lines().any(|line| line == key))
+    std::fs::read_to_string(data.join(TUI_CACHE)).is_ok_and(|text| text == key)
 }
 
 /// A lost write only costs one more probe.
 async fn cache_tui(data: &Path, key: &str) {
     let (path, key) = (data.join(TUI_CACHE), key.to_owned());
     let written = blocking(move || {
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        text.push_str(&key);
-        text.push('\n');
-        Ok(std::fs::write(&path, text)?)
+        let tmp = path.with_extension(uuid::Uuid::new_v4().to_string());
+        let result = std::fs::write(&tmp, key).and_then(|()| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        Ok(result?)
     })
     .await;
     if let Err(e) = written {
@@ -1742,15 +1744,27 @@ mod tests {
         let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault(), temp_dir(), host).unwrap();
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
-        for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
+        // A legacy key cannot tell which installation passed the probe.
+        let cache = manager.data.join(super::TUI_CACHE);
+        std::fs::write(&cache, format!("1.0.0 {} {}\n", crate::runtime::IMAGE, env!("MICROSANDBOX_VERSION"))).unwrap();
+        for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2), ("1.0.0", 3)] {
             fs.file(
                 "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
                 &format!(r#"{{"version":"{version}"}}"#),
             );
             manager.start(&id).await.unwrap();
             assert_eq!(tui_probes(&runtime), probes, "{version}");
+            assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
             manager.stop(&id, None).await.unwrap();
         }
+
+        // Detection now prefers a different installation of the same version.
+        let package = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
+        fs.file(&format!("{package}/package.json"), r#"{"version":"1.0.0"}"#);
+        fs.file(&format!("{package}/dist/cli.js"), "");
+        manager.host.detect();
+        manager.start(&id).await.unwrap();
+        assert_eq!(tui_probes(&runtime), 4);
     }
 
     #[tokio::test]
