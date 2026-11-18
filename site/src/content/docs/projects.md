@@ -89,6 +89,12 @@ the order.
 - A cage stop does not end a Mac shell. A project delete and the app exit end it.
 - Only **Close** in the tree removes a terminal and ends its process.
 
+A terminal's name is its kind and number, for example "Mac shell 2". When the shell or terminal app sets a window title
+(OSC 0 or OSC 2), the tree row and the pane header show that title. The two labels change together. The title stays
+with its process: an empty title, an exit, a reopen or a close shows the name again. The actions of the row and
+the pane keep the name, for example "Actions for Mac shell 2". A long title is shortened to the width of the row
+or header. Point to the title to read all of it.
+
 zwinger keeps the last 1 MiB of output of each terminal. When you show the terminal again, for example after a window
 reload, you see that output.
 

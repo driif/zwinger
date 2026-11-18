@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, X } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { ackSession, attachSession, detachSession, resizeSession, SessionFrame, writeSession } from "./api";
 import { Engine, openTerminal, searchOptions } from "./engine";
+import { followTitle } from "./titles";
 import "./terminal.css";
 
 interface Props {
@@ -31,6 +32,7 @@ export function TerminalView({ processId, visible, focused, style, onFocus, onEx
   useEffect(() => {
     let disposed = false;
     let opened: Engine | undefined;
+    let unfollow: (() => void) | undefined;
     let token: number | undefined;
     /** The frames written before the attach resolved to its token. */
     let unacked = 0;
@@ -52,11 +54,17 @@ export function TerminalView({ processId, visible, focused, style, onFocus, onEx
         opened = created;
         setEngine(created);
         const { term } = created;
+        const endTitle = followTitle(term, processId);
+        unfollow = endTitle;
         term.onData((data) => writeSession(processId, data).catch(fail));
         term.onResize(({ rows, cols }) => resizeSession(processId, rows, cols).catch(() => {}));
         const onFrame = (frame: SessionFrame) => {
           if (disposed) return;
-          if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) return onExit();
+          if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) {
+            // The refresh that removes the pane can come late or fail. Late output must not name the exited process.
+            endTitle();
+            return onExit();
+          }
           // The parse is synchronous. The write callback waits for an animation frame, which a hidden window does not get.
           term.write(frame instanceof ArrayBuffer ? new Uint8Array(frame) : Uint8Array.from(frame));
           ack();
@@ -72,6 +80,7 @@ export function TerminalView({ processId, visible, focused, style, onFocus, onEx
     return () => {
       disposed = true;
       if (token !== undefined) detachSession(processId, token).catch(() => {});
+      unfollow?.();
       opened?.dispose();
     };
   }, []);

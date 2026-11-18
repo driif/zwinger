@@ -1094,8 +1094,25 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
               </Suspense>
             </div>
           </section>
-        ) : selected ? (
+        ) : (
+          !selected && (
+            <div className="empty">
+              <CageMark size={40} />
+              <h1>No projects yet</h1>
+              <p className="muted">
+                A project runs an AI agent in its cage, a microVM. The agent sees only the folders that you mount and reaches only
+                the hosts that you allow.
+              </p>
+              <Button iconLeft={<Plus size={16} />} onClick={actions.newProject}>
+                Create project
+              </Button>
+            </div>
+          )
+        )}
+        {/* Under another screen too: the terminals keep their titles live. */}
+        {selected && (
           <ProjectPage
+            covered={showSettings || showCages || !!roundFolder}
             session={selected.session}
             cage={selected.cage}
             vmCage={selected.vmCage}
@@ -1134,18 +1151,6 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             onPaneExit={refresh}
             onPaneError={(e) => setError(errorMessage(e))}
           />
-        ) : (
-          <div className="empty">
-            <CageMark size={40} />
-            <h1>No projects yet</h1>
-            <p className="muted">
-              A project runs an AI agent in its cage, a microVM. The agent sees only the folders that you mount and reaches only
-              the hosts that you allow.
-            </p>
-            <Button iconLeft={<Plus size={16} />} onClick={actions.newProject}>
-              Create project
-            </Button>
-          </div>
         )}
         {error && <p className="status danger mono">{error}</p>}
       </main>

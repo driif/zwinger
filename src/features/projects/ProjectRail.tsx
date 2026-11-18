@@ -70,6 +70,7 @@ import { LaunchAction, launchActions } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import type { Detection } from "../settings/api";
 import { launchMenu } from "../launcher/SplitLaunch";
+import { useTerminalTitles } from "../terminal/titles";
 import { StartProgress } from "./StartProgress";
 import { mostUrgent } from "./agentState";
 import { cageAfterMove, moveSession, stepSession, stepWorkspace } from "./tree";
@@ -343,6 +344,7 @@ export function ProjectRail({
   children,
 }: Props) {
   const tree = useRef<HTMLUListElement>(null);
+  const titles = useTerminalTitles();
   const [collapsed, setCollapsed] = useState<Set<string>>(
     () => new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]),
   );
@@ -402,6 +404,8 @@ export function ProjectRail({
           // A Mac agent does not open again in a session that has a cage now.
           const hasCage = kind.type === "hostAgent" && !!state && !!session.effectiveCage;
           const name = paneName(pane, panes);
+          // The actions keep the name: the title of a TUI changes often.
+          const liveName = (pane.processId && titles[pane.processId]) || name;
           const close: MenuAction = { label: "Close", icon: <X size={14} />, run: () => onClosePane(pane.key) };
           const open: MenuAction[] = state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : [];
           return {
@@ -409,7 +413,7 @@ export function ProjectRail({
             label: (
               <>
                 <span className="grow">
-                  {name}
+                  {liveName}
                   {state && <span className="muted"> · {state}</span>}
                   {hasCage && <span className="danger"> · the session has a cage</span>}
                 </span>
@@ -417,7 +421,7 @@ export function ProjectRail({
               </>
             ),
             name,
-            title: hasCage ? `${name}: this session has a cage, so an agent with no cage does not open in it.` : undefined,
+            title: hasCage ? `${name}: this session has a cage, so an agent with no cage does not open in it.` : liveName,
             icon: <KindIcon kind={kind} />,
             view: { kind: "terminal", key: pane.key },
             menu:

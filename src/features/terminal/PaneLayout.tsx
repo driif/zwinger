@@ -6,6 +6,7 @@ import type { Pane } from "../../App";
 import { KindIcon, paneName } from "../projects/ProjectRail";
 import { StartProgress } from "../projects/StartProgress";
 import { Path, place, Rect, setRatio } from "./panes";
+import { useTerminalTitles } from "./titles";
 import { TerminalView } from "./TerminalView";
 
 interface Props {
@@ -63,6 +64,7 @@ export function PaneLayout({
   onHide,
 }: Props) {
   const area = useRef<HTMLDivElement>(null);
+  const titles = useTerminalTitles();
   const [actionsFor, setActionsFor] = useState<string>();
   const [drag, setDrag] = useState<{ path: Path; ratio: number }>();
   const shown = layout && drag ? setRatio(layout, drag.path, drag.ratio) : layout;
@@ -120,6 +122,7 @@ export function PaneLayout({
         const pane = panes.find((p) => p.key === terminal);
         if (!pane) return null;
         const name = paneName(pane, panes);
+        const title = pane.processId && titles[pane.processId];
         const actions = [
           { label: "Split right with a Mac shell", icon: <Columns2 size={12} />, run: () => onSplit(terminal, "row") },
           { label: "Split down with a Mac shell", icon: <Rows2 size={12} />, run: () => onSplit(terminal, "column") },
@@ -134,7 +137,7 @@ export function PaneLayout({
           >
             <KindIcon kind={pane.kind} />
             <Badge>{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>
-            <span className="grow pane-name">{name}</span>
+            <span className="grow pane-name" title={title}>{title || name}</span>
             <IconButtonGroup className="pane-actions" label={`Actions for ${name}`}>
               {actions.map((action) => <IconButton key={action.label} label={action.label} icon={action.icon} onClick={action.run} />)}
             </IconButtonGroup>

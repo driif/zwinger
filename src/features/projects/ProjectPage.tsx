@@ -232,6 +232,8 @@ interface Props {
   home?: string;
   onLaunch: (action: LaunchAction) => void;
   onEditorSettings: () => void;
+  /** Another screen fills the main area. Only the hidden terminals stay mounted, so their titles stay live. */
+  covered: boolean;
 }
 
 // Not keyed by project: the terminal view keeps the panes of every project attached.
@@ -264,6 +266,7 @@ export function ProjectPage({
   home,
   onLaunch,
   onEditorSettings,
+  covered,
   ...terminal
 }: Props) {
   const status = vmCage?.status ?? { state: "stopped" };
@@ -325,284 +328,288 @@ export function ProjectPage({
   const defaultEditor = editorActions.find((a) => a.editor.id === editors?.default);
 
   return (
-    <section className="page">
-      <header className="page-header row">
-        <div className="grow">
-          <h1 className="page-title">{session.name}</h1>
-          <p className="muted row">
-            <span className={`dot ${status.state}`} />
-            {!cage && !vmCage ? (
-              "no cage"
-            ) : status.state === "error" ? (
-              <span className="danger">{status.message}</span>
-            ) : status.state === "starting" ? (
-              <StartProgress phase={status.phase} />
-            ) : (
-              status.state
-            )}
-            {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
-            {!cage && vmCage && <span>· no cage</span>}
-            {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
-          </p>
-          <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
-        </div>
-        <SplitLaunch
-          label="New terminal"
-          icon={<Laptop size={14} />}
-          onClick={() => onLaunch(newTerminals[0])}
-          menuLabel="New terminal"
-          menu={[
-            ...launchMenu(newTerminals, onLaunch),
-            // Host agents are set up here, next to the agents that they add.
-            ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
-              label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
-              icon: <Plus size={14} />,
-              run: () => onAdding(agent.kind),
-            })),
-          ]}
-        />
-        {editors && (
-          <SplitLaunch
-            label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
-            icon={<Code size={14} />}
-            onClick={defaultEditor && (() => onLaunch(defaultEditor))}
-            menuLabel="Editors"
-            menu={[
-              ...launchMenu(editorActions, onLaunch),
-              { label: "Editor settings…", icon: <Settings size={14} />, run: onEditorSettings },
-            ]}
-          />
-        )}
-        <Button
-          size="sm"
-          variant={running ? "secondary" : "primary"}
-          iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
-          loading={status.state === "stopping"}
-          disabled={(!cage && !running) || status.state === "starting"}
-          title={cage || running ? undefined : "This project has no cage."}
-          onClick={onToggle}
-        >
-          {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
-        </Button>
-      </header>
-      {adding && detection && cage && (
-        <AddAgent
-          key={adding}
-          cage={cage}
-          detection={detection}
-          kind={adding}
-          run={run}
-          onRefresh={onRefresh}
-          onDone={() => onAdding(undefined)}
-        />
-      )}
-      <div className="notices">
-        {unverified.length > 0 && (
-          <Notice
-            icon={<TriangleAlert size={14} className="warn" />}
-            actions={
-              <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(session.id).then(onRefresh))}>
-                Confirm folders
-              </Button>
-            }
-          >
-            Not verified since the update: <span className="mono">{unverified.join(", ")}</span>. Check that each one is
-            the folder that you added, then confirm it.
-          </Notice>
-        )}
-        {status.state === "running" &&
-          vmCage?.hostNotices
-            .filter((notice) => !hidden.includes(notice))
-            .map((notice) => (
-              <Notice
-                key={notice}
-                icon={<Info size={14} className="muted" />}
-                onDismiss={() => setDismissed({ session: session.id, notices: [...hidden, notice] })}
-              >
-                {notice}
-              </Notice>
-            ))}
-        {status.state === "running" &&
-          vmCage?.guestLogins.map((agent) => (
-            <Notice
-              key={agent}
-              icon={<TriangleAlert size={14} className="warn" />}
-              actions={
-                <>
-                  <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(vmCage.key, agent).then(onRefresh))}>
-                    Remove it
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={onHostAgents}>
-                    Use my Mac login instead
-                  </Button>
-                </>
-              }
-            >
-              {AGENT_NAMES[agent]} has its own login in this cage. Its real token is in the cage, where the agent can
-              read and send it.
-            </Notice>
-          ))}
-      </div>
-      <ElasticTabs
-          className="tabs"
-          hidden={!isTab}
-          label="Project"
-          tabs={TABS}
-          value={tab}
-          onChange={(value) => jump(value as TabView)}
-          panels={{
-            overview: (
-              <div className="overview">
-                {session.terminals.length === 0 && (
-                  <Notice
-                    icon={<Info size={14} className="muted" />}
-                    actions={
-                      <>
-                        <Button size="sm" variant="outline" iconLeft={<Laptop size={14} />} onClick={() => terminal.onNewSession({ type: "host" })}>
-                          New Mac shell
-                        </Button>
-                        <Button size="sm" iconLeft={<Bot size={14} />} onClick={() => terminal.onNewSession("agent")}>
-                          New agent
-                        </Button>
-                      </>
-                    }
-                  >
-                    {hostAgents.length === 0 && detection && detection.agents.length > 0
-                      ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
-                      : "Next: open an agent, or a shell on this Mac in the project folder."}
-                  </Notice>
-                )}
-                {cage ? (
-                  <Suspense>
-                    <ProjectMap
-                      key={session.id}
-                      session={session}
-                      cage={cage}
-                      vmCage={vmCage}
-                      folders={folders}
-                      events={events}
-                      visible={isTab && tab === "overview"}
-                      run={run}
-                      onJump={jump}
-                      onDropFolder={onDropFolder}
-                    />
-                  </Suspense>
+    <section className="page" hidden={covered}>
+      {!covered && (
+        <>
+          <header className="page-header row">
+            <div className="grow">
+              <h1 className="page-title">{session.name}</h1>
+              <p className="muted row">
+                <span className={`dot ${status.state}`} />
+                {!cage && !vmCage ? (
+                  "no cage"
+                ) : status.state === "error" ? (
+                  <span className="danger">{status.message}</span>
+                ) : status.state === "starting" ? (
+                  <StartProgress phase={status.phase} />
                 ) : (
-                  noCage
+                  status.state
                 )}
-                <dl className="facts">
-                  <div>
-                    <dt>Agent starts in</dt>
-                    <dd className="mono">{session.effectiveCage ? (session.guestHarness ?? session.harness ?? "/workspace") : session.folder}</dd>
+                {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
+                {!cage && vmCage && <span>· no cage</span>}
+                {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
+              </p>
+              <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
+            </div>
+            <SplitLaunch
+              label="New terminal"
+              icon={<Laptop size={14} />}
+              onClick={() => onLaunch(newTerminals[0])}
+              menuLabel="New terminal"
+              menu={[
+                ...launchMenu(newTerminals, onLaunch),
+                // Host agents are set up here, next to the agents that they add.
+                ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
+                  label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+                  icon: <Plus size={14} />,
+                  run: () => onAdding(agent.kind),
+                })),
+              ]}
+            />
+            {editors && (
+              <SplitLaunch
+                label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
+                icon={<Code size={14} />}
+                onClick={defaultEditor && (() => onLaunch(defaultEditor))}
+                menuLabel="Editors"
+                menu={[
+                  ...launchMenu(editorActions, onLaunch),
+                  { label: "Editor settings…", icon: <Settings size={14} />, run: onEditorSettings },
+                ]}
+              />
+            )}
+            <Button
+              size="sm"
+              variant={running ? "secondary" : "primary"}
+              iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
+              loading={status.state === "stopping"}
+              disabled={(!cage && !running) || status.state === "starting"}
+              title={cage || running ? undefined : "This project has no cage."}
+              onClick={onToggle}
+            >
+              {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
+            </Button>
+          </header>
+          {adding && detection && cage && (
+            <AddAgent
+              key={adding}
+              cage={cage}
+              detection={detection}
+              kind={adding}
+              run={run}
+              onRefresh={onRefresh}
+              onDone={() => onAdding(undefined)}
+            />
+          )}
+          <div className="notices">
+            {unverified.length > 0 && (
+              <Notice
+                icon={<TriangleAlert size={14} className="warn" />}
+                actions={
+                  <Button size="sm" variant="outline" onClick={() => run(() => confirmPaths(session.id).then(onRefresh))}>
+                    Confirm folders
+                  </Button>
+                }
+              >
+                Not verified since the update: <span className="mono">{unverified.join(", ")}</span>. Check that each one is
+                the folder that you added, then confirm it.
+              </Notice>
+            )}
+            {status.state === "running" &&
+              vmCage?.hostNotices
+                .filter((notice) => !hidden.includes(notice))
+                .map((notice) => (
+                  <Notice
+                    key={notice}
+                    icon={<Info size={14} className="muted" />}
+                    onDismiss={() => setDismissed({ session: session.id, notices: [...hidden, notice] })}
+                  >
+                    {notice}
+                  </Notice>
+                ))}
+            {status.state === "running" &&
+              vmCage?.guestLogins.map((agent) => (
+                <Notice
+                  key={agent}
+                  icon={<TriangleAlert size={14} className="warn" />}
+                  actions={
+                    <>
+                      <Button size="sm" variant="outline" onClick={() => run(() => removeGuestLogin(vmCage.key, agent).then(onRefresh))}>
+                        Remove it
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={onHostAgents}>
+                        Use my Mac login instead
+                      </Button>
+                    </>
+                  }
+                >
+                  {AGENT_NAMES[agent]} has its own login in this cage. Its real token is in the cage, where the agent can
+                  read and send it.
+                </Notice>
+              ))}
+          </div>
+          <ElasticTabs
+              className="tabs"
+              hidden={!isTab}
+              label="Project"
+              tabs={TABS}
+              value={tab}
+              onChange={(value) => jump(value as TabView)}
+              panels={{
+                overview: (
+                  <div className="overview">
+                    {session.terminals.length === 0 && (
+                      <Notice
+                        icon={<Info size={14} className="muted" />}
+                        actions={
+                          <>
+                            <Button size="sm" variant="outline" iconLeft={<Laptop size={14} />} onClick={() => terminal.onNewSession({ type: "host" })}>
+                              New Mac shell
+                            </Button>
+                            <Button size="sm" iconLeft={<Bot size={14} />} onClick={() => terminal.onNewSession("agent")}>
+                              New agent
+                            </Button>
+                          </>
+                        }
+                      >
+                        {hostAgents.length === 0 && detection && detection.agents.length > 0
+                          ? "Next: add an agent from this Mac in the New terminal menu, or open the built-in pi agent."
+                          : "Next: open an agent, or a shell on this Mac in the project folder."}
+                      </Notice>
+                    )}
+                    {cage ? (
+                      <Suspense>
+                        <ProjectMap
+                          key={session.id}
+                          session={session}
+                          cage={cage}
+                          vmCage={vmCage}
+                          folders={folders}
+                          events={events}
+                          visible={isTab && tab === "overview"}
+                          run={run}
+                          onJump={jump}
+                          onDropFolder={onDropFolder}
+                        />
+                      </Suspense>
+                    ) : (
+                      noCage
+                    )}
+                    <dl className="facts">
+                      <div>
+                        <dt>Agent starts in</dt>
+                        <dd className="mono">{session.effectiveCage ? (session.guestHarness ?? session.harness ?? "/workspace") : session.folder}</dd>
+                      </div>
+                      {cage && (
+                        <div>
+                          <dt>Network</dt>
+                          <dd>
+                            {cage.network.offline
+                              ? "Offline"
+                              : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
+                          </dd>
+                        </div>
+                      )}
+                      <div>
+                        <dt>Sessions</dt>
+                        <dd>{sessions}</dd>
+                      </div>
+                      {hostAgents.length > 0 && (
+                        <div>
+                          <dt>From this Mac</dt>
+                          <dd>
+                            {hostAgents
+                              .map((a) =>
+                                [
+                                  AGENT_NAMES[a.kind],
+                                  a.profile && "profile",
+                                  a.login &&
+                                    (a.kind === "claude" &&
+                                    (!cage?.claudeToken?.stored ||
+                                      !cage.claudeToken.expiresAt ||
+                                      cage.claudeToken.expiresAt <= Date.now())
+                                      ? "needs token"
+                                      : "login"),
+                                ]
+                                  .filter(Boolean)
+                                  .join(" + "),
+                              )
+                              .join(", ")}
+                          </dd>
+                        </div>
+                      )}
+                    </dl>
                   </div>
-                  {cage && (
-                    <div>
-                      <dt>Network</dt>
-                      <dd>
-                        {cage.network.offline
-                          ? "Offline"
-                          : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
-                      </dd>
-                    </div>
-                  )}
-                  <div>
-                    <dt>Sessions</dt>
-                    <dd>{sessions}</dd>
-                  </div>
-                  {hostAgents.length > 0 && (
-                    <div>
-                      <dt>From this Mac</dt>
-                      <dd>
-                        {hostAgents
-                          .map((a) =>
-                            [
-                              AGENT_NAMES[a.kind],
-                              a.profile && "profile",
-                              a.login &&
-                                (a.kind === "claude" &&
-                                (!cage?.claudeToken?.stored ||
-                                  !cage.claudeToken.expiresAt ||
-                                  cage.claudeToken.expiresAt <= Date.now())
-                                  ? "needs token"
-                                  : "login"),
-                            ]
-                              .filter(Boolean)
-                              .join(" + "),
-                          )
-                          .join(", ")}
-                      </dd>
-                    </div>
-                  )}
-                </dl>
-              </div>
-            ),
-            network: !cage && !vmCage ? (
-              <div className="tab-body">{noCage}</div>
-            ) : (
-              <NetworkTab
-                key={session.id}
+                ),
+                network: !cage && !vmCage ? (
+                  <div className="tab-body">{noCage}</div>
+                ) : (
+                  <NetworkTab
+                    key={session.id}
+                    session={session}
+                    cage={cage}
+                    vmCage={vmCage}
+                    noCage={noCage}
+                    events={events}
+                    run={edit}
+                    intent={tab === "network" ? intent : undefined}
+                    onIntentDone={onIntentDone}
+                    active={isTab && tab === "network"}
+                    onSeen={onNetSeen}
+                    onStart={onToggle}
+                  />
+                ),
+                settings: (
+                  <SettingsTab
+                    key={session.id}
+                    session={session}
+                    cages={cages}
+                    defaultCage={defaultCage}
+                    folders={folders ?? []}
+                    runtimes={runtimes}
+                    run={edit}
+                    intent={tab === "settings" ? intent : undefined}
+                    onIntentDone={onIntentDone}
+                  />
+                ),
+              }}
+            />
+          {!cage && (view.kind === "task" || view.kind === "taskEdit") && <div className="view task-view">{noCage}</div>}
+          {task && cage && view.kind === "task" && (
+            <div className="view task-view">
+              <Suspense>
+                <TaskRoom
+                  key={task.id}
+                  kind="task"
+                  session={session}
+                  cageRunning={status.state === "running"}
+                  task={task}
+                  runs={runs.filter((r) => r.taskId === task.id)}
+                  run={view.run}
+                  onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
+                  onRunsChange={onRunsChange}
+                  onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
+                  onStartCage={onToggle}
+                />
+              </Suspense>
+            </div>
+          )}
+          {cage && view.kind === "taskEdit" && (
+            <div className="view task-view">
+              <TaskDialog
+                key={view.taskId ?? "new"}
                 session={session}
                 cage={cage}
-                vmCage={vmCage}
-                noCage={noCage}
-                events={events}
-                run={edit}
-                intent={tab === "network" ? intent : undefined}
-                onIntentDone={onIntentDone}
-                active={isTab && tab === "network"}
-                onSeen={onNetSeen}
-                onStart={onToggle}
+                taskId={view.taskId}
+                onDone={async (taskId) => {
+                  // The tree and the task view need the saved task.
+                  await onRefresh();
+                  onView(taskId ? { kind: "task", taskId } : { kind: "overview" });
+                }}
               />
-            ),
-            settings: (
-              <SettingsTab
-                key={session.id}
-                session={session}
-                cages={cages}
-                defaultCage={defaultCage}
-                folders={folders ?? []}
-                runtimes={runtimes}
-                run={edit}
-                intent={tab === "settings" ? intent : undefined}
-                onIntentDone={onIntentDone}
-              />
-            ),
-          }}
-        />
-      {!cage && (view.kind === "task" || view.kind === "taskEdit") && <div className="view task-view">{noCage}</div>}
-      {task && cage && view.kind === "task" && (
-        <div className="view task-view">
-          <Suspense>
-            <TaskRoom
-              key={task.id}
-              kind="task"
-              session={session}
-              cageRunning={status.state === "running"}
-              task={task}
-              runs={runs.filter((r) => r.taskId === task.id)}
-              run={view.run}
-              onRun={(run) => onView({ kind: "task", taskId: task.id, run })}
-              onRunsChange={onRunsChange}
-              onEdit={() => onView({ kind: "taskEdit", taskId: task.id })}
-              onStartCage={onToggle}
-            />
-          </Suspense>
-        </div>
-      )}
-      {cage && view.kind === "taskEdit" && (
-        <div className="view task-view">
-          <TaskDialog
-            key={view.taskId ?? "new"}
-            session={session}
-            cage={cage}
-            taskId={view.taskId}
-            onDone={async (taskId) => {
-              // The tree and the task view need the saved task.
-              await onRefresh();
-              onView(taskId ? { kind: "task", taskId } : { kind: "overview" });
-            }}
-          />
-        </div>
+            </div>
+          )}
+        </>
       )}
       <div className="view" hidden={view.kind !== "terminal"}>
         <TerminalTab
@@ -611,7 +618,7 @@ export function ProjectPage({
           panes={panes}
           focused={focused}
           editor={defaultEditor?.editor.name}
-          visible={view.kind === "terminal"}
+          visible={!covered && view.kind === "terminal"}
           {...terminal}
         />
       </div>

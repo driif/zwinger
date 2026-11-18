@@ -296,6 +296,7 @@ p {
   padding-bottom: var(--zw-page-pad);
 }
 
+.page[hidden],
 .view[hidden] {
   display: none;
 }
