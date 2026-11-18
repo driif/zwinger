@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowRight, Bot, CircleCheck, CircleX, Folder, FolderOpen, Globe, TriangleAlert } from "lucide-react";
 import { ReactNode, useEffect, useState } from "react";
 import { Startup, StartupStep } from "./api";
+import { STEPS } from "./steps";
 import { Detection, hostAgents, putHostAgent } from "../settings/api";
 import { createSession, listSessions, resolveFolder } from "../projects/api";
 import { detectEditors, Editors } from "../launcher/api";
@@ -11,14 +12,6 @@ import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
 import { CageMark } from "../../shared/CageMark";
 import "./onboarding.css";
-
-const STEPS = [
-  { id: "welcome", label: "Check this Mac" },
-  { id: "project", label: "Create a project" },
-  { id: "agent", label: "Add an agent" },
-  { id: "editor", label: "Your editor" },
-  { id: "done", label: "Done" },
-];
 
 const PHASES: Record<Startup["phase"], string> = {
   checking: "Checking this Mac…",

@@ -3,6 +3,8 @@ title: Get started
 description: Install zwinger, create a project and open an agent.
 ---
 
+import { STEPS } from "../../../../src/features/onboarding/steps.ts";
+
 ## Requirements
 
 - A Mac with Apple silicon.
@@ -28,17 +30,22 @@ folder, it shows a message and closes as soon as you dismiss it. Use the open wi
 
 ## First steps
 
-The first start shows five steps:
+export const descriptions = {
+  welcome: <>zwinger checks the macOS version, virtualization and free disk space, then installs the VM runtime.</>,
+  project: <>Select or drop the project folder. The agent works in it as <code>/workspace</code>. See <a href="/projects/">Projects</a>.</>,
+  agent: <>Optionally add an <a href="/agents/">agent</a> that zwinger finds on the Mac, with your login. pi is built in.</>,
+  editor: <>Choose the default editor for <strong>Open in editor</strong>.</>,
+  done: <>Start the <a href="/cages/">cage</a>, then press ⌘P for an agent or ⌘T for a shell.</>,
+};
 
-1. **Check this Mac**: zwinger checks the Mac (macOS version, virtualization, free disk space) and installs the VM
-   runtime.
-2. **Create a project**: select or drop the project folder. The agent works in it as `/workspace`. See
-   [Projects](/projects/).
-3. **Add an agent**: optional. Add an [agent](/agents/) that zwinger finds on the Mac, with your login. pi is built in.
-4. **Your editor**: the default editor for **Open in editor**.
-5. **Done**: start the [cage](/cages/), then press ⌘P for an agent or ⌘T for a shell.
+<ol>
+  {STEPS.map(({ id, label }) => {
+    if (!descriptions[id]) throw new Error(`Missing onboarding description for "${id}".`);
+    return <li><strong>{label}</strong>. {descriptions[id]}</li>;
+  })}
+</ol>
 
-Steps 2 to 4 have **Skip**.
+Choose **Skip** during project, agent or editor setup to finish onboarding early.
 
 ## Two kinds of terminal
 
