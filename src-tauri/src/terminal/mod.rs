@@ -57,6 +57,89 @@ pub struct TerminalView {
     pub terminal_id: Option<String>,
     /// Set only while an agent terminal is live.
     pub agent: Option<AgentState>,
+    /// The last known folder of a live process. `None`: exited, or unknown.
+    pub folder: Option<TerminalFolder>,
+    /// The order of `folder` within its process: a higher one is newer.
+    pub folder_seq: u64,
+}
+
+/// A folder of a process and its order: a higher `seq` is newer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FolderReport {
+    pub seq: u64,
+    pub folder: Option<TerminalFolder>,
+}
+
+/// Where a live terminal process is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalFolder {
+    /// The current folder: a Mac path, or a guest path if `vm`.
+    pub path: PathBuf,
+    pub vm: bool,
+    /// The Mac folder that Open in editor opens for it. `None`: it is not on the Mac.
+    pub opens: Option<PathBuf>,
+}
+
+impl TerminalFolder {
+    fn host(path: PathBuf) -> Self {
+        Self { opens: path.is_dir().then(|| path.clone()), path, vm: false }
+    }
+
+    /// Reads the file system for the mapping: call it with no lock held.
+    fn guest(path: String, applied: &(Vec<Session>, Cage)) -> Self {
+        let opens = editor::map_guest(&path, Members { sessions: &applied.0, cage: &applied.1 });
+        Self { path: path.into(), vm: true, opens }
+    }
+}
+
+/// The guest folder that a VM process of `kind` starts in: the applied harness
+/// for an agent, else the session's guest folder.
+fn guest_start(members: &[Session], session_id: &str, kind: TerminalKind) -> Option<String> {
+    let (member, folder, _) = task_guest_folder(members, session_id)?;
+    Some(match (kind, member.harness.as_deref()) {
+        (TerminalKind::Agent { .. }, Some(harness)) => in_guest_folder(&folder, harness),
+        _ => folder,
+    })
+}
+
+/// Where the live process `id` is now. A Mac process's folder comes from
+/// macOS; a VM process's from its last OSC 7, else its start folder, mapped by
+/// [`editor::map_guest`]. `None`: the folder is unknown, such as when macOS
+/// gives none. It also gives the output's `folder_seq` that it read with its
+/// source. The macOS call and the file system work run with no lock held.
+pub(crate) fn resolve_folder<V>(state: &Mutex<State<V>>, id: &str) -> Result<(u64, Option<TerminalFolder>)> {
+    enum Source {
+        Host(host::HostGroup, u64),
+        /// The output, its start folder and the applied config.
+        Guest(Arc<Mutex<Output>>, String, Box<(Vec<Session>, Cage)>),
+    }
+    let source = {
+        let state = lock(state);
+        let process = state.process(id).ok().filter(|t| t.exit_code.is_none()).ok_or(Error::ProcessNotFound)?;
+        match &process.host_group {
+            Some(group) => Source::Host(group.clone(), lock(&process.output).folder_seq),
+            None => match state.vm_of(&process.session_id) {
+                Some((_, Vm::Running { applied, .. })) => {
+                    match guest_start(&applied.0, &process.session_id, process.kind) {
+                        Some(start) => Source::Guest(process.output.clone(), start, applied.clone()),
+                        None => return Ok((lock(&process.output).folder_seq, None)),
+                    }
+                }
+                _ => return Ok((lock(&process.output).folder_seq, None)),
+            },
+        }
+    };
+    Ok(match source {
+        Source::Host(group, seq) => (seq, group.cwd().map(TerminalFolder::host)),
+        Source::Guest(output, start, applied) => {
+            let (seq, path) = {
+                let output = lock(&output);
+                (output.folder_seq, output.osc.cwd.clone().unwrap_or(start))
+            };
+            (seq, Some(TerminalFolder::guest(path, &applied)))
+        }
+    })
 }
 
 /// What an agent in a terminal does, as its hooks report it.
@@ -138,9 +221,10 @@ impl<R: SandboxRuntime> Manager<R> {
             if !folder.is_dir() {
                 return Err(Error::MissingPath(folder.display().to_string()));
             }
+            let start = TerminalFolder::host(folder.clone());
             // The last cage check and the spawn hold the state lock, which
             // every cage change also takes: no cage can come in between.
-            return self.register(session_id, terminal_id, kind, |state| {
+            return self.register(session_id, terminal_id, kind, start, |state| {
                 if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
                     return Err(Error::HasCage);
                 }
@@ -149,28 +233,27 @@ impl<R: SandboxRuntime> Manager<R> {
             });
         }
         let argv = kind.vm_argv().ok_or(Error::NotRunning)?;
-        let (key, vm, cwd) = {
+        let (key, vm, cwd, applied) = {
             let state = lock(&self.state);
             state.session(session_id)?;
             match state.vm_of(session_id) {
                 Some((key, Vm::Running { vm, applied, runtimes, host, .. })) => {
-                    let (member, folder, _) = task_guest_folder(&applied.0, session_id).ok_or(Error::NotRunning)?;
-                    let cwd = match kind {
-                        TerminalKind::Agent { agent, .. } if !mounted(runtimes).contains(&agent) => {
-                            return Err(self.unmounted(agent, host));
-                        }
-                        TerminalKind::Agent { .. } => member.harness.as_deref(),
-                        TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
-                    };
-                    (key.to_owned(), vm.clone(), cwd.map_or(folder.clone(), |h| in_guest_folder(&folder, h)))
+                    let cwd = guest_start(&applied.0, session_id, kind).ok_or(Error::NotRunning)?;
+                    if let TerminalKind::Agent { agent, .. } = kind
+                        && !mounted(runtimes).contains(&agent)
+                    {
+                        return Err(self.unmounted(agent, host));
+                    }
+                    (key.to_owned(), vm.clone(), cwd, applied.clone())
                 }
                 _ => return Err(Error::NotRunning),
             }
         };
+        let start = TerminalFolder::guest(cwd.clone(), &applied);
         let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
         // The VM may have stopped, or stopped and started again, while
         // the process opened. Its stop did not see this process, so kill it.
-        self.register(session_id, terminal_id, kind, |state| match state.vms.get(&key) {
+        self.register(session_id, terminal_id, kind, start, |state| match state.vms.get(&key) {
             Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
             _ => {
                 let _ = pty.input.send(PtyInput::Kill);
@@ -181,16 +264,18 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Adds the process that `open` gives under the state lock. `open`
     /// kills its process if it fails. If a close or a second open of the
-    /// terminal ran while the process opened, it kills the process.
+    /// terminal ran while the process opened, it kills the process. `start`
+    /// is the folder of the process until its first report.
     fn register(
         &self,
         session_id: &str,
         terminal_id: Option<&str>,
         kind: TerminalKind,
+        start: TerminalFolder,
         open: impl FnOnce(&State<R::Vm>) -> Result<(Pty, Option<host::HostGroup>)>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let output = Arc::new(Mutex::new(Output::default()));
+        let output = Arc::new(Mutex::new(Output { folder: Some(start), ..Output::default() }));
         let events = {
             let mut state = lock(&self.state);
             let (pty, host_group) = open(&state)?;
@@ -232,8 +317,9 @@ impl<R: SandboxRuntime> Manager<R> {
             id.clone(),
             output,
             events,
-            matches!(kind, TerminalKind::Agent { .. }),
+            kind,
             self.agent_sink.clone(),
+            self.folder_sink.clone(),
         ));
         Ok(id)
     }
@@ -332,56 +418,44 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// The host folder that Open in editor opens: the session folder, or the
-    /// current folder of the terminal's live process. A host shell's folder
-    /// comes from macOS; a VM terminal's from its last OSC 7, else its start
-    /// folder, mapped by [`editor::map_guest`]. The flag is false when the
-    /// terminal's folder is unknown and the session folder is used instead.
+    /// current folder of the terminal's live process, resolved again now by
+    /// [`resolve_folder`]. The flag is false when the terminal's folder is
+    /// unknown or not on the Mac, and the session folder is used instead.
     pub fn editor_folder(&self, session_id: &str, terminal_id: Option<&str>) -> Result<(PathBuf, bool)> {
-        enum Cwd {
-            Host(host::HostGroup),
-            /// The output, its start folder and the applied config.
-            Guest(Arc<Mutex<Output>>, String, Box<(Vec<Session>, Cage)>),
-        }
-        let (folder, cwd) = {
+        let (folder, process) = {
             let state = lock(&self.state);
-            let session = state.session(session_id)?;
-            let folder = session.folder.clone();
+            let folder = state.session(session_id)?.folder.clone();
             let process = terminal_id.and_then(|tid| {
                 state.terminals.iter().find(|t| {
                     t.session_id == session_id && t.terminal_id.as_deref() == Some(tid) && t.exit_code.is_none()
                 })
             });
-            let cwd = match (process, state.vm_of(session_id).map(|(_, vm)| vm)) {
-                (Some(Terminal { host_group: Some(group), .. }), _) => Some(Cwd::Host(group.clone())),
-                (Some(process), Some(Vm::Running { applied, .. })) => {
-                    task_guest_folder(&applied.0, session_id).map(|(member, folder, _)| {
-                        let start = match process.kind {
-                            TerminalKind::Agent { .. } => member.harness.as_deref(),
-                            TerminalKind::Shell | TerminalKind::Host | TerminalKind::HostAgent { .. } => None,
-                        };
-                        let start = start.map_or(folder.clone(), |h| in_guest_folder(&folder, h));
-                        Cwd::Guest(process.output.clone(), start, applied.clone())
-                    })
-                }
-                _ => None,
-            };
-            (folder, cwd)
+            (folder, process.map(|t| t.id.clone()))
         };
         if !folder.is_dir() {
             return Err(Error::MissingPath(folder.display().to_string()));
         }
-        let found = match cwd {
-            Some(Cwd::Host(group)) => group.cwd().filter(|path| path.is_dir()),
-            Some(Cwd::Guest(output, start, applied)) => {
-                let guest = lock(&output).osc.cwd.clone().unwrap_or(start);
-                editor::map_guest(&guest, Members { sessions: &applied.0, cage: &applied.1 })
-            }
-            None => None,
-        };
-        Ok(match found {
+        let opens = process.and_then(|id| resolve_folder(&self.state, &id).ok()?.1?.opens);
+        Ok(match opens {
             Some(path) => (path, true),
             None => (folder, terminal_id.is_none()),
         })
+    }
+
+    /// The current folder of each live process of `ids`, resolved now. An
+    /// unknown or exited process is left out. It opens and changes no
+    /// process; it updates only the kept folder that the listing shows, so a
+    /// change with no output, or a new mount mapping, shows there too. A
+    /// folder read before a newer report is left out: the next call reads it.
+    pub fn terminal_folders(&self, ids: &[String]) -> HashMap<String, FolderReport> {
+        ids.iter()
+            .filter_map(|id| {
+                let output = self.output(id).ok()?;
+                let (seq, folder) = resolve_folder(&self.state, id).ok()?;
+                let (seq, _) = output::keep_folder(&output, &folder, seq)?;
+                Some((id.clone(), FolderReport { seq, folder }))
+            })
+            .collect()
     }
 
     pub fn set_pane_layout(&self, session_id: &str, layout: Option<PaneNode>) -> Result<()> {
@@ -407,8 +481,38 @@ impl<R: SandboxRuntime> Manager<R> {
 
 #[cfg(test)]
 mod tests {
+    use super::{FolderReport, TerminalFolder};
     use crate::cage::testing::*;
     use crate::session::{PaneNode, SplitDirection};
+
+    type Seen = Arc<Mutex<Vec<(String, u64, Option<TerminalFolder>)>>>;
+
+    fn follow_folders(manager: &Manager<FakeRuntime>) -> Seen {
+        let seen = Seen::default();
+        let into = seen.clone();
+        manager.set_folder_sink(Box::new(move |process, seq, folder| {
+            lock(&into).push((process.to_owned(), seq, folder.cloned()));
+        }));
+        seen
+    }
+
+    /// The folders of the batch call, without their order.
+    fn batch(manager: &Manager<FakeRuntime>, ids: &[String]) -> Vec<(String, Option<TerminalFolder>)> {
+        manager.terminal_folders(ids).into_iter().map(|(id, report)| (id, report.folder)).collect()
+    }
+
+    fn listed_folder(manager: &Manager<FakeRuntime>, process: &str) -> Option<TerminalFolder> {
+        let listing = manager.list();
+        listing.sessions[0].processes.iter().find(|p| p.id == process).and_then(|p| p.folder.clone())
+    }
+
+    fn mac(path: &Path) -> Option<TerminalFolder> {
+        Some(TerminalFolder { path: path.to_owned(), vm: false, opens: Some(path.to_owned()) })
+    }
+
+    fn vm(guest: &str, opens: Option<&Path>) -> Option<TerminalFolder> {
+        Some(TerminalFolder { path: guest.into(), vm: true, opens: opens.map(Path::to_owned) })
+    }
 
     #[tokio::test]
     async fn session_lifecycle() {
@@ -706,6 +810,130 @@ mod tests {
 
         std::fs::remove_dir_all(&folder).unwrap();
         assert!(matches!(manager.editor_folder(&id, None), Err(Error::MissingPath(_))));
+    }
+
+    #[tokio::test]
+    async fn a_host_shell_folder_follows_its_cd_also_with_no_output() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let seen = follow_folders(&manager);
+        let folder = manager.list().sessions[0].session.folder.clone();
+        for sub in ["sub", "quiet"] {
+            std::fs::create_dir(folder.join(sub)).unwrap();
+        }
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        // The start folder until the first report.
+        assert_eq!(listed_folder(&manager, &process), mac(&folder));
+
+        // The output pump never asks macOS: only the batch call sees a cd.
+        let ids = [process.clone(), "gone".to_owned()];
+        let wait_for = |sub: &'static str| {
+            let want = mac(&folder.join(sub));
+            let manager = &manager;
+            let ids = &ids;
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while manager.terminal_folders(ids).get(&ids[0]).map(|r| &r.folder) != Some(&want) {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("the batch call did not see the cd");
+            }
+        };
+        manager.write(&process, b"cd sub\n".to_vec()).unwrap();
+        wait_for("sub").await;
+        assert_eq!(listed_folder(&manager, &process), mac(&folder.join("sub")));
+
+        // With no echo and no prompt, the cd writes nothing.
+        manager.write(&process, b"stty -echo; PS1=; PS2=\n".to_vec()).unwrap();
+        let output = manager.output(&process).unwrap();
+        let mut len = usize::MAX;
+        while lock(&output).ring.len() != len {
+            len = lock(&output).ring.len();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        manager.write(&process, b"cd ../quiet\n".to_vec()).unwrap();
+        wait_for("quiet").await;
+        assert_eq!(lock(&output).ring.len(), len, "the cd wrote output");
+        assert_eq!(manager.terminal_folders(&ids).len(), 1, "an unknown id is left out");
+        // The batch call keeps the folder for the listing, and each change gets a newer seq.
+        assert_eq!(listed_folder(&manager, &process), mac(&folder.join("quiet")));
+        let seq = manager.list().sessions[0].processes[0].folder_seq;
+        assert_eq!(manager.terminal_folders(&ids)[&process].seq, seq);
+        assert!(lock(&seen).is_empty(), "the pump sent a Mac folder");
+        manager.delete(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_host_shell_whose_folder_macos_does_not_give_has_no_folder() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let folder = manager.list().sessions[0].session.folder.clone();
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        assert_eq!(listed_folder(&manager, &process), mac(&folder));
+
+        // A group that macOS gives no cwd for, while the process stays live.
+        let swap = |group| {
+            let mut state = lock(&manager.state);
+            let t = state.terminals.iter_mut().find(|t| t.id == process).unwrap();
+            std::mem::replace(&mut t.host_group, group)
+        };
+        let real = swap(Some(super::host::HostGroup::retired()));
+        let ids = [process.clone()];
+        assert_eq!(batch(&manager, &ids), [(process.clone(), None)]);
+        assert_eq!(listed_folder(&manager, &process), None, "the start folder is not kept");
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).unwrap(), (folder.clone(), false));
+
+        swap(real);
+        assert_eq!(manager.terminal_folders(&ids)[&process].folder, mac(&folder));
+        manager.delete(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_vm_shell_folder_follows_osc7_and_maps_to_the_mac_folder() {
+        let (manager, _, id) = manager();
+        let seen = follow_folders(&manager);
+        let folder = manager.list().sessions[0].session.folder.clone();
+        std::fs::create_dir(folder.join("sub")).unwrap();
+        let shared = temp_dir();
+        std::fs::create_dir(shared.join("x")).unwrap();
+        manager.add_mount(&id, shared.to_str().unwrap(), "/data", false).unwrap();
+        manager.start(&id).await.unwrap();
+        let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        // The start folder before the first OSC 7, also after the first output.
+        let (_, mut rx) = attach(&manager, &process);
+        assert_eq!(next(&mut rx).await, output("24x80"));
+        assert_eq!(listed_folder(&manager, &process), vm("/workspace", Some(&folder)));
+        assert!(lock(&seen).is_empty());
+
+        // The fake VM echoes its input as output.
+        let cases = [("/workspace/sub", Some(folder.join("sub"))), ("/data/x", Some(shared.join("x"))), ("/etc", None)];
+        for (guest, opens) in &cases {
+            manager.write(&process, format!("\x1b]7;file://vm{guest}\x07").into_bytes()).unwrap();
+            let want = vm(guest, opens.as_deref());
+            until(|| listed_folder(&manager, &process) == want).await;
+            let seq = manager.list().sessions[0].processes[0].folder_seq;
+            assert_eq!(lock(&seen).last(), Some(&(process.clone(), seq, want.clone())));
+            assert_eq!(
+                manager.terminal_folders(std::slice::from_ref(&process))[&process],
+                FolderReport { seq, folder: want }
+            );
+            let editor = opens.clone().map_or((folder.clone(), false), |path| (path, true));
+            assert_eq!(manager.editor_folder(&id, Some(&terminal)).unwrap(), editor);
+        }
+        assert_eq!(lock(&seen).len(), cases.len(), "only a change goes to the sink");
+
+        // An exited process has no folder, and its replacement starts again.
+        manager.send(&process, PtyInput::Kill).unwrap();
+        until(|| manager.list().sessions[0].processes[0].exit_code.is_some()).await;
+        assert_eq!(listed_folder(&manager, &process), None);
+        assert!(manager.terminal_folders(std::slice::from_ref(&process)).is_empty());
+        let again = manager.reopen_terminal(&id, &terminal, 24, 80).await.unwrap();
+        let both = [process.clone(), again.clone()];
+        assert_eq!(batch(&manager, &both), [(again, vm("/workspace", Some(&folder)))]);
     }
 
     #[test]

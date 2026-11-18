@@ -9,6 +9,7 @@ import { removeMount, setMountReadonly } from "../features/settings/api";
 import { SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
+import { editorLabel } from "../features/terminal/folders";
 import { LaunchAction, launchActions, launchCommand } from "../features/launcher/actions";
 import { Editors } from "../features/launcher/api";
 import type { Detection } from "../features/settings/api";
@@ -24,6 +25,8 @@ interface Props {
   focused?: string;
   /** The focused pane when the terminal view shows; the editor items open its folder. */
   here?: string;
+  /** The home folder, shown as `~`. */
+  home?: string;
   actions: Record<ShortcutAction, () => void>;
   onSelect: (id: string) => void;
   onShowPane: (key: string) => void;
@@ -46,6 +49,7 @@ export function CommandBar({
   panes,
   focused,
   here,
+  home,
   actions,
   onSelect,
   onShowPane,
@@ -96,7 +100,7 @@ export function CommandBar({
         launch.type !== "editor"
           ? launch.label
           : herePane
-            ? `Open ${paneName(herePane, panes)}'s folder in ${launch.editor.name}`
+            ? editorLabel(launch.editor.name, herePane.folder, session.folder, home)
             : `Open ${session.name} in ${launch.editor.name}`;
       commands.push(launchCommand(launch, label, shortcut, onLaunch));
     }

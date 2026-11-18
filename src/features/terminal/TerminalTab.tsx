@@ -20,10 +20,12 @@ interface Props {
   onLayout: (layout: PaneNode) => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
-  onPaneExit: () => void;
+  onPaneExit: (processId: string, code: number) => void;
   onPaneError: (error: unknown) => void;
   /** The name of the default editor. */
   editor?: string;
+  /** The home folder, shown as `~`. */
+  home?: string;
   onSplit: (key: string, direction: "row" | "column") => void;
   onOpenEditor: (key: string) => void;
   onHide: (key: string) => void;

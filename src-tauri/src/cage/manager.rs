@@ -23,7 +23,7 @@ use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, VmChoice};
 use crate::store::{self, Store};
 use crate::task_runs;
-use crate::terminal::{AgentState, Terminal, TerminalView};
+use crate::terminal::{AgentState, Terminal, TerminalFolder, TerminalView};
 use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
 /// The network log entries kept per VM.
@@ -38,6 +38,10 @@ pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
 
 /// Gets the process id and the new agent state of a terminal.
 pub type AgentSink = Box<dyn Fn(&str, Option<AgentState>) + Send + Sync>;
+
+/// Gets the process id, the order and the new folder of a live terminal.
+/// `None`: unknown.
+pub type FolderSink = Box<dyn Fn(&str, u64, Option<&TerminalFolder>) + Send + Sync>;
 
 /// Gets the key of a VM whose guest logins changed.
 pub type GuestSink = Box<dyn Fn(&str) + Send + Sync>;
@@ -71,6 +75,7 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
+    pub(crate) folder_sink: Arc<OnceLock<FolderSink>>,
     pub(crate) runs: Arc<task_runs::Registry>,
     /// Serializes run starts, so two starts cannot take the same run name.
     pub(crate) run_start: Mutex<()>,
@@ -479,6 +484,7 @@ impl<R: SandboxRuntime> Manager<R> {
             })),
             net_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
+            folder_sink: Arc::new(OnceLock::new()),
             runs: Arc::default(),
             run_start: Mutex::new(()),
             run_config: task_runs::Config::default(),
@@ -497,6 +503,11 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Only the first sink counts.
     pub fn set_agent_sink(&self, sink: AgentSink) {
         let _ = self.agent_sink.set(sink);
+    }
+
+    /// Only the first sink counts.
+    pub fn set_folder_sink(&self, sink: FolderSink) {
+        let _ = self.folder_sink.set(sink);
     }
 
     /// Only the first sink counts.
@@ -543,15 +554,21 @@ impl<R: SandboxRuntime> Manager<R> {
                         .terminals
                         .iter()
                         .filter(|t| t.session_id == session.id)
-                        .map(|t| TerminalView {
-                            id: t.id.clone(),
-                            kind: t.kind,
-                            exit_code: t.exit_code,
-                            terminal_id: t.terminal_id.clone(),
-                            agent: lock(&t.output)
-                                .osc
-                                .agent
-                                .filter(|_| t.exit_code.is_none() && matches!(t.kind, TerminalKind::Agent { .. })),
+                        .map(|t| {
+                            let output = lock(&t.output);
+                            let live = t.exit_code.is_none();
+                            TerminalView {
+                                id: t.id.clone(),
+                                kind: t.kind,
+                                exit_code: t.exit_code,
+                                terminal_id: t.terminal_id.clone(),
+                                agent: output
+                                    .osc
+                                    .agent
+                                    .filter(|_| live && matches!(t.kind, TerminalKind::Agent { .. })),
+                                folder: output.folder.clone().filter(|_| live),
+                                folder_seq: output.folder_seq,
+                            }
                         })
                         .collect(),
                     session: session.clone(),

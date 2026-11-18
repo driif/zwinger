@@ -276,7 +276,7 @@ interface Props {
   onReopen: (pane: Pane) => void;
   onFocus: (key: string) => void;
   onLayout: (layout: PaneNode) => void;
-  onPaneExit: () => void;
+  onPaneExit: (processId: string, code: number) => void;
   onPaneError: (error: unknown) => void;
   /** Splits the pane of a terminal with a Mac shell. */
   onSplit: (key: string, direction: "row" | "column") => void;
@@ -675,6 +675,7 @@ export function ProjectPage({
           panes={panes}
           focused={focused}
           editor={defaultEditor?.editor.name}
+          home={home}
           visible={!covered && view.kind === "terminal"}
           {...terminal}
         />

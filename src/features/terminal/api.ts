@@ -1,5 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
-import { call, PaneNode, TerminalKind } from "../../shared/api";
+import { call, FolderReport, PaneNode, TerminalKind } from "../../shared/api";
 import type { CursorStyle } from "../settings/api";
 
 /** Saves the split tree of the session's terminal view. */
@@ -36,6 +36,9 @@ export const importGhosttyConfig = () => call<GhosttyImport>("import_ghostty_con
 
 /** Output bytes, or the exit. Tauri can send small raw bodies as a number array. */
 export type SessionFrame = ArrayBuffer | number[] | { exit: number };
+
+/** The current folder of each live process of `ids`. Unknown and exited processes, and stale reads, are left out. */
+export const terminalFolders = (ids: string[]) => call<Record<string, FolderReport>>("terminal_folders", { ids });
 
 export const reorderTerminals = (sessionId: string, terminalIds: string[]) =>
   call<void>("reorder_terminals", { sessionId, terminalIds });

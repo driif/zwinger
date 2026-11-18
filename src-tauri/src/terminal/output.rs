@@ -7,9 +7,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::Instant;
 
-use crate::cage::manager::{AgentSink, State, lock};
-use crate::runtime::PtyEvent;
-use crate::terminal::AgentState;
+use crate::cage::manager::{AgentSink, FolderSink, State, lock};
+use crate::runtime::{PtyEvent, TerminalKind};
+use crate::terminal::{AgentState, TerminalFolder, resolve_folder};
 
 /// The output bytes kept per session, for a view that attaches later.
 pub(crate) const RING: usize = 1 << 20;
@@ -42,6 +42,12 @@ pub(crate) struct Output {
     /// Wakes the pump when a view acknowledges a frame or goes.
     pub(crate) room: Arc<Notify>,
     pub(crate) osc: Osc,
+    /// The last folder of this process, which the listing shows: its start
+    /// folder until the first report. `None` after the exit, or while unknown.
+    pub(crate) folder: Option<TerminalFolder>,
+    /// Goes up at each new OSC 7 folder and at each change of `folder`. A
+    /// folder read at an older value is stale.
+    pub(crate) folder_seq: u64,
 }
 
 /// The longest OSC 7 body that the scanner keeps across frames.
@@ -283,6 +289,7 @@ impl Output {
                     self.send(PtyEvent::Output(held));
                 }
                 self.osc.agent = None;
+                self.folder = None;
                 self.exit = Some(code);
                 PtyEvent::Exit(code)
             }
@@ -404,19 +411,41 @@ impl Frames {
     }
 }
 
+/// Keeps `folder`, read at `seq`, as the folder of the live process. Gives
+/// the seq of the kept folder and true if it changed, so each seq names one
+/// folder. `None`: the process has exited, or `folder` was read before a
+/// newer report or change and is not kept.
+pub(crate) fn keep_folder(output: &Mutex<Output>, folder: &Option<TerminalFolder>, seq: u64) -> Option<(u64, bool)> {
+    let mut output = lock(output);
+    if output.exit.is_some() || output.folder_seq != seq {
+        return None;
+    }
+    if output.folder == *folder {
+        return Some((seq, false));
+    }
+    output.folder.clone_from(folder);
+    output.folder_seq += 1;
+    Some((output.folder_seq, true))
+}
+
 /// Moves the PTY output into the session's output frame by frame, until the
 /// process exits. While the view is full, it does not read, so the process
 /// blocks on its writes. The exit code is recorded before the `Exit` event
 /// is delivered, so a listing done in reaction to it shows the exit. A change
-/// of the agent state goes to `agents`; at the exit, the state goes.
+/// of the agent state goes to `agents`; at the exit, the state goes. A VM
+/// process that reports a new folder by OSC 7 sends its change to `folders`.
+/// The pump never asks macOS: a Mac folder comes from the batch call only.
 pub(crate) async fn pump<V>(
     state: Arc<Mutex<State<V>>>,
     id: String,
     output: Arc<Mutex<Output>>,
     events: Receiver<PtyEvent>,
-    agent_terminal: bool,
+    kind: TerminalKind,
     agents: Arc<OnceLock<AgentSink>>,
+    folders: Arc<OnceLock<FolderSink>>,
 ) {
+    let agent_terminal = matches!(kind, TerminalKind::Agent { .. });
+    let vm = !kind.on_host();
     let mut frames = Frames::new(events);
     let room = lock(&output).room.clone();
     loop {
@@ -440,16 +469,21 @@ pub(crate) async fn pump<V>(
         {
             t.exit_code = Some(code);
         }
-        let (before, after) = {
+        let (before, after, moved) = {
             let mut output = lock(&output);
             let before = output.osc.agent;
+            let cwd = output.osc.cwd.clone();
             if !bytes.is_empty() {
                 output.push(PtyEvent::Output(bytes));
             }
             if let Some(code) = exit {
                 output.push(PtyEvent::Exit(code));
             }
-            (before, output.osc.agent.filter(|_| exit.is_none()))
+            let moved = vm && output.osc.cwd != cwd;
+            if moved {
+                output.folder_seq += 1;
+            }
+            (before, output.osc.agent.filter(|_| exit.is_none()), moved)
         };
         if agent_terminal
             && before != after
@@ -460,14 +494,34 @@ pub(crate) async fn pump<V>(
         if exit.is_some() {
             return;
         }
+        if moved
+            && let Ok((seq, folder)) = resolve_folder(&state, &id)
+            && let Some((seq, true)) = keep_folder(&output, &folder, seq)
+            && let Some(sink) = folders.get()
+        {
+            sink(&id, seq, folder.as_ref());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AGENT_OSC, OSC7_LIMIT, Osc};
+    use super::{AGENT_OSC, OSC7_LIMIT, Osc, Output, keep_folder};
     use crate::cage::testing::*;
-    use crate::terminal::AgentState;
+    use crate::terminal::{AgentState, TerminalFolder};
+
+    #[test]
+    fn a_folder_read_before_a_newer_change_is_not_kept() {
+        let at = |path: &str| Some(TerminalFolder { path: path.into(), vm: true, opens: None });
+        let output = Mutex::new(Output::default());
+        // Two reads at seq 0: the first change wins, the late one is stale.
+        assert_eq!(keep_folder(&output, &at("/new"), 0), Some((1, true)));
+        assert_eq!(keep_folder(&output, &at("/old"), 0), None);
+        assert_eq!(lock(&output).folder, at("/new"));
+        assert_eq!(keep_folder(&output, &at("/new"), 1), Some((1, false)), "no change");
+        lock(&output).exit = Some(0);
+        assert_eq!(keep_folder(&output, &at("/other"), 1), None);
+    }
 
     #[tokio::test]
     async fn a_stale_detach_keeps_the_new_sink() {

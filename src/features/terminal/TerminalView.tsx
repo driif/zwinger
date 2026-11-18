@@ -14,7 +14,7 @@ interface Props {
   /** The place in the pane layout. No style fills the parent. */
   style?: CSSProperties;
   onFocus?: () => void;
-  onExit: () => void;
+  onExit: (processId: string, code: number) => void;
   onError: (error: unknown) => void;
 }
 
@@ -63,7 +63,7 @@ export function TerminalView({ processId, visible, focused, style, onFocus, onEx
           if (!(frame instanceof ArrayBuffer || Array.isArray(frame))) {
             // The refresh that removes the pane can come late or fail. Late output must not name the exited process.
             endTitle();
-            return onExit();
+            return onExit(processId, frame.exit);
           }
           // The parse is synchronous. The write callback waits for an animation frame, which a hidden window does not get.
           term.write(frame instanceof ArrayBuffer ? new Uint8Array(frame) : Uint8Array.from(frame));

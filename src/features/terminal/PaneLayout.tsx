@@ -6,6 +6,7 @@ import type { Pane } from "../../App";
 import { KindIcon, paneName } from "../projects/ProjectRail";
 import { StartProgress } from "../projects/StartProgress";
 import { Path, place, Rect, setRatio } from "./panes";
+import { folderLabel } from "./folders";
 import { useTerminalTitles } from "./titles";
 import { TerminalView } from "./TerminalView";
 
@@ -22,10 +23,12 @@ interface Props {
   /** The end of a divider drag. */
   onLayout: (layout: PaneNode) => void;
   onReopen: (pane: Pane) => void;
-  onPaneExit: () => void;
+  onPaneExit: (processId: string, code: number) => void;
   onPaneError: (error: unknown) => void;
   /** The name of the default editor. None: no editor is on. */
   editor?: string;
+  /** The home folder, shown as `~`. */
+  home?: string;
   onSplit: (key: string, direction: "row" | "column") => void;
   onOpenEditor: (key: string) => void;
   /** Hides the pane. The terminal keeps running. */
@@ -59,6 +62,7 @@ export function PaneLayout({
   onPaneExit,
   onPaneError,
   editor,
+  home,
   onSplit,
   onOpenEditor,
   onHide,
@@ -137,7 +141,17 @@ export function PaneLayout({
           >
             <KindIcon kind={pane.kind} />
             <Badge>{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>
-            <span className="grow pane-name" title={title}>{title || name}</span>
+            <span className="grow pane-label">
+              <span className="pane-name" title={pane.folder ? `${title || name}\n${pane.folder.path}` : title}>
+                {title || name}
+              </span>
+              {pane.folder && (
+                <span className="pane-folder mono" title={pane.folder.path}>
+                  <span aria-hidden="true">{folderLabel(pane.folder, home)}</span>
+                  <span className="sr-only">Folder {pane.folder.path}</span>
+                </span>
+              )}
+            </span>
             <IconButtonGroup className="pane-actions" label={`Actions for ${name}`}>
               {actions.map((action) => <IconButton key={action.label} label={action.label} icon={action.icon} onClick={action.run} />)}
             </IconButtonGroup>

@@ -133,6 +133,25 @@ export interface TerminalView {
   terminalId: string | null;
   /** Set only while an agent terminal is live. */
   agent: AgentState | null;
+  /** The last known folder of a live process. `null`: exited, or unknown. */
+  folder: TerminalFolder | null;
+  /** The order of `folder` within its process: a higher one is newer. */
+  folderSeq: number;
+}
+
+/** A folder of a process and its order: a higher `seq` is newer. */
+export interface FolderReport {
+  seq: number;
+  folder: TerminalFolder | null;
+}
+
+/** Where a live terminal process is. */
+export interface TerminalFolder {
+  /** The current folder: a Mac path, or a guest path if `vm`. */
+  path: string;
+  vm: boolean;
+  /** The Mac folder that Open in editor opens for it. `null`: it is not on the Mac. */
+  opens: string | null;
 }
 
 /** A host shell, VM shell or agent terminal of a session. With no process it is dormant, and it can open again. */

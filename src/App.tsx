@@ -58,6 +58,7 @@ import {
   split,
   tooDeep,
 } from "./features/terminal";
+import { useTerminalFolders } from "./features/terminal/useTerminalFolders";
 import { checkUpdate, UpdateInfo } from "./features/updates/api";
 import {
   AGENT_NAMES,
@@ -68,6 +69,7 @@ import {
   CageView,
   SessionCage,
   SessionView,
+  TerminalFolder,
   TerminalKind,
   // The component that shows the sessions is also named Workspace.
   Workspace as WorkspaceGroup,
@@ -115,6 +117,8 @@ export interface Pane {
   sessionId: string;
   kind: TerminalKind;
   processId?: string;
+  /** The folder of the live process. `null`: no live process, or the folder is unknown. */
+  folder: TerminalFolder | null;
 }
 
 export type Run = (action: () => Promise<unknown>) => Promise<unknown>;
@@ -501,16 +505,29 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }, [liveRunSessions]);
 
   const joined: SessionCage[] = sessions.map((session) => sessionCage(session, cages));
-  const panes: Pane[] = joined.flatMap(({ session }) =>
-    session.terminals.map((t) => ({
-      key: t.id,
-      sessionId: session.id,
-      kind: t.kind,
-      processId: session.processes.find((p) => p.terminalId === t.id && p.exitCode === null)?.id,
-    })),
-  );
   const selected = joined.find((j) => j.session.id === selectedId) ?? joined[0];
   const session = selected?.session;
+  /** The terminal view shows, and no other screen covers it. */
+  const terminalShows = !!session && view.kind === "terminal" && !showSettings && !showCages && !roundFolder;
+  const liveProcess = (target: SessionView, terminalId: string) =>
+    target.processes.find((p) => p.terminalId === terminalId && p.exitCode === null);
+  // A Mac shell's `cd` can write no output, so the backend sees it only when asked.
+  const terminalFolders = useTerminalFolders(
+    sessions,
+    terminalShows ? leaves(session.paneLayout).flatMap((key) => liveProcess(session, key)?.id ?? []) : [],
+  );
+  const panes: Pane[] = joined.flatMap(({ session }) =>
+    session.terminals.map((t) => {
+      const process = liveProcess(session, t.id);
+      return {
+        key: t.id,
+        sessionId: session.id,
+        kind: t.kind,
+        processId: process?.id,
+        folder: process ? terminalFolders.folderOf(process) : null,
+      };
+    }),
+  );
   const vmCage = selected?.vmCage;
   // With no effective cage there is nothing to restart into: the banner offers Stop.
   const cageChanged = vmCage?.status.state === "running" && !!selected.cage && selected.cage.id !== vmCage.id;
@@ -521,8 +538,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     return shown.includes(focusedPanes[target.id]) ? focusedPanes[target.id] : shown[0];
   };
   const focused = session && focusedOf(session);
-  /** The pane whose folder ⌘⇧E and the command menu open. */
-  const here = view.kind === "terminal" && !showSettings ? focused : undefined;
+  /** The pane whose folder ⌘⇧E and the command menu open. None: they open the project folder. */
+  const here = terminalShows ? focused : undefined;
   const events = (vmCage && net[vmCage.key]) ?? [];
   const defaultCage = cages.find((c) => c.id === workspaces.find((w) => w.sessions.includes(session?.id ?? ""))?.defaultCage);
 
@@ -977,6 +994,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           panes={sessionPanes}
           focused={focused}
           here={here}
+          home={home}
           actions={actions}
           onSelect={select}
           onShowPane={showPane}
@@ -1148,7 +1166,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             onReopen={(pane) => run(() => reopen(pane))}
             onFocus={(key) => focusPane(key)}
             onLayout={(layout) => saveLayout(session.id, layout)}
-            onPaneExit={refresh}
+            onPaneExit={(processId) => {
+              terminalFolders.hide(processId);
+              refresh();
+            }}
             onPaneError={(e) => setError(errorMessage(e))}
           />
         )}

@@ -106,6 +106,13 @@ restores it after a restart. Each pane header shows where its terminal runs. **M
 directly on your Mac. **VM** means it runs inside the cage. The badge also appears when the terminal is dormant.
 In a narrow pane, select **…** in its header to split the pane, open its folder in your editor, or hide the pane.
 
+After the name or title, the pane header shows the current folder of the terminal. A Mac folder below your home folder
+starts with `~`. A VM terminal shows its folder in the VM, for example `/workspace/src`. A long folder is shortened in
+the middle. Point to it to read the full path. The folder follows `cd`: a Mac shell's folder comes from macOS, and a
+VM shell's folder comes from the report at each prompt. A new terminal shows its start folder until the first report.
+When the folder is unknown, the header shows no folder. A narrow pane does not show the folder on the screen. Point
+to the name to read the title and the full folder. Assistive technology also reads the full folder.
+
 When you close a pane, the terminal is hidden but continues to run. A hidden terminal releases its WebGL context.
 When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tree.
 
@@ -130,6 +137,11 @@ zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/App
 
 **Open in editor** (⌘⇧E) opens the project folder, or the current folder of the current terminal. In a VM shell, a
 folder below a project folder of the VM or below a mount opens as its folder on the Mac. Other folders open the project folder.
+
+The command menu names the folder that opens, for example **Open ~/dev/app/src in Zed**. When the terminal's folder
+is not on the Mac or is unknown, it names the project folder and the reason, for example **Open project folder ~/dev/app
+in Zed (VM folder /etc is not on the Mac)**. zwinger reads the folder again when you open it. While **Cages**, a round
+folder room or a different screen covers the terminals, the command menu and ⌘⇧E open the project folder.
 
 A VM shell starts in bash. When you install zsh or fish in the VM and start it from the VM shell (for example `zsh`
 or `exec fish`), it also reports its folder at each prompt, and Open in editor follows `cd`. The VM does not need

@@ -158,6 +158,12 @@ impl HostGroup {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A group whose shell is reaped: macOS gives it no folder.
+    #[cfg(test)]
+    pub(crate) fn retired() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+
     #[cfg(test)]
     pub(crate) fn id(&self) -> Option<libc::pid_t> {
         *self.0.lock().unwrap()

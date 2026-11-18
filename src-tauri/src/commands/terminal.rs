@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use tauri::ipc::{Channel, InvokeResponseBody};
 
 use crate::error::Result;
 use crate::runtime::{PtyEvent, TerminalKind};
 use crate::session::PaneNode;
+use crate::terminal::FolderReport;
 
 use super::Managed;
 
@@ -75,4 +78,11 @@ pub fn resize_session(manager: Managed<'_>, id: String, rows: u16, cols: u16) ->
 #[tauri::command]
 pub fn close_terminal(manager: Managed<'_>, session_id: String, terminal_id: String) -> Result<()> {
     manager.close_terminal(&session_id, &terminal_id)
+}
+
+/// The current folder of each live process of `ids`. It skips unknown and
+/// exited processes, and it opens no process.
+#[tauri::command]
+pub async fn terminal_folders(manager: Managed<'_>, ids: Vec<String>) -> Result<HashMap<String, FolderReport>> {
+    Ok(manager.terminal_folders(&ids))
 }

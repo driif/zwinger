@@ -179,6 +179,11 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
         let _ = handle.emit("agent-state", serde_json::json!({ "processId": process_id, "state": state }));
     }));
     let handle = app.clone();
+    manager.set_folder_sink(Box::new(move |process_id, seq, folder| {
+        let _ = handle
+            .emit("terminal-folder", serde_json::json!({ "processId": process_id, "seq": seq, "folder": folder }));
+    }));
+    let handle = app.clone();
     manager.set_guest_sink(Box::new(move |vm_key| {
         let _ = handle.emit("guest-login", vm_key);
     }));
@@ -343,6 +348,7 @@ pub fn run() {
             commands::terminal::write_session,
             commands::terminal::resize_session,
             commands::terminal::close_terminal,
+            commands::terminal::terminal_folders,
             commands::settings::list_runtimes,
             commands::settings::install_runtime,
             commands::settings::cancel_runtime_install,

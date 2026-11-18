@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { AgentState, CageView, call, CredentialSource, Pos, SessionView, StartPhase, Workspace } from "../../shared/api";
+import { AgentState, CageView, call, CredentialSource, Pos, SessionView, StartPhase, FolderReport, Workspace } from "../../shared/api";
 
 export interface Sessions {
   sessions: SessionView[];
@@ -120,6 +120,12 @@ export const onGuestLogin = (handler: (vmKey: string) => void) =>
 export const onAgentState = (handler: (processId: string, state: AgentState | null) => void) =>
   listen<{ processId: string; state: AgentState | null }>("agent-state", ({ payload }) =>
     handler(payload.processId, payload.state),
+  );
+
+/** The folder of a live terminal process changed. `folder` null: it is unknown. */
+export const onTerminalFolder = (handler: (processId: string, report: FolderReport) => void) =>
+  listen<{ processId: string } & FolderReport>("terminal-folder", ({ payload: { processId, seq, folder } }) =>
+    handler(processId, { seq, folder }),
   );
 
 /** Each phase change of a VM start. Resolves to the function that stops the listener. */

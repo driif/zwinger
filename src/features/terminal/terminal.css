@@ -126,14 +126,40 @@
   color: var(--motiv-color-text);
 }
 
+.pane-label {
+  display: flex;
+  align-items: baseline;
+  gap: calc(var(--motiv-space) * 2);
+  min-width: 0;
+}
+
 .pane-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* The text is already cut in the middle; a narrower pane cuts its end too. */
+.pane-folder {
+  flex-shrink: 1000;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--motiv-color-text-muted);
+}
+
 .pane-actions-trigger {
   display: none;
+}
+
+/* Hidden only on the screen: the name shows the full folder on hover, and assistive technology reads it here. */
+@container (max-width: 24rem) {
+  .pane-folder {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+  }
 }
 
 @container (max-width: 14rem) {
