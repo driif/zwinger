@@ -688,6 +688,17 @@ mod tests {
         manager.write(&session, b"\x1b]7;file://vm/etc\x07".to_vec()).unwrap();
         until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.clone(), false)).await;
 
+        // The real output of the bash and the zsh emitters maps to the Mac folder.
+        let odd = folder.join("a b/\u{e4}%");
+        std::fs::create_dir_all(&odd).unwrap();
+        for osc7 in crate::agent::launch::emitted_osc7("/workspace/a b/\u{e4}%") {
+            assert_eq!(osc7, "\x1b]7;file://vm/workspace/a%20b/%C3%A4%25\x07".as_bytes());
+            manager.write(&session, osc7).unwrap();
+            until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (odd.clone(), true)).await;
+            manager.write(&session, b"\x1b]7;file://vm/etc\x07".to_vec()).unwrap();
+            until(|| manager.editor_folder(&id, Some(&terminal)).unwrap() == (folder.clone(), false)).await;
+        }
+
         // An exited session has no folder.
         manager.send(&session, PtyInput::Kill).unwrap();
         until(|| manager.list().sessions[0].processes[0].exit_code.is_some()).await;

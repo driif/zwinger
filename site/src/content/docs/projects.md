@@ -131,6 +131,25 @@ zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/App
 **Open in editor** (⌘⇧E) opens the project folder, or the current folder of the current terminal. In a VM shell, a
 folder below a project folder of the VM or below a mount opens as its folder on the Mac. Other folders open the project folder.
 
+A VM shell starts in bash. When you install zsh or fish in the VM and start it from the VM shell (for example `zsh`
+or `exec fish`), it also reports its folder at each prompt, and Open in editor follows `cd`. The VM does not need
+zsh or fish when the project starts. zwinger does not change your shell config files. It adds files of its own, and
+one line to the system zshenv:
+
+- zsh: zsh reads your `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin` as usual, from your `ZDOTDIR` or your home
+  folder. zwinger adds its prompt hook after your last startup file, so a `precmd_functions=(...)` in your `.zshrc`
+  keeps it. To start zsh, the VM shell gives zsh a zwinger folder as `ZDOTDIR`, and zsh then puts your own
+  `ZDOTDIR` back. The first interactive zsh also adds one line to the system zshenv (`/etc/zsh/zshenv`, or
+  `/etc/zshenv` if there is no `/etc/zsh`), so a zsh that you start from a zsh also reports its folder. The line
+  remains in that VM. On Debian and Ubuntu, a zsh upgrade can ask how to handle the changed file. If the file
+  does not exist or you cannot write it, only a zsh that starts from bash reports its folder. `zsh -f` skips your
+  startup files and does not report its folder.
+- fish 3: zwinger adds `/etc/fish/conf.d/zwinger.fish`. fish packages that use `/etc/fish` read it (Debian, Ubuntu,
+  Alpine and others). A fish that you build with a different prefix does not read it. fish 4 reports its folder
+  itself, and zwinger adds no second report.
+
+Your prompt and your own prompt hooks stay as they are.
+
 ## Map
 
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You

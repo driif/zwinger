@@ -311,6 +311,11 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
 /// so Open in editor knows the folder of a VM shell. `/bin/sh` reads the
 /// profile too, so the code has a guard and only POSIX syntax. The path is
 /// URL-encoded byte by byte; bash can read a byte as a negative number. A second read adds no second emitter.
+///
+/// An interactive bash also points `ZDOTDIR` at [`ZSH_DIR`], so a zsh that
+/// starts from it reads the files of [`zsh_files`], also before the system
+/// zshenv has [`ZSH_LINE`]. The user's own `ZDOTDIR` goes to
+/// `ZWINGER_ZDOTDIR`. Without the zsh file, `ZDOTDIR` stays as it is.
 const OSC7_EMITTER: &str = r#"if [ -n "${BASH_VERSION-}" ]; then
   __zw_osc7() {
     local LC_ALL=C path= c n i=0
@@ -328,20 +333,192 @@ const OSC7_EMITTER: &str = r#"if [ -n "${BASH_VERSION-}" ]; then
     *";__zw_osc7;"*) ;;
     *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__zw_osc7" ;;
   esac
+  case $- in
+    *i*)
+      if [ "${ZDOTDIR-}" != ZSH_DIR ] && [ -r ZSH_DIR/.zshenv ]; then
+        if [ -n "${ZDOTDIR+x}" ]; then
+          ZWINGER_ZDOTDIR=$ZDOTDIR
+          export ZWINGER_ZDOTDIR
+        else
+          unset ZWINGER_ZDOTDIR
+        fi
+        ZDOTDIR=ZSH_DIR
+        export ZDOTDIR
+      fi
+      ;;
+  esac
 fi
 "#;
+
+/// The guest dir that a VM shell gives zsh as `ZDOTDIR`. It holds the files
+/// of [`zsh_files`]. The image's own zsh files stay as they are.
+const ZSH_DIR: &str = "/etc/zwinger/zsh";
+
+/// The zsh emitter of [`OSC7_EMITTER`]: the same URL-encoding, byte by byte.
+const ZSH_EMITTER: &str = r#"__zw_osc7() {
+  emulate -L zsh
+  setopt no_multibyte
+  local LC_ALL=C c url= hex
+  local -i i
+  for (( i = 1; i <= ${#PWD}; i++ )); do
+    c=${PWD[i]}
+    case $c in
+      ([A-Za-z0-9/._~-]) url+=$c ;;
+      (*) printf -v hex '%%%02X' $(( #c & 255 )); url+=$hex ;;
+    esac
+  done
+  printf '\033]7;file://%s%s\007' "${HOST-}" "$url"
+}
+"#;
+
+/// `enter.zsh` in [`ZSH_DIR`]. An interactive zsh that reads startup files
+/// gets [`ZSH_DIR`] as `ZDOTDIR`, and the user's `ZDOTDIR` goes to
+/// `ZWINGER_ZDOTDIR`. The system zshenv reads it through [`ZSH_LINE`], and
+/// the files of [`zsh_files`] read it after each user file. A `zsh -f`
+/// gets the user's `ZDOTDIR` back.
+const ZSH_ENTER: &str = r#"if [[ ${ZDOTDIR-} == ZSH_DIR ]]; then
+  if [[ ! -o rcs ]]; then
+    if (( ${+ZWINGER_ZDOTDIR} )); then ZDOTDIR=$ZWINGER_ZDOTDIR; unset ZWINGER_ZDOTDIR; else unset ZDOTDIR; fi
+  fi
+elif [[ -o interactive && -o rcs ]] && (( ! ${+functions[__zw_osc7]} )) && [[ -r ZSH_DIR/.zshenv ]]; then
+  if (( ${+ZDOTDIR} )); then
+    ZWINGER_ZDOTDIR=$ZDOTDIR
+    [[ ${(t)ZDOTDIR} == *export* ]] && export ZWINGER_ZDOTDIR
+  else
+    unset ZWINGER_ZDOTDIR
+  fi
+  ZDOTDIR=ZSH_DIR
+fi
+"#;
+
+/// The line that the first interactive zsh adds to the system zshenv, so a
+/// zsh that starts from a zsh reads [`ZSH_ENTER`] too.
+const ZSH_LINE: &str = "[[ -r ZSH_DIR/enter.zsh ]] && builtin source ZSH_DIR/enter.zsh";
+
+/// The functions of `.zshenv` in [`ZSH_DIR`]. `__zw_back` gives the user's
+/// `ZDOTDIR` back. `__zw_done` ends the startup: an interactive zsh then
+/// adds the emitter to `precmd_functions` after the user's last file, so a
+/// `precmd_functions=(...)` in the user's `.zshrc` keeps it. It also adds
+/// [`ZSH_LINE`] once to the system zshenv if the file is writable.
+const ZSH_HELPERS: &str = r#"  __zw_back() {
+    if (( ${+ZWINGER_ZDOTDIR} )); then ZDOTDIR=$ZWINGER_ZDOTDIR; unset ZWINGER_ZDOTDIR; else unset ZDOTDIR; fi
+  }
+  __zw_done() {
+    emulate -L zsh
+    unfunction __zw_back __zw_done
+    [[ -o interactive ]] || return 0
+EMITTER
+    (( ${precmd_functions[(Ie)__zw_osc7]} )) || precmd_functions+=(__zw_osc7)
+    local f=/etc/zshenv line='LINE'
+    [[ -d /etc/zsh ]] && f=/etc/zsh/zshenv
+    if [[ -f $f && -w $f && $(<$f) != *"$line"* ]]; then
+      print -rl -- '' "$line" >>$f
+    fi
+  }
+"#;
+
+/// The files in [`ZSH_DIR`]. While `ZDOTDIR` is [`ZSH_DIR`], zsh reads each
+/// startup file here. Each one gives the user's `ZDOTDIR` back, reads the
+/// user's own file, then reads [`ZSH_ENTER`] again if zsh reads more files.
+/// So zsh reads the user's `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin`
+/// as usual, also if the user's `.zshenv` sets `ZDOTDIR`. A second read of
+/// a file in a running shell does nothing.
+fn zsh_files() -> Vec<(String, String)> {
+    let step = |name: &str, more: &str| {
+        let helpers = if name == ".zshenv" { ZSH_HELPERS } else { "" };
+        let body = format!(
+            "# zwinger writes this file at each cage start.\nif [[ ${{ZDOTDIR-}} == ZSH_DIR ]]; then\n{helpers}  __zw_back\n  \
+             [[ -f ${{ZDOTDIR:-$HOME}}/{name} ]] && builtin source \"${{ZDOTDIR:-$HOME}}/{name}\"\n{more}  \
+             [[ ${{ZDOTDIR-}} == ZSH_DIR ]] || __zw_done\nfi\n"
+        );
+        let emitter: String = ZSH_EMITTER.lines().map(|line| format!("    {line}\n")).collect();
+        let body = body.replace("EMITTER\n", &emitter).replace("LINE", ZSH_LINE);
+        (format!("{ZSH_DIR}/{name}"), body.replace("ZSH_DIR", ZSH_DIR))
+    };
+    vec![
+        (
+            format!("{ZSH_DIR}/enter.zsh"),
+            format!("# zwinger writes this file at each cage start.\n{ZSH_ENTER}").replace("ZSH_DIR", ZSH_DIR),
+        ),
+        step(".zshenv", "  builtin source ZSH_DIR/enter.zsh\n"),
+        step(".zprofile", "  builtin source ZSH_DIR/enter.zsh\n"),
+        step(".zshrc", "  [[ -o login ]] && builtin source ZSH_DIR/enter.zsh\n"),
+        step(".zlogin", ""),
+    ]
+}
+
+/// fish reads each file in its system `conf.d` at start, before the user's
+/// config. Packages of fish with the `/etc` sysconfdir use this dir.
+const FISH_CONF: &str = "/etc/fish/conf.d/zwinger.fish";
+
+/// The file of [`FISH_CONF`]: an interactive fish 3 reports its folder with
+/// OSC 7 before each prompt. fish 4 reports it itself, so it gets no second
+/// report. The handler only writes the sequence, so the user's prompt
+/// stays. A second read replaces the handler. fish 3 does not allow
+/// `return` outside a function, so the guard is a block.
+const FISH_EMITTER: &str = r#"# zwinger writes this file at each cage start.
+if status is-interactive; and string match -qr '^[0-3]\.' -- $version
+    function __zw_osc7 --on-event fish_prompt
+        printf '\e]7;file://%s%s\a' $hostname (string escape --style=url -- $PWD)
+    end
+end
+"#;
+
+/// The OSC 7 that the bash and the zsh emitters print in the guest folder
+/// `folder`, which need not exist.
+#[cfg(test)]
+pub(crate) fn emitted_osc7(folder: &str) -> [Vec<u8>; 2] {
+    let run = |shell: &str, args: &[&str], script: String| {
+        let out = std::process::Command::new(shell)
+            .env_clear()
+            .args(args)
+            .arg(script)
+            .arg(shell)
+            .arg(folder)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    };
+    let bash = run("/bin/bash", &["-c"], format!("{}PWD=$1 HOSTNAME=vm; __zw_osc7", profile()));
+    let zsh = run("/bin/zsh", &["-f", "-c"], format!("{ZSH_EMITTER}PWD=$1 HOST=vm; __zw_osc7"));
+    [bash, zsh]
+}
 
 /// The script of [`PROFILE`].
 pub fn profile() -> String {
     format!(
-        "case \":${{PATH-}}:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:${{PATH-}} ;; esac\nexport PATH\n{OSC7_EMITTER}"
+        "case \":${{PATH-}}:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:${{PATH-}} ;; esac\nexport PATH\n{}",
+        OSC7_EMITTER.replace("ZSH_DIR", ZSH_DIR)
     )
 }
 
-/// The root exec that writes [`PROFILE`] in the guest's root fs.
+/// The root exec that writes the shell files in the guest's root fs: the
+/// zsh files, the fish file, then [`PROFILE`], which uses the zsh files.
+/// Each file goes to a temp file first, then replaces the old file.
 pub fn profile_argv() -> Vec<String> {
-    let script = format!("mkdir -p /etc/profile.d && printf '%s' \"$1\" > {PROFILE}");
-    ["/bin/sh", "-c", &script, "sh", &profile()].map(str::to_owned).into()
+    let mut files = zsh_files();
+    files.push((FISH_CONF.to_owned(), FISH_EMITTER.to_owned()));
+    files.push((PROFILE.to_owned(), profile()));
+    let mut script = "set -e\n\
+         put() (\n\
+           umask 022\n\
+           mkdir -p \"${1%/*}\"\n\
+           [ ! -d \"$1\" ] || exit 1\n\
+           tmp=$(mktemp \"$1.XXXXXX\")\n\
+           trap 'rm -f \"$tmp\"' 0\n\
+           printf '%s' \"$2\" > \"$tmp\"\n\
+           chmod 644 \"$tmp\"\n\
+           mv -f \"$tmp\" \"$1\"\n\
+           trap - 0\n\
+         )\n"
+    .to_owned();
+    for (i, (path, _)) in files.iter().enumerate() {
+        script.push_str(&format!("put {path} \"${{{}}}\"\n", i + 1));
+    }
+    let mut argv: Vec<String> = ["/bin/sh", "-c", &script, "sh"].map(str::to_owned).into();
+    argv.extend(files.into_iter().map(|(_, content)| content));
+    argv
 }
 
 /// The lines around the zwinger CA in [`CA_BUNDLE`].
@@ -804,9 +981,267 @@ mod tests {
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "/opt/zwinger/bin:/usr/bin:/bin\n");
         let argv = profile_argv();
         assert_eq!(argv[..2], ["/bin/sh", "-c"]);
-        assert_eq!(argv[2], "mkdir -p /etc/profile.d && printf '%s' \"$1\" > /etc/profile.d/zwinger.sh");
-        assert_eq!(argv[3..], ["sh".to_owned(), profile()]);
+        let mut files: Vec<_> = zsh_files().into_iter().map(|(_, content)| content).collect();
+        files.extend([FISH_EMITTER.to_owned(), profile()]);
+        assert_eq!(argv[3], "sh");
+        assert_eq!(argv[4..], files);
         assert!(PATH.starts_with(&format!("{BIN_DIR}:")));
+    }
+
+    /// A temp dir that is removed when it drops.
+    struct Temp(std::path::PathBuf);
+
+    impl Temp {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_owned()
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn profile_argv_writes_the_shell_files_again_in_place() {
+        let root = Temp::new("shell-files");
+        let etc = root.path("etc");
+        let script = profile_argv()[2].replace("/etc/", &format!("{etc}/"));
+        assert!(!script.contains(" /etc/"), "{script}");
+        let mut argv = profile_argv();
+        argv[2] = script;
+        for _ in 0..2 {
+            let out = std::process::Command::new(&argv[0]).env_clear().args(&argv[1..]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            for (path, content) in zsh_files() {
+                assert_eq!(std::fs::read_to_string(path.replace("/etc/", &format!("{etc}/"))).unwrap(), content);
+            }
+            assert_eq!(std::fs::read_to_string(format!("{etc}/fish/conf.d/zwinger.fish")).unwrap(), FISH_EMITTER);
+            assert_eq!(std::fs::read_to_string(format!("{etc}/profile.d/zwinger.sh")).unwrap(), profile());
+        }
+        for dir in ["zwinger/zsh", "fish/conf.d", "profile.d"] {
+            let names: Vec<_> =
+                std::fs::read_dir(format!("{etc}/{dir}")).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(names.len(), if dir == "zwinger/zsh" { 5 } else { 1 }, "{dir}: {names:?}");
+        }
+    }
+
+    /// Sources the profile with `zsh_dir` in place of [`ZSH_DIR`] twice in
+    /// an interactive bash, and prints `ZDOTDIR` and `ZWINGER_ZDOTDIR`.
+    fn bash_zdotdir(zsh_dir: &str, zdotdir: Option<&str>) -> String {
+        let dir = Temp::new("profile");
+        let file = dir.path("zwinger.sh");
+        std::fs::write(&file, profile().replace(ZSH_DIR, zsh_dir)).unwrap();
+        let mut command = std::process::Command::new("/bin/bash");
+        command.env_clear().env("HOME", &dir.0).args([
+            "--norc",
+            "--noprofile",
+            "-i",
+            "-c",
+            ". \"$1\"; . \"$1\"; echo \"${ZDOTDIR-unset}|${ZWINGER_ZDOTDIR-unset}\"",
+            "bash",
+            &file,
+        ]);
+        if let Some(dir) = zdotdir {
+            command.env("ZDOTDIR", dir);
+        }
+        let out = command.output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn an_interactive_bash_gives_zsh_the_zwinger_dir_once_and_keeps_the_users_dir() {
+        let zsh = Temp::new("zsh-dir");
+        std::fs::write(zsh.0.join(".zshenv"), "").unwrap();
+        let dir = zsh.0.to_str().unwrap();
+        assert_eq!(bash_zdotdir(dir, None), format!("{dir}|unset\n"));
+        assert_eq!(bash_zdotdir(dir, Some("/u")), format!("{dir}|/u\n"));
+        assert_eq!(bash_zdotdir(dir, Some("")), format!("{dir}|\n"));
+        // With no zsh file, zsh reads the user's own files.
+        assert_eq!(bash_zdotdir("/nonexistent/zsh", Some("/u")), "/u|unset\n");
+        // A noninteractive bash keeps the env.
+        let out = std::process::Command::new("/bin/bash")
+            .env_clear()
+            .args(["-c", &format!("{}echo \"${{ZDOTDIR-unset}}\"", profile().replace(ZSH_DIR, dir))])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "unset\n");
+    }
+
+    /// Writes the files of [`zsh_files`] to `zsh_dir`. The files use
+    /// `etc` in place of `/etc` for the system zshenv.
+    fn write_zsh_files(zsh_dir: &str, etc: &str) {
+        std::fs::create_dir_all(zsh_dir).unwrap();
+        for (path, content) in zsh_files() {
+            let content = content.replace(ZSH_DIR, zsh_dir).replace("/etc/zsh", &format!("{etc}/zsh"));
+            std::fs::write(path.replace(ZSH_DIR, zsh_dir), content).unwrap();
+        }
+    }
+
+    /// Runs zsh as a VM bash starts it: `ZDOTDIR` is `zsh_dir`, and the
+    /// user's files are in `home`, or in `user` if the user has a `ZDOTDIR`.
+    fn zsh(zsh_dir: &str, home: &str, user: Option<&str>, args: &[&str]) -> (String, String) {
+        let mut command = std::process::Command::new("/bin/zsh");
+        command.env_clear().env("HOME", home).env("ZDOTDIR", zsh_dir).env("TERM", "dumb");
+        if let Some(user) = user {
+            command.env("ZWINGER_ZDOTDIR", user);
+        }
+        // `-d`: no global files of the host.
+        let out = command.arg("-d").args(args).output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    }
+
+    #[test]
+    fn zsh_reports_its_folder_after_the_users_files_and_keeps_them() {
+        let temp = Temp::new("zsh");
+        let zsh_dir = temp.path("zwinger");
+        let etc = temp.path("etc");
+        std::fs::create_dir_all(format!("{etc}/zsh")).unwrap();
+        let system = format!("{etc}/zsh/zshenv");
+        std::fs::write(&system, "# distro\n").unwrap();
+        write_zsh_files(&zsh_dir, &etc);
+        let folder = temp.0.join("a b/\u{e4}%");
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = folder.to_str().unwrap();
+        let encoded = format!("{}/a%20b/%C3%A4%25", temp.0.to_str().unwrap());
+        let line = ZSH_LINE.replace("ZSH_DIR", &zsh_dir);
+        for user in [None, Some(temp.path("custom"))] {
+            let home = temp.path(if user.is_some() { "home2" } else { "home" });
+            let dotdir = user.clone().unwrap_or_else(|| home.clone());
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&dotdir).unwrap();
+            let log = format!("{home}/log");
+            // A user .zshenv with nounset, and a .zshrc that sets precmd_functions.
+            std::fs::write(format!("{dotdir}/.zshenv"), format!("print env >>{log}\nsetopt nounset\n")).unwrap();
+            std::fs::write(format!("{dotdir}/.zprofile"), format!("print profile >>{log}\n")).unwrap();
+            std::fs::write(
+                format!("{dotdir}/.zshrc"),
+                format!("print rc >>{log}\nPROMPT='mine> '\nmine() {{ :; }}\nprecmd_functions=(mine)\n"),
+            )
+            .unwrap();
+            std::fs::write(format!("{dotdir}/.zlogin"), format!("print login >>{log}\n")).unwrap();
+            let script = "cd \"$1\"; HOST=vm; for f in $precmd_functions; do $f; done; \
+                          for f in $2/.zshenv $2/.zshrc $2/enter.zsh; do source $f; done; \
+                          echo \"|$PROMPT|$precmd_functions|${ZDOTDIR-unset}|${ZWINGER_ZDOTDIR-unset}|${(k)functions[(I)__zw_*]}\"";
+            let restored = user.as_deref().unwrap_or("unset");
+            for (login, files) in [(false, "env rc"), (true, "env profile rc login")] {
+                let _ = std::fs::remove_file(&log);
+                let mut args = vec!["-i", "-c", script, "zsh", folder, &zsh_dir];
+                if login {
+                    args.insert(0, "-l");
+                }
+                let (out, err) = zsh(&zsh_dir, &home, user.as_deref(), &args);
+                assert_eq!(
+                    out,
+                    format!("\x1b]7;file://vm{encoded}\x07|mine> |mine __zw_osc7|{restored}|unset|__zw_osc7\n"),
+                    "{err}"
+                );
+                assert_eq!(err, "");
+                assert_eq!(
+                    std::fs::read_to_string(&log).unwrap().split_whitespace().collect::<Vec<_>>().join(" "),
+                    files
+                );
+            }
+            // The first interactive zsh adds the line once to the system zshenv.
+            assert_eq!(std::fs::read_to_string(&system).unwrap(), format!("# distro\n\n{line}\n"));
+            // A noninteractive zsh reads the user's .zshenv, adds no hook and prints nothing else.
+            let (out, err) = zsh(
+                &zsh_dir,
+                &home,
+                user.as_deref(),
+                &[
+                    "-c",
+                    "echo \"${+functions[__zw_osc7]}${+functions[__zw_done]}|${precmd_functions-}|${ZDOTDIR-unset}\"",
+                ],
+            );
+            assert_eq!(out, format!("00||{restored}\n"), "{err}");
+            assert_eq!(err, "");
+            // zsh -f reads no file of the user and adds no hook.
+            let (out, err) =
+                zsh(&zsh_dir, &home, user.as_deref(), &["-f", "-i", "-c", "echo ${+functions[__zw_osc7]}"]);
+            assert_eq!(out, "0\n", "{err}");
+        }
+    }
+
+    #[test]
+    fn the_system_zshenv_line_gives_an_interactive_zsh_the_zwinger_dir() {
+        let temp = Temp::new("zsh-enter");
+        let zsh_dir = temp.path("zwinger");
+        let user = temp.path("user");
+        std::fs::create_dir(&user).unwrap();
+        write_zsh_files(&zsh_dir, &temp.path("etc"));
+        let run = |args: &[&str], env: &[(&str, &str)]| {
+            let out = std::process::Command::new("/bin/zsh")
+                .env_clear()
+                .env("HOME", &temp.0)
+                .envs(env.iter().copied())
+                .args(args)
+                .args(["-c", "source \"$1\"; echo \"${ZDOTDIR-unset}|${ZWINGER_ZDOTDIR-unset}\"", "zsh"])
+                .arg(format!("{zsh_dir}/enter.zsh"))
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run(&["-d", "-i"], &[]), format!("{zsh_dir}|unset\n"));
+        assert_eq!(
+            run(&["-d", "-i"], &[("ZDOTDIR", &user), ("ZWINGER_ZDOTDIR", "old")]),
+            format!("{zsh_dir}|{user}\n")
+        );
+        assert_eq!(run(&["-d"], &[("ZDOTDIR", &user)]), format!("{user}|unset\n"));
+        // zsh -f from a VM bash gets the user's ZDOTDIR back.
+        assert_eq!(run(&["-f", "-i"], &[("ZDOTDIR", &zsh_dir), ("ZWINGER_ZDOTDIR", &user)]), format!("{user}|unset\n"));
+        assert_eq!(run(&["-f", "-i"], &[("ZDOTDIR", &zsh_dir)]), "unset|unset\n");
+    }
+
+    #[test]
+    fn fish_reports_its_folder_once_if_fish_is_here() {
+        let Ok(version) = std::process::Command::new("fish").arg("--version").output() else {
+            return;
+        };
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let major: u32 = version.split_whitespace().last().unwrap().split('.').next().unwrap().parse().unwrap();
+        let temp = Temp::new("fish");
+        let fish = || {
+            let mut command = std::process::Command::new("fish");
+            command
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &temp.0)
+                .env("XDG_CONFIG_HOME", &temp.0)
+                .env("TERM", "xterm-256color")
+                .arg("--no-config");
+            command
+        };
+        let conf = temp.path("zwinger.fish");
+        std::fs::write(&conf, FISH_EMITTER).unwrap();
+        let folder = temp.0.join("a b/\u{e4}%");
+        std::fs::create_dir_all(&folder).unwrap();
+        let script = "source $argv[1]; source $argv[1]; cd $argv[2]; emit fish_prompt; \
+                      echo \"|$hostname|\"(count (functions --handlers | string match '*__zw_osc7*'))";
+        let out = fish().args(["-i", "-c", script, &conf]).arg(&folder).output().unwrap();
+        let encoded = format!("{}/a%20b/%C3%A4%25", temp.0.to_str().unwrap());
+        let out = String::from_utf8(out.stdout).unwrap();
+        // fish's `hostname` is read-only.
+        let host = out.split('|').nth(1).unwrap_or_default();
+        if major >= 4 {
+            assert_eq!(out, format!("|{host}|0\n"));
+        } else {
+            assert_eq!(out, format!("\x1b]7;file://{host}{encoded}\x07|{host}|1\n"));
+        }
+        // A noninteractive fish adds no handler.
+        let out = fish()
+            .args(["-c", "source $argv[1]; functions -q __zw_osc7; and echo found; or echo none", &conf])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "none\n");
     }
 
     #[test]
@@ -827,7 +1262,12 @@ mod tests {
         );
         // A shell that is not bash skips the emitter.
         let script = format!("emulate sh\n{}echo \"|${{PROMPT_COMMAND:-}}|\"", profile());
-        let out = std::process::Command::new("/bin/zsh").args(["-c", &script]).output().unwrap();
+        let out = std::process::Command::new("/bin/zsh")
+            .env_clear()
+            .env("HOME", root)
+            .args(["-f", "-c", &script])
+            .output()
+            .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "||\n", "{}", String::from_utf8_lossy(&out.stderr));
         // `set -u` with no environment: /bin/sh is bash in sh mode on macOS, so only dash tests the guard.
         let file = std::env::temp_dir().join(format!("zwinger-profile-{}.sh", uuid::Uuid::new_v4()));
