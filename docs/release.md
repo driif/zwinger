@@ -14,7 +14,7 @@ of the project; the app has the public key in `src-tauri/tauri.conf.json` and re
    git push origin main v0.2.0
    ```
 
-3. The `Release` workflow (`.github/workflows/release.yml`) builds on a `macos-14` (arm64) runner and makes a
+3. The `Release` workflow (`.github/workflows/release.yml`) builds on a `macos-15` (arm64) runner and makes a
    **draft** release with the `.dmg`, the updater archive (`.app.tar.gz` and its `.sig`) and `latest.json`.
 4. Check the draft, then publish it. Apps see the update only after you publish: `releases/latest` ignores drafts.
 
