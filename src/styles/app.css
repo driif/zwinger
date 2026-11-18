@@ -162,6 +162,7 @@ p {
 
 .notice {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: var(--zw-gap);
 }
@@ -180,6 +181,27 @@ p {
 
 .notice-actions {
   flex-shrink: 0;
+}
+
+.notice:has(:focus-visible) {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.notice:has(:focus-visible) .notice-text {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.notice-text:focus-visible {
+  outline: none;
+  box-shadow: var(--motiv-focus-ring);
+}
+
+.notice:has(:focus-visible) .notice-actions {
+  grid-column: 2;
+  justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
 .empty {
