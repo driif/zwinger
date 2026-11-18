@@ -1147,9 +1147,7 @@ pub(crate) fn prepare(
             }
             (AgentKind::Pi, Some(package), _) => {
                 // The detection can be older than an update of pi.
-                let manifest = std::fs::read_to_string(package.join("package.json")).ok();
-                let manifest = manifest.and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok());
-                let pi = manifest.as_ref().and_then(|m| m["version"].as_str()).unwrap_or(&found.version);
+                let pi = host.package_version(&package).unwrap_or_else(|| found.version.clone());
                 // A host pi whose TUI loaded with the same pi, image and runtime is not probed again.
                 let key = format!("{pi} {} {}", runtime::IMAGE, env!("MICROSANDBOX_VERSION"));
                 tui_probe = Some(key).filter(|key| !tui_cached(data, key));
@@ -1737,18 +1735,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_update_of_the_host_pi_probes_its_tui_again() {
-        // The pi package is a real folder, so the start reads its `package.json`.
-        let (dir, home, package) = (temp_dir(), temp_dir(), temp_dir());
-        std::fs::write(package.join("package.json"), r#"{"version":"1.0.0"}"#).unwrap();
-        let mut fs = mac(&home);
-        fs.links.insert("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent".into(), package.clone());
+        let dir = temp_dir();
+        let fs = Arc::new(mac(&temp_dir()));
         let runtime = FakeRuntime::default();
-        let host = host_with(fs, FakeLogins::default(), NOW);
+        let host = host_with(fs.clone(), FakeLogins::default(), NOW);
         let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault(), temp_dir(), host).unwrap();
         let id = manager.create(dir.to_str().unwrap(), None).unwrap();
         manager.put_host_agent(&id, uses(AgentKind::Pi, false, false), false).await.unwrap();
         for (version, probes) in [("1.0.0", 1), ("1.0.0", 1), ("1.1.0", 2)] {
-            std::fs::write(package.join("package.json"), format!(r#"{{"version":"{version}"}}"#)).unwrap();
+            fs.file(
+                "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/package.json",
+                &format!(r#"{{"version":"{version}"}}"#),
+            );
             manager.start(&id).await.unwrap();
             assert_eq!(tui_probes(&runtime), probes, "{version}");
             manager.stop(&id, None).await.unwrap();

@@ -51,11 +51,11 @@ pub(crate) fn vault() -> Arc<MemoryVault> {
 
 /// No host agents.
 pub(crate) fn host() -> Arc<HostAgents> {
-    host_with(FakeFs::default(), FakeLogins::default(), 0)
+    host_with(Arc::new(FakeFs::default()), FakeLogins::default(), 0)
 }
 
-pub(crate) fn host_with(fs: FakeFs, logins: FakeLogins, now: i64) -> Arc<HostAgents> {
-    Arc::new(HostAgents::new(Arc::new(fs), Arc::new(logins), Arc::new(FakeClock(now.into())), temp_dir()))
+pub(crate) fn host_with(fs: Arc<FakeFs>, logins: FakeLogins, now: i64) -> Arc<HostAgents> {
+    Arc::new(HostAgents::new(fs, Arc::new(logins), Arc::new(FakeClock(now.into())), temp_dir()))
 }
 
 pub(crate) fn manager() -> (Manager<FakeRuntime>, FakeRuntime, String) {
@@ -284,7 +284,7 @@ pub(crate) fn host_manager(
     let (dir, home) = (temp_dir(), temp_dir());
     let runtime = FakeRuntime::default();
     let vault = vault();
-    let host = host_with(mac(&home), logins, now);
+    let host = host_with(Arc::new(mac(&home)), logins, now);
     let manager = Manager::new(runtime.clone(), Store::new(dir.clone()), vault.clone(), temp_dir(), host).unwrap();
     let id = manager.create(dir.to_str().unwrap(), None).unwrap();
     (manager, runtime, id, vault)

@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::login::{self, LoginSource, LoginState};
-use super::{HostFs, profile};
+use super::{HostFs, package_manifest, profile};
 use crate::agent::{AgentKind, pi};
 use crate::runtimes;
 
@@ -100,7 +100,7 @@ fn version_in(text: &str) -> Option<String> {
 
 /// The canonical dir and the version of an npm package that has `entry`.
 fn package(fs: &dyn HostFs, dir: &Path, entry: &str) -> Option<(PathBuf, String)> {
-    let manifest: Value = serde_json::from_str(&fs.read_to_string(&dir.join("package.json"))?).ok()?;
+    let manifest = package_manifest(fs, dir)?;
     let version = version_in(manifest["version"].as_str()?)?;
     if !entry.is_empty() && !fs.is_file(&dir.join(entry)) {
         return None;
@@ -166,7 +166,7 @@ fn gemini(fs: &dyn HostFs) -> Option<(PathBuf, String, String)> {
 /// package. The entry point is `bin.gemini` of `package.json` (a string or
 /// a map), else a known path; it must be a file inside the package.
 fn gemini_package(fs: &dyn HostFs, dir: &Path) -> Option<(PathBuf, String, String)> {
-    let manifest: Value = serde_json::from_str(&fs.read_to_string(&dir.join("package.json"))?).ok()?;
+    let manifest = package_manifest(fs, dir)?;
     let version = version_in(manifest["version"].as_str()?)?;
     let root = fs.canonicalize(dir)?;
     let named = match &manifest["bin"] {

@@ -48,6 +48,10 @@ pub trait HostFs: Send + Sync {
     fn version(&self, bin: &Path) -> Option<String>;
 }
 
+fn package_manifest(fs: &dyn HostFs, package: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&fs.read_to_string(&package.join("package.json"))?).ok()
+}
+
 pub trait Clock: Send + Sync {
     /// Milliseconds since the epoch.
     fn now_ms(&self) -> i64;
@@ -171,6 +175,11 @@ impl HostAgents {
 
     pub fn home(&self) -> PathBuf {
         self.fs.home()
+    }
+
+    /// Reads the current package version, which can change after detection.
+    pub fn package_version(&self, package: &Path) -> Option<String> {
+        Some(package_manifest(self.fs.as_ref(), package)?["version"].as_str()?.to_owned())
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -324,7 +333,7 @@ pub mod fake {
     pub struct FakeFs {
         pub home: PathBuf,
         pub path: Vec<PathBuf>,
-        pub files: HashMap<PathBuf, String>,
+        pub files: Mutex<HashMap<PathBuf, String>>,
         pub links: HashMap<PathBuf, PathBuf>,
         pub dirs: HashSet<PathBuf>,
         /// The `--version` output per binary.
@@ -332,8 +341,8 @@ pub mod fake {
     }
 
     impl FakeFs {
-        pub fn file(&mut self, path: &str, text: &str) {
-            self.files.insert(PathBuf::from(path), text.to_owned());
+        pub fn file(&self, path: &str, text: &str) {
+            self.files.lock().unwrap().insert(PathBuf::from(path), text.to_owned());
         }
     }
 
@@ -347,11 +356,11 @@ pub mod fake {
         }
 
         fn is_file(&self, path: &Path) -> bool {
-            self.files.contains_key(path) || self.versions.contains_key(path)
+            self.files.lock().unwrap().contains_key(path) || self.versions.contains_key(path)
         }
 
         fn is_dir(&self, path: &Path) -> bool {
-            self.dirs.contains(path) || self.files.keys().any(|f| f.starts_with(path) && f != path)
+            self.dirs.contains(path) || self.files.lock().unwrap().keys().any(|f| f.starts_with(path) && f != path)
         }
 
         fn read_link(&self, path: &Path) -> Option<PathBuf> {
@@ -359,12 +368,14 @@ pub mod fake {
         }
 
         fn read_to_string(&self, path: &Path) -> Option<String> {
-            self.files.get(path).cloned()
+            self.files.lock().unwrap().get(path).cloned()
         }
 
         fn list_dir(&self, path: &Path) -> Vec<String> {
             let mut names: Vec<String> = self
                 .files
+                .lock()
+                .unwrap()
                 .keys()
                 .chain(self.dirs.iter())
                 .filter_map(|p| p.strip_prefix(path).ok()?.components().next())
