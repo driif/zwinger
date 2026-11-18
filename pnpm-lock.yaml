@@ -96,6 +96,9 @@ importers:
       astro:
         specifier: ^7.4.2
         version: 7.4.2(@types/node@24.19.2)(yaml@2.9.1)
+      parse5:
+        specifier: ^8.1.1
+        version: 8.1.1
       react:
         specifier: ^19.3.1
         version: 19.3.1

@@ -1,8 +1,10 @@
 import react from "@astrojs/react";
 import starlight from "@astrojs/starlight";
 import { defineConfig } from "astro/config";
+import cspHeaders from "./src/integrations/csp-headers.mjs";
 
 export default defineConfig({
+  site: "https://zwinger.fedorchuk.me",
   // GlideNav cannot pass `data-astro-prefetch` to its links, so prefetch all links.
   prefetch: { prefetchAll: true, defaultStrategy: "hover" },
   integrations: [
@@ -31,5 +33,7 @@ export default defineConfig({
         "updates",
       ],
     }),
+    // Last, so that it sees the final HTML of all other integrations.
+    cspHeaders(),
   ],
 });

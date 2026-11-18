@@ -32,4 +32,7 @@ The Worker name in the dashboard must be `zwinger`, the `name` in `wrangler.json
 The build must start at the repo root, because `src/components/Shortcuts.astro` imports `src/shared/useShortcuts.ts`
 of the app, and that file needs the root install.
 
-`public/_headers` sets the security headers.
+`public/_headers` sets the security headers, including the `Content-Security-Policy`. Its `{{inline-script-hashes}}`
+placeholder is filled at build time by `src/integrations/csp-headers.mjs`: it parses each built page, hashes each inline
+script and writes the result to `dist/_headers`. To review the final policy, inspect `dist/_headers` after a build. The
+build fails on an inline event handler attribute. `astro dev` does not enforce the CSP.
