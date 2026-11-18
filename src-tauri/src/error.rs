@@ -23,6 +23,10 @@ pub enum Error {
     MountOverlap(String, String),
     #[error("{0} overlaps the zwinger data folder {1}")]
     AppDataOverlap(String, String),
+    #[error(
+        "the mount {guest} ({host}) of cage {cage} overlaps the zwinger data folder {dir}. Remove it in Edit > Mounts, then try again"
+    )]
+    MountAppData { cage: String, guest: String, host: String, dir: String },
     #[error("path now resolves to a different place: {0}")]
     PathChanged(String),
     #[error("folder is not verified since the update: {0}; confirm that it is the folder that you added")]

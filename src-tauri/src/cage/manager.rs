@@ -51,9 +51,9 @@ pub struct Manager<R: SandboxRuntime> {
     /// agent state of each VM, and `bin/<key>`, the host-only agent
     /// wrappers of each VM.
     pub(crate) data: PathBuf,
-    /// The canonical dirs that no session folder or mount may nest with:
-    /// the app data dir and `~/.zwinger`.
-    pub(crate) reserved: Vec<PathBuf>,
+    /// The user's home dir. [`Manager::reserved`] resolves `~/.zwinger`
+    /// below it at each check, so a link that is made later is seen.
+    pub(crate) home: Option<PathBuf>,
     pub(crate) vault: Arc<dyn Vault>,
     /// The zwinger CA of this app run.
     pub(crate) ca: Arc<Ca>,
@@ -424,6 +424,12 @@ fn reserved_dirs(data: &Path, home: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 impl<R: SandboxRuntime> Manager<R> {
+    /// The canonical dirs that no session folder or mount may nest with:
+    /// the app data dir and `~/.zwinger`.
+    pub(crate) fn reserved(&self) -> Vec<PathBuf> {
+        reserved_dirs(&self.data, self.home.clone())
+    }
+
     pub fn new(runtime: R, store: Store, vault: Arc<dyn Vault>, data: PathBuf, host: Arc<HostAgents>) -> Result<Self> {
         let (sessions, cages) = store.load()?;
         prune_vault(vault.as_ref(), &cages);
@@ -451,7 +457,7 @@ impl<R: SandboxRuntime> Manager<R> {
             runtime,
             store,
             workspace_store,
-            reserved: reserved_dirs(&data, dirs::home_dir()),
+            home: dirs::home_dir(),
             data,
             vault,
             ca: Arc::new(ca),
@@ -734,7 +740,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Checks a session against a cage that it starts to use.
     fn check_session_cage(&self, bound: Bound<'_>) -> Result<()> {
         bound.check()?;
-        bound.check_app_data(&self.reserved)
+        bound.check_app_data(&self.reserved())
     }
 
     /// Adds a cage with no mounts, rules or agents. Returns its id.
@@ -937,9 +943,16 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn add_mount(&self, cage_id: &str, host: &str, guest: &str, readonly: bool) -> Result<()> {
+        let reserved = self.reserved();
         self.edit_cage(cage_id, |c, sessions| {
             c.add_mount(sessions, host, guest, readonly)?;
-            sessions.iter().try_for_each(|session| Bound { session, cage: c }.check_app_data(&self.reserved))
+            // The new mount first: an old mount must not hide its own error.
+            let new = c.mounts.last().expect("add_mount pushed the mount");
+            if let Some(dir) = cage::reserved_overlap(&new.host, &reserved) {
+                return Err(Error::AppDataOverlap(new.host.display().to_string(), dir.display().to_string()));
+            }
+            c.check_app_data(&reserved)?;
+            sessions.iter().try_for_each(|session| Bound { session, cage: c }.check_app_data(&reserved))
         })
     }
 
@@ -1498,6 +1511,66 @@ mod tests {
             assert!(matches!(error, Error::AppDataOverlap(..)), "{}: {error}", host.display());
         }
         assert!(manager.list().cages[0].cage.mounts.is_empty());
+    }
+
+    /// An old config can hold a mount of the app data: the add check is newer.
+    fn put_old_mount(manager: &Manager<FakeRuntime>, cage_id: &str, host: &Path) {
+        let host = host.to_str().unwrap();
+        manager.edit_cage(cage_id, |c, sessions| c.add_mount(sessions, host, "/mnt/data", true)).unwrap();
+    }
+
+    fn cage_of(manager: &Manager<FakeRuntime>, id: &str) -> crate::cage::Cage {
+        manager.list().cages.into_iter().map(|c| c.cage).find(|c| c.id == id).unwrap()
+    }
+
+    #[test]
+    fn an_old_app_data_mount_blocks_a_new_mount_until_it_is_removed() {
+        let (manager, _, id) = manager();
+        put_old_mount(&manager, &id, &manager.data);
+        let before = cage_of(&manager, &id);
+        let other = temp_dir();
+        let other = other.to_str().unwrap();
+
+        let error = manager.add_mount(&id, other, "/mnt/other", true).unwrap_err();
+        assert!(
+            matches!(&error, Error::MountAppData { cage, guest, .. } if *cage == before.name && guest == "/mnt/data"),
+            "{error}"
+        );
+        assert_eq!(cage_of(&manager, &id), before);
+
+        // The new mount is invalid too: its own error comes first.
+        std::fs::create_dir(manager.data.join("sub")).unwrap();
+        let error = manager.add_mount(&id, manager.data.join("sub").to_str().unwrap(), "/mnt/sub", true).unwrap_err();
+        assert!(matches!(error, Error::AppDataOverlap(..)), "{error}");
+
+        manager.remove_mount(&id, "/mnt/data").unwrap();
+        manager.add_mount(&id, other, "/mnt/other", true).unwrap();
+        assert_eq!(cage_of(&manager, &id).mounts.len(), 1);
+    }
+
+    #[test]
+    fn add_mount_checks_a_cage_with_no_session() {
+        let (manager, _, _) = manager();
+        let cage_id = manager.create_cage("spare").unwrap();
+        put_old_mount(&manager, &cage_id, &manager.data);
+        let error = manager.add_mount(&cage_id, temp_dir().to_str().unwrap(), "/mnt/other", true).unwrap_err();
+        assert!(
+            matches!(&error, Error::MountAppData { cage, guest, .. } if cage == "spare" && guest == "/mnt/data"),
+            "{error}"
+        );
+        assert_eq!(cage_of(&manager, &cage_id).mounts.len(), 1);
+    }
+
+    #[test]
+    fn add_mount_sees_a_zwinger_home_link_made_after_the_load() {
+        let (mut manager, _, id) = manager();
+        let home = temp_dir();
+        manager.home = Some(home.clone());
+        let target = temp_dir();
+        std::os::unix::fs::symlink(&target, home.join(".zwinger")).unwrap();
+        let error = manager.add_mount(&id, target.to_str().unwrap(), "/mnt/data", true).unwrap_err();
+        assert!(matches!(error, Error::AppDataOverlap(..)), "{error}");
+        assert!(cage_of(&manager, &id).mounts.is_empty());
     }
 
     #[test]

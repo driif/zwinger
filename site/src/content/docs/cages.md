@@ -56,7 +56,12 @@ in its own cage if it must not see the others.
   when the VM has other projects. Their VM terminals open again, and their running tasks are cancelled. After a
   change of the project's cage, **Restart** stops the old VM and starts the new cage for this project only.
 - **Checks.** The start checks each project folder: it must not overlap a mount or a different project folder of the
-  VM, it must be the same folder that you added, and it must not overlap the zwinger data folder.
+  VM, it must be the same folder that you added, and it must not overlap the zwinger data folder. No mount of the
+  cage may overlap the zwinger data folder (the app data folder or `~/.zwinger`). zwinger finds this folder again at
+  each check, so a `~/.zwinger` link that you make later is also seen.
+- **Old mount of the data folder.** An old config can have a mount that overlaps the zwinger data folder. This mount
+  blocks the start of the cage and the addition of new mounts. The error names the cage and the mount. To remove the
+  mount, click its X button in **Edit > Mounts**, then try again.
 - **Hot mount.** A project cannot join a running VM with no restart yet.
 - **Checks across VMs.** A project folder also must not overlap the folder of a project of the same cage that runs in
   a different VM, such as its own VM.

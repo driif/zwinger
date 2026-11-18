@@ -246,6 +246,23 @@ impl Cage {
         })
     }
 
+    /// No mount may nest with a reserved dir, in either direction, even
+    /// read-only: the app data dir holds the pi runtime, the credentials and
+    /// the agent state of every cage. All paths are canonical.
+    pub fn check_app_data(&self, reserved: &[PathBuf]) -> Result<()> {
+        for m in &self.mounts {
+            if let Some(dir) = reserved_overlap(&m.host, reserved) {
+                return Err(Error::MountAppData {
+                    cage: self.name.clone(),
+                    guest: m.guest.clone(),
+                    host: m.host.display().to_string(),
+                    dir: dir.display().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove_mount(&mut self, sessions: &[&Session], guest: &str) -> Result<()> {
         self.mount_mut(guest)?;
         self.keep_harness_mount(sessions, |c| c.mounts.retain(|m| m.guest != guest))
@@ -261,6 +278,11 @@ impl Cage {
     pub fn fill_ids(&mut self) -> bool {
         self.mounts.iter_mut().fold(false, |filled, m| fill_id(&m.host, &mut m.id) | filled)
     }
+}
+
+/// The reserved dir that `path` nests with, in either direction.
+pub(crate) fn reserved_overlap<'r>(path: &Path, reserved: &'r [PathBuf]) -> Option<&'r PathBuf> {
+    reserved.iter().find(|dir| path.starts_with(dir) || dir.starts_with(path))
 }
 
 /// A session and its cage: the checks and guest paths that need both.
@@ -355,16 +377,14 @@ impl Bound<'_> {
         Ok(())
     }
 
-    /// No host path may nest with a reserved dir, in either direction, even
-    /// read-only: the app data dir holds the pi runtime, the credentials and
-    /// the agent state of every cage. All paths are canonical.
+    /// No host path may nest with a reserved dir: see [`Cage::check_app_data`].
+    /// The session folder is not a mount, so its error names only the paths.
     pub fn check_app_data(&self, reserved: &[PathBuf]) -> Result<()> {
-        for (path, _) in self.host_paths() {
-            if let Some(dir) = reserved.iter().find(|dir| path.starts_with(dir) || dir.starts_with(path)) {
-                return Err(Error::AppDataOverlap(path.display().to_string(), dir.display().to_string()));
-            }
+        let folder = &self.session.folder;
+        if let Some(dir) = reserved_overlap(folder, reserved) {
+            return Err(Error::AppDataOverlap(folder.display().to_string(), dir.display().to_string()));
         }
-        Ok(())
+        self.cage.check_app_data(reserved)
     }
 
     /// Resolves the stored host paths again, around a start. A path that now
@@ -751,7 +771,10 @@ mod tests {
         assert!(project.check_app_data(&app).is_ok());
 
         project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
-        assert!(matches!(project.check_app_data(&app), Err(Error::AppDataOverlap(..))));
+        assert!(matches!(
+            project.check_app_data(&app),
+            Err(Error::MountAppData { guest, .. }) if guest == "/mnt/data"
+        ));
         assert!(matches!(project.check_app_data(&[project.session.folder.join("x")]), Err(Error::AppDataOverlap(..))));
     }
 

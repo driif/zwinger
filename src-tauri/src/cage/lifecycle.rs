@@ -293,12 +293,17 @@ impl<R: SandboxRuntime> Manager<R> {
                  Download it in the Agents settings, then restart the cage."
             ));
         }
-        // The paths again right before and after the boot, which binds them: a
-        // folder that was swapped meanwhile is refused.
+        // The paths and the reserved dirs again right before and after the
+        // boot, which binds them: a folder that was swapped or a `~/.zwinger`
+        // link that was made meanwhile is refused.
         progress.begin(Phase::Boot);
         let bound = Members { sessions: &members, cage: &cage };
-        let boot = async {
+        let recheck = || -> Result<()> {
             bound.verify_paths()?;
+            bound.check_app_data(&self.reserved())
+        };
+        let boot = async {
+            recheck()?;
             self.runtime.start(id, bound, &net, &self.state_dir(id), &installed, &binds).await
         };
         let (booted, boot_took) = timed(boot).await;
@@ -308,7 +313,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Ok(vm) => {
                 progress.begin(Phase::Guest);
                 let at = Instant::now();
-                let set_up = match bound.verify_paths() {
+                let set_up = match recheck() {
                     Ok(()) => self.set_up_guest(&vm, &probes, &mut run, &mut names, &mut timings).await,
                     Err(e) => Err(e),
                 };
@@ -662,7 +667,7 @@ impl<R: SandboxRuntime> Manager<R> {
         checked.verify_paths()?;
         checked.check()?;
         cage.network.check()?;
-        checked.check_app_data(&self.reserved)?;
+        checked.check_app_data(&self.reserved())?;
         // A session with no known cage cannot start, so it is not checked.
         let bounds: Vec<Bound> = state.sessions.iter().filter_map(|s| state.bound(&s.id).ok()).collect();
         let others: Vec<Bound> = bounds.iter().copied().filter(|other| other.cage.id != cage.id).collect();
@@ -1301,8 +1306,22 @@ mod tests {
         manager
             .edit_cage(&id, |c, sessions| c.add_mount(sessions, manager.data.to_str().unwrap(), "/mnt/data", true))
             .unwrap();
-        assert!(matches!(manager.start(&id).await, Err(Error::AppDataOverlap(..))));
+        let error = manager.start(&id).await.unwrap_err();
+        assert!(matches!(&error, Error::MountAppData { guest, .. } if guest == "/mnt/data"), "{error}");
         assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
+        assert!(runtime.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_refuses_a_mount_that_a_late_zwinger_home_link_reserves() {
+        let (mut manager, runtime, id) = manager();
+        let home = temp_dir();
+        manager.home = Some(home.clone());
+        let target = temp_dir();
+        manager.add_mount(&id, target.to_str().unwrap(), "/mnt/data", true).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".zwinger")).unwrap();
+        let error = manager.start(&id).await.unwrap_err();
+        assert!(matches!(&error, Error::MountAppData { guest, .. } if guest == "/mnt/data"), "{error}");
         assert!(runtime.log.lock().unwrap().is_empty());
     }
 
@@ -1996,6 +2015,29 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         gate.release.notify_one();
         assert!(matches!(starting.await.unwrap(), Err(Error::PathChanged(_))));
+        assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
+        assert!(matches!(manager.list().cages[0].shared().status, Status::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_zwinger_home_link_made_during_the_boot_stops_the_vm() {
+        let (mut manager, runtime, id) = manager();
+        let home = temp_dir();
+        manager.home = Some(home.clone());
+        let target = temp_dir();
+        manager.add_mount(&id, target.to_str().unwrap(), "/mnt/data", true).unwrap();
+        let gate = Arc::new(PtyGate::default());
+        *runtime.start_gate.lock().unwrap() = Some(gate.clone());
+        let manager = Arc::new(manager);
+        let starting = tokio::spawn({
+            let (manager, id) = (manager.clone(), id.clone());
+            async move { manager.start(&id).await }
+        });
+        gate.entered.notified().await;
+        std::os::unix::fs::symlink(&target, home.join(".zwinger")).unwrap();
+        gate.release.notify_one();
+        let error = starting.await.unwrap().unwrap_err();
+        assert!(matches!(&error, Error::MountAppData { guest, .. } if guest == "/mnt/data"), "{error}");
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), format!("stop {id}")]);
         assert!(matches!(manager.list().cages[0].shared().status, Status::Error { .. }));
     }
