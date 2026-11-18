@@ -56,7 +56,9 @@
   min-width: 0;
   min-height: 0;
   margin-inline: calc(var(--zw-rail-pad) * -1);
-  padding-inline: var(--zw-rail-pad);
+  /* Space for the outer edge of motiv's 4px focus ring. */
+  padding: 4px var(--zw-rail-pad);
+  scroll-padding-block: 4px;
   overflow-x: hidden;
   overflow-y: auto;
   display: flex;
@@ -72,7 +74,9 @@
 }
 
 .tree-item:focus-visible > .tree-row {
-  outline: var(--motiv-focus-ring);
+  position: relative;
+  z-index: 1;
+  box-shadow: var(--motiv-focus-ring);
 }
 
 .tree-item.dragging {

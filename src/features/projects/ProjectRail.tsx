@@ -529,12 +529,20 @@ export function ProjectRail({
         ? `i|${selectedId}|tasks|${view.taskId}`
         : `s|${selectedId}`;
 
-  const focusRow = (id: string) => tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(id)}"]`)?.focus();
+  function focusRow(id: string) {
+    const item = tree.current?.querySelector<HTMLElement>(`[data-tree-id="${window.CSS.escape(id)}"]`);
+    if (!item) return;
+    if (item === document.activeElement) revealRow(item);
+    else item.focus({ preventScroll: true });
+  }
+
+  function revealRow(item: Element) {
+    item.querySelector(":scope > .tree-row")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
 
   function focus(id: string | undefined, event: KeyboardEvent) {
     if (!id) return;
     event.preventDefault();
-    setFocused(id);
     focusRow(id);
   }
 
@@ -934,8 +942,11 @@ export function ProjectRail({
             aria-label="Workspaces"
             onKeyDown={onKeyDown}
             onFocus={(e) => {
-              const id = (e.target as HTMLElement).dataset.treeId;
-              if (id) setFocused(id);
+              const item = e.target as HTMLElement;
+              if (item.dataset.treeId) {
+                setFocused(item.dataset.treeId);
+                revealRow(item);
+              }
             }}
           >
             <SortableContext items={shown.map((w) => `w|${w.id}`)} strategy={verticalListSortingStrategy}>

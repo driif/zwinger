@@ -20,7 +20,8 @@ cage with the name of the project.
 ## Workspaces
 
 The rail shows your projects in **workspaces**. In the rail, a project is a **session**. Each session is in one
-workspace. The tree is workspace → session → Terminals and Tasks.
+workspace. The tree is workspace → session → Terminals and Tasks. Use the Up and Down arrow keys to move between
+visible rows. A ring marks the row that has keyboard focus.
 
 - At the first start, one workspace with the name "Workspace" holds all projects.
 - **New workspace** at the bottom of the rail adds an empty workspace.
