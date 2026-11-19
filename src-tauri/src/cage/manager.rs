@@ -11,7 +11,7 @@ use crate::cage::history::{self, StartHistory, StartRecord};
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
-use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE};
+use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE, vm_state};
 use crate::error::{Error, Member, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::login;
@@ -30,9 +30,8 @@ use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 /// The network log entries kept per VM.
 pub(crate) const NET_RING: usize = 2000;
 
-/// The dir of the per-VM agent state. It keeps its name from before the
-/// rename to projects, so the agent state of existing cages stays.
-pub(crate) const LEGACY_STATE_DIR: &str = "shields";
+/// The runtime home of this app run, as [`Error::NotReaped`] names it.
+const CURRENT_HOME: &str = "~/.zwinger/microsandbox";
 
 /// Gets each new network log entry with its VM key.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
@@ -52,9 +51,9 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) runtime: R,
     pub(crate) store: Store,
     pub(crate) workspace_store: WorkspaceStore,
-    /// The app data dir. It holds the agent runtimes, `shields/<key>`, the
-    /// agent state of each VM, and `bin/<key>`, the host-only agent
-    /// wrappers of each VM.
+    /// The app data dir. It holds the agent runtimes, `projects/<VM key>`,
+    /// the agent state of each VM ([`vm_state`]), and `bin/<VM key>`, the
+    /// host-only agent wrappers of each VM.
     pub(crate) data: PathBuf,
     /// The user's home dir. [`Manager::reserved`] resolves `~/.zwinger`
     /// below it at each check, so a link that is made later is seen.
@@ -65,6 +64,13 @@ pub struct Manager<R: SandboxRuntime> {
     /// The boot reap failed, so the VMs of the last run can still run. The
     /// next cage start reaps them first, under `reap_gate`.
     pub(crate) reap_pending: AtomicBool,
+    /// The agent state in `shields/` is not moved yet. It moves after the
+    /// reap of this home and of each legacy home succeeded, while no VM
+    /// starts, runs or stops ([`Manager::try_migrate_vm_state`]).
+    pub(crate) migrate_pending: AtomicBool,
+    /// The legacy runtime homes whose reap failed. Their VMs can still mount
+    /// agent state. [`Manager::reap_legacy_homes`] reaps them again.
+    pub(crate) unreaped_legacy: Mutex<Vec<PathBuf>>,
     pub(crate) reap_gate: tokio::sync::Mutex<()>,
     /// Serializes the secret edits, so that a rollback cannot undo a later edit.
     /// The state lock is not held during vault calls.
@@ -477,6 +483,8 @@ impl<R: SandboxRuntime> Manager<R> {
             vault,
             ca: Arc::new(ca),
             reap_pending: AtomicBool::new(false),
+            migrate_pending: AtomicBool::new(false),
+            unreaped_legacy: Mutex::default(),
             reap_gate: tokio::sync::Mutex::new(()),
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
@@ -610,8 +618,65 @@ impl<R: SandboxRuntime> Manager<R> {
         bin_dir(&self.data, key)
     }
 
-    pub(crate) fn state_dir(&self, key: &str) -> PathBuf {
-        self.data.join(LEGACY_STATE_DIR).join(key)
+    /// The agent state dir of VM `key`. Fails while its old dir is not moved.
+    pub(crate) fn state_dir(&self, key: &str) -> Result<PathBuf> {
+        vm_state::dir(&self.data, key)
+    }
+
+    /// [`Manager::state_dir`] for an action that deletes the state or hands
+    /// the key out again. Fails with [`Error::NotReaped`] while a VM of an
+    /// earlier run can still mount it, also when the state already moved.
+    pub(crate) fn changeable_state_dir(&self, key: &str) -> Result<PathBuf> {
+        self.check_reaped()?;
+        self.state_dir(key)
+    }
+
+    /// False while a VM of an earlier run can still run: the reap of this
+    /// runtime home or of a legacy home failed and did not succeed since.
+    pub(crate) fn last_run_reaped(&self) -> bool {
+        !self.reap_pending.load(std::sync::atomic::Ordering::SeqCst) && lock(&self.unreaped_legacy).is_empty()
+    }
+
+    /// [`Error::NotReaped`], with the homes whose reap failed, unless
+    /// [`Manager::last_run_reaped`].
+    fn check_reaped(&self) -> Result<()> {
+        if self.last_run_reaped() {
+            return Ok(());
+        }
+        let mut homes: Vec<String> = lock(&self.unreaped_legacy).iter().map(|h| h.display().to_string()).collect();
+        if self.reap_pending.load(std::sync::atomic::Ordering::SeqCst) {
+            homes.insert(0, CURRENT_HOME.to_owned());
+        }
+        Err(Error::NotReaped { homes: homes.join(", ") })
+    }
+
+    /// Moves the agent state from `shields/` if a move is pending, the VMs
+    /// of the earlier runs are reaped and no VM starts, runs or stops. Else
+    /// the move stays pending, and the next start tries again. It holds
+    /// `reap_gate`, then the state lock, as [`Manager::reap_leftovers`]
+    /// does, so no reap, start, wipe or key reservation runs meanwhile.
+    /// Each problem is an app notice.
+    pub(crate) async fn try_migrate_vm_state(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _gate = self.reap_gate.lock().await;
+        if !self.migrate_pending.load(SeqCst) || !self.last_run_reaped() {
+            return;
+        }
+        let report = {
+            let state = lock(&self.state);
+            if state.vms.values().any(|vm| !matches!(vm, Vm::Failed { .. })) {
+                return;
+            }
+            let report = vm_state::migrate(&self.data);
+            self.migrate_pending.store(report.retry, SeqCst);
+            report
+        };
+        if !report.moved.is_empty() {
+            eprintln!("moved the agent state of {} VMs to {}", report.moved.len(), vm_state::STATE_DIR);
+        }
+        for problem in report.problems {
+            self.add_app_notice(problem.notice());
+        }
     }
 
     /// The host-owned profile snapshots of the VM's host agents.
@@ -622,11 +687,12 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Deletes all that is left of the VM `key`: its agent state, its
     /// wrappers, its profiles, its network log and a failed start. Under the
     /// state lock, so no start can take the key meanwhile. The VM must not
-    /// start, run or stop.
+    /// start, run or stop. A key whose state is not moved changes nothing.
     pub(crate) fn wipe_vm(&self, state: &mut State<R::Vm>, key: &str) -> Result<()> {
         if state.vms.get(key).is_some_and(|vm| !matches!(vm, Vm::Failed { .. })) {
             return Err(Error::AlreadyStarted);
         }
+        self.changeable_state_dir(key)?;
         state.vms.remove(key);
         state.live.remove(key);
         state.net.remove(key);
@@ -636,10 +702,11 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Deletes the agent state, the wrappers and the profiles of VM `key`.
-    /// It tries each dir and returns the first error.
+    /// It tries each dir and returns the first error. A key whose state is
+    /// not moved deletes nothing.
     pub(crate) fn remove_vm_dirs(&self, key: &str) -> Result<()> {
         let mut result = Ok(());
-        for dir in [self.state_dir(key), self.bin_dir(key), self.profile_dir(key)] {
+        for dir in [self.changeable_state_dir(key)?, self.bin_dir(key), self.profile_dir(key)] {
             if let Err(source) = std::fs::remove_dir_all(&dir)
                 && source.kind() != std::io::ErrorKind::NotFound
                 && result.is_ok()
@@ -651,9 +718,23 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Reserves a new own-VM key of cage `cage_id` with an empty state. A
-    /// key whose old state cannot be deleted is not handed out.
+    /// key whose old state cannot be deleted or is not moved is not handed
+    /// out. An error that is true for each key, such as a linked parent,
+    /// ends the search.
     pub(crate) fn new_vm_key(&self, state: &mut State<R::Vm>, cage_id: &str) -> Result<String> {
-        let key = cage::free_vm_key(cage_id, |key| state.key_taken(key));
+        self.check_reaped()?;
+        let mut failure = None;
+        let key = cage::free_vm_key(cage_id, |key| match vm_state::resolve(&self.data, key) {
+            Ok(Ok(_)) => state.key_taken(key),
+            Ok(Err(_)) => true,
+            Err(e) => {
+                failure.get_or_insert(e);
+                false
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
         self.wipe_vm(state, &key)?;
         Ok(key)
     }
@@ -844,7 +925,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// and the agent state, the wrappers and the profiles of its VMs. A
     /// session that kept an own VM of the cage after a cage change goes
     /// back to the shared choice. The first error is returned after all
-    /// deletes ran.
+    /// deletes ran. While the state of one of its VM keys is not moved, it
+    /// changes nothing.
     pub fn delete_cage(&self, id: &str) -> Result<()> {
         let _edit = lock(&self.secret_edit);
         let (cage, own_keys) = {
@@ -860,7 +942,6 @@ impl<R: SandboxRuntime> Manager<R> {
             if state.vms.values().any(|vm| vm.cage() == id && !matches!(vm, Vm::Failed { .. })) {
                 return in_use("its VM runs".into());
             }
-            // The sessions are saved first: a failed cage save then leaves only free keys.
             let mut sessions = state.sessions.clone();
             let mut own_keys = Vec::new();
             for session in &mut sessions {
@@ -871,6 +952,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     session.vm = VmChoice::Shared;
                 }
             }
+            let mut keys: Vec<String> =
+                state.vms.iter().filter(|(_, vm)| vm.cage() == id).map(|(k, _)| k.clone()).collect();
+            keys.push(id.to_owned());
+            keys.extend(own_keys.iter().cloned());
+            for key in &keys {
+                self.changeable_state_dir(key)?;
+            }
+            // The sessions are saved first: a failed cage save then leaves only free keys.
             if !own_keys.is_empty() {
                 self.store.save_sessions(&sessions)?;
                 state.sessions = sessions;
@@ -878,10 +967,6 @@ impl<R: SandboxRuntime> Manager<R> {
             let cages: Vec<Cage> = state.cages.iter().filter(|c| c.id != id).cloned().collect();
             self.store.save_cages(&cages)?;
             state.cages = cages;
-            let mut keys: Vec<String> =
-                state.vms.iter().filter(|(_, vm)| vm.cage() == id).map(|(k, _)| k.clone()).collect();
-            keys.push(id.to_owned());
-            keys.extend(own_keys.iter().cloned());
             for key in keys {
                 state.vms.remove(&key);
                 state.live.remove(&key);
@@ -1133,8 +1218,12 @@ impl<R: SandboxRuntime> Manager<R> {
     /// session. A VM with other members is not stopped: the delete fails
     /// with [`Error::StopShared`], and the user stops that VM first. An own
     /// VM of the session loses its state; if that fails, the delete still
-    /// completes and returns [`Error::VmStateLeft`].
+    /// completes and returns [`Error::VmStateLeft`]. While the state of the
+    /// own VM is not moved, the delete changes nothing. While the last run
+    /// is not reaped ([`Manager::last_run_reaped`]), each delete fails with
+    /// [`Error::NotReaped`] and changes nothing, also for a shared VM.
     pub async fn delete(&self, session_id: &str) -> Result<()> {
+        self.check_reaped()?;
         self.stop(session_id, None).await.or_else(|e| match e {
             Error::NotRunning | Error::CageNotFound => Ok(()),
             e => Err(e),
@@ -1158,6 +1247,10 @@ impl<R: SandboxRuntime> Manager<R> {
                 VmChoice::Own { key, .. } => Some(key.clone()),
                 VmChoice::Shared => None,
             };
+            self.check_reaped()?;
+            if let Some(key) = &released {
+                self.changeable_state_dir(key)?;
+            }
             // A failed cleanup keeps the project, so that Delete can run again.
             terminal_history::remove_session(&self.data, session_id)?;
             self.save_both(&state.sessions, &sessions, &workspaces)?;
@@ -1402,7 +1495,7 @@ mod tests {
     async fn delete_cage_removes_the_agent_state_and_the_old_chats() {
         let (manager, _, id) = manager();
         manager.start(&id).await.unwrap();
-        let sessions = manager.state_dir(&id).join("sessions");
+        let sessions = manager.state_dir(&id).unwrap().join("sessions");
         std::fs::create_dir(&sessions).unwrap();
         std::fs::write(sessions.join("a.jsonl"), "{\"type\":\"session\",\"timestamp\":\"t\"}\n").unwrap();
         let chats = manager.data.join("chats").join(&id).join("claude");
@@ -1410,9 +1503,9 @@ mod tests {
         manager.stop(&id, None).await.unwrap();
 
         manager.delete(&id).await.unwrap();
-        assert!(manager.state_dir(&id).exists(), "the cage stays");
+        assert!(manager.state_dir(&id).unwrap().exists(), "the cage stays");
         manager.delete_cage(&id).unwrap();
-        assert!(!manager.state_dir(&id).exists());
+        assert!(!manager.state_dir(&id).unwrap().exists());
         assert!(!manager.data.join("chats").join(&id).exists());
     }
 
@@ -2350,8 +2443,8 @@ mod tests {
         assert_eq!(vm_states(&manager, &a), [(a.clone(), Status::Running), (own.clone(), Status::Running)]);
         let starts: Vec<String> = runtime.log.lock().unwrap().clone();
         assert_eq!(starts, [format!("start {a}"), format!("start {own}")]);
-        assert!(manager.state_dir(&a).is_dir() && manager.state_dir(&own).is_dir());
-        assert_ne!(manager.state_dir(&a), manager.state_dir(&own));
+        assert!(manager.state_dir(&a).unwrap().is_dir() && manager.state_dir(&own).unwrap().is_dir());
+        assert_ne!(manager.state_dir(&a).unwrap(), manager.state_dir(&own).unwrap());
         let list = manager.list();
         let vm_cage = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().vm_cage.clone();
         assert_eq!((vm_cage(&a), vm_cage(&b)), (Some(a.clone()), Some(a.clone())));
@@ -2413,9 +2506,9 @@ mod tests {
 
         // Back to the shared VM: the own VM stops and its state goes.
         manager.start(&b).await.unwrap();
-        assert!(manager.state_dir(&own).is_dir());
+        assert!(manager.state_dir(&own).unwrap().is_dir());
         manager.set_session_vm(&b, false, None).await.unwrap();
-        assert!(!manager.state_dir(&own).exists());
+        assert!(!manager.state_dir(&own).unwrap().exists());
         assert_eq!(vm_key(&manager, &b), Some(shared.clone()));
         assert_eq!(vm_states(&manager, &shared), [(shared, Status::Running)]);
     }
@@ -2434,14 +2527,14 @@ mod tests {
         manager.stop(&a, None).await.unwrap();
         assert!(login.exists() && !manager.list_net_events(&own).unwrap().is_empty());
         manager.set_session_vm(&a, false, None).await.unwrap();
-        assert!(!manager.state_dir(&own).exists());
+        assert!(!manager.state_dir(&own).unwrap().exists());
         assert!(manager.list_net_events(&own).unwrap().is_empty());
 
         // A folder that a failed delete left is gone before the key is handed out again.
         put_codex_login(&manager, &own);
         manager.set_session_vm(&a, true, None).await.unwrap();
         assert_eq!(vm_key(&manager, &a), Some(own.clone()));
-        assert!(!manager.state_dir(&own).exists());
+        assert!(!manager.state_dir(&own).unwrap().exists());
     }
 
     #[tokio::test]
@@ -2459,7 +2552,7 @@ mod tests {
         manager.start(&a).await.unwrap();
         let new = format!("{other}-2");
         assert_eq!(vm_key(&manager, &a), Some(new.clone()));
-        assert!(!login.exists() && !manager.state_dir(&old).exists());
+        assert!(!login.exists() && !manager.state_dir(&old).unwrap().exists());
         assert_eq!(runtime.log.lock().unwrap().last(), Some(&format!("start {new}")));
     }
 
@@ -2469,9 +2562,9 @@ mod tests {
         manager.set_session_vm(&a, true, None).await.unwrap();
         let own = format!("{a}-2");
         manager.start(&a).await.unwrap();
-        assert!(manager.state_dir(&own).is_dir());
+        assert!(manager.state_dir(&own).unwrap().is_dir());
         manager.delete(&a).await.unwrap();
-        assert!(!manager.state_dir(&own).exists() && !manager.bin_dir(&own).exists());
+        assert!(!manager.state_dir(&own).unwrap().exists() && !manager.bin_dir(&own).exists());
     }
 
     #[tokio::test]
@@ -2486,11 +2579,14 @@ mod tests {
         assert!(manager.list().cages[0].vms[1].own);
     }
 
-    /// Puts a file where the agent state dir of VM `key` goes, so its delete fails.
+    /// Puts a file in a read-only folder of the agent state dir of VM `key`,
+    /// so its delete fails.
     fn block_state_delete(manager: &Manager<FakeRuntime>, key: &str) {
-        let dir = manager.state_dir(key);
-        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-        std::fs::write(dir, "x").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = manager.state_dir(key).unwrap().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("x"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
     }
 
     #[tokio::test]
@@ -2502,11 +2598,11 @@ mod tests {
         let Err(e @ Error::VmStateLeft { .. }) = manager.set_session_vm(&a, false, None).await else {
             panic!("a failed delete is an error");
         };
-        let path = manager.state_dir(&own).display().to_string();
+        let path = manager.state_dir(&own).unwrap().display().to_string();
         assert_eq!(
             e.message(),
             format!(
-                "Could not delete the agent state of VM {own} at {path} (Not a directory (os error 20)); delete it by hand."
+                "Could not delete the agent state of VM {own} at {path} (Permission denied (os error 13)); delete it by hand."
             )
         );
         assert_eq!(vm_key(&manager, &a), Some(a.clone()));
@@ -2534,7 +2630,7 @@ mod tests {
         let other = manager.create_cage("other").unwrap();
         manager.set_session_cage(&a, Some(&other)).unwrap();
         manager.delete_cage(&a).unwrap();
-        for dir in [manager.state_dir(&own), manager.bin_dir(&own), manager.profile_dir(&own)] {
+        for dir in [manager.state_dir(&own).unwrap(), manager.bin_dir(&own), manager.profile_dir(&own)] {
             assert!(!dir.exists(), "{} is left", dir.display());
         }
         assert_eq!(lock(&manager.state).session(&a).unwrap().vm, VmChoice::Shared);

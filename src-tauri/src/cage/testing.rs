@@ -315,7 +315,7 @@ pub(crate) fn holders(manager: &Manager<FakeRuntime>) -> Vec<String> {
 }
 
 pub(crate) fn put_codex_login(manager: &Manager<FakeRuntime>, id: &str) -> PathBuf {
-    let codex = manager.state_dir(id).join("codex");
+    let codex = manager.state_dir(id).unwrap().join("codex");
     std::fs::create_dir_all(&codex).unwrap();
     std::fs::write(codex.join("auth.json"), r#"{"tokens":{"access_token":"eyJ"}}"#).unwrap();
     codex.join("auth.json")

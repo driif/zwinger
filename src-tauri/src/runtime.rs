@@ -172,6 +172,8 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     /// Stops and removes the VMs that an earlier app run left behind.
     /// Returns the names of the VMs that it removed.
     fn reap(&self) -> impl Future<Output = Result<Vec<String>>> + Send;
+    /// As [`SandboxRuntime::reap`], in the legacy runtime home `home`.
+    fn reap_home(&self, home: &Path) -> impl Future<Output = Result<Vec<String>>> + Send;
     /// Follows the raw runtime log lines of the VM that are written from now
     /// on. The lines stop when the receiver is dropped.
     fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
@@ -307,6 +309,10 @@ impl SandboxRuntime for Microsandbox {
 
     async fn reap(&self) -> Result<Vec<String>> {
         reap_zwinger().await
+    }
+
+    async fn reap_home(&self, home: &Path) -> Result<Vec<String>> {
+        crate::bootstrap::reap_in(home, crate::REAP_LIMIT).await
     }
 
     /// Tails `runtime.log` itself: `follow_logs` returns a `futures` Stream,
@@ -489,6 +495,8 @@ pub mod fake {
         pub reaped: Arc<Mutex<Vec<String>>>,
         /// Each `reap` fails.
         pub reap_fail: Arc<Mutex<bool>>,
+        /// Each `reap_home` fails.
+        pub home_reap_fail: Arc<Mutex<bool>>,
         /// How long each stop takes.
         pub stop_delay: Arc<Mutex<Duration>>,
         /// The stops that run now, and the most that ran at once.
@@ -582,6 +590,14 @@ pub mod fake {
                 return Err(Error::Io(std::io::Error::other("reap failed")));
             }
             Ok(self.reaped.lock().unwrap().clone())
+        }
+
+        async fn reap_home(&self, home: &Path) -> Result<Vec<String>> {
+            self.log.lock().unwrap().push(format!("reap {}", home.display()));
+            if *self.home_reap_fail.lock().unwrap() {
+                return Err(Error::Io(std::io::Error::other("reap failed")));
+            }
+            Ok(Vec::new())
         }
 
         async fn net_lines(&self, _: &FakeVm) -> Result<Receiver<String>> {

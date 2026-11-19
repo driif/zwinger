@@ -87,6 +87,15 @@ mount or agent edit waits for the restart of each VM.
   shared VM. The state stays while the project keeps its own VM. **Use shared VM**, and a delete of the project,
   delete the state of the own VM. If zwinger cannot delete it, you see the folder: delete it by hand. zwinger does not
   give that key to a new own VM while the folder is there. A new own VM always starts with an empty state.
+- **Where the state is.** The agent state of each VM is in `projects/<key>` in the app data folder. Earlier builds
+  kept it in `shields/<key>`. At start, after zwinger stopped the VMs of the earlier run, it moves each old folder to
+  the new place. If a folder cannot move, for example because `projects/<key>` already has files, a notice names the two
+  folders: move or delete one of them, then restart zwinger. Until the old folder is gone, that VM does not start, and
+  zwinger does not delete or change its state. The move also waits while a VM starts, runs or stops: the next cage
+  start after that VM stops moves the state. If zwinger could not stop the VMs of an earlier run in an old runtime
+  home, the move waits. Deletes, resets and key releases of agent state also wait while an old runtime home is not
+  reaped, also for state that already moved. To try again, start a cage or restart zwinger. zwinger never uses a
+  `shields`, `projects` or `projects/<key>` that is a link: move or delete the link, then restart zwinger.
 - **Stopped VM.** A stopped own VM keeps its network log until the project leaves it.
 - **Running VM.** If the VM of the project runs, the change asks first. A VM with this project only stops. A shared VM
   with other projects restarts without this project: their VM terminals open again, and their running tasks are

@@ -142,6 +142,24 @@ pub enum Error {
     AlreadyStarted,
     #[error("could not delete the agent state of VM {key} at {path} ({source}); delete it by hand")]
     VmStateLeft { key: String, path: String, source: std::io::Error },
+    #[error(
+        "the agent state of VM {key} is still at {legacy} and not at {target}. Restart zwinger to move it. If it does not move, move or delete one of the two, then restart zwinger"
+    )]
+    VmStateNotMoved { key: String, legacy: String, target: String },
+    #[error(
+        "zwinger does not use {path} for agent state, because it is a link or not a folder. Move or delete it, then restart zwinger"
+    )]
+    VmStatePath { path: String },
+    #[error(
+        "zwinger does not read {path}, because it is a link or not a regular file. Move it away or replace it with the file, then restart zwinger"
+    )]
+    StoreFile { path: String },
+    #[error("the VM key {0:?} is not a valid folder name")]
+    BadVmKey(String),
+    #[error(
+        "the VMs of an earlier app run in {homes} are not stopped, so zwinger does not delete, reset or release agent state now. Start a cage or restart zwinger to stop them, then try again"
+    )]
+    NotReaped { homes: String },
     #[error("cage is starting")]
     Starting,
     #[error("cage is stopping")]

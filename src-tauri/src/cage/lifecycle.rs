@@ -12,10 +12,10 @@ use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
 use crate::cage::history::StartRecord;
-use crate::cage::manager::{HostRun, LEGACY_STATE_DIR, Manager, State, Vm, bin_dir, blocking, ids, lock};
+use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
-use crate::cage::{self, Bound, CLAUDE_TOKEN, Cage, Members, WORKSPACE};
+use crate::cage::{self, Bound, CLAUDE_TOKEN, Cage, Members, WORKSPACE, vm_state};
 use crate::error::{Error, Result};
 use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
@@ -69,8 +69,12 @@ impl<R: SandboxRuntime> Manager<R> {
     /// cannot start, the cage does not start. It starts the session's VM
     /// of its effective cage, with the session as its only member. A shared
     /// VM that runs without the session refuses with
-    /// [`Error::RestartToAdd`]: see [`Manager::restart_to_add`].
+    /// [`Error::RestartToAdd`]: see [`Manager::restart_to_add`]. The reap
+    /// of the last run and the move of the agent state run before the
+    /// claim, which can renew and wipe an own VM key.
     pub async fn start(&self, session_id: &str) -> Result<()> {
+        self.reap_leftovers().await?;
+        self.reap_legacy_homes().await;
         let started = Instant::now();
         let claimed = {
             let _edit = lock(&self.secret_edit);
@@ -307,7 +311,7 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let boot = async {
             recheck()?;
-            self.runtime.start(id, bound, &net, &self.state_dir(id), &installed, &binds).await
+            self.runtime.start(id, bound, &net, &self.state_dir(id)?, &installed, &binds).await
         };
         let (booted, boot_took) = timed(boot).await;
         timings.add(Phase::Boot, boot_took);
@@ -483,21 +487,57 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Reaps the VMs of the last run if the boot reap failed: they trust a
     /// CA whose key is gone. Concurrent starts reap once. While the reap
-    /// fails, each start fails.
-    async fn reap_leftovers(&self) -> Result<()> {
-        let _gate = self.reap_gate.lock().await;
-        if !self.reap_pending.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let why = match tokio::time::timeout(crate::REAP_LIMIT, self.runtime.reap()).await {
-            Ok(Ok(_)) => {
+    /// fails, each start fails. Then it tries the move of the agent state
+    /// that is not moved yet ([`Manager::try_migrate_vm_state`]).
+    pub(crate) async fn reap_leftovers(&self) -> Result<()> {
+        {
+            let _gate = self.reap_gate.lock().await;
+            if self.reap_pending.load(Ordering::SeqCst) {
+                let why = match tokio::time::timeout(crate::REAP_LIMIT, self.runtime.reap()).await {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(_) => Some("the reap timed out".to_owned()),
+                };
+                if let Some(why) = why {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "the VMs of the last app run are not stopped: {why}"
+                    ))));
+                }
                 self.reap_pending.store(false, Ordering::SeqCst);
-                return Ok(());
             }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "the reap timed out".to_owned(),
-        };
-        Err(Error::Io(std::io::Error::other(format!("the VMs of the last app run are not stopped: {why}"))))
+        }
+        self.try_migrate_vm_state().await;
+        Ok(())
+    }
+
+    /// Reaps the legacy homes whose reap failed again, then tries the move
+    /// of the agent state. A home that still fails blocks the move and each
+    /// change of agent state ([`Manager::last_run_reaped`]); the start goes
+    /// on, because the keys with an old dir stay refused.
+    pub(crate) async fn reap_legacy_homes(&self) {
+        {
+            let _gate = self.reap_gate.lock().await;
+            let homes = lock(&self.unreaped_legacy).clone();
+            if homes.is_empty() {
+                return;
+            }
+            let mut failed = Vec::new();
+            for home in homes {
+                match tokio::time::timeout(crate::REAP_LIMIT, self.runtime.reap_home(&home)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("reap in {} failed: {e}", home.display());
+                        failed.push(home);
+                    }
+                    Err(_) => {
+                        eprintln!("reap in {} timed out", home.display());
+                        failed.push(home);
+                    }
+                }
+            }
+            *lock(&self.unreaped_legacy) = failed;
+        }
+        self.try_migrate_vm_state().await;
     }
 
     /// Starts the proxy of VM `key`. Its log entries go to the VM's ring and the sink.
@@ -539,12 +579,14 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Looks for guest logins every `GUEST_LOGIN_POLL` while the VM runs, and
     /// calls the guest sink when they change.
     pub(crate) fn watch_guest_logins(&self, id: &str, vm: &Arc<R::Vm>) -> AbortHandle {
-        let (state, sink, dir) = (self.state.clone(), self.guest_sink.clone(), self.state_dir(id));
+        let (state, sink, data) = (self.state.clone(), self.guest_sink.clone(), self.data.clone());
         let (id, vm) = (id.to_owned(), vm.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(GUEST_LOGIN_POLL).await;
-                let dir = dir.clone();
+                let Ok(dir) = vm_state::dir(&data, &id) else {
+                    continue;
+                };
                 let Ok(found) = tokio::task::spawn_blocking(move || guest_login::found(&dir)).await else {
                     continue;
                 };
@@ -568,10 +610,10 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Deletes the agent's login that was made in the guest of VM `key`.
     pub fn remove_guest_login(&self, key: &str, kind: AgentKind) -> Result<()> {
+        let dir = self.changeable_state_dir(key)?;
         if !lock(&self.state).key_taken(key) {
             return Err(Error::CageNotFound);
         }
-        let dir = self.state_dir(key);
         guest_login::remove(&dir, kind)?;
         let found = guest_login::found(&dir);
         if let Some(Vm::Running { host, .. }) = lock(&self.state).vms.get_mut(key) {
@@ -622,7 +664,10 @@ impl<R: SandboxRuntime> Manager<R> {
             _ => {}
         }
         let key = match planned {
-            Some(key) => key,
+            Some(key) => {
+                self.state_dir(&key)?;
+                key
+            }
             None => self.renew_own_key(&mut state, session_id, &cage.id)?,
         };
         let session = state.session(session_id)?.clone();
@@ -652,8 +697,12 @@ impl<R: SandboxRuntime> Manager<R> {
     /// own key of `cage_id` and saves it. Then it deletes the state of the
     /// old key, so no guest login of one cage moves into another. If that
     /// delete fails, the new key stays saved and the start fails with
-    /// [`Error::VmStateLeft`].
+    /// [`Error::VmStateLeft`]. While the state of the old key is not moved,
+    /// it changes nothing.
     fn renew_own_key(&self, state: &mut State<R::Vm>, session_id: &str, cage_id: &str) -> Result<String> {
+        if let VmChoice::Own { key, .. } = &state.session(session_id)?.vm {
+            self.changeable_state_dir(key)?;
+        }
         let key = self.new_vm_key(state, cage_id)?;
         let mut sessions = state.sessions.clone();
         let session = sessions.iter_mut().find(|s| s.id == session_id).ok_or(Error::SessionNotFound)?;
@@ -840,7 +889,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// restarts without the session after the save; it needs a confirmation
     /// as for [`Manager::stop`]. The new VM starts with the next start. A
     /// released state that cannot be deleted gives [`Error::VmStateLeft`]
-    /// after the choice is saved.
+    /// after the choice is saved. While the state of the released own VM is
+    /// not moved, it changes nothing.
     pub async fn set_session_vm(&self, session_id: &str, own: bool, confirmed: Option<&Confirmed>) -> Result<()> {
         let leave = {
             let state = lock(&self.state);
@@ -883,6 +933,9 @@ impl<R: SandboxRuntime> Manager<R> {
                 return Err(Error::StaleRestart);
             }
             let cage = state.bound(session_id)?.cage.id.clone();
+            if let VmChoice::Own { key, .. } = &state.session(session_id)?.vm {
+                self.changeable_state_dir(key)?;
+            }
             let choice = match own {
                 true => VmChoice::Own { key: self.new_vm_key(&mut state, &cage)?, cage },
                 false => VmChoice::Shared,
@@ -1107,8 +1160,7 @@ pub(crate) fn prepare(
     key: &str,
     begin: &dyn Fn(Phase),
 ) -> Result<Prepared> {
-    let state = data.join(LEGACY_STATE_DIR).join(key);
-    std::fs::create_dir_all(&state)?;
+    let state = vm_state::create(data, key)?;
     // Empty: the start writes the wrappers of the agents that run in the VM.
     let bin = bin_dir(data, key);
     if let Err(e) = std::fs::remove_dir_all(&bin)
@@ -1529,7 +1581,7 @@ mod tests {
         );
         assert!(snapshot.join("skills/review/SKILL.md").is_file());
         assert!(!snapshot.join(".credentials.json").exists());
-        let skills = manager.state_dir(&id).join("claude/.claude/skills");
+        let skills = manager.state_dir(&id).unwrap().join("claude/.claude/skills");
         assert_eq!(std::fs::read_link(skills).unwrap(), Path::new("/opt/zwinger/profile/claude/skills"));
 
         let view = manager.list().cages.remove(0);
@@ -1548,7 +1600,7 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         manager.start(&id).await.unwrap();
         assert_eq!(runtime.binds.lock().unwrap().len(), 2, "only the bin dir and the CA");
-        assert!(!manager.state_dir(&id).join("claude/.claude/skills").exists());
+        assert!(!manager.state_dir(&id).unwrap().join("claude/.claude/skills").exists());
         assert!(!snapshot.exists());
         manager.stop(&id, None).await.unwrap();
         manager.delete(&id).await.unwrap();
@@ -1568,12 +1620,12 @@ mod tests {
         // A link that the guest planted at the login file is replaced, not written through.
         let outside = temp_dir().join("precious");
         std::fs::write(&outside, "host").unwrap();
-        std::fs::create_dir_all(manager.state_dir(&id).join("codex")).unwrap();
-        std::os::unix::fs::symlink(&outside, manager.state_dir(&id).join("codex/auth.json")).unwrap();
+        std::fs::create_dir_all(manager.state_dir(&id).unwrap().join("codex")).unwrap();
+        std::os::unix::fs::symlink(&outside, manager.state_dir(&id).unwrap().join("codex/auth.json")).unwrap();
 
         manager.start(&id).await.unwrap();
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "host");
-        let auth = std::fs::read_to_string(manager.state_dir(&id).join("codex/auth.json")).unwrap();
+        let auth = std::fs::read_to_string(manager.state_dir(&id).unwrap().join("codex/auth.json")).unwrap();
         assert!(
             auth.contains("$MSB_CODEX_HOST_LOGIN$") && auth.contains(login::INERT_REFRESH) && auth.contains("id.real")
         );
@@ -1686,7 +1738,8 @@ mod tests {
         assert_eq!(hosts, ["cloudcode-pa.googleapis.com", "api.business.githubcopilot.com"]);
 
         manager.start(&id).await.unwrap();
-        let creds = std::fs::read_to_string(manager.state_dir(&id).join("gemini/.gemini/oauth_creds.json")).unwrap();
+        let creds =
+            std::fs::read_to_string(manager.state_dir(&id).unwrap().join("gemini/.gemini/oauth_creds.json")).unwrap();
         assert!(
             creds.contains("$MSB_GEMINI_HOST_LOGIN$") && !creds.contains("ya29.real") && !creds.contains("1//real")
         );

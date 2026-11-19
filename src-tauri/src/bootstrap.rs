@@ -269,7 +269,7 @@ fn backend(home: &Path) -> Result<LocalBackend> {
 
 /// Stops and removes the zwinger VMs of `home`. Every call runs inside the
 /// scope, so no task falls back to the default home.
-async fn reap_in(home: &Path, limit: Duration) -> Result<Vec<String>> {
+pub(crate) async fn reap_in(home: &Path, limit: Duration) -> Result<Vec<String>> {
     let scoped = backend(home)?;
     with_backend(scoped, async {
         tokio::time::timeout(limit, runtime::reap_zwinger())
@@ -358,14 +358,16 @@ fn action(
 
 /// Stops the zwinger VMs of the legacy homes, makes the app-owned
 /// microsandbox home the default for every sandbox operation, then installs
-/// the runtime that is inside the app binary if needed.
+/// the runtime that is inside the app binary if needed. Returns the legacy
+/// homes whose reap failed or timed out, owned or shared: their zwinger VMs
+/// can still mount the old agent state.
 pub fn prepare_runtime<R: SandboxRuntime>(
     home: &Path,
     legacy: &[(Legacy, PathBuf)],
     runtime: &R,
     reap_limit: Duration,
     on_step: impl Fn(Step),
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     on_step(Step::Resolve);
     let backend = backend(home)?;
     let config = backend.config().clone();
@@ -391,17 +393,21 @@ pub fn prepare_runtime<R: SandboxRuntime>(
     }
     tauri::async_runtime::block_on(async {
         on_step(Step::ReapLegacy);
+        let mut unreaped = Vec::new();
         for (_, path) in legacy {
             // A legacy home with a broken runtime must not block the start.
             match Box::pin(reap_in(path, reap_limit)).await {
                 Ok(reaped) if !reaped.is_empty() => eprintln!("stopped {} VMs in {}", reaped.len(), path.display()),
                 Ok(_) => {}
-                Err(e) => eprintln!("reap in {} failed: {e}", path.display()),
+                Err(e) => {
+                    eprintln!("reap in {} failed: {e}", path.display());
+                    unreaped.push(path.clone());
+                }
             }
         }
         set_default_backend(backend);
         if action == Action::Keep {
-            return Ok(());
+            return Ok(unreaped);
         }
         on_step(Step::Install);
         let partial = partial_pair(home);
@@ -419,7 +425,7 @@ pub fn prepare_runtime<R: SandboxRuntime>(
         // Boxed: the microsandbox futures are deep, and inline they overflow
         // the compiler's layout query depth in release builds.
         Box::pin(install_runtime(&config, InstallOptions { force: true, ..embedded })).await?;
-        Ok(())
+        Ok(unreaped)
     })
 }
 

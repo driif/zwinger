@@ -6,6 +6,7 @@ pub(crate) mod progress;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;
+pub(crate) mod vm_state;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -498,7 +499,7 @@ pub fn vm_key<'a>(session: &'a Session, cage: &'a Cage) -> Option<&'a str> {
 
 /// The lowest own-VM key of cage `cage_id` that is not `taken`:
 /// `<cage id>-<n>` with n >= 2.
-pub fn free_vm_key(cage_id: &str, taken: impl Fn(&str) -> bool) -> String {
+pub fn free_vm_key(cage_id: &str, mut taken: impl FnMut(&str) -> bool) -> String {
     (2..).map(|n| format!("{cage_id}-{n}")).find(|key| !taken(key)).expect("a free key")
 }
 

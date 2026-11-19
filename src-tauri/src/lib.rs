@@ -104,12 +104,18 @@ fn report_panics(app: AppHandle) {
 /// Removes the VMs of an earlier run, loads the sessions and cages and makes the
 /// manager. The manager starts with no VMs, so every cage shows as
 /// stopped; a notice names the removed VMs. If the reap fails, the first
-/// cage start reaps again.
+/// cage start reaps again. `unreaped_legacy`: the legacy runtime homes,
+/// owned or shared, whose reap failed. The agent state moves from
+/// `shields/` only after the reap of this home and of each legacy home
+/// succeeded, so no VM of an earlier run still mounts it. Until then, each
+/// cage start reaps the failed homes again, and no action deletes, resets
+/// or releases agent state ([`Manager::last_run_reaped`]).
 fn boot<R: SandboxRuntime>(
     runtime: R,
     vault: Arc<dyn Vault>,
     data: &Path,
     host: Arc<HostAgents>,
+    unreaped_legacy: Vec<PathBuf>,
 ) -> error::Result<Manager<R>> {
     // The timer must be made inside the runtime, so it is in the future.
     let reaped = tauri::async_runtime::block_on(async { tokio::time::timeout(REAP_LIMIT, runtime.reap()).await });
@@ -126,6 +132,9 @@ fn boot<R: SandboxRuntime>(
     };
     let store = store::Store::new(data.to_owned());
     let manager = Manager::new(runtime, store, vault, data.to_owned(), host)?;
+    let migrate = std::fs::symlink_metadata(data.join(cage::vm_state::LEGACY_DIR)).is_ok();
+    manager.migrate_pending.store(migrate, Ordering::SeqCst);
+    *manager.unreaped_legacy.lock().unwrap_or_else(|e| e.into_inner()) = unreaped_legacy;
     let Some(reaped) = reaped else {
         manager.reap_pending.store(true, Ordering::SeqCst);
         return Ok(manager);
@@ -145,6 +154,7 @@ fn boot<R: SandboxRuntime>(
         manager
             .add_app_notice(format!("zwinger stopped the VMs that the last run left running: {}.", names.join(", ")));
     }
+    tauri::async_runtime::block_on(manager.try_migrate_vm_state());
     Ok(manager)
 }
 
@@ -278,10 +288,11 @@ pub fn run() {
                 }
                 let step = |step| startup.set(&handle, Phase::Installing, checks.clone(), Some(step));
                 let legacy = bootstrap::legacy_homes(&data, &dirs::home_dir().unwrap_or_default());
-                let manager = bootstrap::prepare_runtime(&home, &legacy, &runtime, REAP_LIMIT, step).and_then(|()| {
-                    step(Step::Reap);
-                    boot(runtime, vault, &data, host_agents)
-                });
+                let manager =
+                    bootstrap::prepare_runtime(&home, &legacy, &runtime, REAP_LIMIT, step).and_then(|unreaped| {
+                        step(Step::Reap);
+                        boot(runtime, vault, &data, host_agents, unreaped)
+                    });
                 match manager {
                     Ok(manager) => {
                         connect(&handle, &manager);
@@ -476,7 +487,7 @@ mod tests {
             data.clone(),
         ));
 
-        let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host).unwrap();
+        let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host, Vec::new()).unwrap();
         assert_eq!(*runtime.log.lock().unwrap(), ["reap"]);
         assert_eq!(manager.list().sessions.len(), 1);
         assert_eq!(
@@ -511,18 +522,68 @@ mod tests {
 
     /// Boots with two stored sessions whose folders are outside the app data.
     fn boot_two(runtime: &FakeRuntime) -> (Manager<FakeRuntime>, [String; 2]) {
+        let (root, ids) = two();
+        (boot_at(runtime, &root, Vec::new()), ids)
+    }
+
+    /// A new root with app data in `data` and two stored sessions whose
+    /// folders are outside it.
+    fn two() -> (PathBuf, [String; 2]) {
         let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
         let folders = ["a", "b"].map(|name| {
             std::fs::create_dir_all(root.join(name)).unwrap();
             root.join(name)
         });
+        let ids = stored(&root.join("data"), folders);
+        (root, ids)
+    }
+
+    /// Boots as a fresh app process on the app data of `root`. The reap of
+    /// each legacy home in `unreaped` failed.
+    fn boot_at(runtime: &FakeRuntime, root: &Path, unreaped: Vec<PathBuf>) -> Manager<FakeRuntime> {
         let data = root.join("data");
-        let ids = stored(&data, folders);
-        let manager = boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host_agents(&root)).unwrap();
-        (manager, ids)
+        boot(runtime.clone(), Arc::new(MemoryVault::default()), &data, host_agents(root), unreaped).unwrap()
+    }
+
+    /// An agent state dir of the build before the move, with one file.
+    fn old_state(root: &Path, key: &str) {
+        let dir = root.join("data/shields").join(key);
+        std::fs::create_dir_all(dir.join("codex")).unwrap();
+        std::fs::write(dir.join("codex/auth.json"), key).unwrap();
+    }
+
+    /// Each file below the agent state dirs and the store files, with its contents.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, String)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    out.push((path.clone(), String::new()));
+                    walk(&path, out);
+                } else {
+                    out.push((path.clone(), std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let data = root.join("data");
+        let mut out = Vec::new();
+        for dir in ["shields", "projects"] {
+            walk(&data.join(dir), &mut out);
+        }
+        for file in ["sessions.json", "cages.json"] {
+            out.push((data.join(file), std::fs::read_to_string(data.join(file)).unwrap()));
+        }
+        out.sort();
+        out
+    }
+
+    fn not_moved(e: &error::Error, key: &str) -> bool {
+        matches!(e, error::Error::VmStateNotMoved { key: k, .. } if k == key)
     }
 
     fn reaps(runtime: &FakeRuntime) -> usize {
@@ -576,6 +637,442 @@ mod tests {
         let (manager, [a, _]) = boot_two(&runtime);
         tauri::async_runtime::block_on(manager.start(&a)).unwrap();
         assert_eq!(*runtime.log.lock().unwrap(), ["reap".to_owned(), format!("start {a}")]);
+    }
+
+    #[test]
+    fn the_boot_moves_the_agent_state_after_both_reaps() {
+        let runtime = FakeRuntime::default();
+        let (root, [a, _]) = two();
+        old_state(&root, &a);
+        let manager = boot_at(&runtime, &root, Vec::new());
+        assert!(!root.join("data/shields").exists());
+        let dir = manager.state_dir(&a).unwrap();
+        assert_eq!(dir, root.join("data/projects").join(&a));
+        assert_eq!(std::fs::read_to_string(dir.join("codex/auth.json")).unwrap(), a);
+        assert!(manager.take_app_notices().is_empty());
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+    }
+
+    #[test]
+    fn a_failed_boot_reap_moves_the_agent_state_at_the_first_reap_that_succeeds() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        let (root, [a, _]) = two();
+        old_state(&root, &a);
+        let manager = boot_at(&runtime, &root, Vec::new());
+        assert!(root.join("data/shields").join(&a).is_dir(), "no move while old VMs can mount it");
+        let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+        assert!(e.to_string().contains("not stopped"), "{e}");
+        assert!(root.join("data/shields").join(&a).is_dir());
+
+        *runtime.reap_fail.lock().unwrap() = false;
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        assert!(!root.join("data/shields").exists());
+        let auth = root.join("data/projects").join(&a).join("codex/auth.json");
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), a);
+        assert_eq!(
+            *runtime.log.lock().unwrap(),
+            ["reap".to_owned(), "reap".into(), "reap".into(), format!("start {a}")]
+        );
+    }
+
+    /// A failed or timed-out reap of a legacy home, owned or shared, gives
+    /// the same `unreaped` entry: the move waits until a reap of that home
+    /// succeeds, at a later cage start or at the next app start.
+    #[test]
+    fn a_failed_legacy_reap_defers_the_move_until_a_retry_succeeds() {
+        for home in ["data/microsandbox", ".microsandbox"] {
+            let runtime = FakeRuntime::default();
+            *runtime.home_reap_fail.lock().unwrap() = true;
+            let (root, [a, b]) = two();
+            old_state(&root, &a);
+            let home = root.join(home);
+            let manager = boot_at(&runtime, &root, vec![home.clone()]);
+            let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+            assert!(not_moved(&e, &a), "{e}");
+            assert!(root.join("data/shields").join(&a).is_dir());
+            assert!(!root.join("data/projects").join(&a).exists(), "no empty new state is made");
+            tauri::async_runtime::block_on(manager.start(&b)).unwrap();
+            let retries =
+                runtime.log.lock().unwrap().iter().filter(|l| **l == format!("reap {}", home.display())).count();
+            assert_eq!(retries, 2, "each start reaps the failed home again");
+            tauri::async_runtime::block_on(manager.stop(&b, None)).unwrap();
+
+            // The next start in the same process reaps it again and moves the state.
+            *runtime.home_reap_fail.lock().unwrap() = false;
+            tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+            assert!(!root.join("data/shields").exists());
+            let auth = root.join("data/projects").join(&a).join("codex/auth.json");
+            assert_eq!(std::fs::read_to_string(auth).unwrap(), a);
+            drop(manager);
+
+            // The next app start, with the home still failing, moves the rest after a retry.
+            *runtime.home_reap_fail.lock().unwrap() = true;
+            let own = format!("{b}-2");
+            old_state(&root, &own);
+            let manager = boot_at(&runtime, &root, vec![home.clone()]);
+            assert!(root.join("data/shields").join(&own).is_dir());
+            drop(manager);
+            *runtime.home_reap_fail.lock().unwrap() = false;
+            let manager = boot_at(&runtime, &root, Vec::new());
+            assert!(!root.join("data/shields").exists());
+            assert!(manager.state_dir(&own).unwrap().join("codex/auth.json").is_file());
+        }
+    }
+
+    /// With no `shields/`, a failed legacy reap is still retried at each
+    /// start: its VMs can mount the moved state. The starts go on.
+    #[test]
+    fn a_failed_legacy_reap_with_nothing_to_move_is_retried() {
+        let runtime = FakeRuntime::default();
+        *runtime.home_reap_fail.lock().unwrap() = true;
+        let (root, [a, _]) = two();
+        let home = root.join(".microsandbox");
+        let manager = boot_at(&runtime, &root, vec![home.clone()]);
+        assert!(!manager.last_run_reaped());
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        let retry = format!("reap {}", home.display());
+        assert_eq!(*runtime.log.lock().unwrap(), ["reap".to_owned(), retry.clone(), format!("start {a}")]);
+        tauri::async_runtime::block_on(manager.stop(&a, None)).unwrap();
+
+        *runtime.home_reap_fail.lock().unwrap() = false;
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        assert!(manager.last_run_reaped());
+        tauri::async_runtime::block_on(manager.stop(&a, None)).unwrap();
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        let retries = runtime.log.lock().unwrap().iter().filter(|l| **l == retry).count();
+        assert_eq!(retries, 2, "no retry after a reap succeeded");
+    }
+
+    /// A legacy home is reaped while an unrelated VM runs or starts: the
+    /// old state of the other key stays in `shields/` and the move stays
+    /// pending. After that VM stops, the next start moves it.
+    #[test]
+    fn the_agent_state_does_not_move_while_another_vm_is_active() {
+        let runtime = FakeRuntime::default();
+        *runtime.home_reap_fail.lock().unwrap() = true;
+        let (root, [a, b]) = two();
+        old_state(&root, &a);
+        let legacy = root.join("data/shields").join(&a);
+        let manager = boot_at(&runtime, &root, vec![root.join("data/microsandbox")]);
+        tauri::async_runtime::block_on(manager.start(&b)).unwrap();
+        *runtime.home_reap_fail.lock().unwrap() = false;
+
+        // The reap succeeds now, but `b` runs.
+        let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+        assert!(not_moved(&e, &a), "{e}");
+        assert!(manager.last_run_reaped());
+        assert!(manager.migrate_pending.load(Ordering::SeqCst));
+        assert!(legacy.join("codex/auth.json").is_file() && !root.join("data/projects").join(&a).exists());
+        tauri::async_runtime::block_on(manager.stop(&b, None)).unwrap();
+
+        // A VM that starts blocks the move too.
+        manager.state.lock().unwrap().vms.insert(
+            b.clone(),
+            cage::manager::Vm::Starting {
+                cage: b.clone(),
+                members: vec![b.clone()],
+                phase: cage::progress::Phase::Prepare,
+            },
+        );
+        tauri::async_runtime::block_on(manager.try_migrate_vm_state());
+        assert!(manager.migrate_pending.load(Ordering::SeqCst));
+        assert!(legacy.join("codex/auth.json").is_file());
+        manager.state.lock().unwrap().vms.remove(&b);
+
+        tauri::async_runtime::block_on(manager.start(&a)).unwrap();
+        assert!(!manager.migrate_pending.load(Ordering::SeqCst));
+        assert!(!root.join("data/shields").exists());
+        let auth = root.join("data/projects").join(&a).join("codex/auth.json");
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), a);
+    }
+
+    /// The own VM key of session `a` is in `projects/`, and the reap of a
+    /// runtime home failed: `failed_home` is a legacy home, or `None` for
+    /// the home of this run. No guest-login removal, key release or project
+    /// delete changes a record or a file, and the error names the home.
+    fn a_moved_own_key_stays_while_a_home_is_not_reaped(failed_home: Option<&str>) {
+        let runtime = FakeRuntime::default();
+        let (root, [a, b]) = two();
+        let own = format!("{a}-2");
+        own_vm(&root, &a, &own);
+        // Session `a` moved to cage `b` and keeps its own VM of cage `a`.
+        let store = store::Store::new(root.join("data"));
+        let (mut sessions, cages) = store.load().unwrap();
+        sessions.iter_mut().for_each(|s| s.cage = Some(b.clone()));
+        store.save_sessions(&sessions).unwrap();
+        store.save_cages(&cages).unwrap();
+        for key in [&a, &own] {
+            let dir = root.join("data/projects").join(key);
+            std::fs::create_dir_all(dir.join("codex")).unwrap();
+            std::fs::write(dir.join("codex/auth.json"), key).unwrap();
+        }
+        let unreaped = match failed_home {
+            Some(home) => {
+                *runtime.home_reap_fail.lock().unwrap() = true;
+                vec![root.join(home)]
+            }
+            None => {
+                *runtime.reap_fail.lock().unwrap() = true;
+                Vec::new()
+            }
+        };
+        let manager = boot_at(&runtime, &root, unreaped);
+        assert!(!manager.last_run_reaped());
+        let before = snapshot(&root);
+        let home = failed_home.map_or("~/.zwinger/microsandbox".to_owned(), |h| root.join(h).display().to_string());
+        let refused = |r: error::Result<()>| match r {
+            Err(e @ error::Error::NotReaped { .. }) => {
+                let text = e.message();
+                assert!(text.contains(&home) && text.contains("Start a cage or restart zwinger"), "{text}");
+                true
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(manager.remove_guest_login(&own, agent::AgentKind::Codex)));
+        assert!(refused(tauri::async_runtime::block_on(manager.set_session_vm(&a, false, None))));
+        assert!(refused(tauri::async_runtime::block_on(manager.delete(&a))));
+        assert!(refused(tauri::async_runtime::block_on(manager.delete(&b))));
+        assert!(refused(manager.delete_cage(&a)));
+        assert_eq!(snapshot(&root), before);
+        assert_eq!(manager.list().sessions.len(), 2);
+        let session = manager.list().sessions.into_iter().find(|s| s.session.id == a).unwrap();
+        assert_eq!(session.session.vm, VmChoice::Own { key: own.clone(), cage: a.clone() });
+
+        // A start reaps the home again, and then the release runs.
+        *runtime.home_reap_fail.lock().unwrap() = false;
+        *runtime.reap_fail.lock().unwrap() = false;
+        tauri::async_runtime::block_on(manager.start(&b)).unwrap();
+        assert!(manager.last_run_reaped());
+        tauri::async_runtime::block_on(manager.stop(&b, None)).unwrap();
+        tauri::async_runtime::block_on(manager.set_session_vm(&a, false, None)).unwrap();
+        assert!(!root.join("data/projects").join(&own).exists());
+    }
+
+    #[test]
+    fn a_failed_legacy_home_reap_keeps_a_moved_own_key() {
+        for home in [".microsandbox", "data/microsandbox"] {
+            a_moved_own_key_stays_while_a_home_is_not_reaped(Some(home));
+        }
+    }
+
+    #[test]
+    fn a_failed_current_home_reap_keeps_a_moved_own_key() {
+        a_moved_own_key_stays_while_a_home_is_not_reaped(None);
+    }
+
+    #[test]
+    fn a_conflict_is_a_notice_and_keeps_the_key_pending() {
+        let runtime = FakeRuntime::default();
+        let (root, [a, b]) = two();
+        old_state(&root, &a);
+        old_state(&root, &b);
+        let target = root.join("data/projects").join(&a);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("new"), "new").unwrap();
+        let manager = boot_at(&runtime, &root, Vec::new());
+        let notices = manager.take_app_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let legacy = root.join("data/shields").join(&a);
+        assert!(notices[0].contains(&legacy.display().to_string()), "{notices:?}");
+        assert!(notices[0].contains(&target.display().to_string()), "{notices:?}");
+        assert!(legacy.join("codex/auth.json").is_file() && target.join("new").is_file());
+        let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+        assert!(not_moved(&e, &a), "{e}");
+        tauri::async_runtime::block_on(manager.start(&b)).unwrap();
+    }
+
+    /// Session `a` uses cage `b` and keeps its own VM `<a>-2` of cage `a`,
+    /// as after a cage change. Cage `a` has no session. All three keys wait
+    /// for the move, after a failed boot reap with no VM in the map, and
+    /// then because their new dirs have contents.
+    #[test]
+    fn a_key_whose_state_did_not_move_changes_no_record_and_no_file() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        *runtime.home_reap_fail.lock().unwrap() = true;
+        let (root, [a, b]) = two();
+        let own = format!("{a}-2");
+        let store = store::Store::new(root.join("data"));
+        let (mut sessions, cages) = store.load().unwrap();
+        for session in &mut sessions {
+            session.cage = Some(b.clone());
+            if session.id == a {
+                session.vm = VmChoice::Own { key: own.clone(), cage: a.clone() };
+            }
+        }
+        store.save_sessions(&sessions).unwrap();
+        store.save_cages(&cages).unwrap();
+        for key in [&a, &b, &own] {
+            old_state(&root, key);
+            let target = root.join("data/projects").join(key);
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("new"), "new").unwrap();
+        }
+        let manager = boot_at(&runtime, &root, vec![root.join("data/microsandbox")]);
+        let before = snapshot(&root);
+        assert!(matches!(manager.delete_cage(&a), Err(error::Error::NotReaped { .. })));
+        assert_eq!(snapshot(&root), before);
+        *runtime.reap_fail.lock().unwrap() = false;
+        *runtime.home_reap_fail.lock().unwrap() = false;
+
+        // `claim_start` with `renew_own_key`, and with a planned key.
+        assert!(not_moved(&tauri::async_runtime::block_on(manager.start(&a)).unwrap_err(), &own));
+        assert!(not_moved(&tauri::async_runtime::block_on(manager.start(&b)).unwrap_err(), &b));
+        assert!(not_moved(&manager.claim_start(&b).unwrap_err(), &b));
+        assert!(not_moved(&manager.remove_guest_login(&own, agent::AgentKind::Codex).unwrap_err(), &own));
+        assert!(not_moved(&tauri::async_runtime::block_on(manager.set_session_vm(&a, false, None)).unwrap_err(), &own));
+        let e = manager.delete_cage(&a).unwrap_err();
+        assert!(not_moved(&e, &a) || not_moved(&e, &own), "{e}");
+        assert!(not_moved(&tauri::async_runtime::block_on(manager.delete(&a)).unwrap_err(), &own));
+        {
+            let mut state = manager.state.lock().unwrap();
+            assert!(not_moved(&manager.wipe_vm(&mut state, &b).unwrap_err(), &b));
+            assert!(not_moved(&manager.remove_vm_dirs(&own).unwrap_err(), &own));
+            assert!(state.vms.is_empty());
+        }
+        assert_eq!(snapshot(&root), before);
+        assert_eq!(manager.list().sessions.len(), 2);
+        assert_eq!(manager.list().cages.len(), 2);
+
+        // A new own key skips a key with an old dir.
+        old_state(&root, &format!("{b}-2"));
+        tauri::async_runtime::block_on(manager.set_session_vm(&b, true, None)).unwrap();
+        let session = manager.list().sessions.into_iter().find(|s| s.session.id == b).unwrap();
+        assert_eq!(session.session.vm, VmChoice::Own { key: format!("{b}-3"), cage: b.clone() });
+        assert!(root.join("data/shields").join(format!("{b}-2")).join("codex/auth.json").is_file());
+    }
+
+    /// Stores session `a` with its own VM `<a>-2` of cage `a`.
+    fn own_vm(root: &Path, a: &str, key: &str) {
+        let store = store::Store::new(root.join("data"));
+        let (mut sessions, cages) = store.load().unwrap();
+        for session in &mut sessions {
+            if session.id == a {
+                session.vm = VmChoice::Own { key: key.to_owned(), cage: a.to_owned() };
+            }
+        }
+        store.save_sessions(&sessions).unwrap();
+        store.save_cages(&cages).unwrap();
+    }
+
+    /// The state moved in an earlier run, whose VMs may still run: the boot
+    /// reap of this run failed. No action deletes a state or hands a key out.
+    #[test]
+    fn a_moved_state_changes_nothing_while_the_last_run_is_not_reaped() {
+        let runtime = FakeRuntime::default();
+        *runtime.reap_fail.lock().unwrap() = true;
+        let (root, [a, b]) = two();
+        let own = format!("{a}-2");
+        own_vm(&root, &a, &own);
+        // Session `a` moved to cage `b` and keeps its own VM of cage `a`.
+        let store = store::Store::new(root.join("data"));
+        let (mut sessions, cages) = store.load().unwrap();
+        sessions.iter_mut().for_each(|s| s.cage = Some(b.clone()));
+        store.save_sessions(&sessions).unwrap();
+        store.save_cages(&cages).unwrap();
+        for key in [&a, &b, &own] {
+            let dir = root.join("data/projects").join(key);
+            std::fs::create_dir_all(dir.join("codex")).unwrap();
+            std::fs::write(dir.join("codex/auth.json"), key).unwrap();
+        }
+        let manager = boot_at(&runtime, &root, Vec::new());
+        let before = snapshot(&root);
+        let not_reaped = |r: error::Result<()>| matches!(r, Err(error::Error::NotReaped { .. }));
+        assert!(not_reaped(manager.remove_guest_login(&own, agent::AgentKind::Codex)));
+        assert!(not_reaped(manager.remove_guest_login(&b, agent::AgentKind::Codex)));
+        assert!(not_reaped(tauri::async_runtime::block_on(manager.set_session_vm(&a, false, None))));
+        assert!(not_reaped(tauri::async_runtime::block_on(manager.set_session_vm(&b, true, None))));
+        assert!(not_reaped(manager.delete_cage(&a)));
+        assert!(not_reaped(tauri::async_runtime::block_on(manager.delete(&a))));
+        // Session `b` uses the shared VM of cage `b`.
+        assert!(not_reaped(tauri::async_runtime::block_on(manager.delete(&b))));
+        assert_eq!(manager.list().sessions.len(), 2);
+        {
+            let mut state = manager.state.lock().unwrap();
+            assert!(not_reaped(manager.wipe_vm(&mut state, &own)));
+            assert!(not_reaped(manager.remove_vm_dirs(&b)));
+            assert!(not_reaped(manager.new_vm_key(&mut state, &b).map(drop)));
+        }
+        assert_eq!(snapshot(&root), before);
+
+        // After a reap succeeds, the actions run again.
+        *runtime.reap_fail.lock().unwrap() = false;
+        tauri::async_runtime::block_on(manager.start(&b)).unwrap();
+        tauri::async_runtime::block_on(manager.set_session_vm(&a, false, None)).unwrap();
+        assert!(!root.join("data/projects").join(&own).exists());
+    }
+
+    /// A link at `shields/`, `projects/` or `projects/<key>` is never used for
+    /// a fresh start, and nothing is made at its target.
+    #[test]
+    fn a_fresh_start_never_uses_a_linked_state_path() {
+        for linked in ["shields", "projects", "projects/<a>"] {
+            let runtime = FakeRuntime::default();
+            let (root, [a, b]) = two();
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let link = root.join("data").join(linked.replace("<a>", &a));
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let manager = boot_at(&runtime, &root, Vec::new());
+            let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+            assert!(matches!(e, error::Error::VmStatePath { .. }), "{linked}: {e}");
+            let b_start = tauri::async_runtime::block_on(manager.start(&b));
+            assert_eq!(b_start.is_ok(), linked == "projects/<a>", "{linked}: {b_start:?}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "{linked}");
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{linked}");
+        }
+    }
+
+    /// A root-wide lookup error ends the search for a new own VM key.
+    #[test]
+    fn a_linked_state_parent_fails_a_new_own_key_once() {
+        let runtime = FakeRuntime::default();
+        let (root, [a, _]) = two();
+        let manager = boot_at(&runtime, &root, Vec::new());
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("data/projects")).unwrap();
+        let e = tauri::async_runtime::block_on(manager.set_session_vm(&a, true, None)).unwrap_err();
+        assert!(matches!(e, error::Error::VmStatePath { .. }), "{e}");
+        let session = manager.list().sessions.into_iter().find(|s| s.session.id == a).unwrap();
+        assert_eq!(session.session.vm, VmChoice::Shared);
+    }
+
+    /// A stored VM key that is not one path component is refused.
+    #[test]
+    fn a_malformed_stored_vm_key_is_refused() {
+        for key in ["../escape", "a/b", ".."] {
+            let runtime = FakeRuntime::default();
+            let (root, [a, _]) = two();
+            own_vm(&root, &a, key);
+            let manager = boot_at(&runtime, &root, Vec::new());
+            let e = tauri::async_runtime::block_on(manager.start(&a)).unwrap_err();
+            assert!(matches!(e, error::Error::BadVmKey(_)), "{key}: {e}");
+            assert!(matches!(manager.remove_guest_login(key, agent::AgentKind::Codex), Err(error::Error::BadVmKey(_))));
+            assert!(!root.join("data/projects").exists() && !root.join("escape").exists(), "{key}");
+        }
+    }
+
+    /// The backup of the shields store stays or goes by the app version:
+    /// the store tests check that with explicit versions.
+    #[test]
+    fn a_direct_upgrade_from_the_shields_store_converts_it_and_moves_the_state() {
+        let runtime = FakeRuntime::default();
+        let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let old = serde_json::json!([{ "id": "a", "name": "proj", "folder": root.join("proj"), "mounts": [],
+            "network": { "allowAll": false, "domains": [] } }])
+        .to_string();
+        std::fs::write(root.join("data/shields.json"), &old).unwrap();
+        old_state(&root, "a");
+        let manager = boot_at(&runtime, &root, Vec::new());
+        assert_eq!(manager.list().cages[0].cage.id, "a");
+        assert_eq!(std::fs::read_to_string(root.join("data/projects.json")).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(root.join("data/projects/a/codex/auth.json")).unwrap(), "a");
+        assert!(!root.join("data/shields").exists());
     }
 
     #[test]

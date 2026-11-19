@@ -59,8 +59,10 @@ at start. Projects, preferences and agent runtimes stay in the app data folder
 (`~/Library/Application Support/com.driif.zwinger`).
 
 Earlier builds used `<app data>/microsandbox` or `~/.microsandbox`. At each start, zwinger stops and removes its own
-VMs (`zwinger-*`) in these homes. A failure there is logged and does not block the start. **Settings > Storage** shows
-the old homes with their size:
+VMs (`zwinger-*`) in these homes. A failure there does not block the start. A failure in either home defers the move
+of the agent state from `shields/` to `projects/`, because its zwinger VMs can still mount the old folders. Until the
+reap succeeds, deletes, resets and key releases of agent state also wait. Each cage start reaps the failed homes again.
+The move runs after they succeed, when no VM starts, runs or stops. **Settings > Storage** shows the old homes with their size:
 
 - `<app data>/microsandbox`: only zwinger used it. Remove deletes the folder.
 - `~/.microsandbox`: other microsandbox tools can use it. Remove deletes only zwinger's VMs and its image
@@ -69,6 +71,21 @@ the old homes with their size:
 If `MSB_PATH` is set (a developer runtime) and that pair does not work, the start fails with a message that names the
 path. zwinger does not replace a developer runtime. A damaged runtime in the runtime home is installed again during the
 same start.
+
+## Compatibility removals
+
+- `shields.json` backup ([#223](https://github.com/driif/zwinger/issues/223)). The removal is in
+  `src-tauri/src/store/mod.rs` and is tested.
+  - Now: 0.1.0 keeps `shields.json`. The gate `BACKUP_REMOVAL_FROM` is 0.4.0, and pre-release builds never remove it.
+  - Activation: a stable build with an app version at or after `BACKUP_REMOVAL_FROM` deletes a regular
+    `shields.json` after `sessions.json` and `cages.json` load, save and read back. A load or save error keeps it,
+    also a failed save of the cages without old Claude logins, and the next start tries again. A link, a folder or a
+    special file at that path stays, and the conversion refuses it with an error that names the path.
+  - The release window: the earliest gate is 0.4.0, after three published compatibility releases that keep the
+    backup. Before you publish the first release at or after the gate, the release owner verifies these three
+    releases. If they are not published, set `BACKUP_REMOVAL_FROM` to a later version.
+  - A direct upgrade from v0.1.0 to any version at or after the gate first converts `shields.json` to the current
+    stores. It deletes the backup only after a clean save. The code that reads `shields.json` stays.
 
 ## First start of an unsigned app
 
