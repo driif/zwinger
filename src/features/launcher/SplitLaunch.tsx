@@ -1,13 +1,14 @@
 import { Button, IconButton } from "@driif/motiv";
-import { Box, ChevronDown, Code, Copy, FolderOpen, History, Laptop, ShieldOff } from "lucide-react";
+import { Box, ChevronDown, Copy, FolderOpen, History, Laptop, ShieldOff } from "lucide-react";
 import { ReactNode, useRef, useState } from "react";
 import { AGENT_ICONS } from "../tasks/roomParts";
 import { ActionMenu, MenuAction } from "../../shared/ActionMenu";
 import type { LaunchAction } from "./actions";
+import { EditorIcon } from "./EditorIcon";
 import "./launcher.css";
 
 function icon(action: LaunchAction) {
-  if (action.type === "editor") return <Code size={14} />;
+  if (action.type === "editor") return <EditorIcon icon={action.editor.icon} />;
   if (action.type === "copyPath") return <Copy size={14} />;
   if (action.type === "reveal") return <FolderOpen size={14} />;
   const { kind } = action;

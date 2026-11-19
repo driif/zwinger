@@ -9,7 +9,7 @@ import {
   SegmentedControl,
   SpringCheckbox,
 } from "@driif/motiv";
-import { Bot, Code, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
+import { Bot, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -47,6 +47,7 @@ import { tildePath } from "../../shared/paths";
 import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
+import { EditorIcon } from "../launcher/EditorIcon";
 
 // React Flow and the run room are large and not on the first screen of every project.
 const ProjectMap = lazy(() => import("./ProjectMap").then((m) => ({ default: m.ProjectMap })));
@@ -432,7 +433,7 @@ export function ProjectPage({
             {editors && (
               <SplitLaunch
                 label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
-                icon={<Code size={14} />}
+                icon={<EditorIcon icon={defaultEditor?.editor.icon ?? null} />}
                 onClick={defaultEditor && onOpenDefaultEditor}
                 menuLabel="Editors"
                 menu={[

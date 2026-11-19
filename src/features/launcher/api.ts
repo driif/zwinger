@@ -7,6 +7,8 @@ export interface Editor {
   path: string;
   /** The launchers offer it. */
   enabled: boolean;
+  /** The app icon as a `data:image/png` URL. `null`: the generic icon shows. */
+  icon: string | null;
 }
 
 /** The detected editors in a fixed order, and the default, which is on. `null`: no editor is on. */

@@ -55,6 +55,35 @@ pub struct Editor {
     pub path: PathBuf,
 }
 
+/// The `Contents/Resources` file that the bundle's `Info.plist` names in
+/// `CFBundleIconFile`, also when that file is not there. `None` if the plist
+/// is unreadable, is no regular file in the bundle, or the name is not a plain
+/// file name. A bundle with only an asset catalog (`CFBundleIconName`) has none.
+pub fn declared_icon(bundle: &Path) -> Option<PathBuf> {
+    let root = bundle.canonicalize().ok()?;
+    let plist = root.join("Contents/Info.plist").canonicalize().ok()?;
+    if !plist.starts_with(&root) || !plist.is_file() {
+        return None;
+    }
+    let info = plist::Value::from_file(plist).ok()?;
+    let name = info.as_dictionary()?.get("CFBundleIconFile")?.as_string()?;
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return None;
+    }
+    let file = if Path::new(name).extension().is_some() { name.to_owned() } else { format!("{name}.icns") };
+    Some(bundle.join("Contents/Resources").join(file))
+}
+
+/// The [`declared_icon`] file, resolved. `None` if it is not a regular file in
+/// the bundle's `Contents/Resources`. A link that stays in that folder is valid.
+pub fn icon_source(bundle: &Path) -> Option<PathBuf> {
+    let declared = declared_icon(bundle)?;
+    let root = bundle.canonicalize().ok()?;
+    let resources = bundle.join("Contents/Resources").canonicalize().ok()?;
+    let path = declared.canonicalize().ok()?;
+    (resources.starts_with(&root) && path.starts_with(&resources) && path.is_file()).then_some(path)
+}
+
 /// The folders that hold the apps. No login shell and no `PATH`.
 pub fn app_dirs(home: &Path) -> [PathBuf; 3] {
     [PathBuf::from("/Applications"), home.join("Applications"), PathBuf::from("/Applications/Setapp")]
@@ -119,6 +148,8 @@ pub struct EditorView {
     #[serde(flatten)]
     pub editor: Editor,
     pub enabled: bool,
+    /// The app icon as a `data:image/png` URL. `None`: the UI shows a generic icon.
+    pub icon: Option<String>,
 }
 
 /// The detected editors and the default, as the launchers show them.
@@ -134,7 +165,10 @@ pub struct Editors {
 pub fn view(prefs: &EditorPrefs, detected: Vec<Editor>) -> Editors {
     let on: Vec<String> = enabled(prefs, &detected).into_iter().map(|e| e.id.clone()).collect();
     let default = default_of(prefs, &detected).map(|e| e.id.clone());
-    let editors = detected.into_iter().map(|editor| EditorView { enabled: on.contains(&editor.id), editor }).collect();
+    let editors = detected
+        .into_iter()
+        .map(|editor| EditorView { enabled: on.contains(&editor.id), editor, icon: None })
+        .collect();
     Editors { editors, default, names: KNOWN.iter().map(|k| (k.id, k.name)).collect() }
 }
 
@@ -216,6 +250,86 @@ mod tests {
         assert_eq!(id(&prefs(None, Some("nova")), &all).as_deref(), Some("zed"));
     }
 
+    /// A bundle in a new folder below `root` with `info` as its `Info.plist`, and its `Resources` folder.
+    fn make_bundle(root: &Path, info: &plist::Dictionary, binary: bool) -> (PathBuf, PathBuf) {
+        let bundle = root.join(uuid::Uuid::new_v4().to_string()).join("Editor.app");
+        let resources = bundle.join("Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let file = bundle.join("Contents/Info.plist");
+        let value = plist::Value::Dictionary(info.clone());
+        if binary { value.to_file_binary(file) } else { value.to_file_xml(file) }.unwrap();
+        (bundle, resources)
+    }
+
+    fn info(icon: &str) -> plist::Dictionary {
+        let mut info = plist::Dictionary::new();
+        info.insert("CFBundleIconFile".into(), icon.into());
+        info
+    }
+
+    #[test]
+    fn the_icon_source_is_the_named_file_in_resources() {
+        let root = temp();
+        for binary in [false, true] {
+            let (bundle, resources) = make_bundle(&root, &info("Code.icns"), binary);
+            std::fs::write(resources.join("Code.icns"), "icns").unwrap();
+            assert_eq!(icon_source(&bundle), Some(resources.join("Code.icns")), "binary {binary}");
+        }
+        // Xcode names its icon with no extension.
+        let (bundle, resources) = make_bundle(&root, &info("Xcode"), false);
+        std::fs::write(resources.join("Xcode.icns"), "icns").unwrap();
+        assert_eq!(icon_source(&bundle), Some(resources.join("Xcode.icns")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_bad_plist_name_or_file_gives_no_icon_source() {
+        let root = temp();
+        // A missing icon file, or a folder with the icon's name.
+        let (bundle, resources) = make_bundle(&root, &info("Gone.icns"), false);
+        assert_eq!(icon_source(&bundle), None);
+        std::fs::create_dir(resources.join("Gone.icns")).unwrap();
+        assert_eq!(icon_source(&bundle), None);
+        // Only an asset catalog.
+        let mut catalog = plist::Dictionary::new();
+        catalog.insert("CFBundleIconName".into(), "AppIcon".into());
+        assert_eq!(icon_source(&make_bundle(&root, &catalog, false).0), None);
+        // A malformed plist.
+        let (bundle, resources) = make_bundle(&root, &info("Code.icns"), false);
+        std::fs::write(resources.join("Code.icns"), "icns").unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), "<plist><dict><key>").unwrap();
+        assert_eq!(icon_source(&bundle), None);
+        // A name with a separator or `..`, also when the file is there, or a link out of Resources.
+        for name in ["../Info.plist", "..", "/etc/hosts", "sub/Code.icns", "Code..icns", ""] {
+            let (bundle, resources) = make_bundle(&root, &info(name), false);
+            std::fs::create_dir(resources.join("sub")).unwrap();
+            std::fs::write(resources.join("sub/Code.icns"), "icns").unwrap();
+            std::fs::write(resources.join("Code..icns"), "icns").unwrap();
+            assert_eq!(icon_source(&bundle), None, "{name}");
+        }
+        let (bundle, resources) = make_bundle(&root, &info("Link.icns"), false);
+        std::os::unix::fs::symlink(bundle.join("Contents/Info.plist"), resources.join("Link.icns")).unwrap();
+        assert_eq!(icon_source(&bundle), None);
+        // A link in Resources that stays there is valid.
+        std::fs::write(resources.join("Real.icns"), "icns").unwrap();
+        std::fs::remove_file(resources.join("Link.icns")).unwrap();
+        std::os::unix::fs::symlink("Real.icns", resources.join("Link.icns")).unwrap();
+        assert_eq!(icon_source(&bundle), Some(resources.join("Real.icns")));
+        // An Info.plist or Resources that links out of the bundle.
+        let (outside, _) = make_bundle(&root, &info("Code.icns"), false);
+        std::fs::write(outside.join("Contents/Resources/Code.icns"), "icns").unwrap();
+        let (bundle, resources) = make_bundle(&root, &info("Code.icns"), false);
+        std::fs::write(resources.join("Code.icns"), "icns").unwrap();
+        std::fs::remove_file(bundle.join("Contents/Info.plist")).unwrap();
+        std::os::unix::fs::symlink(outside.join("Contents/Info.plist"), bundle.join("Contents/Info.plist")).unwrap();
+        assert_eq!(declared_icon(&bundle), None);
+        let (bundle, resources) = make_bundle(&root, &info("Code.icns"), false);
+        std::fs::remove_dir(&resources).unwrap();
+        std::os::unix::fs::symlink(outside.join("Contents/Resources"), &resources).unwrap();
+        assert_eq!(icon_source(&bundle), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn unset_prefs_turn_all_on_and_an_empty_list_turns_all_off() {
         let all = [editor("vscode"), editor("zed")];
@@ -228,7 +342,7 @@ mod tests {
         let json = serde_json::to_value(&view.editors[0]).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "id": "vscode", "name": "vscode", "path": "/Applications/vscode.app", "enabled": true })
+            serde_json::json!({ "id": "vscode", "name": "vscode", "path": "/Applications/vscode.app", "enabled": true, "icon": null })
         );
         // A known editor that is not installed still has its name.
         assert_eq!(view.names.get("nova"), Some(&"Nova"));

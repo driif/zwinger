@@ -2,6 +2,7 @@ import { Button, Card, CardBody, CardHeader, LiquidSwitch, RadioGroup } from "@d
 import { RefreshCw } from "lucide-react";
 import { Prefs } from "./api";
 import { Editors } from "../launcher/api";
+import { EditorIcon } from "../launcher/EditorIcon";
 import type { Run } from "../../App";
 
 interface Props {
@@ -38,6 +39,7 @@ export function EditorsSettings({ editors, prefs, onPrefs, run, onDetect }: Prop
           <ul className="list">
             {editors?.editors.map((editor) => (
               <li key={editor.id} className="row">
+                <EditorIcon icon={editor.icon} />
                 <LiquidSwitch label={editor.name} checked={editor.enabled} onChange={(checked) => toggle(editor.id, checked)} />
                 <span className="grow muted mono">{editor.path}</span>
               </li>

@@ -5,6 +5,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::editor::{self, Editor, Editors};
+use crate::editor_icons::EditorIcons;
 use crate::error::{Error, Result};
 use crate::preferences::Preferences;
 
@@ -14,10 +15,16 @@ fn detected() -> Vec<Editor> {
     editor::detect(&editor::app_dirs(&dirs::home_dir().unwrap_or_default()))
 }
 
-/// Looks for the editors again. The check reads a few app folders only.
+/// Looks for the editors again. The check reads a few app folders, and converts an
+/// app icon only when it is new or changed.
 #[tauri::command]
-pub fn detect_editors(preferences: State<'_, Preferences>) -> Editors {
-    editor::view(&preferences.get().editors, detected())
+pub async fn detect_editors(preferences: State<'_, Preferences>, icons: State<'_, EditorIcons>) -> Result<Editors> {
+    let found = tokio::task::spawn_blocking(detected).await.map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let mut view = editor::view(&preferences.get().editors, found);
+    for editor in &mut view.editors {
+        editor.icon = icons.icon(&editor.editor.path).await;
+    }
+    Ok(view)
 }
 
 /// What Open in editor did, so the UI can say where it fell back.

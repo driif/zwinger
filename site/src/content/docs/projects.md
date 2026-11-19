@@ -161,6 +161,11 @@ that pane. The keys do not go to the shell, and the other panes do not change. T
 zwinger finds the editors on your Mac (Zed, VS Code, Cursor and others) in `/Applications`, `~/Applications` and
 `/Applications/Setapp`. Turn editors on and select a default in **Settings > Editors**.
 
+Each editor shows its app icon in the editor button, the editor menus and **Settings > Editors**. When zwinger cannot
+read the icon, a generic editor icon shows. This occurs when the app has no icon file, when the file is damaged, or when
+the app keeps its icon only in an asset catalog. When an app update changes its icon, **Detect again** or the next start
+shows the new icon.
+
 A project can use a different editor. Select it in the **Editor** field in the project's **Settings** tab. **App
 default** removes the project's editor, and the project then uses the app default. When the project's editor is off or
 not installed, the project uses the app default. The field then shows the editor as **(not available)**, so you can

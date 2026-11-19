@@ -23,9 +23,9 @@ const detection = (...kinds: AgentKind[]) => ({ agents: kinds.map((kind) => ({ k
 
 const editors: Editors = {
   editors: [
-    { id: "zed", name: "Zed", path: "/Applications/Zed.app", enabled: true },
-    { id: "cursor", name: "Cursor", path: "/Applications/Cursor.app", enabled: false },
-    { id: "vscode", name: "VS Code", path: "/Applications/Visual Studio Code.app", enabled: true },
+    { id: "zed", name: "Zed", path: "/Applications/Zed.app", enabled: true, icon: "data:image/png;base64,iVBORw0KGgo=" },
+    { id: "cursor", name: "Cursor", path: "/Applications/Cursor.app", enabled: false, icon: null },
+    { id: "vscode", name: "VS Code", path: "/Applications/Visual Studio Code.app", enabled: true, icon: null },
   ],
   default: "vscode",
   names: { zed: "Zed", cursor: "Cursor", vscode: "VS Code", nova: "Nova" },

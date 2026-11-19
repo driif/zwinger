@@ -4,6 +4,7 @@ mod bootstrap;
 mod cage;
 mod commands;
 mod editor;
+mod editor_icons;
 mod error;
 mod host_agents;
 mod instance;
@@ -296,6 +297,7 @@ pub fn run() {
             app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
             app.manage(commands::tasks::Watches::default());
+            app.manage(editor_icons::EditorIcons::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
