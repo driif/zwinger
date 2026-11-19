@@ -428,7 +428,8 @@ pub fn run() {
         RunEvent::Reopen { .. }
             if app.try_state::<InstanceLock>().is_some()
                 && app.state::<commands::window::WindowReveal>().is_revealed()
-                && let Some(window) = app.get_webview_window("main") => {
+                && let Some(window) = app.get_webview_window("main") =>
+        {
             let _ = window.show();
             let _ = window.set_focus();
         }
