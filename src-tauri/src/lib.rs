@@ -228,6 +228,7 @@ pub fn run() {
                 return Ok(());
             };
             app.manage(lock);
+            app.manage(commands::window::WindowReveal::default());
             report_panics(app.handle().clone());
             if let Err(e) = raise_open_files() {
                 eprintln!("the open file limit could not be raised: {e}");
@@ -298,6 +299,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::window::reveal_main_window,
             commands::sessions::list_sessions,
             commands::sessions::create_session,
             commands::sessions::delete_session,
@@ -422,6 +424,13 @@ pub fn run() {
                 manager.kill_host_sessions();
                 tauri::async_runtime::block_on(manager.stop_all(STOP_ALL_LIMIT));
             }
+        }
+        RunEvent::Reopen { .. }
+            if app.try_state::<InstanceLock>().is_some()
+                && app.state::<commands::window::WindowReveal>().is_revealed()
+                && let Some(window) = app.get_webview_window("main") => {
+            let _ = window.show();
+            let _ = window.set_focus();
         }
         _ => {}
     });

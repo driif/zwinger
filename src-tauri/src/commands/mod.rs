@@ -6,6 +6,7 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
+pub(crate) mod window;
 
 use tauri::State;
 

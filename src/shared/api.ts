@@ -5,6 +5,9 @@ import { isBackendError } from "./errorMessage.ts";
 /** The window event of a lost backend. The backend also emits it on a panic. */
 export const BACKEND_LOST = "backend-lost";
 
+export const revealMainWindow = (backgroundColor: string) =>
+  call<void>("reveal_main_window", { backgroundColor });
+
 let lostCalls = 0;
 
 /** Every command goes through here. Three rejections in a row that are not `{ code, message }` mean that the backend is gone. */

@@ -17,6 +17,7 @@ read-only. To make your own theme, click **Duplicate** on a theme, then edit it.
   keeps it.
 
 zwinger keeps each custom theme as one JSON file in the `themes` folder of its app data.
+New windows open directly in the last-used theme. If the saved theme cannot be read, the window opens in zwinger dark.
 
 ## Text size
 

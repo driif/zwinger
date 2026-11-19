@@ -13,6 +13,8 @@
     "windows": [
       {
         "title": "zwinger",
+        "visible": false,
+        "backgroundColor": "#28232f",
         "width": 1280,
         "height": 800,
         "minWidth": 960,
