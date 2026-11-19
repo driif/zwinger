@@ -630,20 +630,47 @@ mod tests {
         Some(TerminalFolder { path: guest.into(), vm: true, opens: opens.map(Path::to_owned) })
     }
 
+    /// Waits for the real login shell to print the line. If asked, waits for its clean exit too.
+    async fn print_history_line(manager: &Manager<FakeRuntime>, process: &str, line: &str, exit: bool) {
+        let (token, mut rx) = attach(manager, process);
+        let end = if exit { "exit\n" } else { "" };
+        manager.write(process, format!("printf '{line}\\n'\n{end}").into_bytes()).unwrap();
+
+        let expected = format!("{line}\r\n");
+        let mut seen = String::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    PtyEvent::Output(bytes) => {
+                        seen.push_str(&String::from_utf8_lossy(&bytes));
+                        manager.ack_session(process, token);
+                        if !exit && seen.contains(&expected) {
+                            return;
+                        }
+                    }
+                    PtyEvent::Exit(code) => {
+                        assert!(
+                            exit && code == 0 && seen.contains(&expected),
+                            "shell exited ({code}) waiting for {line}"
+                        );
+                        return;
+                    }
+                }
+            }
+            panic!("shell stream closed waiting for {line}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("shell timed out waiting for {line}"));
+        manager.detach_session(process, token);
+    }
+
     #[tokio::test]
     async fn host_history_survives_quit_restart_and_reopen_without_duplication() {
         host_sh();
         let (manager, _, id) = manager();
         let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminal = terminal_ids(&manager)[0].clone();
-        let (_, mut rx) = attach(&manager, &process);
-        manager.write(&process, b"printf 'first-history-line\\n'\n".to_vec()).unwrap();
-        let mut seen = String::new();
-        while !seen.contains("first-history-line\r\n") {
-            if let PtyEvent::Output(bytes) = next(&mut rx).await {
-                seen.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
+        print_history_line(&manager, &process, "first-history-line", false).await;
         manager.kill_host_sessions();
         let first = manager.terminal_history(&id, &terminal).unwrap();
         assert!(String::from_utf8_lossy(&first[0]).contains("first-history-line"));
@@ -660,14 +687,7 @@ mod tests {
         .unwrap();
         assert_eq!(reloaded.terminal_history(&id, &terminal), Some(first.clone()));
         let process = reloaded.reopen_terminal(&id, &terminal, 24, 80).await.unwrap();
-        let (_, mut rx) = attach(&reloaded, &process);
-        reloaded.write(&process, b"printf 'second-history-line\\n'\n".to_vec()).unwrap();
-        let mut seen = String::new();
-        while !seen.contains("second-history-line\r\n") {
-            if let PtyEvent::Output(bytes) = next(&mut rx).await {
-                seen.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
+        print_history_line(&reloaded, &process, "second-history-line", false).await;
         reloaded.kill_host_sessions();
         let second = reloaded.terminal_history(&id, &terminal).unwrap();
         assert_eq!(second.len(), 2);
@@ -683,14 +703,7 @@ mod tests {
         let second = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminals = terminal_ids(&manager);
         for (process, line) in [(&first, "alpha-only"), (&second, "bravo-only")] {
-            let (_, mut rx) = attach(&manager, process);
-            manager.write(process, format!("printf '{line}\\n'\n").into_bytes()).unwrap();
-            let mut seen = String::new();
-            while !seen.contains(&format!("{line}\r\n")) {
-                if let PtyEvent::Output(bytes) = next(&mut rx).await {
-                    seen.push_str(&String::from_utf8_lossy(&bytes));
-                }
-            }
+            print_history_line(&manager, process, line, false).await;
         }
         manager.kill_host_sessions();
         let reloaded = Manager::new(
@@ -713,9 +726,7 @@ mod tests {
         let (manager, _, id) = manager();
         let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminal = terminal_ids(&manager)[0].clone();
-        let (_, mut rx) = attach(&manager, &process);
-        manager.write(&process, b"printf 'exited-history\\n'\nexit\n".to_vec()).unwrap();
-        while !matches!(next(&mut rx).await, PtyEvent::Exit(_)) {}
+        print_history_line(&manager, &process, "exited-history", true).await;
         manager.kill_host_sessions();
         assert!(
             String::from_utf8_lossy(&manager.terminal_history(&id, &terminal).unwrap()[0]).contains("exited-history")
@@ -823,14 +834,7 @@ mod tests {
         for gone in ["terminal", "project"] {
             let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
             let terminal = terminal_ids(&manager).last().unwrap().clone();
-            let (_, mut rx) = attach(&manager, &process);
-            manager.write(&process, b"printf 'orphan-line\\n'\n".to_vec()).unwrap();
-            let mut seen = String::new();
-            while !seen.contains("orphan-line\r\n") {
-                if let PtyEvent::Output(bytes) = next(&mut rx).await {
-                    seen.push_str(&String::from_utf8_lossy(&bytes));
-                }
-            }
+            print_history_line(&manager, &process, "orphan-line", false).await;
             // A Close or Delete removed the record, and its process is not retired yet.
             let saved = {
                 let mut state = lock(&manager.state);
