@@ -242,6 +242,8 @@ mod tests {
         assert!(sessions.iter().all(|s| s.editor.is_none()));
         // A session saved before map viewports fits its map.
         assert!(sessions.iter().all(|s| s.viewport.is_none()));
+        // A session saved before project accents uses the theme color.
+        assert!(sessions.iter().all(|s| s.accent.is_none()));
 
         store.save_cages(&[]).unwrap();
         assert!(matches!(store.load(), Err(Error::MissingCage { cage, .. }) if cage == "c"));
@@ -300,6 +302,7 @@ mod tests {
             vm: VmChoice::Shared,
             harness: Some("/workspace/agent".into()),
             editor: None,
+            accent: None,
             terminals: vec![
                 TerminalRecord {
                     id: "term-1".into(),
@@ -448,6 +451,7 @@ mod tests {
         let (session, cage) = (&sessions[0], &cages[0]);
         assert_eq!(session.harness, None);
         assert_eq!(session.editor, None);
+        assert_eq!(session.accent, None);
         assert!(session.layout.is_empty() && session.tasks.is_empty() && session.terminals.is_empty());
         assert_eq!(session.pane_layout, None);
         assert_eq!(session.viewport, None);

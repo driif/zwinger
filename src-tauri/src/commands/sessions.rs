@@ -80,6 +80,12 @@ pub fn set_project_editor(manager: Managed<'_>, session_id: String, editor: Opti
     manager.set_editor(&session_id, editor.as_deref())
 }
 
+/// `None` lets the project follow the theme color.
+#[tauri::command]
+pub fn set_project_accent(manager: Managed<'_>, session_id: String, accent: Option<String>) -> Result<()> {
+    manager.set_accent(&session_id, accent.as_deref())
+}
+
 #[tauri::command]
 pub fn list_folders(manager: Managed<'_>, session_id: String) -> Result<Vec<String>> {
     manager.list_folders(&session_id)

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import type { Prefs } from "../settings/api.ts";
 import { listThemes, type Theme, type ThemeList } from "./api.ts";
 
@@ -85,6 +85,10 @@ const DARK = "(prefers-color-scheme: dark)";
 /** The theme on the window now. */
 let active = BUILT_INS[0];
 
+const themeListeners = new Set<() => void>();
+/** The primary color of the theme on the window, `#rrggbb`. `undefined` until it is read after a theme change. */
+let themeColor: string | undefined;
+
 /** Sets the base as `data-theme` and the tokens as inline properties of `<html>`, in place of the earlier ones. */
 export function applyTheme(theme: Theme) {
   const { style, dataset } = document.documentElement;
@@ -92,7 +96,49 @@ export function applyTheme(theme: Theme) {
   dataset.theme = theme.base;
   for (const [name, value] of Object.entries(theme.tokens)) style.setProperty(name, value);
   active = theme;
+  themeColor = undefined;
+  for (const listener of themeListeners) listener();
 }
+
+const hex = (bytes: number[]) => "#" + bytes.map((n) => n.toString(16).padStart(2, "0")).join("");
+
+/** `rgb(…)`, `rgba(…)` or `color(srgb …)` as an opaque `#rrggbb`. Other color spaces give `undefined`. */
+function srgbHex(color: string) {
+  const srgb = color.startsWith("color(srgb ");
+  if (!srgb && !color.startsWith("rgb")) return;
+  const numbers = color.slice(srgb ? 11 : 0).match(/[\d.]+(e-?\d+)?/g)?.map(Number);
+  if (!numbers || numbers.length < 3) return;
+  return hex(numbers.slice(0, 3).map((n) => Math.round(Math.min(255, Math.max(0, srgb ? n * 255 : n)))));
+}
+
+/** CSS resolves the token, also a `var()`, short hex, `oklch(…)` or `color(display-p3 …)`. A 1×1 sRGB canvas pixel converts it. */
+function readThemeColor() {
+  const probe = document.createElement("span");
+  probe.hidden = true;
+  probe.style.color = "var(--motiv-color-primary)";
+  document.body.append(probe);
+  const computed = getComputedStyle(probe).color;
+  probe.remove();
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const context = canvas.getContext("2d", { colorSpace: "srgb", willReadFrequently: true });
+  if (context) {
+    context.fillStyle = computed;
+    context.fillRect(0, 0, 1, 1);
+    const [r, g, b, alpha] = context.getImageData(0, 0, 1, 1).data;
+    // A transparent pixel has no color, so the computed components are used.
+    if (alpha > 0) return hex([r, g, b]);
+  }
+  return srgbHex(computed) ?? computed;
+}
+
+const subscribeTheme = (listener: () => void) => {
+  themeListeners.add(listener);
+  return () => themeListeners.delete(listener);
+};
+
+/** The primary color of the theme on the window, as `#rrggbb`. It changes after each theme change. */
+export const useThemeColor = () => useSyncExternalStore(subscribeTheme, () => (themeColor ??= readThemeColor()));
 
 /** Before the first render: the theme of the last run, so the window does not flash. A bad cache gives the default. */
 export function applyCachedTheme() {

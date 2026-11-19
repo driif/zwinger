@@ -317,6 +317,7 @@ pub fn run() {
             commands::sessions::resolve_folder,
             commands::sessions::set_harness,
             commands::sessions::set_project_editor,
+            commands::sessions::set_project_accent,
             commands::sessions::list_folders,
             commands::cages::add_mount,
             commands::cages::remove_mount,

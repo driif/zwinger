@@ -198,6 +198,8 @@ pub enum Error {
     EditorFailed(String, String),
     #[error("unknown editor: {0}")]
     UnknownEditor(String),
+    #[error("accent color must be #rrggbb: {0}")]
+    InvalidAccent(String),
     #[error("invalid theme: {0}")]
     InvalidTheme(String),
     #[error("update: {0}")]

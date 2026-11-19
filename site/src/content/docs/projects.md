@@ -17,6 +17,20 @@ first.
 A new project in a workspace with a default cage uses that cage. In a workspace with no default cage, it gets a new
 cage with the name of the project.
 
+## Accent color
+
+Each project has a color mark: a stripe at the left edge of its row in the sidebar, and a bar before its name at the
+top of the project page. By default the mark uses the primary color of the theme, and it changes when you change the
+theme.
+
+To give a project its own color, open the project's **Settings** tab. In **Accent color**, click the swatch and select a
+color. zwinger saves the color when you close the color picker. You can also type the color in the **Hex** field as
+`#rrggbb` and press Enter or move to a different field. **Use theme color** removes the project's color. Each project
+has its own color, also when two projects share a cage. A color change does not restart the VM.
+
+If zwinger cannot save the color, a notice shows the project name and the error, also on a different page. The project
+keeps its saved color, and you can try again.
+
 ## Workspaces
 
 The rail shows your projects in **workspaces**. In the rail, a project is a **session**. Each session is in one

@@ -81,6 +81,7 @@ impl Project {
             vm: VmChoice::Shared,
             harness: self.harness,
             editor: None,
+            accent: None,
             terminals: self.terminals,
             pane_layout: self.pane_layout,
             tasks: self.tasks,

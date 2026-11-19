@@ -8,6 +8,26 @@ export const setHarness = (sessionId: string, harness: string | null) =>
 export const setProjectEditor = (sessionId: string, editor: string | null) =>
   call<void>("set_project_editor", { sessionId, editor });
 
+/** The last pending accent write of each project. */
+const accentWrites = new Map<string, Promise<void>>();
+
+/**
+ * The writes of one project run one after the other in call order, so a later choice lands last. Other projects do not
+ * wait. `null`: the theme color.
+ */
+export const setProjectAccent = (sessionId: string, accent: string | null) => {
+  const write = (accentWrites.get(sessionId) ?? Promise.resolve()).then(() =>
+    call<void>("set_project_accent", { sessionId, accent }),
+  );
+  const last: Promise<void> = write
+    .catch(() => {})
+    .then(() => {
+      if (accentWrites.get(sessionId) === last) accentWrites.delete(sessionId);
+    });
+  accentWrites.set(sessionId, last);
+  return write;
+};
+
 export const listFolders = (sessionId: string) =>
   call<string[]>("list_folders", { sessionId });
 

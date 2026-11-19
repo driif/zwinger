@@ -1,10 +1,11 @@
-import { Button, Card, CardBody, CardHeader, FloatingField, RadioGroup, Select } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, FloatingField, RadioGroup, Select, TextField } from "@driif/motiv";
 import { Trash2 } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { setHarness } from "./api";
+import { setHarness, setProjectAccent } from "./api";
 import { deleteSession, renameSession, setSessionCage } from "../projects/api";
 import { CageView, SessionView } from "../../shared/api";
 import type { Editors } from "../launcher/api";
+import { useThemeColor } from "../appearance/themes";
 import type { Intent, Run, Runtimes } from "../../App";
 import { errorMessage } from "../../shared/errorMessage";
 import { CageSettings, StartDiagnostics, WORKSPACE } from "../cages/CageSettings";
@@ -26,6 +27,8 @@ interface Props {
   onIntentDone: () => void;
 }
 
+const HEX = /^#[0-9a-f]{6}$/i;
+
 export function SettingsTab({ session, onProjectEditor, cages, defaultCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
   const { cage, vmCage } = sessionCage(session, cages);
   // By key, not by `vmCage`: that is null for a planned VM, and for a shared VM that runs for other projects.
@@ -35,6 +38,13 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
   const [confirmDelete, setConfirmDelete] = useState(false);
   const nameField = useRef<HTMLInputElement>(null);
   const harnessGroup = useRef<HTMLFieldSetElement>(null);
+  /** The picker value before it is stored. `undefined`: the field shows the stored accent. `null`: the theme color. */
+  const [accentDraft, setAccentDraft] = useState<string | null>();
+  /** The text in the Hex field. `undefined`: not edited, the field shows the accent. */
+  const [hexDraft, setHexDraft] = useState<string>();
+  /** The number of the last accent save. Only that save can reset the draft. */
+  const accentSaves = useRef(0);
+  const accentField = useRef<HTMLInputElement>(null);
 
   const harnessOptions = [...folders.map((f) => `${WORKSPACE}/${f}`), ...(cage?.mounts ?? []).map((m) => m.guest)];
   if (session.harness && !harnessOptions.includes(session.harness)) harnessOptions.push(session.harness);
@@ -46,6 +56,44 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
     session.editor && !enabledEditors.some((e) => e.id === session.editor)
       ? (editors?.names[session.editor] ?? session.editor)
       : undefined;
+
+  const accent = accentDraft === undefined ? session.accent : accentDraft;
+  const themeColor = useThemeColor();
+  const shownAccent = accent ?? themeColor;
+  const hexInvalid = hexDraft !== undefined && !HEX.test(hexDraft);
+
+  // The app shows the error with the project name, also after this tab closes. Its refresh shows the stored accent.
+  const saveAccent = (next: string | null) => {
+    const save = ++accentSaves.current;
+    setAccentDraft(next);
+    setHexDraft(undefined);
+    run(() =>
+      setProjectAccent(session.id, next).catch((e) => {
+        // A later save keeps its draft. Else the field goes back to the stored accent.
+        if (save === accentSaves.current) setAccentDraft(undefined);
+        throw new Error(`${session.name}: the accent color was not saved. ${errorMessage(e)}`);
+      }),
+    );
+  };
+
+  // A Hex field that the user did not edit does not save, so the theme color does not become the project's accent.
+  const saveHex = () => {
+    if (hexDraft !== undefined && !hexInvalid) saveAccent(hexDraft.toLowerCase());
+  };
+
+  // The draft stays until the session list has the stored value, so the field does not jump back.
+  useEffect(() => {
+    if (session.accent === accentDraft) setAccentDraft(undefined);
+  }, [session.accent]);
+
+  // The input event changes the draft only. The native change event comes when the picker commits, and saves.
+  useEffect(() => {
+    const field = accentField.current;
+    if (!field) return;
+    const commit = () => saveAccent(field.value);
+    field.addEventListener("change", commit);
+    return () => field.removeEventListener("change", commit);
+  });
 
   // A blank name reverts to the folder name, as in the backend.
   const nextName = name.trim() || (session.folder.split("/").filter(Boolean).pop() ?? session.folder);
@@ -113,6 +161,35 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
             onChange={(id) => run(() => setSessionCage(session.id, id || null))}
           />
           {!cage && <p className="muted">With no cage, the project opens Mac shells only.</p>}
+          <div className="row">
+            <TextField
+              ref={accentField}
+              type="color"
+              label="Accent color"
+              value={shownAccent}
+              hint={accent === null ? "Uses the theme color." : undefined}
+              onChange={(e) => {
+                setAccentDraft(e.target.value);
+                setHexDraft(undefined);
+              }}
+            />
+            <TextField
+              label="Hex"
+              value={hexDraft ?? shownAccent}
+              maxLength={7}
+              spellCheck={false}
+              hint={hexInvalid ? "Enter a color as #rrggbb." : undefined}
+              aria-invalid={hexInvalid}
+              onChange={(e) => setHexDraft(e.target.value)}
+              onBlur={saveHex}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveHex();
+              }}
+            />
+            <Button variant="outline" disabled={accent === null} onClick={() => saveAccent(null)}>
+              Use theme color
+            </Button>
+          </div>
           {editors && (
             <Select
               label="Editor"

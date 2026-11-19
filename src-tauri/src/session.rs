@@ -46,6 +46,9 @@ pub struct Session {
     /// The id of the editor that opens the session. `None`: the app default.
     #[serde(default)]
     pub editor: Option<String>,
+    /// The project's mark color, `#rrggbb` in lowercase. `None`: the theme color.
+    #[serde(default)]
+    pub accent: Option<String>,
     /// In tree order. A terminal with no live process is dormant: it opens
     /// again under the same id.
     #[serde(default)]
@@ -214,6 +217,7 @@ impl Session {
             vm: VmChoice::Shared,
             harness: None,
             editor: None,
+            accent: None,
             terminals: Vec::new(),
             pane_layout: None,
             tasks: Vec::new(),
@@ -300,6 +304,18 @@ impl Session {
             return Err(Error::UnknownEditor(id.to_owned()));
         }
         self.editor = editor.map(str::to_owned);
+        Ok(())
+    }
+
+    /// Accepts only `#rrggbb` and stores it in lowercase. `None` clears it.
+    pub fn set_accent(&mut self, accent: Option<&str>) -> Result<()> {
+        if let Some(color) = accent {
+            let hex = color.strip_prefix('#').filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+            if hex.is_none() {
+                return Err(Error::InvalidAccent(color.to_owned()));
+            }
+        }
+        self.accent = accent.map(str::to_ascii_lowercase);
         Ok(())
     }
 
@@ -427,6 +443,26 @@ mod tests {
         assert_eq!(session.layout.keys().collect::<Vec<_>>(), ["harness"]);
         session.set_layout(None);
         assert!(session.layout.is_empty());
+    }
+
+    #[test]
+    fn set_accent_takes_only_rrggbb_and_keeps_the_old_value_on_error() {
+        let dir = std::env::temp_dir().join(format!("zwinger-accent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::new(dir.to_str().unwrap(), None, []).unwrap();
+        assert_eq!(session.accent, None);
+        session.set_accent(Some("#A1B2C3")).unwrap();
+        assert_eq!(session.accent.as_deref(), Some("#a1b2c3"));
+        session.set_accent(Some("#00ff7f")).unwrap();
+        assert_eq!(session.accent.as_deref(), Some("#00ff7f"));
+        for bad in
+            ["", "#", "00ff7f", "#0f7", "#00ff7", "#00ff7f0", "#00gg7f", "red", " #00ff7f", "#00ff7f ", "#ää0000"]
+        {
+            assert!(matches!(session.set_accent(Some(bad)), Err(Error::InvalidAccent(_))), "{bad:?}");
+            assert_eq!(session.accent.as_deref(), Some("#00ff7f"));
+        }
+        session.set_accent(None).unwrap();
+        assert_eq!(session.accent, None);
     }
 
     #[test]

@@ -219,6 +219,8 @@ export interface SessionView {
   harness: string | null;
   /** The id of the editor that opens the project. `null`: the app default. */
   editor: string | null;
+  /** The project's mark color, `#rrggbb`. `null`: the theme color. */
+  accent: string | null;
   /** In tree order. */
   terminals: TerminalRecord[];
   /** `null`: no pane is open. */

@@ -10,7 +10,7 @@ import {
   SpringCheckbox,
 } from "@driif/motiv";
 import { Bot, Code, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
+import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
   Detection,
@@ -394,9 +394,9 @@ export function ProjectPage({
     <section className="page" hidden={covered}>
       {!covered && (
         <>
-          <header className="page-header row">
+          <header className="page-header row" style={{ "--zw-project-accent": session.accent ?? undefined } as CSSProperties}>
             <div className="grow">
-              <h1 className="page-title">{session.name}</h1>
+              <h1 className="page-title project-title">{session.name}</h1>
               <p className="muted row">
                 <span className={`dot ${status.state}`} />
                 {!cage && !vmCage ? (

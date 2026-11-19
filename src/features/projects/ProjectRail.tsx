@@ -175,6 +175,8 @@ interface RowProps {
   selected: boolean;
   tabStop: boolean;
   className?: string;
+  /** The project's accent, as `--zw-project-accent`. */
+  accent?: string | null;
   sessionDrop?: string;
   /** The workspace that a folder dropped from Finder on this row goes to. */
   workspaceDrop?: string;
@@ -191,7 +193,7 @@ interface RowProps {
 
 /** A treeitem. A sortable one is dragged by its own row only, so a drag in a child list does not move the parent. */
 function TreeRow(props: RowProps) {
-  const { id, level, drag, expanded, selected, tabStop, className, sessionDrop, workspaceDrop, drop, row, onOpen, onMenu, onRename, children } =
+  const { id, level, drag, expanded, selected, tabStop, className, accent, sessionDrop, workspaceDrop, drop, row, onOpen, onMenu, onRename, children } =
     props;
   const sortable = useSortable({ id, data: drag, disabled: !drag });
   const droppable = useDroppable({ id: `d|${id}`, data: drop, disabled: !drop });
@@ -208,7 +210,13 @@ function TreeRow(props: RowProps) {
       data-session-drop={sessionDrop}
       data-workspace-drop={workspaceDrop}
       className={`tree-item ${className ?? ""} ${sortable.isDragging ? "dragging" : ""} ${droppable.isOver ? "drop-target" : ""}`}
-      style={{ transform: CSS.Translate.toString(sortable.transform), transition: sortable.transition }}
+      style={
+        {
+          transform: CSS.Translate.toString(sortable.transform),
+          transition: sortable.transition,
+          "--zw-project-accent": accent ?? undefined,
+        } as CSSProperties
+      }
       onKeyDown={(event) => event.target === event.currentTarget && sortable.listeners?.onKeyDown?.(event)}
     >
       <div
@@ -1024,6 +1032,7 @@ export function ProjectRail({
                               selected={selectedRow === sessionRow}
                               tabStop={tabStop === sessionRow}
                               className={`tree-project ${session.id === selectedId ? "current" : ""} ${forbidden === session.id ? "forbidden-target" : ""}`}
+                              accent={session.accent}
                               sessionDrop={session.id}
                               workspaceDrop={workspace.id}
                               onOpen={() => onOpen(session.id, { kind: "terminal" })}

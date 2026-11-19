@@ -237,6 +237,19 @@ p {
   font-size: var(--motiv-font-size-lg);
 }
 
+/* The project mark before the title. */
+.project-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 0.9em;
+  margin-right: var(--motiv-space);
+  vertical-align: -0.05em;
+  border-radius: 2px;
+  background: var(--zw-project-accent, var(--motiv-color-primary));
+  box-shadow: 0 0 0 1px var(--motiv-color-border);
+}
+
 /* Layout only: the tab panels fill the page and scroll on their own. */
 .tabs {
   flex: 1;

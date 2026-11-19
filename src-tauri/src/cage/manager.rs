@@ -1035,6 +1035,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.edit_session(session_id, |s, _| s.set_editor(editor))
     }
 
+    pub fn set_accent(&self, session_id: &str, accent: Option<&str>) -> Result<()> {
+        self.edit_session(session_id, |s, _| s.set_accent(accent))
+    }
+
     /// The editor override of the session.
     pub fn session_editor(&self, session_id: &str) -> Result<Option<String>> {
         Ok(lock(&self.state).session(session_id)?.editor.clone())
@@ -1276,7 +1280,7 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
     })
 }
 
-/// A new name, layout, viewport, task, terminal list, editor, unprompted setting or
+/// A new name, layout, viewport, task, terminal list, editor, accent, unprompted setting or
 /// network rule is used at once, so it needs no restart. A change of the session's
 /// cage or VM choice is not checked here.
 fn session_changed(old: &Session, session: &Session) -> bool {
@@ -1288,6 +1292,7 @@ fn session_changed(old: &Session, session: &Session) -> bool {
         terminals: session.terminals.clone(),
         pane_layout: session.pane_layout.clone(),
         editor: session.editor.clone(),
+        accent: session.accent.clone(),
         cage: session.cage.clone(),
         vm: session.vm.clone(),
         ..old.clone()
@@ -1527,6 +1532,65 @@ mod tests {
         let list = manager.list();
         assert!(!list.cages[0].shared().pending_restart);
         assert_eq!(list.sessions[0].session.layout.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_project_accent_is_set_changed_cleared_and_kept_without_a_restart() {
+        let (manager, _, a) = manager();
+        manager.start(&a).await.unwrap();
+        let session = |m: &Manager<FakeRuntime>, id: &str| {
+            m.list().sessions.into_iter().find(|s| s.session.id == id).unwrap().session
+        };
+        assert_eq!(session(&manager, &a).accent, None);
+        manager.set_accent(&a, Some("#FF8800")).unwrap();
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        assert_eq!(session(&manager, &a).accent.as_deref(), Some("#ff8800"));
+        manager.set_accent(&a, Some("#123abc")).unwrap();
+
+        // An invalid accent changes nothing, in memory or on disk.
+        let before = session(&manager, &a);
+        assert!(matches!(manager.set_accent(&a, Some("blue")), Err(Error::InvalidAccent(_))));
+        assert_eq!(session(&manager, &a), before);
+        assert!(matches!(manager.set_accent("gone", None), Err(Error::SessionNotFound)));
+
+        // An accent edit keeps the other fields; other edits keep the accent.
+        let view = Viewport { x: 1.0, y: 2.0, zoom: 1.5 };
+        manager.rename(&a, "renamed").unwrap();
+        manager.set_viewport(&a, Some(view)).unwrap();
+        manager.set_layout(&a, Some([("harness".to_owned(), Pos { x: 3.0, y: 4.0 })].into())).unwrap();
+        let edited = session(&manager, &a);
+        assert_eq!(
+            (edited.name.as_str(), edited.viewport, edited.accent.as_deref()),
+            ("renamed", Some(view), Some("#123abc"))
+        );
+        manager.set_accent(&a, Some("#abcdef")).unwrap();
+        assert_eq!(session(&manager, &a), crate::session::Session { accent: Some("#abcdef".into()), ..edited });
+        assert!(!manager.list().cages[0].shared().pending_restart);
+
+        // A second project of the same cage has its own accent.
+        let cage = session(&manager, &a).cage;
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.set_session_cage(&b, cage.as_deref()).unwrap();
+        manager.set_accent(&b, Some("#000000")).unwrap();
+
+        let reload = || {
+            Manager::new(
+                FakeRuntime::default(),
+                Store::new(manager.store.dir().to_owned()),
+                vault(),
+                temp_dir(),
+                host(),
+            )
+            .unwrap()
+        };
+        let reloaded = reload();
+        assert_eq!(session(&reloaded, &a).accent.as_deref(), Some("#abcdef"));
+        assert_eq!(session(&reloaded, &b).accent.as_deref(), Some("#000000"));
+        assert_eq!(session(&reloaded, &b).cage, cage);
+        reloaded.set_accent(&a, None).unwrap();
+        let reloaded = reload();
+        assert_eq!(session(&reloaded, &a).accent, None);
+        assert_eq!(session(&reloaded, &b).accent.as_deref(), Some("#000000"));
     }
 
     #[tokio::test]

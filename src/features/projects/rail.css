@@ -146,6 +146,23 @@
   background: var(--motiv-color-primary-subtle);
 }
 
+/* The project mark: an inset stripe on the left edge. It takes no space in the row. */
+.tree-project > .tree-row {
+  position: relative;
+}
+
+.tree-project > .tree-row::before {
+  content: "";
+  position: absolute;
+  inset-block: 5px;
+  left: 1px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--zw-project-accent, var(--motiv-color-primary));
+  box-shadow: 0 0 0 1px var(--motiv-color-border);
+  pointer-events: none;
+}
+
 .tree-name {
   display: flex;
   flex-direction: column;
