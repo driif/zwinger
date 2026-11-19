@@ -210,3 +210,11 @@
     display: inline-grid;
   }
 }
+
+.terminal-link-notice {
+  position: absolute;
+  bottom: var(--motiv-space);
+  right: calc(var(--motiv-space) * 4);
+  z-index: 1;
+  max-width: calc(100% - var(--motiv-space) * 5);
+}

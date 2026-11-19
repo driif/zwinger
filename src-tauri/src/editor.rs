@@ -1,6 +1,7 @@
 //! Editors: the IDEs on this Mac that open a host folder.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -177,19 +178,123 @@ pub fn view(prefs: &EditorPrefs, detected: Vec<Editor>) -> Editors {
 /// a path that is gone on the host, or a path whose `..` or link leads out
 /// of its host folder.
 pub fn map_guest(guest: &str, members: Members<'_>) -> Option<PathBuf> {
+    map_guest_path(guest, members).filter(|path| path.is_dir())
+}
+
+/// The host path of a guest path below the guest folder of a member or a
+/// mount of the VM, of any type. `None` for any other path, a path that is
+/// gone on the host, or a path whose `..` or link leads out of its host folder.
+pub fn map_guest_path(guest: &str, members: Members<'_>) -> Option<PathBuf> {
+    let (base, _, rest) = guest_share(guest, members)?;
+    let path = base.join(rest.trim_start_matches('/')).canonicalize().ok()?;
+    path.starts_with(&base).then_some(path)
+}
+
+/// The guest folder `guest` with each link resolved, as the shell sees it
+/// after `cd -P`. A link resolves only when it stays in its member folder or
+/// mount. `None` when no member or mount has `guest`, or a link leads out.
+pub fn physical_guest_dir(guest: &str, members: Members<'_>) -> Option<String> {
+    let (base, root, rest) = guest_share(guest, members)?;
+    let dir = base.join(rest.trim_start_matches('/')).canonicalize().ok()?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let below = dir.strip_prefix(&base).ok()?.to_str()?;
+    Some(if below.is_empty() { root } else { format!("{}/{below}", root.trim_end_matches('/')) })
+}
+
+/// The canonical host folder, the guest root and the rest of `guest` below
+/// that root, for the longest guest root of a member or a mount that has `guest`.
+fn guest_share<'g>(guest: &'g str, members: Members<'_>) -> Option<(PathBuf, String, &'g str)> {
     let below = |root: &str| guest.strip_prefix(root).filter(|rest| rest.is_empty() || rest.starts_with('/'));
     let folders = members.sessions.iter().filter_map(|s| {
         let (_, root, _) = task_guest_folder(members.sessions, &s.id)?;
         Some((s.folder.as_path(), root))
     });
-    let (host, rest) = folders
+    let (host, root, rest) = folders
         .chain(members.cage.mounts.iter().map(|m| (m.host.as_path(), m.guest.clone())))
-        .filter_map(|(host, root)| Some((host, root.len(), below(&root)?)))
-        .max_by_key(|(_, len, _)| *len)
-        .map(|(host, _, rest)| (host, rest))?;
-    let base = host.canonicalize().ok()?;
-    let path = base.join(rest.trim_start_matches('/')).canonicalize().ok()?;
-    (path.starts_with(&base) && path.is_dir()).then_some(path)
+        .filter_map(|(host, root)| {
+            let rest = below(&root)?;
+            Some((host, root, rest))
+        })
+        .max_by_key(|(_, root, _)| root.len())?;
+    Some((host.canonicalize().ok()?, root, rest))
+}
+
+/// A command that opens a file in an editor. It runs with no shell.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    /// The editor has no documented way to go to a line, so it opens the file only.
+    pub line_ignored: bool,
+}
+
+/// The command that opens `file` at `line` (and `col`, where the editor takes
+/// one) in the editor `editor_id` of `bundle`. An editor with a line protocol
+/// uses the launcher in its bundle; the caller checks that the launcher is there.
+pub fn location_launch(editor_id: &str, bundle: &Path, file: &Path, line: u32, col: Option<u32>) -> Launch {
+    let at = || {
+        let mut at = file.as_os_str().to_owned();
+        at.push(format!(":{line}"));
+        if let Some(col) = col {
+            at.push(format!(":{col}"));
+        }
+        at
+    };
+    let in_bundle = |rest: &str| bundle.join(rest);
+    let open = PathBuf::from("/usr/bin/open");
+    let (program, args, line_ignored): (PathBuf, Vec<OsString>, bool) = match editor_id {
+        "zed" => (in_bundle("Contents/MacOS/cli"), vec!["--zed".into(), bundle.into(), at()], false),
+        "vscode" | "cursor" | "windsurf" | "vscodium" => {
+            // Stable and Insiders both have `bin/code` in the bundle.
+            let script = match editor_id {
+                "vscode" => "code",
+                "vscodium" => "codium",
+                other => other,
+            };
+            (in_bundle(&format!("Contents/Resources/app/bin/{script}")), vec!["--goto".into(), at()], false)
+        }
+        "sublime" => (in_bundle("Contents/SharedSupport/bin/subl"), vec![at()], false),
+        "intellij" | "webstorm" | "rustrover" | "pycharm" | "goland" => {
+            let mut args: Vec<OsString> = vec!["-na".into(), bundle.into(), "--args".into(), "--line".into()];
+            args.push(line.to_string().into());
+            if let Some(col) = col {
+                args.extend(["--column".into(), col.to_string().into()]);
+            }
+            args.push(file.into());
+            (open, args, false)
+        }
+        "xcode" => (
+            in_bundle("Contents/Developer/usr/bin/xed"),
+            vec!["--line".into(), line.to_string().into(), file.into()],
+            false,
+        ),
+        // Nova goes to a line through its documented `nova://open` URL.
+        "nova" => (open, vec!["-a".into(), bundle.into(), nova_url(file, line, col).into()], false),
+        _ => (open, vec!["-a".into(), bundle.into(), file.into()], true),
+    };
+    Launch { program, args, line_ignored }
+}
+
+/// The `nova://open` URL of `file` at `line` and `col`. Each byte of the path
+/// other than an unreserved character or `/` is percent-encoded. The documented
+/// `line=N:C` has a literal colon.
+fn nova_url(file: &Path, line: u32, col: Option<u32>) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut url = String::from("nova://open?path=");
+    for &byte in file.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            url.push(byte as char);
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url.push_str(&format!("&line={line}"));
+    if let Some(col) = col {
+        url.push_str(&format!(":{col}"));
+    }
+    url
 }
 
 #[cfg(test)]
@@ -458,5 +563,96 @@ mod tests {
         for guest in ["/workspace", "/workspace/src", "/workspace/alphax"] {
             assert_eq!(map(guest), None, "{guest}");
         }
+    }
+
+    #[test]
+    fn guest_file_paths_map_like_folders_and_never_out() {
+        let root = temp();
+        let folder = root.join("project");
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::write(folder.join("src/main.rs"), "").unwrap();
+        std::fs::write(root.join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.rs"), folder.join("link.rs")).unwrap();
+        let session = Session::new(folder.to_str().unwrap(), Some("c".into()), []).unwrap();
+        let cage = Cage::new("c".into(), session.name.clone());
+        let sessions = [session];
+        let members = || Members { sessions: &sessions, cage: &cage };
+        assert_eq!(map_guest_path("/workspace/src/main.rs", members()), Some(folder.join("src/main.rs")));
+        assert_eq!(map_guest_path("/workspace/src/../src/main.rs", members()), Some(folder.join("src/main.rs")));
+        assert_eq!(map_guest_path("/workspace/src", members()), Some(folder.join("src")));
+        // A file is no folder for `map_guest`.
+        assert_eq!(map_guest("/workspace/src/main.rs", members()), None);
+        for guest in ["/workspace/../secret.rs", "/workspace/link.rs", "/workspace/gone.rs", "/etc/hosts"] {
+            assert_eq!(map_guest_path(guest, members()), None, "{guest}");
+        }
+    }
+
+    #[test]
+    fn each_editor_gets_its_own_line_arguments() {
+        let file = Path::new("/p/a b.rs");
+        let args = |id: &str, bundle: &str, col| {
+            let launch = location_launch(id, Path::new(bundle), file, 12, col);
+            let args: Vec<String> = launch.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+            (launch.program.to_string_lossy().into_owned(), args, launch.line_ignored)
+        };
+        let own = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            args("zed", "/A/Zed Preview.app", Some(4)),
+            (
+                "/A/Zed Preview.app/Contents/MacOS/cli".into(),
+                own(&["--zed", "/A/Zed Preview.app", "/p/a b.rs:12:4"]),
+                false
+            )
+        );
+        for (id, bundle, script) in [
+            ("vscode", "/A/Visual Studio Code.app", "code"),
+            ("vscode", "/A/Visual Studio Code - Insiders.app", "code"),
+            ("cursor", "/A/Cursor.app", "cursor"),
+            ("windsurf", "/A/Windsurf.app", "windsurf"),
+            ("vscodium", "/A/VSCodium.app", "codium"),
+        ] {
+            assert_eq!(
+                args(id, bundle, None),
+                (format!("{bundle}/Contents/Resources/app/bin/{script}"), own(&["--goto", "/p/a b.rs:12"]), false)
+            );
+        }
+        assert_eq!(
+            args("sublime", "/A/Sublime Text.app", Some(4)),
+            ("/A/Sublime Text.app/Contents/SharedSupport/bin/subl".into(), own(&["/p/a b.rs:12:4"]), false)
+        );
+        for id in ["intellij", "webstorm", "rustrover", "pycharm", "goland"] {
+            assert_eq!(
+                args(id, "/A/IDE.app", Some(4)),
+                (
+                    "/usr/bin/open".into(),
+                    own(&["-na", "/A/IDE.app", "--args", "--line", "12", "--column", "4", "/p/a b.rs"]),
+                    false
+                )
+            );
+        }
+        assert_eq!(
+            args("goland", "/A/IDE.app", None).1,
+            own(&["-na", "/A/IDE.app", "--args", "--line", "12", "/p/a b.rs"])
+        );
+        // Xcode takes a line only.
+        assert_eq!(
+            args("xcode", "/A/Xcode.app", Some(4)),
+            ("/A/Xcode.app/Contents/Developer/usr/bin/xed".into(), own(&["--line", "12", "/p/a b.rs"]), false)
+        );
+        // Nova takes the line and the column through its URL; the path is percent-encoded.
+        let nova = |col| location_launch("nova", Path::new("/A/Nova.app"), Path::new("/p/a b&c=ü.rs"), 12, col);
+        assert_eq!(nova(Some(4)).program, Path::new("/usr/bin/open"));
+        assert_eq!(
+            nova(Some(4)).args,
+            [OsString::from("-a"), "/A/Nova.app".into(), "nova://open?path=/p/a%20b%26c%3D%C3%BC.rs&line=12:4".into()]
+        );
+        assert_eq!(nova(None).args[2], "nova://open?path=/p/a%20b%26c%3D%C3%BC.rs&line=12");
+        assert!(!nova(Some(4)).line_ignored);
+        // No documented line protocol: the file opens, and the line is ignored.
+        assert_eq!(
+            args("fleet", "/A/E.app", Some(4)),
+            ("/usr/bin/open".into(), own(&["-a", "/A/E.app", "/p/a b.rs"]), true)
+        );
+        assert!(KNOWN.iter().all(|k| !args(k.id, "/A/E.app", None).0.is_empty()));
     }
 }

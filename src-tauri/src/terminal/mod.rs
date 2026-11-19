@@ -103,43 +103,123 @@ fn guest_start(members: &[Session], session_id: &str, kind: TerminalKind) -> Opt
     })
 }
 
+/// Where the folder of a live process comes from.
+enum Source {
+    Host(host::HostGroup),
+    /// The output, its start folder and the applied config.
+    Guest(Arc<Mutex<Output>>, String, Box<(Vec<Session>, Cage)>),
+    /// A VM process whose VM does not run.
+    Stopped,
+    /// A VM process with no guest folder.
+    Unknown,
+}
+
+/// The session of the live process `id`, the output's `folder_seq`, and the
+/// source of its folder. It reads no file system.
+fn folder_source<V>(state: &Mutex<State<V>>, id: &str) -> Result<(String, u64, Source)> {
+    let state = lock(state);
+    let process = state.process(id).ok().filter(|t| t.exit_code.is_none()).ok_or(Error::ProcessNotFound)?;
+    let seq = lock(&process.output).folder_seq;
+    let source = match &process.host_group {
+        Some(group) => Source::Host(group.clone()),
+        None => match state.vm_of(&process.session_id) {
+            Some((_, Vm::Running { applied, .. })) => {
+                match guest_start(&applied.0, &process.session_id, process.kind) {
+                    Some(start) => Source::Guest(process.output.clone(), start, applied.clone()),
+                    None => Source::Unknown,
+                }
+            }
+            _ => Source::Stopped,
+        },
+    };
+    Ok((process.session_id.clone(), seq, source))
+}
+
+/// The current guest folder of a VM process: its last OSC 7, else its start folder.
+fn guest_cwd(output: &Mutex<Output>, start: String) -> (u64, String) {
+    let output = lock(output);
+    (output.folder_seq, output.osc.cwd.clone().unwrap_or(start))
+}
+
 /// Where the live process `id` is now. A Mac process's folder comes from
 /// macOS; a VM process's from its last OSC 7, else its start folder, mapped by
 /// [`editor::map_guest`]. `None`: the folder is unknown, such as when macOS
 /// gives none. It also gives the output's `folder_seq` that it read with its
 /// source. The macOS call and the file system work run with no lock held.
 pub(crate) fn resolve_folder<V>(state: &Mutex<State<V>>, id: &str) -> Result<(u64, Option<TerminalFolder>)> {
-    enum Source {
-        Host(host::HostGroup, u64),
-        /// The output, its start folder and the applied config.
-        Guest(Arc<Mutex<Output>>, String, Box<(Vec<Session>, Cage)>),
-    }
-    let source = {
-        let state = lock(state);
-        let process = state.process(id).ok().filter(|t| t.exit_code.is_none()).ok_or(Error::ProcessNotFound)?;
-        match &process.host_group {
-            Some(group) => Source::Host(group.clone(), lock(&process.output).folder_seq),
-            None => match state.vm_of(&process.session_id) {
-                Some((_, Vm::Running { applied, .. })) => {
-                    match guest_start(&applied.0, &process.session_id, process.kind) {
-                        Some(start) => Source::Guest(process.output.clone(), start, applied.clone()),
-                        None => return Ok((lock(&process.output).folder_seq, None)),
-                    }
-                }
-                _ => return Ok((lock(&process.output).folder_seq, None)),
-            },
-        }
-    };
+    let (_, seq, source) = folder_source(state, id)?;
     Ok(match source {
-        Source::Host(group, seq) => (seq, group.cwd().map(TerminalFolder::host)),
+        Source::Host(group) => (seq, group.cwd().map(TerminalFolder::host)),
         Source::Guest(output, start, applied) => {
-            let (seq, path) = {
-                let output = lock(&output);
-                (output.folder_seq, output.osc.cwd.clone().unwrap_or(start))
-            };
+            let (seq, path) = guest_cwd(&output, start);
             (seq, Some(TerminalFolder::guest(path, &applied)))
         }
+        Source::Stopped | Source::Unknown => (seq, None),
     })
+}
+
+/// The guest path of the relative path `raw` in the guest folder `cwd`. Each
+/// leading `.` and `..` of `raw` applies to `cwd` as text (`..` stops at `/`),
+/// so `../bravo/a.rs` reaches a sibling folder that is shared on its own. The
+/// rest of `raw` stays as it is: an interior `..` after a link follows the link
+/// on the Mac. The caller resolves the links in `cwd` first, because the
+/// process opens `../a.rs` from the real folder, not from the OSC 7 text.
+fn guest_join(cwd: &str, raw: &str) -> String {
+    let mut base: Vec<&str> = cwd.split('/').filter(|s| !s.is_empty()).collect();
+    let mut rest = raw;
+    loop {
+        let (head, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        match head {
+            "." => {}
+            ".." => {
+                base.pop();
+            }
+            _ => break,
+        }
+        rest = tail.trim_start_matches('/');
+    }
+    if !rest.is_empty() {
+        base.push(rest);
+    }
+    format!("/{}", base.join("/"))
+}
+
+/// The session of the live process `id` and the Mac file that the path `raw`
+/// in its output names. A relative path resolves against the current folder of
+/// the process, never against the project folder. A VM path maps to the Mac
+/// only below a member folder or a mount. The result is a regular file.
+pub(crate) fn locate<V>(state: &Mutex<State<V>>, id: &str, raw: &str) -> Result<(String, PathBuf)> {
+    let (session_id, _, source) = folder_source(state, id)?;
+    let absolute = raw.starts_with('/');
+    let unknown = || Error::LinkFolderUnknown(raw.to_owned());
+    let path = match source {
+        Source::Host(group) => {
+            let path = if absolute {
+                PathBuf::from(raw)
+            } else {
+                group.cwd().filter(|cwd| cwd.is_dir()).ok_or_else(unknown)?.join(raw)
+            };
+            path.canonicalize().map_err(|_| Error::LinkMissing(raw.to_owned()))?
+        }
+        Source::Guest(output, start, applied) => {
+            let members = Members { sessions: &applied.0, cage: &applied.1 };
+            let guest = if absolute {
+                raw.to_owned()
+            } else {
+                let cwd = guest_cwd(&output, start).1;
+                let cwd =
+                    editor::physical_guest_dir(&cwd, members).ok_or_else(|| Error::LinkNotShared(raw.to_owned()))?;
+                guest_join(&cwd, raw)
+            };
+            editor::map_guest_path(&guest, members).ok_or_else(|| Error::LinkNotShared(raw.to_owned()))?
+        }
+        Source::Stopped => return Err(Error::LinkVmStopped(raw.to_owned())),
+        Source::Unknown => return Err(unknown()),
+    };
+    if !path.is_file() {
+        return Err(Error::LinkNotFile(raw.to_owned()));
+    }
+    Ok((session_id, path))
 }
 
 /// What an agent in a terminal does, as its hooks report it.
@@ -440,6 +520,12 @@ impl<R: SandboxRuntime> Manager<R> {
             Some(path) => (path, true),
             None => (folder, terminal_id.is_none()),
         })
+    }
+
+    /// The session of the live process `process_id` and the Mac file that the
+    /// path `raw` in its output names. See [`locate`].
+    pub fn location(&self, process_id: &str, raw: &str) -> Result<(String, PathBuf)> {
+        locate(&self.state, process_id, raw)
     }
 
     /// The current folder of each live process of `ids`, resolved now. An
@@ -934,6 +1020,132 @@ mod tests {
         let again = manager.reopen_terminal(&id, &terminal, 24, 80).await.unwrap();
         let both = [process.clone(), again.clone()];
         assert_eq!(batch(&manager, &both), [(again, vm("/workspace", Some(&folder)))]);
+    }
+
+    #[tokio::test]
+    async fn a_host_link_resolves_against_the_current_folder_only() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let folder = manager.list().sessions[0].session.folder.clone().canonicalize().unwrap();
+        std::fs::create_dir_all(folder.join("sub/dir")).unwrap();
+        std::fs::write(folder.join("top.rs"), "").unwrap();
+        std::fs::write(folder.join("sub/inner.rs"), "").unwrap();
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let at = |raw: &str| manager.location(&process, raw);
+        until(|| at("top.rs").ok() == Some((id.clone(), folder.join("top.rs")))).await;
+        assert!(matches!(at("inner.rs"), Err(Error::LinkMissing(_))));
+        assert!(matches!(at("sub/dir"), Err(Error::LinkNotFile(_))));
+
+        // After a cd, a relative path resolves in the new folder; an absolute path anywhere.
+        manager.write(&process, b"cd sub\n".to_vec()).unwrap();
+        until(|| at("inner.rs").is_ok()).await;
+        assert!(matches!(at("top.rs"), Err(Error::LinkMissing(_))));
+        assert_eq!(at("../top.rs").unwrap().1, folder.join("top.rs"));
+        let absolute = folder.join("top.rs");
+        assert_eq!(at(absolute.to_str().unwrap()).unwrap().1, absolute);
+
+        // A folder that is gone, or that macOS does not give, is never the project folder.
+        std::fs::remove_dir_all(folder.join("sub")).unwrap();
+        assert!(matches!(at("top.rs"), Err(Error::LinkFolderUnknown(_))));
+        let real = {
+            let mut state = lock(&manager.state);
+            let t = state.terminals.iter_mut().find(|t| t.id == process).unwrap();
+            t.host_group.replace(super::host::HostGroup::retired())
+        };
+        assert!(matches!(at("top.rs"), Err(Error::LinkFolderUnknown(_))));
+        assert_eq!(at(absolute.to_str().unwrap()).unwrap().1, absolute);
+        lock(&manager.state).terminals.iter_mut().find(|t| t.id == process).unwrap().host_group = real;
+        assert!(matches!(manager.location("gone", "top.rs"), Err(Error::ProcessNotFound)));
+        manager.delete(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_vm_link_maps_through_the_shared_folders_only() {
+        let (manager, _, id) = manager();
+        let folder = manager.list().sessions[0].session.folder.clone().canonicalize().unwrap();
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("top.rs"), "").unwrap();
+        std::fs::write(folder.join("sub/inner.rs"), "").unwrap();
+        let shared = temp_dir().canonicalize().unwrap();
+        std::fs::write(shared.join("data.rs"), "").unwrap();
+        manager.add_mount(&id, shared.to_str().unwrap(), "/data", false).unwrap();
+        manager.start(&id).await.unwrap();
+        let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let at = |raw: &str| manager.location(&process, raw);
+        assert_eq!(at("top.rs").unwrap(), (id.clone(), folder.join("top.rs")));
+        assert_eq!(at("/workspace/sub/inner.rs").unwrap().1, folder.join("sub/inner.rs"));
+        assert_eq!(at("/data/data.rs").unwrap().1, shared.join("data.rs"));
+        assert!(matches!(at("sub"), Err(Error::LinkNotFile(_))));
+        for raw in ["gone.rs", "../etc/passwd", "/etc/hosts", "/workspace/../top.rs"] {
+            assert!(matches!(at(raw), Err(Error::LinkNotShared(_))), "{raw}");
+        }
+
+        // The fake VM echoes its input as output: an OSC 7 changes the folder.
+        manager.write(&process, b"\x1b]7;file://vm/workspace/sub\x07".to_vec()).unwrap();
+        until(|| at("inner.rs").is_ok()).await;
+        assert!(matches!(at("top.rs"), Err(Error::LinkNotShared(_))));
+        assert_eq!(at("../top.rs").unwrap().1, folder.join("top.rs"));
+        // The process can remain in its physical directory after its reported alias disappears.
+        std::fs::create_dir_all(folder.join("deep/sub")).unwrap();
+        std::fs::write(folder.join("deep/top.rs"), "").unwrap();
+        let alias = folder.join("alias");
+        std::os::unix::fs::symlink(folder.join("deep/sub"), &alias).unwrap();
+        manager.write(&process, b"\x1b]7;file://vm/workspace/alias\x07".to_vec()).unwrap();
+        until(|| at("../top.rs").is_ok_and(|(_, file)| file == folder.join("deep/top.rs"))).await;
+        std::fs::remove_file(&alias).unwrap();
+        assert!(at("../top.rs").is_err());
+        std::fs::write(&alias, "").unwrap();
+        assert!(at("../top.rs").is_err());
+        assert_eq!(at("/workspace/top.rs").unwrap().1, folder.join("top.rs"));
+
+        manager.write(&process, b"\x1b]7;file://vm/etc\x07".to_vec()).unwrap();
+        until(|| matches!(at("inner.rs"), Err(Error::LinkNotShared(_)))).await;
+        assert_eq!(at("/workspace/top.rs").unwrap().1, folder.join("top.rs"));
+
+        manager.send(&process, PtyInput::Kill).unwrap();
+        until(|| manager.list().sessions[0].processes[0].exit_code.is_some()).await;
+        assert!(matches!(at("/workspace/top.rs"), Err(Error::ProcessNotFound)));
+    }
+
+    #[test]
+    fn a_leading_dot_dot_reaches_a_sibling_member_and_an_interior_one_follows_links() {
+        use super::{Cage, Members, Session, editor, guest_join};
+        assert_eq!(guest_join("/workspace/alpha", "../bravo/a.rs"), "/workspace/bravo/a.rs");
+        assert_eq!(guest_join("/workspace/alpha/", "./.././a.rs"), "/workspace/a.rs");
+        assert_eq!(guest_join("/workspace", "../../../a.rs"), "/a.rs");
+        assert_eq!(guest_join("/", ".."), "/");
+        assert_eq!(guest_join("/workspace/alpha", "near/link/../a.rs"), "/workspace/alpha/near/link/../a.rs");
+
+        let root = temp_dir().canonicalize().unwrap();
+        let (alpha, bravo) = (root.join("alpha"), root.join("bravo"));
+        std::fs::create_dir_all(alpha.join("deep/sub")).unwrap();
+        std::fs::create_dir_all(alpha.join("near")).unwrap();
+        std::fs::create_dir_all(bravo.join("src")).unwrap();
+        std::fs::write(bravo.join("src/main.rs"), "").unwrap();
+        std::fs::write(alpha.join("deep/correct.rs"), "").unwrap();
+        std::os::unix::fs::symlink(alpha.join("deep/sub"), alpha.join("near/link")).unwrap();
+        let first = Session::new(alpha.to_str().unwrap(), Some("c".into()), []).unwrap();
+        let second = Session::new(bravo.to_str().unwrap(), Some("c".into()), [first.slug.as_str()]).unwrap();
+        let cwd = format!("/workspace/{}", first.slug);
+        let sibling = format!("../{}/src/main.rs", second.slug);
+        let cage = Cage::new("c".into(), "c".into());
+        let sessions = [first, second];
+        let members = || Members { sessions: &sessions, cage: &cage };
+        let map_from = |cwd: &str, raw: &str| {
+            let cwd = editor::physical_guest_dir(cwd, members())?;
+            editor::map_guest_path(&guest_join(&cwd, raw), members())
+        };
+        let map = |raw: &str| map_from(&cwd, raw);
+        assert_eq!(map(&sibling), Some(bravo.join("src/main.rs")));
+        assert_eq!(map("../unmapped/x.rs"), None);
+        // `near/link/..` is `deep` on the Mac, not `near`.
+        assert_eq!(map("near/link/../correct.rs"), Some(alpha.join("deep/correct.rs")));
+        // In the linked folder `near/link`, `..` is `deep`, not `near`.
+        let linked = format!("{cwd}/near/link");
+        assert_eq!(editor::physical_guest_dir(&linked, members()), Some(format!("{cwd}/deep/sub")));
+        assert_eq!(map_from(&linked, "../correct.rs"), Some(alpha.join("deep/correct.rs")));
+        assert_eq!(map_from(&linked, "../../../x.rs"), None);
+        assert_eq!(editor::physical_guest_dir(&cwd, members()), Some(cwd.clone()));
     }
 
     #[test]

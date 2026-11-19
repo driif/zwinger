@@ -388,6 +388,8 @@ pub fn run() {
             commands::editors::detect_editors,
             commands::editors::open_in_editor,
             commands::editors::reveal_session,
+            commands::editors::terminal_location,
+            commands::editors::open_terminal_location,
             commands::appearance::list_themes,
             commands::appearance::save_theme,
             commands::appearance::delete_theme,

@@ -196,6 +196,20 @@ pub enum Error {
     NoEditor,
     #[error("{0} did not open: {1}")]
     EditorFailed(String, String),
+    #[error("{0} has no command-line launcher at {1}; install the app again")]
+    EditorLauncherMissing(String, String),
+    #[error("the folder of the terminal is unknown or gone, so the relative path {0} does not open")]
+    LinkFolderUnknown(String),
+    #[error("the cage of the terminal is not running, so {0} does not open")]
+    LinkVmStopped(String),
+    #[error("{0} is not in a folder that the cage shares with this Mac")]
+    LinkNotShared(String),
+    #[error("file not found: {0}")]
+    LinkMissing(String),
+    #[error("{0} is not a file")]
+    LinkNotFile(String),
+    #[error("a line and a column start at 1")]
+    LinkZeroPosition,
     #[error("unknown editor: {0}")]
     UnknownEditor(String),
     #[error("accent color must be #rrggbb: {0}")]

@@ -1,9 +1,10 @@
 import { Button, IconButton, TextField } from "@driif/motiv";
-import { ChevronDown, ChevronUp, Play, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Info, Play, X } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
-import { ackSession, attachSession, detachSession, resizeSession, SessionFrame, writeSession } from "./api";
+import { ackSession, attachSession, detachSession, OpenedLocation, resizeSession, SessionFrame, writeSession } from "./api";
 import { Engine, openTerminal, searchOptions } from "./engine";
 import { followTitle } from "./titles";
+import { Notice } from "../../shared/Notice";
 import "./terminal.css";
 
 /** Turns off the VT mouse reports, so a drag selects text again. The screen and its styles stay. */
@@ -41,6 +42,8 @@ export function TerminalView({ processId, exitCode, visible, focused, focusReque
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<{ resultIndex: number; resultCount: number }>();
   const [exitFrame, setExitFrame] = useState<number>();
+  /** Set when a file link opened in an editor that cannot go to the line. */
+  const [lineIgnored, setLineIgnored] = useState<string>();
   const exit = exitFrame ?? exitCode;
   /** Read in the xterm listeners: an exited process takes no input, resize or reply, also before a refresh. */
   const exited = useRef(exit !== null);
@@ -66,7 +69,12 @@ export function TerminalView({ processId, exitCode, visible, focused, focusReque
       if (token === undefined) unacked++;
       else ackSession(processId, token).catch(fail);
     };
-    openTerminal(container.current!, () => setFinding((n) => n + 1))
+    const links = {
+      processId,
+      onOpened: ({ editor, lineIgnored }: OpenedLocation) => setLineIgnored(lineIgnored ? editor : undefined),
+      onError,
+    };
+    openTerminal(container.current!, () => setFinding((n) => n + 1), links)
       .then(async (created) => {
         if (disposed) return created.dispose();
         opened = created;
@@ -171,6 +179,13 @@ export function TerminalView({ processId, exitCode, visible, focused, focusReque
   return (
     <div ref={pane} className="terminal-pane" hidden={!visible} style={style} onFocus={onFocus}>
       <div ref={container} className="terminal" />
+      {lineIgnored && (
+        <div className="terminal-link-notice">
+          <Notice icon={<Info size={14} />} onDismiss={() => setLineIgnored(undefined)}>
+            {lineIgnored} cannot go to a line, so it opened the file only.
+          </Notice>
+        </div>
+      )}
       {exit !== null && (
         <div className="terminal-exit">
           <span className="muted">Exited with code {exit}</span>

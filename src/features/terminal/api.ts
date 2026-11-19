@@ -93,3 +93,18 @@ export const resizeSession = (id: string, rows: number, cols: number) =>
 /** Removes the terminal and ends its process. */
 export const closeTerminal = (sessionId: string, terminalId: string) =>
   call<void>("close_terminal", { sessionId, terminalId });
+
+/** Resolves to the Mac file that the path `path` in the output of the live process names. Fails if it is no file. */
+export const terminalLocation = (processId: string, path: string) =>
+  call<string>("terminal_location", { processId, path });
+
+/** What a file link opened. `lineIgnored`: the editor has no way to go to a line, so it opened the file only. */
+export interface OpenedLocation {
+  editor: string;
+  file: string;
+  lineIgnored: boolean;
+}
+
+/** Opens the file of a link in the terminal output, at the line, in the project's editor or the app default. */
+export const openTerminalLocation = (processId: string, path: string, line: number, col?: number) =>
+  call<OpenedLocation>("open_terminal_location", { processId, path, line, col: col ?? null });

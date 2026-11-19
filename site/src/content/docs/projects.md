@@ -205,6 +205,32 @@ one line to the system zshenv:
 
 Your prompt and your own prompt hooks stay as they are.
 
+## File links in the terminal
+
+A file location in terminal output becomes a link: `src/main.rs:12`, `src/main.rs:12:5`, `src/app.ts(14,5)` and
+the Rust `--> src/main.rs:12:5`. Hold ⌘ and click the link to open the file at that line in the project's editor,
+else the app default editor. A plain click, a selection, a drag and a copy work as before. A web address
+(`https://...`) stays a web link and opens in the browser.
+
+The text becomes a link only when it names a file on your Mac. A folder or a file that does not exist stays plain
+text. A host and port such as `localhost:3000` or `127.0.0.1:8080`, and a time such as `12:30`, always stay plain
+text. A quoted path can have spaces: `"src/My File.ts:43"` or `"src/My File.ts":43` links the whole path. A relative path resolves against the current folder of the terminal,
+never against the project folder. When zwinger does not know the current folder, a relative path is not a link.
+
+In a VM shell, a path maps to the Mac only below a project folder of the VM or below a mount. A path that is outside
+these folders is not a link, and nothing opens.
+
+Each editor gets the line in its own way:
+
+- Zed, VS Code, Cursor, Windsurf, VSCodium, Sublime Text and Nova: the line and the column.
+- IntelliJ IDEA, WebStorm, RustRover, PyCharm and GoLand: the line and the column.
+- Xcode: the line only.
+- Fleet: the file only. A notice tells you that the editor did not go to the line.
+
+Zed, VS Code, Cursor, Windsurf, VSCodium, Sublime Text and Xcode open the file through the command-line tool in their
+app. When that tool is missing, the file does not open and an error shows. Nova opens the file through its own link in
+the selected app. IntelliJ IDEA, WebStorm, RustRover, PyCharm and GoLand open it through the macOS `open` command.
+
 ## Map
 
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You

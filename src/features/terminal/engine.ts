@@ -5,11 +5,20 @@ import type { LigaturesAddon } from "@xterm/addon-ligatures";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TerminalColors } from "../appearance/api";
 import type { TerminalPrefs } from "../settings/api";
+import { openTerminalLocation, terminalLocation, type OpenedLocation } from "./api";
+import { fileLinkProvider } from "./fileLinks";
 
 /** The terminal settings and colors that all terminals use. */
 interface Look {
   prefs: TerminalPrefs;
   colors: TerminalColors;
+}
+
+/** The process whose paths in the output become file links, and where an open reports. */
+export interface FileLinks {
+  processId: string;
+  onOpened: (opened: OpenedLocation) => void;
+  onError: (error: unknown) => void;
 }
 
 /** An xterm in its element. A visible one draws with WebGL. */
@@ -132,9 +141,9 @@ let xterm: Promise<typeof import("./xterm")> | undefined;
 
 /**
  * Opens an xterm in `el`. It fits itself when `el` changes size. xterm.js loads on the first terminal.
- * ⌘F in the terminal calls `onFind` and does not go to the shell.
+ * ⌘F in the terminal calls `onFind` and does not go to the shell. ⌘-click on a `path:line` opens the file.
  */
-export async function openTerminal(el: HTMLElement, onFind: () => void): Promise<Engine> {
+export async function openTerminal(el: HTMLElement, onFind: () => void, links: FileLinks): Promise<Engine> {
   xterm ??= import("./xterm");
   const { Terminal, FitAddon, SearchAddon, Unicode11Addon, WebLinksAddon, WebglAddon } = await xterm;
   // The workspace sets the look as it renders, before its terminals mount.
@@ -153,6 +162,13 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
   term.loadAddon(search);
   // The webview does not open windows; the system browser opens the link.
   term.loadAddon(new WebLinksAddon((_, uri) => openUrl(uri)));
+  const { processId } = links;
+  const files = fileLinkProvider(
+    term,
+    (path) => terminalLocation(processId, path),
+    ({ path, line, col }) => openTerminalLocation(processId, path, line, col).then(links.onOpened, links.onError),
+  );
+  const fileProvider = term.registerLinkProvider(files);
   // Shift+Enter is ESC CR: a new line in the prompt of an agent TUI.
   term.attachCustomKeyEventHandler((event) => {
     if (event.key.toLowerCase() === "f" && event.metaKey && !event.shiftKey && !event.altKey && !event.ctrlKey) {
@@ -236,6 +252,7 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
       markSized();
       observer.disconnect();
       el.removeEventListener("wheel", scrollPane, { capture: true });
+      fileProvider.dispose();
       entry.ligaturesGeneration++;
       entry.ligatures?.dispose();
       live.delete(entry);
