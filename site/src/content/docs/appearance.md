@@ -17,6 +17,23 @@ read-only. To make your own theme, click **Duplicate** on a theme, then edit it.
   keeps it.
 
 zwinger keeps each custom theme as one JSON file in the `themes` folder of its app data.
+
+### Import and export a theme
+
+- To share a custom theme, click **Export** on its card, then choose where to save the JSON file. Built-in themes have
+  no **Export**.
+- To add a theme from a JSON file, click **Import theme…** in the **Theme** card, then choose the file.
+
+zwinger checks the file before it adds the theme. It refuses a file that is larger than 64 KiB, is a link or not a
+regular file, is not valid theme JSON, or uses the id of a built-in theme. A refused file adds nothing.
+
+An import never replaces a theme. The imported theme gets a new id if a theme file with the same id exists, or if your
+settings still select a theme with that id. The imported theme gets a number, for example `Sea 2`, if a custom theme or a
+built-in theme has the same name. Names that differ only in spaces are the same name. A note shows the name, for example
+`Imported 'Sea' as 'Sea 2'`.
+
+An import does not select the theme. Click **Use** on its card to apply it.
+
 New windows open directly in the last-used theme. If the saved theme cannot be read, the window opens in zwinger dark.
 
 ## Text size

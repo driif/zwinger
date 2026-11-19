@@ -412,6 +412,8 @@ pub fn run() {
             commands::appearance::list_themes,
             commands::appearance::save_theme,
             commands::appearance::delete_theme,
+            commands::appearance::import_theme,
+            commands::appearance::export_theme,
             updates::check_update,
             updates::install_update,
         ])

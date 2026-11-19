@@ -31,3 +31,31 @@ export const listThemes = () => call<ThemeList>("list_themes");
 export const saveTheme = (theme: Theme) => call<void>("save_theme", { theme });
 
 export const deleteTheme = (id: string) => call<void>("delete_theme", { id });
+
+/** `renamed`: a saved theme had `originalName`, so the theme got a number. */
+export interface ImportResult {
+  theme: Theme;
+  originalName: string;
+  renamed: boolean;
+}
+
+/** Asks for a theme file and adds it as a new theme. `null`: the user cancelled. */
+export const importTheme = () => call<ImportResult | null>("import_theme");
+
+/** Asks for a place and writes the theme file there. `false`: the user cancelled. */
+export const exportTheme = (id: string) => call<boolean>("export_theme", { id });
+
+/** The text of the notice after an import. */
+export const importedMessage = ({ theme, originalName, renamed }: ImportResult) =>
+  renamed ? `Imported '${originalName}' as '${theme.name}'` : `Imported '${theme.name}'`;
+
+/**
+ * Imports a theme file and reloads the themes. Returns the notice text, or `undefined` when the user cancelled.
+ * The prefs do not change: the user selects the new theme with Use.
+ */
+export async function importAndReload(reload: () => Promise<void>, pick = importTheme) {
+  const result = await pick();
+  if (!result) return undefined;
+  await reload();
+  return importedMessage(result);
+}

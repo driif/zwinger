@@ -1,10 +1,10 @@
 import { Button, Card, CardBody, CardHeader, LiquidSwitch, SegmentedControl, Select } from "@driif/motiv";
-import { Check, Copy, Pencil, Trash2, TriangleAlert } from "lucide-react";
+import { Check, Copy, Download, Pencil, Trash2, TriangleAlert, Upload } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Prefs } from "../settings/api";
 import type { Run } from "../../App";
 import { Notice } from "../../shared/Notice";
-import { deleteTheme, saveTheme, Theme } from "./api";
+import { deleteTheme, exportTheme, importAndReload, saveTheme, Theme } from "./api";
 import { ThemeEditor } from "./ThemeEditor";
 import { Appearance, BUILT_INS, isBuiltIn } from "./themes";
 import "./appearance.css";
@@ -23,6 +23,7 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
   const { themes, skipped, reload, preview } = appearance;
   const [editing, setEditing] = useState<Theme>();
   const [asking, setAsking] = useState<string>();
+  const [imported, setImported] = useState<string>();
 
   // A draft must not stay on the window after the page closes.
   useEffect(() => () => preview(undefined), []);
@@ -63,6 +64,13 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
       });
     });
 
+  // A cancel or an error keeps the last notice.
+  const importFile = () =>
+    run(async () => {
+      const message = await importAndReload(reload);
+      if (message) setImported(message);
+    });
+
   const inUse = (theme: Theme) => prefs[slot(theme)] === theme.id;
 
   return (
@@ -94,8 +102,18 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
           title="Theme"
           titleAs="h2"
           description="Built-in themes are read-only. Duplicate one to make your own theme."
+          actions={
+            <Button size="sm" variant="outline" iconLeft={<Upload size={14} />} onClick={importFile}>
+              Import theme…
+            </Button>
+          }
         />
         <CardBody className="stack">
+          {imported && (
+            <Notice icon={<Check size={14} />} onDismiss={() => setImported(undefined)}>
+              {imported}
+            </Notice>
+          )}
           <LiquidSwitch
             label="Follow the system: use a light theme and a dark theme as macOS changes its appearance"
             checked={prefs.followSystem}
@@ -144,6 +162,9 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
                       </Button>
                       {!isBuiltIn(theme.id) && (
                         <>
+                          <Button size="sm" variant="ghost" iconLeft={<Download size={14} />} onClick={() => run(() => exportTheme(theme.id))}>
+                            Export
+                          </Button>
                           <Button size="sm" variant="ghost" aria-label={`Edit ${theme.name}`} iconLeft={<Pencil size={14} />} onClick={() => setEditing(theme)} />
                           <Button
                             size="sm"
