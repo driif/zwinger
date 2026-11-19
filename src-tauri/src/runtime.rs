@@ -3,7 +3,7 @@ use std::future::Future;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT};
+use microsandbox::sandbox::{DeploymentProfile, MAX_SANDBOX_LIST_LIMIT, SandboxBuilder};
 use microsandbox::{ExecEvent, LogLevel, Sandbox};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
@@ -248,10 +248,9 @@ pub struct Microsandbox {
     pub pi: PathBuf,
 }
 
-impl SandboxRuntime for Microsandbox {
-    type Vm = Sandbox;
-
-    async fn start(
+impl Microsandbox {
+    /// The VM that [`SandboxRuntime::start`] creates.
+    fn sandbox_builder(
         &self,
         key: &str,
         members: Members<'_>,
@@ -259,7 +258,7 @@ impl SandboxRuntime for Microsandbox {
         state: &Path,
         runtimes: &[Installed],
         binds: &[Bind],
-    ) -> Result<Sandbox> {
+    ) -> Result<SandboxBuilder> {
         let policy = sandbox_policy(net.port)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{key}"))
             .image(IMAGE)
@@ -269,7 +268,9 @@ impl SandboxRuntime for Microsandbox {
             .replace()
             // The network events are debug lines of the runtime log.
             .log_level(LogLevel::Debug)
-            .workdir(WORKSPACE);
+            .workdir(WORKSPACE)
+            .cpus(members.cage.resources.cpus())
+            .memory(members.cage.resources.memory_mib());
         for session in members.sessions {
             let (_, guest, _) = task_guest_folder(members.sessions, &session.id).expect("a member");
             builder = builder.volume(guest, |m| m.bind(&session.folder));
@@ -295,7 +296,23 @@ impl SandboxRuntime for Microsandbox {
         for (name, value) in &net.env {
             builder = builder.env(name, value);
         }
-        Ok(builder.create().await?)
+        Ok(builder)
+    }
+}
+
+impl SandboxRuntime for Microsandbox {
+    type Vm = Sandbox;
+
+    async fn start(
+        &self,
+        key: &str,
+        members: Members<'_>,
+        net: &GuestNet,
+        state: &Path,
+        runtimes: &[Installed],
+        binds: &[Bind],
+    ) -> Result<Sandbox> {
+        Ok(self.sandbox_builder(key, members, net, state, runtimes, binds)?.create().await?)
     }
 
     /// A graceful stop has no deadline in microsandbox, so a stuck VM is
@@ -734,6 +751,35 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A local backend in a temp home, so the build reads no user config.
+    #[tokio::test]
+    async fn the_vm_gets_the_cpus_and_memory_of_the_cage() {
+        use crate::cage::testing::temp_dir;
+        use crate::cage::{Cage, Resources};
+        use crate::session::Session;
+
+        let home = temp_dir();
+        let backend = microsandbox::LocalBackend::builder()
+            .home(&home)
+            .config_path(home.join("config.json"))
+            .build_lazy()
+            .unwrap();
+        let session = Session::new(temp_dir().to_str().unwrap(), Some("c".into()), []).unwrap();
+        let mut cage = Cage::new("c".into(), "c".into());
+        cage.resources = Resources::new(4, 2048).unwrap();
+        let members = Members { sessions: std::slice::from_ref(&session), cage: &cage };
+        let net = GuestNet { port: 41234, env: Vec::new() };
+        let builder =
+            Microsandbox { pi: temp_dir() }.sandbox_builder("c", members, &net, &temp_dir(), &[], &[]).unwrap();
+        let config = microsandbox::with_backend(
+            std::sync::Arc::new(backend) as std::sync::Arc<dyn microsandbox::Backend>,
+            builder.build(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((config.spec.resources.cpus, config.spec.resources.memory_mib), (4, 2048));
+    }
 
     #[test]
     fn the_vm_reaches_only_the_proxy_port() {

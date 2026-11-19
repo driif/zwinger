@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::cage::{Cage, FileId, HostAgentUse, Mount, fill_id};
+use crate::cage::{Cage, FileId, HostAgentUse, Mount, Resources, fill_id};
 use crate::network::NetworkPolicy;
 use crate::secrets::Secret;
 use crate::session::{PaneNode, Pos, Session, Task, TerminalRecord, VmChoice, folder_slug};
@@ -96,6 +96,7 @@ impl Project {
             logins: self.logins,
             host_agents: self.host_agents,
             agents_unprompted: self.agents_unprompted,
+            resources: Resources::default(),
         };
         (session, cage)
     }

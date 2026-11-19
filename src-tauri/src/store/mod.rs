@@ -356,7 +356,7 @@ fn migrate_secrets(logins: &mut Vec<Secret>, network: &mut NetworkPolicy) {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
-    use crate::cage::{Bound, FileId, HostAgentUse, Mount};
+    use crate::cage::{Bound, FileId, HostAgentUse, Mount, Resources};
     use crate::runtime::TerminalKind;
     use crate::secrets::{Origin, Places};
     use crate::session::{PaneNode, Pos, SplitDirection, Task, TaskAgent, TerminalRecord, Viewport, VmChoice};
@@ -515,6 +515,7 @@ mod tests {
             logins: Vec::new(),
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             agents_unprompted: false,
+            resources: Resources::default(),
         };
         assert_eq!(cage.network.credentials().len(), 2);
         assert_eq!((sessions, cages), (vec![session], vec![cage]));
@@ -854,6 +855,21 @@ mod tests {
         assert!(cage.logins.is_empty() && cage.host_agents.is_empty());
         assert_eq!(cage.network.default, DefaultAction::Block);
         assert!(cage.agents_unprompted);
+        assert_eq!((cage.resources.cpus(), cage.resources.memory_mib()), (1, 512));
+    }
+
+    #[test]
+    fn a_cage_without_resources_gets_the_runtime_defaults_and_bad_resources_fail() {
+        let mut cage = serde_json::to_value(Cage::new("c".into(), "c".into())).unwrap();
+        assert_eq!(cage["resources"], serde_json::json!({ "cpus": 1, "memoryMib": 512 }));
+        cage.as_object_mut().unwrap().remove("resources");
+        assert_eq!(serde_json::from_value::<Cage>(cage.clone()).unwrap().resources, Resources::default());
+        for bad in [(0, 512), (9, 512), (256, 512), (1, 511), (1, 8193)] {
+            cage["resources"] = serde_json::json!({ "cpus": bad.0, "memoryMib": bad.1 });
+            assert!(serde_json::from_value::<Cage>(cage.clone()).is_err(), "{bad:?}");
+        }
+        cage["resources"] = serde_json::json!({ "cpus": 8, "memoryMib": 8192 });
+        assert_eq!(serde_json::from_value::<Cage>(cage).unwrap().resources, Resources::new(8, 8192).unwrap());
     }
 
     #[test]

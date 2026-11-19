@@ -53,7 +53,7 @@ export function CagesPage({ cages, sessions, workspaces, runtimes, run }: Props)
           <h1 className="page-title grow">{edited.name}</h1>
         </header>
         <div className="tab-body">
-          <CageSettings cage={edited} vm={editedVm} runtimes={runtimes} run={run} />
+          <CageSettings key={edited.id} cage={edited} vm={editedVm} runtimes={runtimes} run={run} />
           <StartDiagnostics vm={editedVm} startHistory={editedVm.startHistory} />
         </div>
       </section>

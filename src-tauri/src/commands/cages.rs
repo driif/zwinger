@@ -129,6 +129,11 @@ pub fn remove_guest_login(manager: Managed<'_>, vm_key: String, agent: AgentKind
 }
 
 #[tauri::command]
+pub fn set_cage_resources(manager: Managed<'_>, cage_id: String, cpus: u32, memory_mib: u32) -> Result<()> {
+    manager.set_resources(&cage_id, cpus, memory_mib)
+}
+
+#[tauri::command]
 pub fn set_agents_unprompted(manager: Managed<'_>, cage_id: String, on: bool) -> Result<()> {
     manager.set_agents_unprompted(&cage_id, on)
 }

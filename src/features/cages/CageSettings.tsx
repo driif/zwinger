@@ -1,9 +1,20 @@
-import { Badge, Button, Card, CardBody, CardHeader, FloatingField, LiquidSwitch, SegmentedControl } from "@driif/motiv";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  FloatingField,
+  LiquidSwitch,
+  SegmentedControl,
+  TextField,
+} from "@driif/motiv";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import { addMount, removeMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
+import { setCageResources } from "./api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -11,6 +22,9 @@ import { phaseName } from "../projects/StartProgress";
 import { direction, duration, trendSummary } from "./startTrend";
 
 export const WORKSPACE = "/workspace";
+/** The same bounds as `cage::CPUS` and `cage::MEMORY_MIB` in the backend. */
+const CPUS = { min: 1, max: 8 };
+const MEMORY_MIB = { min: 512, max: 8192 };
 
 /** The same rules as `cage::guest_path` in the backend. */
 function guestError(path: string) {
@@ -30,6 +44,12 @@ interface MountDraft {
   error?: string;
 }
 
+interface ResourcesDraft {
+  cpus?: string;
+  memoryMib?: string;
+  error?: string;
+}
+
 interface Props {
   cage: CageView;
   /** The cage whose VM the runtime state comes from. */
@@ -43,6 +63,23 @@ interface Props {
 /** The settings of a cage: its mounts and its agent runtimes. All sessions of the cage share them. */
 export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
   const [draft, setDraft] = useState<MountDraft>();
+  const [resources, setResources] = useState<ResourcesDraft>({});
+  const saved = cage.resources;
+  // A field with no draft shows the saved value, so a save elsewhere shows at once.
+  const cpus = resources.cpus ?? String(saved.cpus);
+  const memoryMib = resources.memoryMib ?? String(saved.memoryMib);
+  const resourcesChanged = cpus !== String(saved.cpus) || memoryMib !== String(saved.memoryMib);
+  const applied = vm?.status.state === "running" ? vm.appliedResources : null;
+
+  function saveResources(event: FormEvent) {
+    event.preventDefault();
+    run(() =>
+      setCageResources(cage.id, Number(cpus), Number(memoryMib)).then(
+        () => setResources({}),
+        (e) => setResources({ ...resources, error: errorMessage(e) }),
+      ),
+    );
+  }
 
   function draftMount(host: string, dropped?: string) {
     const base = host.split("/").filter(Boolean).pop() ?? "data";
@@ -158,6 +195,50 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
               </li>
             ))}
           </ul>
+        </CardBody>
+      </Card>
+
+      <Card variant="outlined" padding="md">
+        <CardHeader
+          title="Resources"
+          titleAs="h2"
+          description="The CPUs and memory of each VM of this cage. The next start applies a change."
+        />
+        <CardBody>
+          <form className="stack" onSubmit={saveResources}>
+            <div className="row">
+              <TextField
+                type="number"
+                label="CPUs"
+                min={CPUS.min}
+                max={CPUS.max}
+                step={1}
+                value={cpus}
+                hint={`${CPUS.min} to ${CPUS.max}`}
+                onChange={(e) => setResources({ ...resources, cpus: e.target.value, error: undefined })}
+              />
+              <TextField
+                type="number"
+                label="Memory (MiB)"
+                min={MEMORY_MIB.min}
+                max={MEMORY_MIB.max}
+                step={1}
+                value={memoryMib}
+                hint={`${MEMORY_MIB.min} to ${MEMORY_MIB.max}`}
+                onChange={(e) => setResources({ ...resources, memoryMib: e.target.value, error: undefined })}
+              />
+            </div>
+            {resources.error && <p role="alert">{resources.error}</p>}
+            <p className="muted">
+              A running VM keeps its values until it restarts.
+              {applied && ` It runs with ${applied.cpus} CPUs and ${applied.memoryMib} MiB.`}
+            </p>
+            <div className="row end">
+              <Button size="sm" type="submit" disabled={!resourcesChanged}>
+                Save
+              </Button>
+            </div>
+          </form>
         </CardBody>
       </Card>
 

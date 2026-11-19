@@ -118,6 +118,20 @@ the Mac is in the cage:
 Credentials and logins from the Mac are never in the VM. The proxy of the cage adds them to the requests to their
 hosts only.
 
+## Resources
+
+**Settings > Resources** of a project, or **Cages > Edit**, sets the CPUs and the memory of each VM of the cage: its shared VM and the own VMs of its
+projects.
+
+- **CPUs**: 1 to 8. The default is 1.
+- **Memory**: 512 to 8192 MiB. The default is 512 MiB.
+
+zwinger refuses a value outside these bounds and keeps the old value. zwinger does not compare the values with the
+cores or the memory of your Mac. The cage value replaces the default of the VM runtime.
+
+The next start of a VM applies a change. A running VM keeps its values until it restarts, and its status shows that
+a restart is pending.
+
 ## Terminals in the cage
 
 A VM shell (⌘⇧T) and an agent session (⌘P) run in the cage. A VM shell starts in the project's folder in the VM

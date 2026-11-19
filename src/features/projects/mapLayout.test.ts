@@ -14,6 +14,7 @@ const session = {
 const cage: CageView = {
   id: "dev", name: "Dev", mounts: [], hostAgents: [], logins: [], agentsUnprompted: false,
   network: { default: "block", offline: false, rules: [] }, claudeToken: null, vms: [],
+  resources: { cpus: 1, memoryMib: 512 },
 };
 const metrics = { rowHeight: 24, space: 4, charWidth: 8 };
 

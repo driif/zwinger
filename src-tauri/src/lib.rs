@@ -402,6 +402,7 @@ pub fn run() {
             commands::cages::set_claude_token,
             commands::cages::remove_host_agent,
             commands::cages::set_agents_unprompted,
+            commands::cages::set_cage_resources,
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,

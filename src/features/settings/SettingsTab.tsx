@@ -234,7 +234,7 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
         </Card>
       )}
 
-      {cage && <CageSettings cage={cage} vm={vmCage} runtimes={runtimes} run={run} intent={intent} />}
+      {cage && <CageSettings key={cage.id} cage={cage} vm={vmCage} runtimes={runtimes} run={run} intent={intent} />}
       {/* Outside the `cage` guard: a running VM keeps its diagnostics when the project has no next cage. */}
       <StartDiagnostics vm={vmCage} startHistory={startHistory} />
 

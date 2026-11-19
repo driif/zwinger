@@ -238,6 +238,12 @@ pub enum Error {
     LinkZeroPosition,
     #[error("unknown editor: {0}")]
     UnknownEditor(String),
+    #[error(
+        "a cage needs {}-{} CPUs and {}-{} MiB of memory, not {cpus} CPUs and {memory_mib} MiB",
+        crate::cage::CPUS.start(), crate::cage::CPUS.end(),
+        crate::cage::MEMORY_MIB.start(), crate::cage::MEMORY_MIB.end()
+    )]
+    InvalidResources { cpus: u32, memory_mib: u32 },
     #[error("accent color must be #rrggbb: {0}")]
     InvalidAccent(String),
     #[error("invalid theme: {0}")]

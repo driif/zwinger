@@ -272,6 +272,9 @@ pub struct VmView {
     pub start_timings: Option<Timings>,
     /// The last successful starts of the VM, oldest first, also when it is stopped.
     pub start_history: Vec<StartRecord>,
+    /// The resources that the running VM started with. Not `resources`: the
+    /// UI merges a VM view into its cage.
+    pub applied_resources: Option<cage::Resources>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1217,6 +1220,15 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
+    /// Applies on the next start of each VM of the cage.
+    pub fn set_resources(&self, cage_id: &str, cpus: u32, memory_mib: u32) -> Result<()> {
+        let resources = cage::Resources::new(cpus, memory_mib)?;
+        self.edit_cage(cage_id, |c, _| {
+            c.resources = resources;
+            Ok(())
+        })
+    }
+
     /// Stops the VM that runs for the session and saves the sessions
     /// without it. The cage stays. Then it deletes the run records of the
     /// session. A VM with other members is not stopped: the delete fails
@@ -1330,15 +1342,16 @@ fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> V
         Some(Vm::Failed { message, .. }) => (Status::Error { message: message.clone() }, false, Vec::new()),
     };
     let members = state.members(members).into_iter().map(|m| m.name).collect();
-    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings) = match vm {
-        Some(Vm::Running { runtimes, host, proxy, .. }) => (
+    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings, applied_resources) = match vm {
+        Some(Vm::Running { runtimes, host, proxy, applied, .. }) => (
             runtimes.clone(),
             proxy.login_expires(),
             host.notices.clone(),
             host.guest_logins.clone(),
             Some(host.timings.clone()),
+            Some(applied.1.resources),
         ),
-        _ => (Vec::new(), None, Vec::new(), Vec::new(), None),
+        _ => (Vec::new(), None, Vec::new(), Vec::new(), None, None),
     };
     VmView {
         key: key.to_owned(),
@@ -1352,6 +1365,7 @@ fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> V
         guest_logins,
         start_timings,
         start_history: state.history.of(key),
+        applied_resources,
     }
 }
 
@@ -1493,6 +1507,45 @@ mod tests {
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
         assert!(!manager.bin_dir(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn resources_are_checked_saved_and_wait_for_a_restart() {
+        let (manager, _, id) = manager();
+        let file = manager.store.dir().join(crate::store::CAGES);
+        manager.start(&id).await.unwrap();
+        let saved = std::fs::read(&file).unwrap();
+        for (cpus, memory_mib) in [(0, 1024), (9, 1024), (256, 1024), (u32::MAX, 1024), (2, 511), (2, 8193), (2, 0)] {
+            let error = manager.set_resources(&id, cpus, memory_mib).unwrap_err();
+            assert!(matches!(error, Error::InvalidResources { .. }), "{cpus} {memory_mib}");
+            assert_eq!(std::fs::read(&file).unwrap(), saved);
+            assert_eq!(manager.list().cages[0].cage.resources, crate::cage::Resources::default());
+        }
+        assert!(!manager.list().cages[0].shared().pending_restart);
+
+        manager.set_resources(&id, 8, 8192).unwrap();
+        let view = manager.list().cages.remove(0);
+        assert_eq!(view.cage.resources, crate::cage::Resources::new(8, 8192).unwrap());
+        // The running VM keeps what it started with until it restarts.
+        assert_eq!(view.shared().applied_resources, Some(crate::cage::Resources::default()));
+        assert!(view.shared().pending_restart);
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.store.dir().to_owned()),
+            vault(),
+            temp_dir(),
+            host(),
+        )
+        .unwrap();
+        assert_eq!(cage_of(&reloaded, &id).resources, crate::cage::Resources::new(8, 8192).unwrap());
+
+        manager.stop(&id, None).await.unwrap();
+        assert_eq!(manager.list().cages[0].shared().applied_resources, None);
+        manager.start(&id).await.unwrap();
+        let view = manager.list().cages[0].shared();
+        assert_eq!(view.applied_resources, Some(crate::cage::Resources::new(8, 8192).unwrap()));
+        assert!(!view.pending_restart);
+        manager.stop(&id, None).await.unwrap();
     }
 
     #[tokio::test]

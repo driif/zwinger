@@ -265,6 +265,8 @@ export interface CageView {
   hostAgents: HostAgentUse[];
   /** The agent commands skip their permission prompts: the cage is the sandbox. */
   agentsUnprompted: boolean;
+  /** The CPUs and memory of each VM of the cage. A change applies on the next start. */
+  resources: Resources;
   /** `library`: the token comes from the credential library. */
   claudeToken: { stored: boolean; library: boolean; expiresAt: number | null } | null;
   /** The shared VM, also when it is stopped, then the own VMs that start, run, stop or failed. */
@@ -291,6 +293,13 @@ export interface VmView {
   startTimings: StartTimings | null;
   /** The last successful starts of the VM, oldest first, also when it is stopped. */
   startHistory: StartRecord[];
+  /** The resources that the running VM started with. */
+  appliedResources: Resources | null;
+}
+
+export interface Resources {
+  cpus: number;
+  memoryMib: number;
 }
 
 /** A cage with the state of one of its VMs. `id` is the cage id, `key` the VM key. */

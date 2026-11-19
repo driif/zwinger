@@ -47,10 +47,65 @@ pub struct Cage {
     /// The agent commands skip their permission prompts: the cage is the sandbox.
     #[serde(default = "yes")]
     pub agents_unprompted: bool,
+    /// The CPUs and memory of each VM of the cage. Applies on the next start.
+    #[serde(default)]
+    pub resources: Resources,
 }
 
 fn yes() -> bool {
     true
+}
+
+pub(crate) const CPUS: std::ops::RangeInclusive<u32> = 1..=8;
+pub(crate) const MEMORY_MIB: std::ops::RangeInclusive<u32> = 512..=8192;
+
+/// The CPUs and memory of a VM. Always in [`CPUS`] and [`MEMORY_MIB`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "RawResources")]
+pub struct Resources {
+    cpus: u8,
+    memory_mib: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawResources {
+    cpus: u32,
+    memory_mib: u32,
+}
+
+impl TryFrom<RawResources> for Resources {
+    type Error = Error;
+
+    fn try_from(raw: RawResources) -> Result<Self> {
+        Self::new(raw.cpus, raw.memory_mib)
+    }
+}
+
+impl Resources {
+    pub fn new(cpus: u32, memory_mib: u32) -> Result<Self> {
+        match u8::try_from(cpus) {
+            Ok(cpus_u8) if CPUS.contains(&cpus) && MEMORY_MIB.contains(&memory_mib) => {
+                Ok(Self { cpus: cpus_u8, memory_mib })
+            }
+            _ => Err(Error::InvalidResources { cpus, memory_mib }),
+        }
+    }
+
+    pub fn cpus(self) -> u8 {
+        self.cpus
+    }
+
+    pub fn memory_mib(self) -> u32 {
+        self.memory_mib
+    }
+}
+
+/// The microsandbox 0.7.8 defaults, so a cage from before resources keeps them.
+impl Default for Resources {
+    fn default() -> Self {
+        Self { cpus: 1, memory_mib: 512 }
+    }
 }
 
 /// A host agent of a cage: its runtime, and if the cage also gets the
@@ -99,6 +154,7 @@ impl Cage {
             logins: Vec::new(),
             host_agents: Vec::new(),
             agents_unprompted: true,
+            resources: Resources::default(),
         }
     }
 
