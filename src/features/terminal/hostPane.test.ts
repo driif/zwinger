@@ -11,7 +11,7 @@ Object.assign(globalThis, { paneTestReact: React });
 const virtual = (source: string) => `data:text/javascript,${encodeURIComponent(source)}`;
 const icon = "export const Code=()=>null, Columns2=()=>null, Ellipsis=()=>null, Play=()=>null, Rows2=()=>null, X=()=>null;";
 const motiv = `const div=({children})=>globalThis.paneTestReact.createElement('div',null,children);
-  export const Badge=div, Dialog=div, IconButton=div, IconButtonGroup=div;
+  export const Badge=div, Dialog=div, IconButton=div, IconButtonGroup=div, Splitter=div;
   export const Button=({children})=>globalThis.paneTestReact.createElement('button',null,children);`;
 const stubs: Record<string, string> = {
   "@driif/motiv": motiv,

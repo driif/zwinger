@@ -37,6 +37,9 @@ The rail shows your projects in **workspaces**. In the rail, a project is a **se
 workspace. The tree is workspace → session → Terminals and Tasks. Use the Up and Down arrow keys to move between
 visible rows. A ring marks the row that has keyboard focus.
 
+To resize the project list, drag its right edge or press Tab to focus the edge and use the Left and Right arrow keys.
+Home sets the minimum width and End sets the maximum. Double-click the edge to restore the default width.
+
 - At the first start, one workspace with the name "Workspace" holds all projects.
 - **New workspace** at the bottom of the rail adds an empty workspace.
 - To rename a workspace or a session, double-click its row, or use **Rename** in its menu (right-click or the **…**
@@ -145,6 +148,10 @@ the middle. Point to it to read the full path. The folder follows `cd`: a Mac sh
 VM shell's folder comes from the report at each prompt. A new terminal shows its start folder until the first report.
 When the folder is unknown, the header shows no folder. A narrow pane does not show the folder on the screen. Point
 to the name to read the title and the full folder. Assistive technology also reads the full folder.
+
+To resize panes, drag their divider or press Tab to focus it. Use Left and Right on a vertical divider, or Up and Down
+on a horizontal one. Each arrow press moves the divider by one percent of its split. Home and End move it to the
+limits of 10% and 90%.
 
 When you close a pane, the terminal is hidden but continues to run. A hidden terminal releases its WebGL context.
 When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tree.

@@ -19,19 +19,12 @@
 /* The drag handle on the right edge of the rail. */
 .rail-handle {
   position: absolute;
+  margin: 0;
   top: 0;
   bottom: 0;
   left: var(--zw-rail-width);
   transform: translateX(-50%);
   z-index: 3;
-  width: calc(var(--motiv-space) * 1.5);
-  cursor: col-resize;
-  touch-action: none;
-}
-
-.rail-handle:hover,
-.rail-handle.dragging {
-  background: var(--motiv-color-primary-subtle);
 }
 
 .rail-blocked {

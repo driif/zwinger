@@ -1,11 +1,11 @@
-import { Badge, Button, Dialog, IconButton, IconButtonGroup } from "@driif/motiv";
+import { Badge, Button, Dialog, IconButton, IconButtonGroup, Splitter } from "@driif/motiv";
 import { Code, Columns2, Ellipsis, Play, Rows2, X } from "lucide-react";
-import { CSSProperties, PointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
 import { KindIcon, paneName } from "../projects/ProjectRail";
 import { StartProgress } from "../projects/StartProgress";
-import { Path, place, Rect, setRatio } from "./panes";
+import { place, Rect, setRatio } from "./panes";
 import { folderLabel } from "./folders";
 import { useTerminalTitles } from "./titles";
 import { TerminalView } from "./TerminalView";
@@ -22,7 +22,7 @@ interface Props {
   focused?: string;
   visible: boolean;
   onFocus: (key: string) => void;
-  /** The end of a divider drag. */
+  /** A committed divider position. */
   onLayout: (layout: PaneNode) => void;
   onReopen: (pane: Pane) => void;
   onPaneExit: (processId: string, code: number) => void;
@@ -148,21 +148,52 @@ export function PaneLayout({
   const titles = useTerminalTitles();
   const [actionsFor, setActionsFor] = useState<string>();
   const [focusRequest, setFocusRequest] = useState(0);
-  const [drag, setDrag] = useState<{ path: Path; ratio: number }>();
-  const shown = layout && drag ? setRatio(layout, drag.path, drag.ratio) : layout;
+  const [preview, setPreview] = useState<{ saved: PaneNode; layout: PaneNode }>();
+  const shown = preview && preview.saved === layout ? preview.layout : layout;
   const { panes: places, splits } = shown ? place(shown) : { panes: [], splits: [] };
   const rects = new Map(places.map((p) => [p.terminal, p.rect]));
 
-  function ratioAt(event: PointerEvent, rect: Rect, row: boolean) {
-    const box = area.current!.getBoundingClientRect();
-    const share = row
-      ? ((event.clientX - box.left) / box.width - rect.left) / rect.width
-      : ((event.clientY - box.top) / box.height - rect.top) / rect.height;
-    return Math.min(0.9, Math.max(0.1, share));
-  }
-
   return (
     <div ref={area} className="pane-layout" hidden={!layout}>
+      {layout && splits.map(({ path, direction, ratio, rect }) => {
+        const row = direction === "row";
+        const line = row
+          ? {
+              left: `${(rect.left + rect.width * ratio) * 100}%`,
+              top: `${rect.top * 100}%`,
+              height: `${rect.height * 100}%`,
+              transform: "translateX(-50%)",
+            }
+          : {
+              top: `${(rect.top + rect.height * ratio) * 100}%`,
+              left: `${rect.left * 100}%`,
+              width: `${rect.width * 100}%`,
+              transform: "translateY(-50%)",
+            };
+        return (
+          <Splitter
+            key={path.join("") || "root"}
+            className="pane-divider"
+            style={line}
+            orientation={row ? "vertical" : "horizontal"}
+            label="Resize the panes"
+            value={ratio}
+            min={0.1}
+            max={0.9}
+            step={0.01}
+            aria-valuetext={`${Math.round(ratio * 100)}%`}
+            getValueFromDelta={(delta, start) => {
+              const box = area.current!.getBoundingClientRect();
+              return start + delta / (row ? box.width * rect.width : box.height * rect.height);
+            }}
+            onChange={(value) => setPreview({ saved: layout, layout: setRatio(layout, path, value) })}
+            onCommit={(value) => {
+              setPreview(undefined);
+              onLayout(setRatio(layout, path, value));
+            }}
+          />
+        );
+      })}
       {panes.map((pane) => {
         const rect = rects.get(pane.key);
         if (pane.kind.type === "host") return (
@@ -280,35 +311,6 @@ export function PaneLayout({
               </Dialog>
             )}
           </div>
-        );
-      })}
-      {splits.map(({ path, direction, ratio, rect }) => {
-        const row = direction === "row";
-        const line = row
-          ? { left: `${(rect.left + rect.width * ratio) * 100}%`, top: `${rect.top * 100}%`, height: `${rect.height * 100}%` }
-          : { top: `${(rect.top + rect.height * ratio) * 100}%`, left: `${rect.left * 100}%`, width: `${rect.width * 100}%` };
-        const dragging = drag?.path.join() === path.join();
-        return (
-          <div
-            key={path.join("") || "root"}
-            className={`pane-divider ${direction} ${dragging ? "dragging" : ""}`}
-            style={line}
-            role="separator"
-            aria-orientation={row ? "vertical" : "horizontal"}
-            aria-label="Resize the panes"
-            aria-valuenow={Math.round(ratio * 100)}
-            onPointerDown={(event) => {
-              event.currentTarget.setPointerCapture(event.pointerId);
-              setDrag({ path, ratio });
-            }}
-            onPointerMove={(event) => dragging && setDrag({ path, ratio: ratioAt(event, rect, row) })}
-            onPointerUp={(event) => {
-              if (!dragging) return;
-              setDrag(undefined);
-              onLayout(setRatio(layout!, path, ratioAt(event, rect, row)));
-            }}
-            onPointerCancel={() => setDrag(undefined)}
-          />
         );
       })}
     </div>
