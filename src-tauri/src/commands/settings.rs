@@ -6,12 +6,17 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager as _, State};
 
 use crate::bootstrap::{self, Bootstrap, Legacy, Startup};
-use crate::error::Result;
+use crate::cage::manager::Manager;
+use crate::error::{Error, Result};
 use crate::host_agents::HostAgents;
 use crate::host_agents::detect::Detection;
+use crate::legacy_keychain::{self, LegacyKeychain, Report, Row, StatusView};
 use crate::preferences::{Preferences, Prefs};
+use crate::runtime::Microsandbox;
 use crate::runtimes::{Progress, RuntimeView, Runtimes};
 use crate::terminal::ghostty;
+
+use super::Managed;
 
 #[tauri::command]
 pub fn startup_status(bootstrap: State<'_, Bootstrap>) -> Startup {
@@ -126,6 +131,57 @@ pub async fn install_runtime(
 #[tauri::command]
 pub fn cancel_runtime_install(runtimes: State<'_, Runtimes>, name: String) {
     runtimes.cancel(&name);
+}
+
+/// The import receipt of old Keychain credentials. Reads only the receipt:
+/// it never touches the Keychain.
+#[tauri::command]
+pub fn legacy_keychain_status(manager: Managed<'_>) -> Result<StatusView> {
+    legacy_keychain::status(&manager.data)
+}
+
+/// Runs a Keychain step on a blocking thread, because macOS can wait for
+/// the user at a prompt. The steps return no values.
+async fn keychain_step<T: Send + 'static>(
+    app: AppHandle,
+    step: impl FnOnce(&LegacyKeychain, &Manager<Microsandbox>) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let starting = || Error::LegacyKeychain("zwinger is still starting; try again when the projects show".into());
+        let manager = app.try_state::<Manager<Microsandbox>>().ok_or_else(starting)?;
+        let legacy = app.try_state::<LegacyKeychain>().ok_or_else(starting)?;
+        step(&legacy, &manager)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Lists the old items and resolves them. Reads no value, changes nothing
+/// and allows no cleanup. Runs only on a click.
+#[tauri::command]
+pub async fn scan_legacy_keychain(app: AppHandle) -> Result<Vec<Row>> {
+    keychain_step(app, |legacy, manager| legacy.scan(manager)).await
+}
+
+/// Copies the values of the importable old items into the vault and saves
+/// the import receipt. Never replaces a stored value and never removes an item.
+#[tauri::command]
+pub async fn import_legacy_keychain(app: AppHandle) -> Result<Report> {
+    keychain_step(app, |legacy, manager| legacy.import(manager)).await
+}
+
+/// Removes the chosen old items that the saved import receipt allows.
+/// `accounts` go only if the vault holds the imported value. `confirmed`
+/// are the reviewable items that the user confirmed one by one from the
+/// import result `generation`.
+#[tauri::command]
+pub async fn clean_legacy_keychain(
+    app: AppHandle,
+    accounts: Vec<String>,
+    confirmed: Vec<String>,
+    generation: Option<uuid::Uuid>,
+) -> Result<Report> {
+    keychain_step(app, move |legacy, manager| legacy.clean(manager, &accounts, &confirmed, generation)).await
 }
 
 type Host<'a> = State<'a, Arc<HostAgents>>;

@@ -240,3 +240,76 @@ export const setLibraryCredential = (name: string, value: string, rotate: boolea
 /** Fails while a rule of a cage attaches the entry; the error names the cages. */
 export const deleteLibraryCredential = (name: string) =>
   call<void>("delete_library_credential", { name });
+
+/** The state of one old Keychain item after a step. */
+export type LegacyOutcome =
+  | "importable"
+  | "skipped"
+  | "retiredCa"
+  | "imported"
+  | "same"
+  | "conflict"
+  | "denied"
+  | "missing"
+  | "failed"
+  | "cleaned"
+  | "kept";
+
+/** Why an old item was not imported, changed or removed. */
+export type LegacyReason =
+  | "format"
+  | "noCage"
+  | "noCredential"
+  | "library"
+  | "hostLogin"
+  | "empty"
+  | "notText"
+  | "vault"
+  | "keychain"
+  | "changed"
+  | "notImported"
+  | "notConfirmed"
+  | "ambiguous";
+
+/** One old item, by its account `<project id>/<NAME>`. Never a value. `code`: the OSStatus of a Keychain failure. */
+export interface LegacyRow {
+  account: string;
+  outcome: LegacyOutcome;
+  reason?: LegacyReason;
+  code?: number;
+}
+
+/**
+ * `saved`: the import receipt was written. Without it, no cleanup is allowed. `generation`: the import that the receipt
+ * holds. A confirmed removal names it.
+ */
+export interface LegacyReport {
+  rows: LegacyRow[];
+  saved: boolean;
+  generation: string;
+}
+
+/** The saved import receipt. `pending`: imported items that a cleanup can check and remove. */
+export interface LegacyStatus {
+  ran: boolean;
+  imported: string[];
+  cleaned: string[];
+  pending: string[];
+}
+
+/** Reads only the import receipt. It never touches the Keychain. */
+export const legacyKeychainStatus = () => call<LegacyStatus>("legacy_keychain_status");
+
+/** Lists the old items. Reads no value, changes nothing and allows no cleanup. */
+export const scanLegacyKeychain = () => call<LegacyRow[]>("scan_legacy_keychain");
+
+/** Copies the importable old values into the vault and saves the receipt. macOS can ask once per item. Removes nothing. */
+export const importLegacyKeychain = () => call<LegacyReport>("import_legacy_keychain");
+
+/**
+ * Removes old items that the saved import receipt allows. `accounts` go only if the vault holds the imported value.
+ * `confirmed` are reviewable items that the user confirmed from the import result `generation`. macOS can ask once per
+ * item.
+ */
+export const cleanLegacyKeychain = (accounts: string[], confirmed: string[], generation?: string) =>
+  call<LegacyReport>("clean_legacy_keychain", { accounts, confirmed, generation: generation ?? null });

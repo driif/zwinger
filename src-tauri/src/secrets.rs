@@ -295,6 +295,35 @@ pub trait Vault: Send + Sync {
     fn delete(&self, owner: &Owner, name: &str) -> Result<()>;
     /// The [`Account`]s of all stored values. Returns no values.
     fn accounts(&self) -> Result<Vec<Account>>;
+    /// Reads the value from the same file it syncs before retiring the other copy.
+    fn durable_value(&self, owner: &Owner, name: &str) -> Result<Option<SecretValue>>;
+    /// Saves `value` only if the account has no value, then reads it back.
+    /// A stored value is never replaced: an equal one is [`Inserted::Same`],
+    /// a different one [`Inserted::Conflict`]. The caller holds the manager's
+    /// `secret_edit`, so no other edit of the app runs between the steps.
+    fn insert_new(&self, owner: &Owner, name: &str, value: &SecretValue) -> Result<Inserted> {
+        match self.entry(owner, name)? {
+            Some(found) if found.value == *value => return Ok(Inserted::Same),
+            Some(_) => return Ok(Inserted::Conflict),
+            None => {}
+        }
+        self.set(owner, name, value)?;
+        match self.entry(owner, name)? {
+            Some(found) if found.value == *value => Ok(Inserted::New),
+            _ => Err(Error::Vault("the saved value did not read back the same".into())),
+        }
+    }
+}
+
+/// The result of [`Vault::insert_new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inserted {
+    /// The value is saved and reads back the same.
+    New,
+    /// The account already has this value. Nothing is written.
+    Same,
+    /// The account has a different value. It stays.
+    Conflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,6 +353,14 @@ enum StoredValue {
     Dated { value: String, saved_at: i64 },
 }
 
+impl StoredValue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Legacy(value) | Self::Dated { value, .. } => value,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Stored {
     version: u32,
@@ -346,6 +383,11 @@ impl Stored {
     fn remove(&mut self, owner: &Owner, name: &str) -> Option<StoredValue> {
         let (map, prefix) = self.map(owner);
         map.remove(&format!("{prefix}{name}"))
+    }
+
+    fn text(&mut self, owner: &Owner, name: &str) -> Option<String> {
+        let (map, prefix) = self.map(owner);
+        map.get(&format!("{prefix}{name}")).map(|value| value.text().to_owned())
     }
 }
 
@@ -426,6 +468,10 @@ impl FileVault {
 
     /// The checked folder and its values. A missing folder or file is an empty vault.
     fn load(&self) -> Result<(Option<OwnedFd>, Stored)> {
+        self.read_store(false)
+    }
+
+    fn read_store(&self, sync: bool) -> Result<(Option<OwnedFd>, Stored)> {
         let Some(dir) = self.open_dir()? else {
             return Ok((None, Stored::default()));
         };
@@ -441,13 +487,23 @@ impl FileVault {
         let stat = rustix::fs::fstat(&fd).map_err(|e| vault_io(&self.file, e.into()))?;
         self.check(&self.file, &stat, FileType::RegularFile, 0o600)?;
         let mut text = Vec::new();
-        io::Read::read_to_end(&mut fs::File::from(fd), &mut text).map_err(|e| vault_io(&self.file, e))?;
+        let mut file = fs::File::from(fd);
+        io::Read::read_to_end(&mut file, &mut text).map_err(|e| vault_io(&self.file, e))?;
         // The serde_json message can quote a value, so only its place is shown.
         let stored: Stored = serde_json::from_slice(&text).map_err(|e| {
             Error::Vault(format!("{} is not valid at line {}, column {}", self.file.display(), e.line(), e.column()))
         })?;
         if !(1..=FORMAT).contains(&stored.version) {
             return Err(Error::Vault(format!("{} has unknown version {}", self.file.display(), stored.version)));
+        }
+        if sync {
+            file.sync_all().map_err(|e| vault_io(&self.file, e))?;
+            rustix::fs::fsync(&dir).map_err(|e| vault_io(&self.dir, e.into()))?;
+            let current = rustix::fs::statat(&dir, VAULT_FILE, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| vault_io(&self.file, e.into()))?;
+            if (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino) {
+                return Err(Error::Vault("the vault file changed during verification".into()));
+            }
         }
         Ok((Some(dir), stored))
     }
@@ -565,6 +621,25 @@ impl Vault for FileVault {
         self.save(dir, stored)
     }
 
+    /// The compare, the write and the read back run under one lock.
+    fn insert_new(&self, owner: &Owner, name: &str, value: &SecretValue) -> Result<Inserted> {
+        let _lock = self.locked();
+        let (dir, mut stored) = self.load()?;
+        match stored.text(owner, name) {
+            Some(found) if found == value.expose() => return Ok(Inserted::Same),
+            Some(_) => return Ok(Inserted::Conflict),
+            None => {}
+        }
+        let (map, prefix) = stored.map(owner);
+        let entry = StoredValue::Dated { value: value.expose().to_owned(), saved_at: now_ms() };
+        map.insert(format!("{prefix}{name}"), entry);
+        self.save(dir, stored)?;
+        match self.load()?.1.text(owner, name) {
+            Some(found) if found == value.expose() => Ok(Inserted::New),
+            _ => Err(Error::Vault("the saved value did not read back the same".into())),
+        }
+    }
+
     fn accounts(&self) -> Result<Vec<Account>> {
         let _lock = self.locked();
         let stored = self.load()?.1;
@@ -574,6 +649,11 @@ impl Vault for FileVault {
             Some((Owner::Cage(Cow::Owned(id.to_owned())), name.to_owned()))
         });
         Ok(cages.chain(stored.library.into_keys().map(|name| (Owner::Library, name))).collect())
+    }
+
+    fn durable_value(&self, owner: &Owner, name: &str) -> Result<Option<SecretValue>> {
+        let _lock = self.locked();
+        Ok(self.read_store(true)?.1.text(owner, name).map(SecretValue::new))
     }
 }
 
@@ -594,6 +674,8 @@ pub mod fake {
         pub gets: AtomicUsize,
         /// Makes the next set change the value and then fail.
         pub fail_after_write: AtomicBool,
+        /// While set, each sync fails, as a failed folder sync after a rename.
+        pub fail_sync: AtomicBool,
     }
 
     impl MemoryVault {
@@ -640,6 +722,13 @@ pub mod fake {
 
         fn accounts(&self) -> Result<Vec<Account>> {
             Ok(self.values.lock().unwrap().keys().cloned().collect())
+        }
+
+        fn durable_value(&self, owner: &Owner, name: &str) -> Result<Option<SecretValue>> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                return Err(Error::Vault("folder sync failed".into()));
+            }
+            self.get(owner, name)
         }
     }
 }
@@ -965,6 +1054,54 @@ pub mod tests {
         let json: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(VAULT_FILE)).unwrap()).unwrap();
         assert_eq!(json["version"], 3);
         assert_eq!(json["values"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn sync_checks_the_vault_file_and_refuses_a_link() {
+        let (vault, dir) = file_vault();
+        assert_eq!(vault.durable_value(&c("p"), "KEY").unwrap(), None);
+        vault.set(&c("p"), "KEY", &SecretValue::new("v")).unwrap();
+        assert_eq!(vault.durable_value(&c("p"), "KEY").unwrap(), Some(SecretValue::new("v")));
+        fs::remove_file(dir.join(VAULT_FILE)).unwrap();
+        assert_eq!(vault.durable_value(&c("p"), "KEY").unwrap(), None);
+        std::os::unix::fs::symlink("/dev/null", dir.join(VAULT_FILE)).unwrap();
+        assert!(matches!(vault.durable_value(&c("p"), "KEY"), Err(Error::VaultLink { .. })));
+    }
+
+    #[test]
+    fn insert_new_never_replaces_a_stored_value() {
+        let (vault, _) = file_vault();
+        let value = SecretValue::new("first");
+        assert_eq!(vault.insert_new(&c("p/1"), "KEY", &value).unwrap(), Inserted::New);
+        assert!(vault.entry(&c("p/1"), "KEY").unwrap().unwrap().saved_at.is_some());
+        assert_eq!(vault.insert_new(&c("p/1"), "KEY", &value).unwrap(), Inserted::Same);
+        let other = SecretValue::new("second");
+        assert_eq!(vault.insert_new(&c("p/1"), "KEY", &other).unwrap(), Inserted::Conflict);
+        assert_eq!(vault.get(&c("p/1"), "KEY").unwrap().unwrap(), value);
+        // The library is a different map: the same name there is a new value.
+        assert_eq!(vault.insert_new(&Owner::Library, "KEY", &other).unwrap(), Inserted::New);
+        assert_eq!(vault.get(&c("p/1"), "KEY").unwrap().unwrap(), value);
+    }
+
+    #[test]
+    fn a_failed_insert_new_keeps_the_old_file() {
+        let (vault, _) = file_vault();
+        vault.set(&c("p"), "OLD", &SecretValue::new("old")).unwrap();
+        vault.fail_rename.store(true, Ordering::SeqCst);
+        assert!(matches!(vault.insert_new(&c("p"), "NEW", &SecretValue::new("new")), Err(Error::Vault(_))));
+        assert_eq!(vault.get(&c("p"), "NEW").unwrap(), None);
+        assert_eq!(vault.get(&c("p"), "OLD").unwrap().unwrap().expose(), "old");
+    }
+
+    #[test]
+    fn the_default_insert_new_fails_a_write_and_keeps_a_stored_value() {
+        let vault = fake::MemoryVault::default();
+        vault.set(&c("p"), "KEY", &SecretValue::new("newer")).unwrap();
+        assert_eq!(vault.insert_new(&c("p"), "KEY", &SecretValue::new("old")).unwrap(), Inserted::Conflict);
+        assert_eq!(vault.get(&c("p"), "KEY").unwrap().unwrap().expose(), "newer");
+        *vault.writes_left.lock().unwrap() = Some(0);
+        assert!(vault.insert_new(&c("p"), "OTHER", &SecretValue::new("v")).is_err());
+        assert_eq!(vault.get(&c("p"), "OTHER").unwrap(), None);
     }
 
     pub fn secret(name: &str, hosts: &[&str]) -> Secret {

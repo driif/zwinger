@@ -259,6 +259,10 @@ impl Vault for GatedVault {
     fn accounts(&self) -> Result<Vec<secrets::Account>> {
         self.inner.accounts()
     }
+
+    fn durable_value(&self, owner: &Owner, name: &str) -> Result<Option<SecretValue>> {
+        self.inner.durable_value(owner, name)
+    }
 }
 
 pub(crate) const NOW: i64 = 1_800_000_000_000;

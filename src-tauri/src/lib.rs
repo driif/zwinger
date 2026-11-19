@@ -8,6 +8,7 @@ mod editor_icons;
 mod error;
 mod host_agents;
 mod instance;
+mod legacy_keychain;
 mod netlog;
 mod network;
 mod preferences;
@@ -263,6 +264,8 @@ pub fn run() {
             app.manage(Bootstrap::default());
             app.manage(preferences::Preferences::load(data.join("preferences.json")));
             app.manage(appearance::Themes { dir: data.join("themes") });
+            // Makes no Keychain call: each one follows a click in Settings.
+            app.manage(legacy_keychain::LegacyKeychain::new(legacy_keychain::system_source()));
             // Off the main thread: the runtime install and the reap take seconds.
             // The project commands need the manager, so the UI shows the projects
             // only in the Ready phase.
@@ -397,6 +400,10 @@ pub fn run() {
             commands::settings::clean_images,
             commands::settings::legacy_storage,
             commands::settings::remove_legacy_runtime,
+            commands::settings::legacy_keychain_status,
+            commands::settings::scan_legacy_keychain,
+            commands::settings::import_legacy_keychain,
+            commands::settings::clean_legacy_keychain,
             commands::editors::detect_editors,
             commands::editors::open_in_editor,
             commands::editors::reveal_session,

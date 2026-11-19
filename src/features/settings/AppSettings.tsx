@@ -29,6 +29,7 @@ import { TerminalSettings } from "../terminal";
 import { Editors } from "../launcher/api";
 import { EditorsSettings } from "./EditorsSettings";
 import { LibraryCredentials } from "./LibraryCredentials";
+import { LegacyKeychain } from "./LegacyKeychain";
 
 const REPO = "https://github.com/driif/zwinger";
 
@@ -361,6 +362,7 @@ export function AppSettings({
           credentials: (
             <div className="tab-body">
               <LibraryCredentials />
+              <LegacyKeychain />
             </div>
           ),
           appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,

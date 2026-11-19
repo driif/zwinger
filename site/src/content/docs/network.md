@@ -102,8 +102,63 @@ Any process that runs as your macOS user can read the vault file. The file prote
 from the cages, not from other programs of your user.
 :::
 
-Older versions kept the values in the macOS Keychain. The app does not move them to the vault file. A credential from
-before shows **Not set**: enter its value again. A cage with such a credential does not start until you do.
+Older versions kept the values in the macOS Keychain. A credential from before shows **Not set** until you import it
+or enter its value again. A cage with such a credential does not start until you do one of the two.
+
+### Import from the macOS Keychain
+
+Open **Settings > Credentials**, section **Credentials in the macOS Keychain**. zwinger does not touch the Keychain
+until you click a button there. It never reads or changes the Keychain at app start.
+
+1. **Check Keychain** lists the old items (service `zwinger`) and tells what an import does with each. It reads no
+   value, changes nothing and does not allow a removal.
+2. **Import from Keychain** copies each value to the cage with the same project id, if that cage still has its own
+   credential with that name, and saves an import receipt. macOS can ask for your password or for **Allow** one time
+   for each item. If you cancel a prompt, that item stays, and the import continues with the others. Click Import
+   again to try again.
+3. **Remove from Keychain** is a separate step. Only items from a saved import receipt can be removed, also after a
+   restart. zwinger reads each item again and removes it only if the item did not change after the import and the vault
+   holds the same value, saved to disk. macOS can ask again for each item.
+
+An item that changed after the import, or a new item with the same name, stays until you import again. If more than one
+Keychain item has the same name, zwinger does not read or remove any of them. A new import takes back the removal of
+each item that it cannot read or find.
+
+The import never replaces a value in the vault and never removes a Keychain item. The report gives one result for each
+item:
+
+| Result | Meaning |
+|---|---|
+| Imported | The vault has the value now. |
+| Already in the vault | The vault had the same value. Nothing changed. |
+| Different value | The vault has a different value. Both values stay. |
+| Not imported | No cage has this project id, the cage has no own credential with this name, the cage takes the name from the credential library, or the name is a host login. The item stays. |
+| Old proxy CA key | `zwinger/PROXY_CA_KEY` of versions before the in-memory CA. It is never imported or used. |
+| macOS did not give access | You canceled the prompt, or the Keychain is locked. The item stays. |
+| Kept | The item stayed in the Keychain. The report gives the reason. |
+| Not in the Keychain | The item was already gone when checked. |
+| Removed from the Keychain | Cleanup removed the selected item. |
+| Failed | The vault could not be written or saved to disk, or more than one item has this name. The item stays. |
+
+The import does not attach a value to the credential library, and it does not change a rule. A value of a cage that
+no longer has the credential is not imported, so it stays in the Keychain and does not go at the next app start.
+
+After an import, **Other old items** lists the items that the vault does not hold with the same value, for example the
+old proxy CA key or a value of a deleted cage. If the Keychain has only the old proxy CA key, run **Import from
+Keychain** to get this list. Select each item, then confirm. This deletes the only copy, and it cannot be undone. An
+item that changed since import stays if the final check detects the change. macOS checks and deletes in separate calls.
+Another app can still edit the item during that short interval. A macOS prompt during removal can delay other credential edits.
+
+A kept item stays in the Keychain. To get its value, open **Keychain Access**, search for `zwinger`, open the item with
+the account name from the report and select **Show password**. Then enter the value in the cage or in the credential
+library.
+
+The import receipt `legacy-keychain.json` in the app data folder keeps only the account names, an item revision from
+the Keychain and the result of each item. It never keeps a value. If zwinger cannot read the receipt, or it is from a
+newer version, zwinger does not change it and does not import or remove an item. Move the file away, then import again.
+
+Starting another import clears earlier cleanup approvals. If you quit during a cleanup, run **Import from Keychain**
+again to review any items that remain.
 
 :::caution
 Do not give a credential to a host that sends requests back, for example `httpbin.org`, `postman-echo.com` or an

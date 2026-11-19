@@ -33,6 +33,11 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Check legacy import with an empty synthetic macOS Keychain
+        if: runner.os == 'macOS' && runner.environment == 'github-hosted'
+        env:
+          ZWINGER_HOSTED_RUNNER: ${{ runner.environment }}
+        run: python3 scripts/test-legacy-keychain-ci.py
 
   docs:
     runs-on: ubuntu-latest

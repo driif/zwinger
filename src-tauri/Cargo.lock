@@ -9208,6 +9208,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "core-foundation 0.10.1",
  "dirs",
  "flate2",
  "http",
@@ -9226,6 +9227,8 @@ dependencies = [
  "rustix",
  "rustls",
  "rustls-platform-verifier",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",

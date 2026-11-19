@@ -92,6 +92,12 @@ pub enum Error {
     VaultLink { path: String },
     #[error("the credential vault \"{path}\" is not a {kind}; move it to a different folder, then try again")]
     VaultType { path: String, kind: &'static str },
+    /// A Keychain failure of the import of old credentials. The text comes
+    /// from the OSStatus only, never from an item.
+    #[error("{0}")]
+    LegacyKeychain(String),
+    #[error("an import or cleanup of the old Keychain items already runs; wait until it ends")]
+    LegacyKeychainBusy,
     #[error("library credential {0} not found; add it in Settings first")]
     LibraryCredentialNotFound(String),
     #[error("library credential {0} already exists; rotate it instead")]

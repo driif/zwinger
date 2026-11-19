@@ -288,6 +288,24 @@ pub(crate) fn write<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()>
     Ok(())
 }
 
+/// Opens a regular file relative to its directory without following links.
+pub(crate) fn open_data_file(dir: &Path, name: &str) -> Result<Option<File>> {
+    let Some(fd) = open_dir(dir)? else { return Ok(None) };
+    open_regular(&fd, name, &dir.join(name))
+}
+
+/// Publishes a private file and syncs both its contents and its directory entry.
+pub(crate) fn write_synced<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<()> {
+    let dir = open_dir(dir)?.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let bytes = serde_json::to_vec(value)?;
+    publish(&dir, name, true, |file| {
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })?;
+    rustix::fs::fsync(&dir).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
 /// Each user secret becomes a credential with the same name, so it keeps its
 /// vault account, on a rule for each of its exact hosts, with its header,
 /// query or body places. The rule allows the host only where the old policy
