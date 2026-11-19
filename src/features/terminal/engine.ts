@@ -7,6 +7,7 @@ import type { TerminalColors } from "../appearance/api";
 import type { TerminalPrefs } from "../settings/api";
 import { openTerminalLocation, terminalLocation, type OpenedLocation } from "./api";
 import { fileLinkProvider } from "./fileLinks";
+import { NUMBERS } from "./settings.ts";
 
 /** The terminal settings and colors that all terminals use. */
 interface Look {
@@ -40,6 +41,7 @@ interface Live {
   term: Terminal;
   el: HTMLElement;
   fit: () => void;
+  historyScrollback?: number;
   ligatures?: LigaturesAddon;
   ligaturesGeneration: number;
 }
@@ -114,7 +116,9 @@ export function setLook(prefs: TerminalPrefs, colors: TerminalColors) {
   for (const entry of live) {
     // This runs during render: a value that xterm refuses must not blank the app.
     try {
-      Object.assign(entry.term.options, options(look));
+      const next = options(look);
+      if (entry.historyScrollback) next.scrollback = Math.max(next.scrollback, entry.historyScrollback);
+      Object.assign(entry.term.options, next);
     } catch {
       // The terminal keeps its old options.
     }
@@ -138,6 +142,24 @@ export function searchOptions(): ISearchOptions {
 }
 
 let xterm: Promise<typeof import("./xterm")> | undefined;
+
+function scrollByWheel(el: HTMLElement, event: WheelEvent, deltaX: number) {
+  const unit = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL ? 1
+    : event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : el.clientHeight;
+  el.scrollBy(deltaX * unit, event.deltaY * unit);
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+/** A run consumes its own scrollback before the wheel moves to the adjacent run. */
+function scrollAdjacentRun(term: Terminal, pane: HTMLElement | null, event: WheelEvent) {
+  if (!pane) return;
+  const buffer = term.buffer.active;
+  const down = event.deltaY > 0 && buffer.viewportY >= buffer.baseY
+    && pane.scrollTop + pane.clientHeight < pane.scrollHeight;
+  const up = event.deltaY < 0 && buffer.viewportY === 0 && pane.scrollTop > 0;
+  if (down || up) scrollByWheel(pane, event, 0);
+}
 
 /**
  * Opens an xterm in `el`. It fits itself when `el` changes size. xterm.js loads on the first terminal.
@@ -186,18 +208,20 @@ export async function openTerminal(el: HTMLElement, onFind: () => void, links: F
   let frozen = false;
   // A frozen grid can be larger than its pane. The wheel scrolls the pane first, before xterm takes it.
   const scrollPane = (event: WheelEvent) => {
-    if (!frozen) return;
-    const { deltaX, deltaY } = event;
-    const down = deltaY > 0 && el.scrollTop + el.clientHeight < el.scrollHeight;
-    const up = deltaY < 0 && el.scrollTop > 0;
-    const right = deltaX > 0 && el.scrollLeft + el.clientWidth < el.scrollWidth;
-    const left = deltaX < 0 && el.scrollLeft > 0;
-    if (!(down || up || right || left)) return;
-    // A line or page delta is rare. A cell is about 16 pixels.
-    const unit = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL ? 1 : event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : el.clientHeight;
-    el.scrollBy(deltaX * unit, deltaY * unit);
-    event.preventDefault();
-    event.stopPropagation();
+    if (frozen) {
+      const { deltaX, deltaY } = event;
+      const down = deltaY > 0 && el.scrollTop + el.clientHeight < el.scrollHeight;
+      const up = deltaY < 0 && el.scrollTop > 0;
+      const right = deltaX > 0 && el.scrollLeft + el.clientWidth < el.scrollWidth;
+      const left = deltaX < 0 && el.scrollLeft > 0;
+      if (down || up || right || left) {
+        scrollByWheel(el, event, deltaX);
+        return;
+      }
+    }
+    if (term.buffer.active.type === "normal" && term.modes.mouseTrackingMode === "none") {
+      scrollAdjacentRun(term, el.closest<HTMLElement>(".host-pane.live"), event);
+    }
   };
   el.addEventListener("wheel", scrollPane, { capture: true, passive: false });
   let markSized!: () => void;
@@ -259,5 +283,46 @@ export async function openTerminal(el: HTMLElement, onFind: () => void, links: F
       releaseWebgl();
       term.dispose();
     },
+  };
+}
+
+/** Opens saved output without any input, link, title or clipboard path. */
+export async function openHistory(el: HTMLElement, bytes: number[]): Promise<() => void> {
+  xterm ??= import("./xterm");
+  const { Terminal, FitAddon, Unicode11Addon } = await xterm;
+  const lookOptions = options(look!);
+  const lines = bytes.reduce((count, byte) => count + Number(byte === 10), 0);
+  const estimate = lines + Math.ceil(bytes.length / 80) + 24;
+  const historyScrollback = Math.max(lookOptions.scrollback, Math.min(estimate, NUMBERS.scrollback.max));
+  const term = new Terminal({ allowProposedApi: true, ...lookOptions, scrollback: historyScrollback, disableStdin: true, cursorBlink: false });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  term.loadAddon(new Unicode11Addon());
+  term.unicode.activeVersion = "11";
+  const ignored = () => true;
+  const handlers = [0, 1, 2, 8, 52].map((code) => term.parser.registerOscHandler(code, ignored));
+  term.open(el);
+  const fitNow = () => {
+    if (el.offsetParent !== null) fit.fit();
+  };
+  const entry: Live = { term, el, fit: fitNow, historyScrollback, ligaturesGeneration: 0 };
+  style(entry, look!);
+  live.add(entry);
+  if (look!.prefs.ligatures) void setLigatures(entry, true);
+  const observer = new ResizeObserver(fitNow);
+  observer.observe(el);
+  fitNow();
+  const leaveHistory = (event: WheelEvent) => scrollAdjacentRun(term, el.parentElement, event);
+  el.addEventListener("wheel", leaveHistory, { capture: true, passive: false });
+  term.write(Uint8Array.from(bytes));
+  term.write("\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?25l");
+  return () => {
+    observer.disconnect();
+    el.removeEventListener("wheel", leaveHistory, { capture: true });
+    handlers.forEach((handler) => handler.dispose());
+    entry.ligaturesGeneration++;
+    entry.ligatures?.dispose();
+    live.delete(entry);
+    term.dispose();
   };
 }

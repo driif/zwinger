@@ -860,8 +860,11 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   function closePane(key: string) {
     const pane = panes.find((p) => p.key === key);
     if (!pane) return;
-    run(() => closeTerminal(pane.sessionId, key));
-    if (view.kind === "terminal" && view.key === key) setView({ kind: "terminal" });
+    // A failed Close keeps the terminal, so the view changes only after success.
+    run(async () => {
+      await closeTerminal(pane.sessionId, key);
+      setView((v) => (v.kind === "terminal" && v.key === key ? { kind: "terminal" } : v));
+    });
   }
 
   /** Saves the order of the session's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */

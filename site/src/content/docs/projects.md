@@ -104,13 +104,20 @@ The tree shows all terminals of a project in one Terminals group. Drag a termina
 the order.
 
 - A terminal that has no process is **dormant**. This occurs after a cage stop or an app restart. **Open** starts a
-  new process in the same place.
+  new process in the same place. After an app restart, a dormant Mac shell shows its prior output read-only when it
+  has saved history. You can scroll, select and copy it. Open the shell to see that history above the live prompt.
 - When a process exits, its terminal keeps the last screen and shows the exit code next to **Open**.
   You can scroll, select and copy the output. If the pane gets smaller, scroll to see the full screen.
   **Open** starts a new process with an empty screen. After an app restart, the terminal is dormant again.
   Stopping the cage also makes a VM terminal dormant.
 - A cage stop does not end a Mac shell. A project delete and the app exit end it.
 - Only **Close** in the tree removes a terminal and ends its process.
+
+Mac shell history stays in the app data folder under `terminal-history`. Each file has a 1 MiB limit and keeps at most
+the 16 most recent shell runs of its terminal. Its folders are private to your account (0700) and its files are private
+(0600). Restored history keeps at least the **Scrollback lines** setting, up to 100,000 lines. **Close** removes a
+terminal's history; deleting a project removes the history of all its terminals. If the history cannot be removed,
+**Close** or the delete shows an error and keeps the terminal or project. Fix the cause, then try again.
 
 A terminal's name is its kind and number, for example "Mac shell 2". When the shell or terminal app sets a window title
 (OSC 0 or OSC 2), the tree row and the pane header show that title. The two labels change together. The title stays

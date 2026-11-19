@@ -355,6 +355,7 @@ pub fn run() {
             commands::terminal::write_session,
             commands::terminal::resize_session,
             commands::terminal::close_terminal,
+            commands::terminal::terminal_history,
             commands::terminal::terminal_folders,
             commands::settings::list_runtimes,
             commands::settings::install_runtime,

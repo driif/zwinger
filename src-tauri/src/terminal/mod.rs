@@ -1,4 +1,5 @@
 pub(crate) mod ghostty;
+pub(crate) mod history;
 pub(crate) mod host;
 pub(crate) mod output;
 
@@ -461,12 +462,18 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Removes the terminal and kills its process. An unknown terminal is
     /// not an error: it is already gone.
     pub fn close_terminal(&self, session_id: &str, terminal_id: &str) -> Result<()> {
+        // History goes first: a failed removal keeps the record, so that Close can run again.
         self.edit_session(session_id, |s, _| {
+            let Ok(record) = s.terminal(terminal_id) else { return Ok(()) };
+            if record.kind == TerminalKind::Host {
+                history::remove_terminal(&self.data, session_id, terminal_id)?;
+            }
             s.remove_terminal(terminal_id);
             Ok(())
         })?;
         lock(&self.state).terminals.retain(|t| {
-            let closed = t.terminal_id.as_deref() == Some(terminal_id);
+            // A terminal ID of another project must not retire that project's process.
+            let closed = t.session_id == session_id && t.terminal_id.as_deref() == Some(terminal_id);
             if closed {
                 t.kill();
             }
@@ -475,19 +482,42 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
+    pub fn terminal_history(&self, session_id: &str, terminal_id: &str) -> Option<Vec<Vec<u8>>> {
+        {
+            let state = lock(&self.state);
+            let record = state.session(session_id).ok()?.terminal(terminal_id).ok()?;
+            if record.kind != TerminalKind::Host {
+                return None;
+            }
+        }
+        history::load(&self.data, session_id, terminal_id)
+    }
+
     /// Hangs up all host shells and agents, and kills the ones that have not exited
     /// after [`host::HANGUP_LIMIT`]. It blocks for at most that limit and
     /// needs no async runtime, so an app exit can call it.
     pub fn kill_host_sessions(&self) {
         let mut groups = Vec::new();
-        lock(&self.state).terminals.retain(|t| {
+        let mut guard = lock(&self.state);
+        let state = &mut *guard;
+        let sessions = &state.sessions;
+        state.terminals.retain(|t| {
             let killed = t.kind.on_host();
+            // A Close or Delete removes the record first. Its history must not come back.
+            if t.kind == TerminalKind::Host
+                && let Some(terminal_id) = &t.terminal_id
+                && sessions.iter().any(|s| s.id == t.session_id && s.terminal(terminal_id).is_ok())
+            {
+                let ring: Vec<u8> = lock(&t.output).ring.iter().copied().collect();
+                let _ = history::save(&self.data, &t.session_id, terminal_id, &ring);
+            }
             if killed && let Some(group) = &t.host_group {
                 group.hangup();
                 groups.push(group.clone());
             }
             !killed
         });
+        drop(guard);
         if groups.is_empty() {
             return;
         }
@@ -598,6 +628,273 @@ mod tests {
 
     fn vm(guest: &str, opens: Option<&Path>) -> Option<TerminalFolder> {
         Some(TerminalFolder { path: guest.into(), vm: true, opens: opens.map(Path::to_owned) })
+    }
+
+    #[tokio::test]
+    async fn host_history_survives_quit_restart_and_reopen_without_duplication() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        let (_, mut rx) = attach(&manager, &process);
+        manager.write(&process, b"printf 'first-history-line\\n'\n".to_vec()).unwrap();
+        let mut seen = String::new();
+        while !seen.contains("first-history-line\r\n") {
+            if let PtyEvent::Output(bytes) = next(&mut rx).await {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        manager.kill_host_sessions();
+        let first = manager.terminal_history(&id, &terminal).unwrap();
+        assert!(String::from_utf8_lossy(&first[0]).contains("first-history-line"));
+        manager.kill_host_sessions();
+        assert_eq!(manager.terminal_history(&id, &terminal), Some(first.clone()));
+
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.list().sessions[0].session.folder.clone()),
+            vault(),
+            manager.data.clone(),
+            host(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.terminal_history(&id, &terminal), Some(first.clone()));
+        let process = reloaded.reopen_terminal(&id, &terminal, 24, 80).await.unwrap();
+        let (_, mut rx) = attach(&reloaded, &process);
+        reloaded.write(&process, b"printf 'second-history-line\\n'\n".to_vec()).unwrap();
+        let mut seen = String::new();
+        while !seen.contains("second-history-line\r\n") {
+            if let PtyEvent::Output(bytes) = next(&mut rx).await {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        reloaded.kill_host_sessions();
+        let second = reloaded.terminal_history(&id, &terminal).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0], first[0]);
+        assert!(String::from_utf8_lossy(&second[1]).contains("second-history-line"));
+    }
+
+    #[tokio::test]
+    async fn two_host_shells_keep_separate_history_after_restart() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let first = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let second = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let terminals = terminal_ids(&manager);
+        for (process, line) in [(&first, "alpha-only"), (&second, "bravo-only")] {
+            let (_, mut rx) = attach(&manager, process);
+            manager.write(process, format!("printf '{line}\\n'\n").into_bytes()).unwrap();
+            let mut seen = String::new();
+            while !seen.contains(&format!("{line}\r\n")) {
+                if let PtyEvent::Output(bytes) = next(&mut rx).await {
+                    seen.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        manager.kill_host_sessions();
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.list().sessions[0].session.folder.clone()),
+            vault(),
+            manager.data.clone(),
+            host(),
+        )
+        .unwrap();
+        let a = String::from_utf8(reloaded.terminal_history(&id, &terminals[0]).unwrap()[0].clone()).unwrap();
+        let b = String::from_utf8(reloaded.terminal_history(&id, &terminals[1]).unwrap()[0].clone()).unwrap();
+        assert!(a.contains("alpha-only") && !a.contains("bravo-only"));
+        assert!(b.contains("bravo-only") && !b.contains("alpha-only"));
+    }
+
+    #[tokio::test]
+    async fn an_exited_host_shell_is_still_captured_on_quit() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        let (_, mut rx) = attach(&manager, &process);
+        manager.write(&process, b"printf 'exited-history\\n'\nexit\n".to_vec()).unwrap();
+        while !matches!(next(&mut rx).await, PtyEvent::Exit(_)) {}
+        manager.kill_host_sessions();
+        assert!(
+            String::from_utf8_lossy(&manager.terminal_history(&id, &terminal).unwrap()[0]).contains("exited-history")
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_history_stays_untouched_and_close_and_delete_remove_it() {
+        let (manager, _, id) = manager();
+        let terminal = {
+            let mut state = lock(&manager.state);
+            manager.add_terminal(&mut state, &id, TerminalKind::Host).unwrap()
+        };
+        super::history::save(&manager.data, &id, &terminal, b"untouched\n").unwrap();
+        manager.kill_host_sessions();
+        assert_eq!(manager.terminal_history(&id, &terminal), Some(vec![b"untouched\n".to_vec()]));
+        assert!(manager.terminal_history("wrong", &terminal).is_none());
+        assert!(manager.terminal_history(&id, "unknown").is_none());
+        manager.close_terminal(&id, &terminal).unwrap();
+        assert!(super::history::load(&manager.data, &id, &terminal).is_none());
+
+        let other = {
+            let mut state = lock(&manager.state);
+            manager.add_terminal(&mut state, &id, TerminalKind::Host).unwrap()
+        };
+        super::history::save(&manager.data, &id, &other, b"delete\n").unwrap();
+        manager.delete(&id).await.unwrap();
+        assert!(super::history::load(&manager.data, &id, &other).is_none());
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_history_cleanup_keeps_the_record_and_a_retry_succeeds() {
+        // Root can unlink in a read-only folder, so the failure cannot occur.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (manager, _, id) = manager();
+        let other_dir = temp_dir();
+        let other = manager.create(other_dir.to_str().unwrap(), None).unwrap();
+        let add = |session: &str| {
+            let mut state = lock(&manager.state);
+            manager.add_terminal(&mut state, session, TerminalKind::Host).unwrap()
+        };
+        let (closed, kept, elsewhere, empty) = (add(&id), add(&id), add(&other), add(&id));
+        for (session, terminal) in [(&id, &closed), (&id, &kept), (&other, &elsewhere)] {
+            super::history::save(&manager.data, session, terminal, b"synthetic\n").unwrap();
+        }
+        let folder = manager.data.join("terminal-history").join(&id);
+        let records = |session: &str| {
+            let state = lock(&manager.state);
+            state.session(session).map(|s| s.terminals.iter().map(|t| t.id.clone()).collect::<Vec<_>>())
+        };
+
+        chmod(&folder, 0o500);
+        assert!(matches!(manager.close_terminal(&id, &closed), Err(Error::Io(_))));
+        assert!(records(&id).unwrap().contains(&closed));
+        assert!(matches!(manager.delete(&id).await, Err(Error::Io(_))));
+        assert!(records(&id).is_ok());
+        chmod(&folder, 0o700);
+        assert!(super::history::load(&manager.data, &id, &closed).is_some());
+        let (stored, _) = manager.store.load().unwrap();
+        assert!(stored.iter().any(|s| s.id == id && s.terminals.iter().any(|t| t.id == closed)));
+
+        manager.close_terminal(&id, &closed).unwrap();
+        assert!(!records(&id).unwrap().contains(&closed));
+        assert!(super::history::load(&manager.data, &id, &closed).is_none());
+        assert!(super::history::load(&manager.data, &id, &kept).is_some());
+        manager.close_terminal(&id, &empty).unwrap();
+        manager.close_terminal(&id, "unknown").unwrap();
+
+        manager.delete(&id).await.unwrap();
+        assert!(records(&id).is_err());
+        assert!(!folder.exists());
+        assert_eq!(records(&other).unwrap(), vec![elsewhere.clone()]);
+        assert!(super::history::load(&manager.data, &other, &elsewhere).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_history_folder_blocks_delete_with_a_clear_error() {
+        let (manager, _, id) = manager();
+        let terminal = {
+            let mut state = lock(&manager.state);
+            manager.add_terminal(&mut state, &id, TerminalKind::Host).unwrap()
+        };
+        super::history::save(&manager.data, &id, &terminal, b"synthetic\n").unwrap();
+        let folder = manager.data.join("terminal-history").join(&id);
+        std::fs::create_dir(folder.join("stray")).unwrap();
+        let Err(Error::Io(e)) = manager.delete(&id).await else { panic!("delete must fail") };
+        assert!(e.to_string().contains("stray") && e.to_string().contains(folder.to_str().unwrap()));
+        assert!(lock(&manager.state).session(&id).is_ok());
+        std::fs::remove_dir(folder.join("stray")).unwrap();
+        manager.delete(&id).await.unwrap();
+        assert!(!folder.exists());
+    }
+
+    #[tokio::test]
+    async fn a_quit_after_close_or_delete_writes_no_history() {
+        host_sh();
+        let (manager, _, id) = manager();
+        for gone in ["terminal", "project"] {
+            let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+            let terminal = terminal_ids(&manager).last().unwrap().clone();
+            let (_, mut rx) = attach(&manager, &process);
+            manager.write(&process, b"printf 'orphan-line\\n'\n".to_vec()).unwrap();
+            let mut seen = String::new();
+            while !seen.contains("orphan-line\r\n") {
+                if let PtyEvent::Output(bytes) = next(&mut rx).await {
+                    seen.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+            // A Close or Delete removed the record, and its process is not retired yet.
+            let saved = {
+                let mut state = lock(&manager.state);
+                let saved = state.sessions.clone();
+                match gone {
+                    "terminal" => state.sessions.iter_mut().for_each(|s| s.remove_terminal(&terminal)),
+                    _ => state.sessions.retain(|s| s.id != id),
+                }
+                saved
+            };
+            manager.kill_host_sessions();
+            assert!(super::history::load(&manager.data, &id, &terminal).is_none());
+            lock(&manager.state).sessions = saved;
+        }
+    }
+
+    #[test]
+    fn non_host_shell_terminals_close_when_the_history_store_is_unavailable() {
+        let (manager, _, id) = manager();
+        std::fs::write(manager.data.join("terminal-history"), b"not a directory").unwrap();
+        for kind in [
+            TerminalKind::Shell,
+            TerminalKind::Agent { agent: AgentKind::Pi, resume: false },
+            TerminalKind::HostAgent { agent: AgentKind::Pi, resume: false },
+        ] {
+            let terminal = manager.add_terminal(&mut lock(&manager.state), &id, kind).unwrap();
+            manager.close_terminal(&id, &terminal).unwrap();
+            assert!(lock(&manager.state).session(&id).unwrap().terminal(&terminal).is_err());
+        }
+    }
+
+    #[test]
+    fn vm_and_host_agent_history_is_never_returned_or_captured() {
+        let (manager, _, id) = manager();
+        let kinds = [
+            TerminalKind::Shell,
+            TerminalKind::Agent { agent: AgentKind::Pi, resume: false },
+            TerminalKind::HostAgent { agent: AgentKind::Pi, resume: false },
+        ];
+        for kind in kinds {
+            let terminal = {
+                let mut state = lock(&manager.state);
+                let terminal = manager.add_terminal(&mut state, &id, kind).unwrap();
+                let (input, _) = mpsc::unbounded_channel();
+                state.terminals.push(super::Terminal {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_id: id.clone(),
+                    kind,
+                    input,
+                    exit_code: Some(0),
+                    output: Arc::new(Mutex::new(super::Output {
+                        ring: b"new\n".iter().copied().collect(),
+                        ..Default::default()
+                    })),
+                    terminal_id: Some(terminal.clone()),
+                    host_group: None,
+                });
+                terminal
+            };
+            super::history::save(&manager.data, &id, &terminal, b"prior\n").unwrap();
+            assert!(manager.terminal_history(&id, &terminal).is_none());
+            manager.kill_host_sessions();
+            assert_eq!(super::history::load(&manager.data, &id, &terminal), Some(vec![b"prior\n".to_vec()]));
+        }
     }
 
     #[tokio::test]
@@ -1146,6 +1443,28 @@ mod tests {
         assert_eq!(map_from(&linked, "../correct.rs"), Some(alpha.join("deep/correct.rs")));
         assert_eq!(map_from(&linked, "../../../x.rs"), None);
         assert_eq!(editor::physical_guest_dir(&cwd, members()), Some(cwd.clone()));
+    }
+
+    #[tokio::test]
+    async fn close_with_a_foreign_terminal_id_keeps_the_other_project_shell() {
+        host_sh();
+        let (manager, _, id) = manager();
+        let other_dir = temp_dir();
+        let other = manager.create(other_dir.to_str().unwrap(), None).unwrap();
+        let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        manager.close_terminal(&other, &terminal).unwrap();
+        assert!(lock(&manager.state).session(&id).unwrap().terminal(&terminal).is_ok());
+        let (_, mut rx) = attach(&manager, &process);
+        manager.write(&process, b"printf 'still-alive\\n'\n".to_vec()).unwrap();
+        let mut seen = String::new();
+        while !seen.contains("still-alive\r\n") {
+            if let PtyEvent::Output(bytes) = next(&mut rx).await {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        manager.close_terminal(&id, &terminal).unwrap();
+        assert!(matches!(manager.write(&process, b"x".to_vec()), Err(Error::ProcessNotFound)));
     }
 
     #[test]

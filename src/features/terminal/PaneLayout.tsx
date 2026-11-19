@@ -1,6 +1,6 @@
 import { Badge, Button, Dialog, IconButton, IconButtonGroup } from "@driif/motiv";
 import { Code, Columns2, Ellipsis, Play, Rows2, X } from "lucide-react";
-import { CSSProperties, PointerEvent, useRef, useState } from "react";
+import { CSSProperties, PointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
 import { KindIcon, paneName } from "../projects/ProjectRail";
@@ -9,6 +9,8 @@ import { Path, place, Rect, setRatio } from "./panes";
 import { folderLabel } from "./folders";
 import { useTerminalTitles } from "./titles";
 import { TerminalView } from "./TerminalView";
+import { HostHistory } from "./HostHistory";
+import { terminalHistory } from "./api";
 
 interface Props {
   /** The layout of the shown project. */
@@ -49,6 +51,81 @@ const body = (r: Rect): CSSProperties => ({
   height: `calc(${r.height * 100}% - var(--zw-pane-header))`,
 });
 
+interface HostPaneProps {
+  pane: Pane;
+  name: string;
+  rect?: Rect;
+  visible: boolean;
+  focused: boolean;
+  focusRequest: number;
+  onFocus: () => void;
+  onPaneExit: (processId: string, code: number) => void;
+  onPaneError: (error: unknown) => void;
+  onReopen: () => void;
+}
+
+function HostPane(props: HostPaneProps) {
+  const [runs, setRuns] = useState<number[][] | null>();
+  const { pane } = props;
+  const shown = props.visible && !!props.rect;
+  useEffect(() => {
+    if (!shown) {
+      setRuns(undefined);
+      return;
+    }
+    let active = true;
+    terminalHistory(pane.sessionId, pane.key)
+      .then((history) => { if (active) setRuns(history?.length ? history : null); })
+      .catch(() => { if (active) setRuns(null); });
+    return () => { active = false; };
+  }, [pane.sessionId, pane.key, shown]);
+
+  return <HostPaneBody {...props} runs={runs} />;
+}
+
+export function HostPaneBody({ pane, name, rect, visible, focused, focusRequest, onFocus, onPaneExit, onPaneError, onReopen, runs }: HostPaneProps & { runs?: number[][] | null }) {
+  const outer = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (pane.processId && runs && outer.current) outer.current.scrollTop = outer.current.scrollHeight;
+  }, [pane.processId, runs]);
+
+  if (!pane.processId && !runs) {
+    return rect && (
+      <div className="pane-dormant" style={body(rect)}>
+        <p className="muted">{name} is not running.</p>
+        <Button variant="outline" iconLeft={<Play size={14} />} onClick={onReopen}>Open</Button>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={outer} className={pane.processId ? "host-pane live" : "host-pane dormant"} style={rect && body(rect)} hidden={!visible || !rect}>
+      {runs?.map((run, index) => <HostHistory key={index} bytes={run} />)}
+      {pane.processId ? (
+        <div className="host-live">
+          <TerminalView
+            key={pane.processId}
+            processId={pane.processId}
+            exitCode={pane.exitCode}
+            visible={visible && !!rect}
+            focused={focused}
+            focusRequest={focusRequest}
+            onFocus={onFocus}
+            onExit={onPaneExit}
+            onReopen={onReopen}
+            onError={onPaneError}
+          />
+        </div>
+      ) : (
+        <div className="terminal-exit">
+          <span className="muted">Not running</span>
+          <Button size="sm" variant="outline" iconLeft={<Play size={14} />} onClick={onReopen}>Open</Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The panes of the shown project side by side, with dividers that drag. */
 export function PaneLayout({
   layout,
@@ -88,6 +165,21 @@ export function PaneLayout({
     <div ref={area} className="pane-layout" hidden={!layout}>
       {panes.map((pane) => {
         const rect = rects.get(pane.key);
+        if (pane.kind.type === "host") return (
+          <HostPane
+            key={pane.key}
+            pane={pane}
+            name={paneName(pane, panes)}
+            rect={rect}
+            visible={visible}
+            focused={pane.key === focused}
+            focusRequest={focusRequest}
+            onFocus={() => onFocus(pane.key)}
+            onPaneExit={onPaneExit}
+            onPaneError={onPaneError}
+            onReopen={() => onReopen(pane)}
+          />
+        );
         return (
           pane.processId && (
             <TerminalView
@@ -110,9 +202,10 @@ export function PaneLayout({
         const pane = panes.find((p) => p.key === terminal);
         return (
           pane &&
+          pane.kind.type !== "host" &&
           !pane.processId && (
             <div key={terminal} className="pane-dormant" style={body(rect)}>
-              {status.state === "starting" && pane.kind.type !== "host" && pane.kind.type !== "hostAgent" ? (
+              {status.state === "starting" && pane.kind.type !== "hostAgent" ? (
                 <StartProgress phase={status.phase} />
               ) : (
                 <>

@@ -111,6 +111,44 @@
   font-size: var(--motiv-font-size-sm);
 }
 
+.host-pane {
+  position: absolute;
+  box-sizing: border-box;
+  min-height: 0;
+  overflow: auto;
+}
+
+.host-pane[hidden] {
+  display: none;
+}
+
+.host-pane .host-history,
+.host-pane.live .host-live {
+  height: 100%;
+}
+
+.host-pane .host-history {
+  flex: none;
+}
+
+.host-live {
+  position: relative;
+}
+
+.host-pane.dormant[hidden] {
+  display: none;
+}
+
+.host-pane.dormant .terminal-exit {
+  position: sticky;
+  bottom: 0;
+  background: var(--motiv-color-surface);
+}
+
+.host-history .xterm-cursor {
+  display: none;
+}
+
 .pane-dormant {
   position: absolute;
   box-sizing: border-box;

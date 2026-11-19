@@ -24,7 +24,7 @@ use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
 use crate::task_runs;
-use crate::terminal::{AgentState, Terminal, TerminalFolder, TerminalView};
+use crate::terminal::{AgentState, Terminal, TerminalFolder, TerminalView, history as terminal_history};
 use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
 /// The network log entries kept per VM.
@@ -1158,6 +1158,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 VmChoice::Own { key, .. } => Some(key.clone()),
                 VmChoice::Shared => None,
             };
+            // A failed cleanup keeps the project, so that Delete can run again.
+            terminal_history::remove_session(&self.data, session_id)?;
             self.save_both(&state.sessions, &sessions, &workspaces)?;
             state.sessions = sessions;
             state.workspaces = workspaces;

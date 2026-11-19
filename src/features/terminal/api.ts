@@ -94,6 +94,9 @@ export const resizeSession = (id: string, rows: number, cols: number) =>
 export const closeTerminal = (sessionId: string, terminalId: string) =>
   call<void>("close_terminal", { sessionId, terminalId });
 
+export const terminalHistory = (sessionId: string, terminalId: string) =>
+  call<number[][] | null>("terminal_history", { sessionId, terminalId });
+
 /** Resolves to the Mac file that the path `path` in the output of the live process names. Fails if it is no file. */
 export const terminalLocation = (processId: string, path: string) =>
   call<string>("terminal_location", { processId, path });

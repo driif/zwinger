@@ -80,6 +80,11 @@ pub fn close_terminal(manager: Managed<'_>, session_id: String, terminal_id: Str
     manager.close_terminal(&session_id, &terminal_id)
 }
 
+#[tauri::command]
+pub fn terminal_history(manager: Managed<'_>, session_id: String, terminal_id: String) -> Option<Vec<Vec<u8>>> {
+    manager.terminal_history(&session_id, &terminal_id)
+}
+
 /// The current folder of each live process of `ids`. It skips unknown and
 /// exited processes, and it opens no process.
 #[tauri::command]
