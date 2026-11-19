@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,16 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn set_offline(&self, id: &str, offline: bool) -> Result<()> {
         self.edit_network(id, |n| {
             n.offline = offline;
+            Ok(())
+        })
+    }
+
+    /// Sets the host port grant, or with `None` removes it. A bad port
+    /// changes nothing.
+    pub fn set_host_port(&self, id: &str, port: Option<u16>) -> Result<()> {
+        let port = port.map(|p| NonZeroU16::new(p).ok_or(Error::InvalidHostPort(p))).transpose()?;
+        self.edit_network(id, |n| {
+            n.host_port = port;
             Ok(())
         })
     }
@@ -626,6 +637,37 @@ mod tests {
         let net = runtime.net.lock().unwrap().clone().unwrap();
         assert!(net.env.contains(&("NPM_TOKEN".to_owned(), "$MSB_NPM_TOKEN$".to_owned())));
         assert!(!net.env.iter().any(|(_, v)| v == "t"));
+    }
+
+    #[tokio::test]
+    async fn the_host_port_grant_is_saved_reaches_the_proxy_and_a_bad_port_changes_nothing() {
+        let (manager, _, id, vault) = manager_with_vault();
+        manager.start(&id).await.unwrap();
+        manager.set_host_port(&id, Some(11434)).unwrap();
+        let port = std::num::NonZeroU16::new(11434);
+        assert_eq!(live(&manager, &id).snapshot().policy.host_port, port);
+        assert!(!manager.list().cages[0].shared().pending_restart);
+
+        let saved = std::fs::read_to_string(manager.store.cages_path()).unwrap();
+        assert!(matches!(manager.set_host_port(&id, Some(0)), Err(Error::InvalidHostPort(0))));
+        assert_eq!(std::fs::read_to_string(manager.store.cages_path()).unwrap(), saved);
+        assert_eq!(live(&manager, &id).snapshot().policy.host_port, port);
+        assert!(matches!(manager.set_host_port("nope", Some(1)), Err(Error::CageNotFound)));
+
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.store.dir().to_owned()),
+            vault,
+            manager.data.clone(),
+            manager.host.clone(),
+        )
+        .unwrap();
+        assert_eq!(reloaded.list().cages[0].cage.network.host_port, port);
+
+        manager.set_host_port(&id, None).unwrap();
+        assert_eq!(live(&manager, &id).snapshot().policy.host_port, None);
+        assert!(!std::fs::read_to_string(manager.store.cages_path()).unwrap().contains("hostPort"));
+        manager.stop(&id, None).await.unwrap();
     }
 
     #[test]

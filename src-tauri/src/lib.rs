@@ -366,6 +366,7 @@ pub fn run() {
             commands::network::proxy_ca_fingerprint,
             commands::network::set_network_default,
             commands::network::set_offline,
+            commands::network::set_host_port,
             commands::network::put_rule,
             commands::network::remove_rule,
             commands::network::set_rule_credential,

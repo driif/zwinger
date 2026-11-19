@@ -28,6 +28,12 @@ pub fn set_offline(manager: Managed<'_>, cage_id: String, offline: bool) -> Resu
     manager.set_offline(&cage_id, offline)
 }
 
+/// `None` removes the host port grant.
+#[tauri::command]
+pub fn set_host_port(manager: Managed<'_>, cage_id: String, port: Option<u16>) -> Result<()> {
+    manager.set_host_port(&cage_id, port)
+}
+
 #[tauri::command]
 pub fn put_rule(manager: Managed<'_>, cage_id: String, rule: RuleDraft) -> Result<String> {
     manager.put_rule(&cage_id, rule)

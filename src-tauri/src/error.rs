@@ -73,6 +73,8 @@ pub enum Error {
     RuleNotFound,
     #[error("invalid rule: {0}")]
     InvalidRule(String),
+    #[error("a host port must be 1-65535, not {0}")]
+    InvalidHostPort(u16),
     #[error("the network proxy of the cage does not start, so the cage does not start: {0}")]
     Proxy(String),
     #[error("secret {0} has no stored value; set it again")]

@@ -23,6 +23,10 @@ pub struct Entry {
     /// `None` for a direct connection.
     pub method: Option<String>,
     pub host: String,
+    /// The target port of a request to the Mac's gateway name, which the
+    /// host port grant can open. `None` for every other host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// The path and the names of the query parameters.
     pub path: Option<String>,
     pub status: Option<u16>,
@@ -32,7 +36,7 @@ pub struct Entry {
     /// Milliseconds from the request to the end of the response.
     pub ms: u64,
     pub allowed: bool,
-    /// `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo` or `direct`.
+    /// `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo`, `host-port` or `direct`.
     pub reason: String,
     /// The names of the injected credentials.
     pub credentials: Vec<String>,
@@ -54,6 +58,7 @@ impl Entry {
             at: now_ms(),
             method: Some(method.to_owned()),
             host: host.to_owned(),
+            port: None,
             path: path.map(redact),
             status: None,
             up: 0,
@@ -73,6 +78,7 @@ impl Entry {
             at: event.at,
             method: None,
             host: event.host.clone(),
+            port: None,
             path: None,
             status: None,
             up: 0,

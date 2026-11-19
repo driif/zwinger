@@ -98,6 +98,8 @@ export interface NetworkPolicy {
   /** Blocks all requests now and keeps the rules. */
   offline: boolean;
   rules: Rule[];
+  /** The host port grant: the guest reaches `127.0.0.1:<port>` of this Mac at `http://host.microsandbox.internal:<port>`. */
+  hostPort?: number;
 }
 
 /** The login of a host agent, read on this Mac. The user cannot edit it. */

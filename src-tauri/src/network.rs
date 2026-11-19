@@ -4,6 +4,8 @@
 //! an Allow rule. On a Block rule it is inactive. The service catalog ships
 //! with the app.
 
+use std::num::NonZeroU16;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
@@ -129,6 +131,11 @@ pub struct NetworkPolicy {
     /// Blocks all requests now and keeps the rules.
     pub offline: bool,
     pub rules: Vec<Rule>,
+    /// The host port grant (ADR 0009): the guest reaches `127.0.0.1:<port>`
+    /// of the Mac at `host.microsandbox.internal:<port>`, plain HTTP only.
+    /// A config from before the grant has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<NonZeroU16>,
 }
 
 /// The shapes before the rules: `mode` with an allow list, and before that `allowAll`.
@@ -141,6 +148,8 @@ enum StoredPolicy {
         offline: bool,
         #[serde(default)]
         rules: Vec<Rule>,
+        #[serde(default, rename = "hostPort")]
+        host_port: Option<NonZeroU16>,
     },
     Mode {
         mode: OldMode,
@@ -164,17 +173,20 @@ enum OldMode {
 impl From<StoredPolicy> for NetworkPolicy {
     fn from(stored: StoredPolicy) -> Self {
         let (mode, domains) = match stored {
-            StoredPolicy::Current { default, offline, rules } => return Self { default, offline, rules },
+            StoredPolicy::Current { default, offline, rules, host_port } => {
+                return Self { default, offline, rules, host_port };
+            }
             StoredPolicy::Mode { mode, domains } => (mode, domains),
             StoredPolicy::Legacy { allow_all, domains } => {
                 (if allow_all { OldMode::Public } else { OldMode::List }, domains)
             }
         };
-        match mode {
-            OldMode::Public => Self { default: DefaultAction::Allow, offline: false, rules: allow_rules(&domains) },
-            OldMode::List => Self { default: DefaultAction::Block, offline: false, rules: allow_rules(&domains) },
-            OldMode::Deny => Self { default: DefaultAction::Block, offline: true, rules: allow_rules(&domains) },
-        }
+        let (default, offline) = match mode {
+            OldMode::Public => (DefaultAction::Allow, false),
+            OldMode::List => (DefaultAction::Block, false),
+            OldMode::Deny => (DefaultAction::Block, true),
+        };
+        Self { default, offline, rules: allow_rules(&domains), host_port: None }
     }
 }
 
@@ -698,12 +710,13 @@ pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
     }
     let refresh = login::denied_hosts(&cage.logins);
     let tokeninfo = cage.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
-    let ctx = decide::Context { policy: &cage.network, refresh: &refresh, tokeninfo };
+    // The agents use HTTPS, so port 443; no proxy port is known here.
+    let ctx = decide::Context { policy: &cage.network, refresh: &refresh, tokeninfo, listener: 0 };
     needs
         .into_iter()
         .filter_map(|(agent, host)| {
             let service = CATALOG.iter().find(|s| s.id != REGISTRIES && s.domains.iter().any(|d| covers(d, &host)))?;
-            let allowed = matches!(decide::decide(&ctx, &host, None), Decision::Allow(_) | Decision::TokenInfo);
+            let allowed = matches!(decide::decide(&ctx, &host, 443, None), Decision::Allow(_) | Decision::TokenInfo);
             Some(AgentNeed { agent, service: service.id, host, allowed })
         })
         .collect()
@@ -980,5 +993,23 @@ mod tests {
         let json = serde_json::to_value(&library).unwrap();
         assert_eq!(json["source"], "library");
         assert_eq!(serde_json::from_value::<Credential>(json).unwrap(), library);
+    }
+
+    #[test]
+    fn the_host_port_grant_is_optional_and_never_zero() {
+        let policy = |json: &str| serde_json::from_str::<NetworkPolicy>(json);
+        // A config from before the grant has none, and writes none.
+        let old = r#"{"default":"block","offline":false,"rules":[]}"#;
+        let before = policy(old).unwrap();
+        assert_eq!(before.host_port, None);
+        assert_eq!(serde_json::to_string(&before).unwrap(), old);
+        let granted = policy(r#"{"default":"block","hostPort":11434}"#).unwrap();
+        assert_eq!(granted.host_port, NonZeroU16::new(11434));
+        let json = serde_json::to_string(&granted).unwrap();
+        assert!(json.contains(r#""hostPort":11434"#), "{json}");
+        assert_eq!(policy(&json).unwrap(), granted);
+        for bad in ["0", "65536", "-1", "\"80\""] {
+            assert!(policy(&format!(r#"{{"default":"block","hostPort":{bad}}}"#)).is_err(), "{bad}");
+        }
     }
 }

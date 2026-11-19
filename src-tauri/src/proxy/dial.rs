@@ -18,7 +18,7 @@ use super::local;
 
 /// The longest wait for the name and the TCP connect together, and for the
 /// permits before them.
-const CONNECT_LIMIT: Duration = Duration::from_secs(30);
+pub(super) const CONNECT_LIMIT: Duration = Duration::from_secs(30);
 /// The upstream connections of one project at once, idle ones included.
 const PROJECT_UPSTREAMS: usize = 128;
 /// The upstream connections of all projects at once.

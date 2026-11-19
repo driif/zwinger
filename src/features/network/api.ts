@@ -30,6 +30,13 @@ export const setNetworkDefault = (cageId: string, value: DefaultAction) =>
 export const setOffline = (cageId: string, offline: boolean) =>
   call<void>("set_offline", { cageId, offline });
 
+/** `null` removes the host port grant. */
+export const setHostPort = (cageId: string, port: number | null) =>
+  call<void>("set_host_port", { cageId, port });
+
+/** The name of this Mac in the guest. The host port grant opens one port of it. */
+export const GUEST_HOST = "host.microsandbox.internal";
+
 /** No `rule.id`: adds the rule, or changes the rule with the same target. The credentials stay. Resolves to the rule id. */
 export const putRule = (
   cageId: string,
@@ -82,6 +89,8 @@ export interface NetEvent {
   /** `null` for a direct connection. */
   method: string | null;
   host: string;
+  /** The target port of a request to `GUEST_HOST`. Absent for every other host. */
+  port?: number;
   /** The path with the names of the query parameters only. */
   path: string | null;
   status: number | null;
@@ -90,7 +99,7 @@ export interface NetEvent {
   down: number;
   ms: number;
   allowed: boolean;
-  /** `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo` or `direct`. */
+  /** `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo`, `host-port`, `misdirected`, `method` or `direct`. */
   reason: string;
   /** The names of the injected credentials. */
   credentials: string[];

@@ -4,7 +4,10 @@
 //! host and its checked addresses, then terminated with a leaf of the zwinger
 //! CA, so each inner request is decided, logged and gets its credentials.
 //! Plain HTTP is decided and logged the same, but gets no credentials.
-//! Every upstream connection goes through [`dial::dial`].
+//! Every upstream connection goes through [`dial::dial`], except the host
+//! port grant (ADR 0009): plain HTTP to the gateway name on the granted port
+//! goes to `127.0.0.1:<port>` through [`LocalConnector`] alone. Its CONNECT
+//! carries plain HTTP only.
 
 pub mod ca;
 pub mod decide;
@@ -17,8 +20,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -38,7 +41,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::client::legacy::connect::{Connect, Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use lru::LruCache;
 use rustls::ClientConfig;
@@ -93,6 +96,19 @@ pub const BLOCKED_HEADER: &str = "x-zwinger-blocked";
 pub const ERROR_HEADER: &str = "x-zwinger-error";
 /// The log note of a plain HTTP request to a host with credentials.
 const PLAIN_HTTP: &str = "no credential: plain http";
+/// The log note of TLS in a CONNECT to the host port: the grant is plain HTTP only.
+const HOST_PORT_HTTP_ONLY: &str = "the host port takes plain http only";
+/// The log note of an upgrade request to the host port.
+const HOST_PORT_NO_UPGRADE: &str = "the host port takes no upgrade";
+/// The log note of a request to the host port with another method.
+const HOST_PORT_METHOD: &str = "the host port takes GET, HEAD, POST, PUT, DELETE, OPTIONS and PATCH only";
+/// The log note of a request to the host port that does not name its authority.
+const HOST_PORT_AUTHORITY: &str =
+    "the request must name http://host.microsandbox.internal:<port>; it can omit the port only for port 80";
+/// The methods of the host port. A CONNECT or an unknown method could make
+/// the local service a raw tunnel.
+const HOST_PORT_METHODS: [Method; 7] =
+    [Method::GET, Method::HEAD, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS, Method::PATCH];
 
 pub type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
 /// One of [`MAX_CONNECTIONS`]. A guest connection holds it, then the tunnel
@@ -187,6 +203,11 @@ struct Shared {
     auto: Client<Connector, ProxyBody>,
     /// HTTP/1.1 only, for WebSocket upgrades.
     h1: Client<Connector, ProxyBody>,
+    /// The host port grant only. It keeps no idle connection, so no
+    /// connection outlives a removed grant.
+    local: Client<LocalConnector, ProxyBody>,
+    /// The port of this proxy, which the grant never opens.
+    port: u16,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -220,6 +241,11 @@ impl Proxy {
                 #[cfg(test)]
                 config.upstream_root.as_ref(),
             )?,
+            local: Client::builder(TokioExecutor::new())
+                .timer(TokioTimer::new())
+                .pool_max_idle_per_host(0)
+                .build(LocalConnector { upstreams: upstreams.clone() }),
+            port,
             upstreams,
             shutdown: shutdown_rx,
         });
@@ -349,9 +375,10 @@ impl Shared {
         scheme.eq_ignore_ascii_case("basic") && bool::from(decoded.ct_eq(&self.expected))
     }
 
-    fn decide(&self, policy: &NetworkPolicy, host: &str, request: Option<(&str, &str)>) -> Decision {
+    fn decide(&self, policy: &NetworkPolicy, origin: &Origin, request: Option<(&str, &str)>) -> Decision {
         let tokeninfo = self.logins.iter().any(|l| l.kind == AgentKind::Gemini);
-        decide(&Context { policy, refresh: &self.refresh, tokeninfo }, host, request)
+        let context = Context { policy, refresh: &self.refresh, tokeninfo, listener: self.port };
+        decide(&context, &origin.host, origin.port, request)
     }
 
     fn log(&self, entry: Entry) {
@@ -496,6 +523,14 @@ impl Origin {
         normal_host(authority.host()) == self.host && authority.port_u16().unwrap_or(self.default_port()) == self.port
     }
 
+    /// A log entry for a request to this origin. The gateway name carries
+    /// its port, as the host port grant opens one port of it.
+    fn entry(&self, method: &str, path: Option<&str>) -> Entry {
+        let mut entry = Entry::new(method, &self.host, path);
+        entry.port = (self.host == GUEST_HOST).then_some(self.port);
+        entry
+    }
+
     fn uri(&self, path_and_query: &str) -> Option<Uri> {
         let scheme = if self.https { "https" } else { "http" };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -543,22 +578,28 @@ async fn connect(
     };
     let origin = Origin { https: true, host: normal_host(authority.host()), port: authority.port_u16().unwrap_or(443) };
     let policy = shared.live.snapshot().policy;
-    match shared.decide(&policy, &origin.host, None) {
+    let host_port = match shared.decide(&policy, &origin, None) {
         Decision::Block(reason) => {
-            return shared.block(Entry::new("CONNECT", &origin.host, None), &reason.to_string());
+            return shared.block(origin.entry("CONNECT", None), &reason.to_string());
         }
+        Decision::HostPort(port) if !names_gateway(authority.as_str(), port) => {
+            let mut entry = origin.entry("CONNECT", None);
+            entry.note = Some(HOST_PORT_AUTHORITY.into());
+            return shared.block(entry, &Reason::HostPort.to_string());
+        }
+        Decision::HostPort(_) => true,
         // The proxy answers the tokeninfo check itself.
-        Decision::TokenInfo => {}
+        Decision::TokenInfo => false,
         Decision::Allow(_) => {
             let upstreams = &shared.upstreams;
             match dial::checked(upstreams.resolver.as_ref(), &origin.host, origin.port).await {
                 Ok(addrs) => upstreams.pin(&origin.host, origin.port, addrs),
                 Err(DialError::Blocked(_)) => {
-                    let entry = Entry::new("CONNECT", &origin.host, None);
+                    let entry = origin.entry("CONNECT", None);
                     return shared.block(entry, &Reason::AlwaysBlocked.to_string());
                 }
                 Err(e) => {
-                    let mut entry = Entry::new("CONNECT", &origin.host, None);
+                    let mut entry = origin.entry("CONNECT", None);
                     entry.status = Some(StatusCode::BAD_GATEWAY.as_u16());
                     entry.allowed = true;
                     entry.reason = "unreachable".into();
@@ -566,15 +607,82 @@ async fn connect(
                     return failed(StatusCode::BAD_GATEWAY, &e.to_string(), format!("zwinger: {e}\n"));
                 }
             }
+            false
         }
-    }
+    };
     let shutdown = shared.shutdown.clone();
     tokio::spawn(guard(shutdown, activity, async move {
         if let Ok(upgraded) = hyper::upgrade::on(req).await {
-            mitm(shared, TokioIo::new(upgraded), origin, permit).await;
+            let io = TokioIo::new(upgraded);
+            if host_port {
+                local_tunnel(shared, io, origin, permit).await;
+            } else {
+                mitm(shared, io, origin, permit).await;
+            }
         }
     }));
     Response::new(empty())
+}
+
+/// A CONNECT to the host port. Node's fetch sends plain HTTP through such a
+/// tunnel too, so the tunnel serves plain HTTP/1.1 and decides each request
+/// again. TLS in it is closed and logged: the proxy does not silently turn
+/// the guest's HTTPS into plain HTTP.
+async fn local_tunnel(shared: Arc<Shared>, mut io: TokioIo<hyper::upgrade::Upgraded>, origin: Origin, permit: Permit) {
+    use tokio::io::AsyncReadExt;
+    let mut first = [0];
+    let Ok(Ok(1)) = tokio::time::timeout(HEADER_LIMIT, io.read(&mut first)).await else {
+        return;
+    };
+    // 0x16: the record type of a TLS handshake.
+    if first[0] == 0x16 {
+        let mut entry = origin.entry("CONNECT", None);
+        entry.note = Some(HOST_PORT_HTTP_ONLY.into());
+        shared.block(entry, &Reason::HostPort.to_string());
+        return;
+    }
+    let plain = Origin { https: false, ..origin };
+    let service = service_fn(move |req| {
+        let (shared, plain, permit) = (shared.clone(), plain.clone(), permit.clone());
+        async move { Ok::<_, Infallible>(forward(shared, req, plain, permit).await) }
+    });
+    let io = Prefixed { first: Some(first[0]), io };
+    let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_LIMIT)
+        .max_buf_size(HEADER_BYTES)
+        .serve_connection(TokioIo::new(io), service)
+        .await;
+}
+
+/// A stream that gives back one byte that was read from it first.
+struct Prefixed<T> {
+    first: Option<u8>,
+    io: T,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if let Some(byte) = self.first.take() {
+            buf.put_slice(&[byte]);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Prefixed<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Terminates the guest's TLS with a leaf for the CONNECT host and serves
@@ -649,7 +757,7 @@ async fn forward(
         websocket.then(|| GuestUpgrade { on: hyper::upgrade::on(&mut req), permit, shutdown: shared.shutdown.clone() });
     let (mut parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str()).to_owned();
-    let mut entry = Entry::new(parts.method.as_str(), &origin.host, Some(&path));
+    let mut entry = origin.entry(parts.method.as_str(), Some(&path));
     if named(&parts).iter().any(|a| !origin.is(a)) {
         entry.status = Some(StatusCode::MISDIRECTED_REQUEST.as_u16());
         entry.reason = "misdirected".into();
@@ -672,9 +780,12 @@ async fn forward(
         );
     }
     let Snapshot { policy, values } = shared.live.snapshot();
-    match shared.decide(&policy, &origin.host, Some((parts.method.as_str(), parts.uri.path()))) {
+    match shared.decide(&policy, &origin, Some((parts.method.as_str(), parts.uri.path()))) {
         Decision::Block(reason) => return shared.block(entry, &reason.to_string()),
         Decision::TokenInfo => return tokeninfo(&shared, &parts, entry, started).await,
+        // A host port tunnel serves plain HTTP only, so no TLS request gets here.
+        Decision::HostPort(_) if origin.https => return shared.block(entry, &Reason::HostPort.to_string()),
+        Decision::HostPort(port) => return host_port(&shared, parts, body, entry, started, port).await,
         Decision::Allow(reason) => {
             entry.allowed = true;
             entry.reason = reason.to_string();
@@ -725,6 +836,93 @@ async fn forward(
     send(client, Request::from_parts(parts, body), finish, guest_upgrade).await
 }
 
+/// The host port grant: plain HTTP to `127.0.0.1:<port>` of the Mac. It
+/// adds no credential and no host login, and takes no upgrade, so it opens
+/// no tunnel. The service gets `127.0.0.1:<port>` as its `host`.
+async fn host_port(
+    shared: &Shared,
+    mut parts: http::request::Parts,
+    body: Incoming,
+    mut entry: Entry,
+    started: Instant,
+    port: NonZeroU16,
+) -> Response<ProxyBody> {
+    let refused = if !HOST_PORT_METHODS.contains(&parts.method) {
+        Some(HOST_PORT_METHOD)
+    } else if !names_grant(&parts, port) {
+        Some(HOST_PORT_AUTHORITY)
+    } else if parts.headers.contains_key(UPGRADE) {
+        Some(HOST_PORT_NO_UPGRADE)
+    } else {
+        None
+    };
+    if let Some(note) = refused {
+        entry.note = Some(note.into());
+        return shared.block(entry, &Reason::HostPort.to_string());
+    }
+    entry.allowed = true;
+    entry.reason = Reason::HostPort.to_string();
+    strip_hop(&mut parts.headers, false);
+    parts.headers.remove(HOST);
+    let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    let Ok(uri) = format!("http://{}:{port}{path}", Ipv4Addr::LOCALHOST).parse() else {
+        return shared.block(entry, "invalid target");
+    };
+    parts.uri = uri;
+    parts.version = Version::HTTP_11;
+    parts.extensions = http::Extensions::new();
+    let up = Arc::new(AtomicU64::new(0));
+    let body = Counted { inner: body, count: up.clone() }.boxed_unsync();
+    let finish = Finish { entry, started, up, sink: shared.sink.clone() };
+    send(&shared.local, Request::from_parts(parts, body), finish, None).await
+}
+
+/// The request names `http://host.microsandbox.internal:<port>` and no
+/// other authority: in a URI with no scheme or `http`, and in one `host`
+/// field at most. A `host` value that is not text fails.
+fn names_grant(parts: &http::request::Parts, port: NonZeroU16) -> bool {
+    if !matches!(parts.uri.scheme_str(), None | Some("http")) {
+        return false;
+    }
+    let mut names = Vec::new();
+    if let Some(authority) = parts.uri.authority() {
+        names.push(authority.as_str());
+    }
+    let hosts = parts.headers.get_all(HOST);
+    if hosts.iter().count() > 1 {
+        return false;
+    }
+    for host in hosts {
+        let Ok(host) = host.to_str() else {
+            return false;
+        };
+        names.push(host);
+    }
+    !names.is_empty() && names.iter().all(|n| names_gateway(n, port))
+}
+
+/// `authority` is exactly the gateway name, with one final dot at most and
+/// any case, and the granted port. No port means port 80. A written port
+/// must be decimal digits: `Authority::port_u16` gives `None` for a bad
+/// port, and `u16::from_str` takes a leading `+`.
+fn names_gateway(authority: &str, port: NonZeroU16) -> bool {
+    let (host, written) = match authority.split_once(':') {
+        Some((host, written)) => (host, Some(written)),
+        None => (authority, None),
+    };
+    if !host.strip_suffix('.').unwrap_or(host).eq_ignore_ascii_case(GUEST_HOST) {
+        return false;
+    }
+    match written {
+        None => port.get() == 80,
+        Some(written) => {
+            (1..=5).contains(&written.len())
+                && written.bytes().all(|b| b.is_ascii_digit())
+                && written.parse::<u16>() == Ok(port.get())
+        }
+    }
+}
+
 /// The guest side of a WebSocket upgrade.
 struct GuestUpgrade {
     on: hyper::upgrade::OnUpgrade,
@@ -752,8 +950,8 @@ impl Finish {
 /// Sends the request upstream and streams the response back. The entry is
 /// logged when the response body ends. A dial to an always-blocked address
 /// is a block.
-async fn send(
-    client: &Client<Connector, ProxyBody>,
+async fn send<C: Connect + Clone + Send + Sync + 'static>(
+    client: &Client<C, ProxyBody>,
     request: Request<ProxyBody>,
     mut finish: Finish,
     guest_upgrade: Option<GuestUpgrade>,
@@ -1001,6 +1199,41 @@ impl tower_service::Service<Uri> for Connector {
     }
 }
 
+/// Connects the client of the host port grant: the permits, then TCP to
+/// `127.0.0.1` on the port of the URI. It resolves no name and dials no
+/// other address.
+#[derive(Clone)]
+struct LocalConnector {
+    upstreams: Arc<Upstreams>,
+}
+
+impl tower_service::Service<Uri> for LocalConnector {
+    type Response = Upstream;
+    type Error = ConnectError;
+    type Future = Pin<Box<dyn Future<Output = Result<Upstream, ConnectError>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut TaskContext<'_>) -> Poll<Result<(), ConnectError>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let upstreams = self.upstreams.clone();
+        Box::pin(async move {
+            if uri.scheme_str() != Some("http") || uri.host() != Some("127.0.0.1") {
+                return Err(ConnectError::Name);
+            }
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, uri.port_u16().ok_or(ConnectError::Name)?));
+            let permits = upstreams.limits.acquire(GUEST_HOST).await.map_err(ConnectError::Dial)?;
+            let name = addr.to_string();
+            let tcp = tokio::time::timeout(dial::CONNECT_LIMIT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| ConnectError::Dial(DialError::Timeout(name.clone())))?
+                .map_err(|e| ConnectError::Dial(DialError::Connect(name, e)))?;
+            Ok(Upstream { io: UpstreamIo::Plain(TokioIo::new(tcp)), _permits: permits })
+        })
+    }
+}
+
 /// An upstream connection. It holds its permits until it closes, also
 /// while it is idle in the pool or carries a WebSocket.
 struct Upstream {
@@ -1201,6 +1434,21 @@ mod tests {
         f: &Fixture,
         authority: &str,
     ) -> Result<TokioIo<tokio_rustls::client::TlsStream<TcpStream>>, StatusCode> {
+        let tcp = connect_only(f, authority).await?;
+        let mut roots = RootCertStore::empty();
+        roots.add(f.ca.der().clone()).unwrap();
+        let config = ClientConfig::builder_with_provider(ca::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let host = authority.rsplit_once(':').unwrap().0.to_owned();
+        let tls = TlsConnector::from(Arc::new(config)).connect(ServerName::try_from(host).unwrap(), tcp).await.unwrap();
+        Ok(TokioIo::new(tls))
+    }
+
+    /// A CONNECT to `authority`. Returns the stream after the `200`.
+    async fn connect_only(f: &Fixture, authority: &str) -> Result<TcpStream, StatusCode> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
         let connect =
@@ -1216,16 +1464,7 @@ mod tests {
         if status != 200 {
             return Err(StatusCode::from_u16(status).unwrap());
         }
-        let mut roots = RootCertStore::empty();
-        roots.add(f.ca.der().clone()).unwrap();
-        let config = ClientConfig::builder_with_provider(ca::provider())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let host = authority.rsplit_once(':').unwrap().0.to_owned();
-        let tls = TlsConnector::from(Arc::new(config)).connect(ServerName::try_from(host).unwrap(), tcp).await.unwrap();
-        Ok(TokioIo::new(tls))
+        Ok(tcp)
     }
 
     #[tokio::test]
@@ -1253,7 +1492,7 @@ mod tests {
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
             source: Source::Local,
         });
-        let policy = NetworkPolicy { default: DefaultAction::Block, offline: false, rules: vec![allowed] };
+        let policy = NetworkPolicy { default: DefaultAction::Block, rules: vec![allowed], ..Default::default() };
         let f = fixture(policy, Vec::new(), Vec::new()).await;
         let port = upstream().await;
 
@@ -1368,8 +1607,8 @@ mod tests {
     async fn connect_is_decided_on_its_host_and_the_inner_requests_are_bound_to_it() {
         let policy = NetworkPolicy {
             default: DefaultAction::Block,
-            offline: false,
             rules: vec![rule("api.test", Action::Allow)],
+            ..Default::default()
         };
         let f = fixture(policy, Vec::new(), Vec::new()).await;
         assert_eq!(tunnel(&f, "blocked.example:443").await.err(), Some(StatusCode::FORBIDDEN));
@@ -1456,7 +1695,7 @@ mod tests {
             if reversed {
                 rules.reverse();
             }
-            let policy = NetworkPolicy { default: DefaultAction::Block, offline: false, rules };
+            let policy = NetworkPolicy { default: DefaultAction::Block, rules, ..Default::default() };
             policy.check().unwrap();
             let values = [
                 (library.clone(), SecretValue::new("shared-fixture")),
@@ -1558,5 +1797,326 @@ mod tests {
             Request::get("/tokeninfo?access_token=mine").header(HOST, TOKENINFO_HOST).body(Empty::new()).unwrap();
         assert_eq!(send_over(io, request).await.0, StatusCode::FORBIDDEN);
         assert!(f.entries().iter().all(|e| !format!("{e:?}").contains("ya29")));
+    }
+
+    /// A grant for `port`, an Allow rule with a credential for the gateway
+    /// name, and a host login for it: the local route must use none of them.
+    async fn host_port_fixture(port: u16) -> Fixture {
+        let mut tempting = bound(GUEST_HOST, Source::Local);
+        tempting.action = Action::Allow;
+        let policy = NetworkPolicy {
+            default: DefaultAction::Allow,
+            rules: vec![tempting],
+            host_port: NonZeroU16::new(port),
+            ..Default::default()
+        };
+        let doc = serde_json::json!({ "access_token": "ya29.real", "expiry_date": log::now_ms() as i64 + 3_600_000 });
+        let token = host_login::parse(AgentKind::Gemini, &doc.to_string()).unwrap();
+        let login = Login::new("LOGIN".into(), vec![GUEST_HOST.into()], token, Arc::new(NoLogin));
+        fixture(policy, vec![Arc::new(login)], Vec::new()).await
+    }
+
+    fn to_guest_host(f: &Fixture, port: u16, path: &str) -> http::request::Builder {
+        Request::get(format!("http://{GUEST_HOST}:{port}{path}"))
+            .header(PROXY_AUTHORIZATION, f.auth())
+            .header(AUTHORIZATION, "Bearer $MSB_KEY$")
+    }
+
+    #[tokio::test]
+    async fn the_host_port_grant_reaches_loopback_with_no_credential() {
+        let port = upstream().await;
+        let f = host_port_fixture(port).await;
+        let tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        let request = to_guest_host(&f, port, "/api/tags?key=v").body(Empty::new()).unwrap();
+        let (status, headers, body) = send_over(TokioIo::new(tcp), request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(headers.get(BLOCKED_HEADER).is_none());
+        assert!(body.starts_with("GET /api/tags?key=v "), "{body}");
+        assert!(body.contains(&format!("host=Some(\"127.0.0.1:{port}\")")), "{body}");
+        // The guest's own placeholder passes, and nothing replaces it.
+        assert!(body.contains("auth=Some(\"Bearer $MSB_KEY$\")"), "{body}");
+        assert!(body.contains("proxy=None"), "{body}");
+        assert!(!body.contains("sk-1") && !body.contains("ya29"), "{body}");
+        let entry = f.entries().pop().unwrap();
+        assert_eq!((entry.allowed, entry.reason.as_str(), entry.port), (true, "host-port", Some(port)));
+        assert!(entry.credentials.is_empty() && entry.note.is_none(), "{entry:?}");
+        // The connection does not stay in a pool.
+        assert!(eventually(|| f.proxy.upstreams.limits.used() == 0).await);
+
+        // Another port of the gateway name stays always blocked.
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let (status, headers, _) = plain(&f, &format!("http://{GUEST_HOST}:{other}/"), Some(f.auth())).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "always-blocked"));
+        assert_eq!(f.entries().pop().unwrap().port, Some(other));
+        for host in ["localhost", "127.0.0.1"] {
+            let (status, _, _) = plain(&f, &format!("http://{host}:{port}/"), Some(f.auth())).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_port_refuses_https_upgrades_and_the_proxy_port() {
+        let port = upstream().await;
+        let f = host_port_fixture(port).await;
+        // TLS in a CONNECT is closed: the proxy does not turn the guest's HTTPS into plain HTTP.
+        let mut tcp = connect_only(&f, &format!("{GUEST_HOST}:{port}")).await.unwrap();
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            tcp.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05]).await.unwrap();
+            let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut [0; 16])).await;
+            assert!(matches!(read, Ok(Ok(0) | Err(_))), "the TLS tunnel stayed open: {read:?}");
+        }
+        let entry = f.entries().pop().unwrap();
+        assert_eq!(
+            (entry.method.as_deref(), entry.reason.as_str(), entry.port, entry.note.as_deref()),
+            (Some("CONNECT"), "host-port", Some(port), Some(HOST_PORT_HTTP_ONLY))
+        );
+        // A CONNECT to another port of the gateway name is refused at once.
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        assert_eq!(connect_only(&f, &format!("{GUEST_HOST}:{other}")).await.err(), Some(StatusCode::FORBIDDEN));
+        let tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        let request = to_guest_host(&f, port, "/")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Empty::new())
+            .unwrap();
+        let (status, headers, _) = send_over(TokioIo::new(tcp), request).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "host-port"));
+        assert_eq!(f.entries().pop().unwrap().note.as_deref(), Some(HOST_PORT_NO_UPGRADE));
+        // A grant of the proxy's own port opens nothing.
+        let own = f.proxy.port;
+        f.live.edit(|p, _| p.host_port = NonZeroU16::new(own));
+        let (status, headers, _) = plain(&f, &format!("http://{GUEST_HOST}:{own}/"), Some(f.auth())).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "always-blocked"));
+    }
+
+    #[tokio::test]
+    async fn a_removed_grant_or_offline_blocks_the_next_request_of_a_kept_connection() {
+        let port = upstream().await;
+        let f = host_port_fixture(port).await;
+        let tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+        tokio::spawn(connection);
+        let status = async |sender: &mut hyper::client::conn::http1::SendRequest<Empty<Bytes>>| {
+            let request = to_guest_host(&f, port, "/").body(Empty::new()).unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            let status = response.status();
+            response.into_body().collect().await.unwrap();
+            status
+        };
+        assert_eq!(status(&mut sender).await, StatusCode::OK);
+        f.live.edit(|p, _| p.offline = true);
+        assert_eq!(status(&mut sender).await, StatusCode::FORBIDDEN);
+        f.live.edit(|p, _| p.offline = false);
+        assert_eq!(status(&mut sender).await, StatusCode::OK);
+        f.live.edit(|p, _| p.host_port = None);
+        assert_eq!(status(&mut sender).await, StatusCode::FORBIDDEN);
+        let reasons: Vec<String> = f.entries().into_iter().map(|e| e.reason).collect();
+        assert_eq!(reasons, ["host-port", "offline", "host-port", "always-blocked"]);
+    }
+
+    /// Node's fetch tunnels plain HTTP with a CONNECT. Each request in the
+    /// tunnel is decided again and gets no credential.
+    #[tokio::test]
+    async fn plain_http_in_a_host_port_tunnel_is_decided_per_request() {
+        let port = upstream().await;
+        let f = host_port_fixture(port).await;
+        let authority = format!("{GUEST_HOST}:{port}");
+        let tcp = connect_only(&f, &authority).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+        tokio::spawn(connection);
+        let request = || {
+            Request::get("/v1")
+                .header(HOST, &authority)
+                .header(AUTHORIZATION, "Bearer $MSB_KEY$")
+                .body(Empty::<Bytes>::new())
+        };
+        let response = sender.send_request(request().unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("auth=Some(\"Bearer $MSB_KEY$\")") && !body.contains("sk-1"), "{body}");
+        let entry = f.entries().pop().unwrap();
+        assert_eq!((entry.reason.as_str(), entry.port, entry.allowed), ("host-port", Some(port), true));
+        assert!(entry.credentials.is_empty());
+
+        f.live.edit(|p, _| p.offline = true);
+        let response = sender.send_request(request().unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(f.entries().pop().unwrap().reason, "offline");
+        f.live.edit(|p, _| {
+            p.offline = false;
+            p.host_port = None;
+        });
+        let response = sender.send_request(request().unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(f.entries().pop().unwrap().reason, "always-blocked");
+    }
+
+    /// Sends raw bytes in a new host port tunnel and returns the first
+    /// answer, or an empty string if the proxy closes the tunnel.
+    async fn in_tunnel(f: &Fixture, port: u16, bytes: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = connect_only(f, &format!("{GUEST_HOST}:{port}")).await.unwrap();
+        tcp.write_all(bytes).await.unwrap();
+        let mut answer = vec![0; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut answer)).await;
+        let n = read.unwrap_or(Ok(0)).unwrap_or(0);
+        String::from_utf8_lossy(&answer[..n]).into_owned()
+    }
+
+    /// No request may make the local service a raw tunnel, reach it with
+    /// TLS, or name another target. The service is a bare listener, so a
+    /// dial would show as an accepted connection.
+    #[tokio::test]
+    async fn the_host_port_tunnel_refuses_each_bad_request_before_a_dial() {
+        let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = service.local_addr().unwrap().port();
+        let f = host_port_fixture(port).await;
+        let authority = format!("{GUEST_HOST}:{port}");
+        let refused = [
+            (format!("CONNECT {authority} HTTP/1.1\r\nhost: {authority}\r\n\r\n"), "403", Some(HOST_PORT_METHOD)),
+            (format!("FOO / HTTP/1.1\r\nhost: {authority}\r\n\r\n"), "403", Some(HOST_PORT_METHOD)),
+            ("GET / HTTP/1.0\r\n\r\n".to_owned(), "403", Some(HOST_PORT_AUTHORITY)),
+            (format!("GET / HTTP/1.1\r\nhost: {GUEST_HOST}\r\n\r\n"), "421", None),
+            (format!("GET / HTTP/1.1\r\nhost: {GUEST_HOST}:{}\r\n\r\n", port + 1), "421", None),
+            (format!("GET http://example.com/ HTTP/1.1\r\nhost: {authority}\r\n\r\n"), "421", None),
+            (
+                format!("GET https://{authority}/ HTTP/1.1\r\nhost: {authority}\r\n\r\n"),
+                "403",
+                Some(HOST_PORT_AUTHORITY),
+            ),
+        ];
+        for (request, status, note) in refused {
+            let answer = in_tunnel(&f, port, request.as_bytes()).await;
+            assert_eq!(answer.get(9..13), Some(&*format!("{status} ")), "{request:?} -> {answer:?}");
+            let entry = f.entries().pop().unwrap();
+            assert!(!entry.allowed, "{request:?}");
+            assert_eq!(entry.note.as_deref(), note, "{request:?}");
+        }
+        // Bytes that are not HTTP end at the parse error, with no entry.
+        let before = f.entries().len();
+        let answer = in_tunnel(&f, port, b"\x00\x01\x02 not http\r\n\r\n").await;
+        assert!(answer.is_empty() || answer.starts_with("HTTP/1.1 400 "), "{answer:?}");
+        assert_eq!(f.entries().len(), before);
+        let dial = tokio::time::timeout(Duration::from_millis(300), service.accept()).await;
+        assert!(dial.is_err(), "the proxy dialed the local service");
+    }
+
+    /// A bare host means port 80, as for each plain HTTP origin: it names
+    /// a port-80 grant and no other grant.
+    #[test]
+    fn a_bare_host_names_only_a_port_80_grant() {
+        let parts = |uri: &str, host: &str| Request::get(uri).header(HOST, host).body(()).unwrap().into_parts().0;
+        let web = NonZeroU16::new(80).unwrap();
+        assert!(names_grant(&parts("/", GUEST_HOST), web));
+        assert!(names_grant(&parts("/", &format!("{GUEST_HOST}:80")), web));
+        assert!(names_grant(&parts(&format!("http://{GUEST_HOST}/"), &format!("{GUEST_HOST}:80")), web));
+        assert!(!names_grant(&parts(&format!("https://{GUEST_HOST}/"), GUEST_HOST), web));
+        assert!(!names_grant(&parts("/", "example.com"), web));
+        assert!(!names_grant(&parts("/", "example.com:80"), web));
+        let ollama = NonZeroU16::new(11434).unwrap();
+        assert!(!names_grant(&parts("/", GUEST_HOST), ollama));
+        assert!(names_grant(&parts("/", &format!("{GUEST_HOST}:11434")), ollama));
+    }
+
+    #[test]
+    fn only_the_exact_gateway_name_and_port_name_the_grant() {
+        let web = NonZeroU16::new(80).unwrap();
+        let ollama = NonZeroU16::new(11434).unwrap();
+        let upper = GUEST_HOST.to_ascii_uppercase();
+        let accepted = [
+            (GUEST_HOST.to_owned(), web),
+            (format!("{GUEST_HOST}:80"), web),
+            (format!("{GUEST_HOST}:080"), web),
+            (format!("{upper}.:80"), web),
+            (format!("{GUEST_HOST}.:11434"), ollama),
+        ];
+        for (authority, port) in accepted {
+            assert!(names_gateway(&authority, port), "{authority}");
+        }
+        let refused = [
+            format!("{GUEST_HOST}:65536"),
+            format!("{GUEST_HOST}:65616"),
+            format!("{GUEST_HOST}:abc"),
+            format!("user@{GUEST_HOST}:80"),
+            format!("user:pass@{GUEST_HOST}"),
+            format!("{GUEST_HOST}:"),
+            format!("{GUEST_HOST}:+80"),
+            format!("{GUEST_HOST}:-80"),
+            format!("{GUEST_HOST}:000080"),
+            format!("{GUEST_HOST}::80"),
+            format!("[{GUEST_HOST}]:80"),
+            format!("{GUEST_HOST}..:80"),
+            format!("{GUEST_HOST}:80:80"),
+            format!("{GUEST_HOST}:81"),
+            format!(".{GUEST_HOST}:80"),
+            format!("x{GUEST_HOST}:80"),
+            "example.com:80".to_owned(),
+            String::new(),
+        ];
+        for authority in refused {
+            assert!(!names_gateway(&authority, web), "{authority}");
+        }
+        assert!(!names_gateway(GUEST_HOST, ollama));
+        assert!(!names_gateway(&format!("{GUEST_HOST}:80"), ollama));
+    }
+
+    #[test]
+    fn names_grant_fails_closed_on_two_host_fields_and_a_host_that_is_not_text() {
+        let web = NonZeroU16::new(80).unwrap();
+        let two = Request::get("/").header(HOST, GUEST_HOST).header(HOST, GUEST_HOST).body(()).unwrap();
+        assert!(!names_grant(&two.into_parts().0, web));
+        let binary = http::HeaderValue::from_bytes(b"host.microsandbox.internal\xff").unwrap();
+        let request = Request::get("/").header(HOST, binary).body(()).unwrap();
+        assert!(!names_grant(&request.into_parts().0, web));
+        let none = Request::get("/").body(()).unwrap();
+        assert!(!names_grant(&none.into_parts().0, web));
+        let userinfo = Request::get(format!("http://user@{GUEST_HOST}/")).body(()).unwrap();
+        assert!(!names_grant(&userinfo.into_parts().0, web));
+    }
+
+    /// A written port that is not the grant's digits reaches no local
+    /// service: not in a CONNECT target, not in a tunnel, not in an
+    /// absolute-form request.
+    #[tokio::test]
+    async fn a_malformed_port_of_the_gateway_name_reaches_no_local_service() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = service.local_addr().unwrap().port();
+        let f = host_port_fixture(port).await;
+        for written in [(u32::from(port) + 65536).to_string(), "abc".to_owned()] {
+            let authority = format!("{GUEST_HOST}:{written}");
+            assert!(connect_only(&f, &authority).await.is_err(), "CONNECT {authority}");
+
+            let answer = in_tunnel(&f, port, format!("GET / HTTP/1.1\r\nhost: {authority}\r\n\r\n").as_bytes()).await;
+            assert!(answer.get(9..12).is_some_and(|s| s != "200"), "tunnel {authority} -> {answer:?}");
+
+            let mut tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+            let request = format!(
+                "GET http://{authority}/ HTTP/1.1\r\nhost: {authority}\r\nproxy-authorization: {}\r\n\r\n",
+                f.auth()
+            );
+            tcp.write_all(request.as_bytes()).await.unwrap();
+            let mut answer = vec![0; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut answer)).await.unwrap().unwrap();
+            let answer = String::from_utf8_lossy(&answer[..n]);
+            assert!(answer.get(9..12).is_some_and(|s| s != "200"), "absolute {authority} -> {answer:?}");
+        }
+        assert!(f.entries().iter().all(|e| !e.allowed), "{:?}", f.entries());
+        let dial = tokio::time::timeout(Duration::from_millis(300), service.accept()).await;
+        assert!(dial.is_err(), "the proxy dialed the local service");
+    }
+
+    /// With a grant of 443, a CONNECT whose port is not written as digits
+    /// would default to 443 and open a local tunnel.
+    #[tokio::test]
+    async fn a_connect_with_a_malformed_port_opens_no_tunnel_for_a_443_grant() {
+        let f = host_port_fixture(443).await;
+        assert_eq!(connect_only(&f, &format!("{GUEST_HOST}:abc")).await.err(), Some(StatusCode::FORBIDDEN));
+        let entry = f.entries().pop().unwrap();
+        assert_eq!((entry.reason.as_str(), entry.note.as_deref()), ("host-port", Some(HOST_PORT_AUTHORITY)));
     }
 }

@@ -1,8 +1,8 @@
 import type { Edge, Node } from "@xyflow/react";
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, type LucideIcon, Package, UserCog } from "lucide-react";
-import type { NetEvent, Service } from "../network/api.ts";
+import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, Laptop, type LucideIcon, Package, UserCog } from "lucide-react";
+import { GUEST_HOST, type NetEvent, type Service } from "../network/api.ts";
 import { AGENT_NAMES, type AgentKind, type CageView, type SessionView, type VmCage } from "../../shared/api.ts";
-import { covers, decide, ruleDomains, ruleLabel, serviceIcon, serviceOf } from "../network/network.ts";
+import { covers, decide, ruleDomains, ruleLabel, ruleMatches, serviceIcon, serviceOf } from "../network/network.ts";
 
 const HOST_X = 16;
 const HOST_W = 230;
@@ -290,6 +290,28 @@ export function mapLayout(
         active: active(`rule:${label}`),
       },
       blocked,
+    );
+  }
+  if (network.hostPort !== undefined) {
+    const url = `http://${GUEST_HOST}:${network.hostPort}`;
+    // As in the proxy, Offline and a matching Block rule come before the grant.
+    const block = network.rules.find((r) => r.action === "block" && ruleMatches(r, GUEST_HOST, catalog));
+    const reach = `${url} reaches 127.0.0.1:${network.hostPort} of this Mac`;
+    host(
+      "host-port",
+      {
+        icon: Laptop,
+        label: `Service on this Mac · ${network.hostPort}`,
+        title: network.offline
+          ? `${reach}, but the cage is offline`
+          : block
+            ? `${reach}, but the rule ${ruleLabel(block, catalog)} blocks it`
+            : `${reach}, plain HTTP only`,
+        tone: network.offline || block ? "blocked" : "warn",
+        badges: [],
+        active: active("host-port"),
+      },
+      network.offline || block !== undefined,
     );
   }
   // A host login that no rule names is shown on its own, as nothing else names it.

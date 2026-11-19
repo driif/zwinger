@@ -1,7 +1,7 @@
 import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
-import { Ban, Check, KeyRound, Play } from "lucide-react";
+import { Ban, Check, KeyRound, Play, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { NetEvent, putRule, Service, wildcardFor } from "./api";
+import { NetEvent, putRule, Service, setHostPort, wildcardFor } from "./api";
 import { Action, CageView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
@@ -17,6 +17,8 @@ const REASONS: Record<string, string> = {
   "always-blocked": "always blocked",
   default: "the default",
   tokeninfo: "login check, answered by zwinger",
+  "host-port": "service on this Mac",
+  method: "method refused",
   misdirected: "named another host than its connection",
   direct: "direct connection blocked — this tool ignores the proxy",
 };
@@ -27,6 +29,8 @@ const reasonText = (reason: string) =>
     : (REASONS[reason] ?? reason);
 
 interface Group {
+  /** The host, with its port for the gateway name of this Mac. */
+  key: string;
   host: string;
   count: number;
   last: NetEvent;
@@ -53,7 +57,10 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
   const groups = new Map<string, Group>();
   for (const event of events) {
     if (filter !== "all" && event.allowed !== (filter === "allowed")) continue;
-    const group = groups.get(event.host) ?? {
+    const key =
+      event.port === undefined ? event.host : `${event.host}:${event.port}`;
+    const group = groups.get(key) ?? {
+      key,
       host: event.host,
       count: 0,
       last: event,
@@ -64,10 +71,11 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
     group.credentials = [
       ...new Set([...group.credentials, ...event.credentials]),
     ];
-    groups.set(event.host, group);
+    groups.set(key, group);
   }
   const shown = [...groups.values()].sort((a, b) => b.last.at - a.last.at);
   const missing = shown
+    .filter((g) => g.last.port === undefined)
     .map((g) => g.host)
     .filter((h) => !(h in wildcards))
     .join(" ");
@@ -85,6 +93,18 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
 
   function actions({ host, last }: Group) {
     if (!cage) return null;
+    // The gateway name of this Mac takes no rule: only the host port grant opens it.
+    if (last.port !== undefined)
+      return cage.network.hostPort === last.port ? (
+        <Button
+          size="sm"
+          variant="outline"
+          iconLeft={<X size={14} />}
+          onClick={() => run(() => setHostPort(cage.id, null))}
+        >
+          Remove
+        </Button>
+      ) : null;
     // A rule does not open the floor, and a tool that ignores the proxy stays blocked.
     if (
       last.reason === "always-blocked" ||
@@ -178,7 +198,7 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
           {shown.map((group) => {
             const { last } = group;
             return (
-              <li key={group.host} className="stack">
+              <li key={group.key} className="stack">
                 <div className="row">
                   <span className="muted mono">
                     {new Date(last.at).toLocaleTimeString()}
@@ -187,8 +207,8 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
                     {last.allowed ? <Check size={14} /> : <Ban size={14} />}
                     {last.allowed ? "allowed" : "blocked"}
                   </span>
-                  <span className="grow mono" title={group.host}>
-                    {group.host}
+                  <span className="grow mono" title={group.key}>
+                    {group.key}
                   </span>
                   <span className="muted">×{group.count}</span>
                 </div>

@@ -18,15 +18,46 @@ The network policy belongs to the cage of a project: the projects of one cage sh
 The proxy checks each request in this sequence:
 
 1. Offline.
-2. Addresses that are always blocked: this Mac, the local network, loopback, link-local ranges and cloud metadata.
-3. Block rules.
-4. Allow rules.
-5. The default.
+2. The service on this Mac, unless a Block rule names `host.microsandbox.internal`.
+3. Addresses that are always blocked: this Mac, the local network, loopback, link-local ranges and cloud metadata, except the port in step 2.
+4. Block rules.
+5. Allow rules.
+6. The default.
 
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
 
 The rules that the network page edits are the rules of the project's current cage. **Test** and **Activity** apply to
 the VM that runs for the project. After a cage change, that VM uses its old cage until a restart.
+
+## Service on this Mac
+
+A cage can reach one port of this Mac, for example a local model server. The section **Service on this Mac** on the
+network page sets the port. The agent then uses the URL `http://host.microsandbox.internal:<port>`. The page shows the
+URL with a copy button.
+
+:::caution
+The service acts as your Mac user. The agent can do all that the service lets a local client do. Allow only a port
+whose service you trust with the agent.
+:::
+
+For example, for Ollama:
+
+1. Start Ollama on the Mac as usual. It listens on `127.0.0.1:11434`. You do not need `OLLAMA_HOST=0.0.0.0`.
+2. Set the port to `11434` and confirm.
+3. In the cage, use `http://host.microsandbox.internal:11434`, for example
+   `OLLAMA_HOST=http://host.microsandbox.internal:11434`.
+
+The limits:
+
+- Plain HTTP only. HTTPS and WebSocket are blocked, with the reason `host-port`.
+- For port 80, the URL can omit `:80`. For each other port, the URL must name the port.
+- A written port must use one to five ASCII decimal digits whose value is the port, for example `:11434` or `:080` for port 80. A URL with a user
+  name (`user@`) is blocked.
+- The proxy connects to `127.0.0.1` (IPv4) only. A service that listens only on `::1` or on a LAN address is not
+  reachable.
+- The proxy adds no credential and no host login.
+- A Block rule for `host.microsandbox.internal` and Offline block the port. An Allow rule does not open it.
+- **Remove** and Offline block the next request. A response that is already streaming continues to its end.
 
 ## Activity
 
@@ -36,7 +67,8 @@ The network page groups the requests by host. The newest host is first. For each
 - the latest request: method, path, status, reason and note. If a tool does not use the proxy, the reason is "direct
   connection blocked — this tool ignores the proxy".
 - the credentials that the proxy added.
-- **Allow** or **Block** for the host, its wildcard or its service.
+- **Allow** or **Block** for the host, its wildcard or its service. For the service on this Mac, the host shows as
+  `host.microsandbox.internal:<port>`, with **Remove** in place of the rule actions.
 
 The log keeps the names of the query parameters, never their values, headers or bodies.
 

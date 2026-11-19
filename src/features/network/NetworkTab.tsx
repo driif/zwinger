@@ -3,6 +3,8 @@ import {
   Card,
   CardBody,
   CardHeader,
+  Confirm,
+  CopyField,
   FloatingField,
   LiquidSwitch,
   SegmentedControl,
@@ -13,18 +15,21 @@ import {
   ChevronDown,
   ChevronRight,
   KeyRound,
+  Laptop,
   Plus,
   TriangleAlert,
   X,
 } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import {
+  GUEST_HOST,
   NetEvent,
   NetStage,
   NetTest,
   putRule,
   removeRule,
   Service,
+  setHostPort,
   setNetworkDefault,
   setOffline,
   testNetwork,
@@ -116,6 +121,7 @@ export function NetworkTab({
   const [activityVisible, setActivityVisible] = useState(false);
   const latestSeq = events[events.length - 1]?.seq ?? 0;
   const running = vmCage?.status.state === "running";
+  const hostPort = cage?.network.hostPort;
 
   useEffect(() => {
     if (!cage && intent) onIntentDone();
@@ -189,7 +195,11 @@ export function NetworkTab({
         />
         <CardBody>
           <ol className="stack">
-            <li>Always blocked: your Mac, your network, cloud metadata.</li>
+            <li>
+              Always blocked: your Mac, your network, cloud metadata.
+              {hostPort !== undefined &&
+                ` The exception is 127.0.0.1:${hostPort}, the service on this Mac. Offline or a Block rule for ${GUEST_HOST} still blocks it.`}
+            </li>
             <li>Blocked services and hosts. Block always beats Allow.</li>
             <li>
               Allowed services and hosts. Their credentials are added here.
@@ -237,7 +247,11 @@ export function NetworkTab({
         <CardHeader
           title="Always blocked"
           titleAs="h2"
-          description="No rule and no default opens these. You cannot change this."
+          description={
+            hostPort === undefined
+              ? "No rule and no default opens these. You cannot change this."
+              : `No rule and no default opens these. The only exception is 127.0.0.1:${hostPort}, the service on this Mac.`
+          }
         />
         <CardBody>
           <ul className="list">
@@ -245,7 +259,11 @@ export function NetworkTab({
               <li key={group.label} className="row">
                 <Ban size={14} className="danger" />
                 <span className="grow">{group.label}</span>
-                <span className="muted mono">{group.hint}</span>
+                <span className="muted mono">
+                  {group.label === "This computer" && hostPort !== undefined
+                    ? `${group.hint}, except 127.0.0.1:${hostPort}`
+                    : group.hint}
+                </span>
               </li>
             ))}
           </ul>
@@ -347,6 +365,8 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
           {test}
         </CardBody>
       </Card>
+
+      <HostPort key={id} cageId={id} port={network.hostPort} run={run} />
 
       <Card variant="outlined" padding="md">
         <CardHeader
@@ -573,5 +593,118 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
       </Card>
 
     </>
+  );
+}
+
+interface HostPortProps {
+  cageId: string;
+  /** The granted port. `undefined`: no grant. */
+  port?: number;
+  run: Run;
+}
+
+/** The host port grant: one port of this Mac's loopback, for a service such as Ollama. */
+function HostPort({ cageId, port, run }: HostPortProps) {
+  const [input, setInput] = useState("");
+  const [problem, setProblem] = useState<string>();
+  const [confirming, setConfirming] = useState(false);
+  const wanted = Number(input.trim());
+  const valid = /^\d+$/.test(input.trim()) && wanted >= 1 && wanted <= 65535;
+
+  function grant() {
+    setConfirming(false);
+    run(() =>
+      setHostPort(cageId, wanted).then(
+        () => setInput(""),
+        (e) => setProblem(errorMessage(e)),
+      ),
+    );
+  }
+
+  return (
+    <Card variant="outlined" padding="md">
+      <CardHeader
+        title="Service on this Mac"
+        titleAs="h2"
+        description="Let the agent reach one port of this Mac, such as Ollama on 11434."
+      />
+      <CardBody className="stack">
+        {port === undefined ? (
+          <form
+            className="row"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!valid) return setProblem("Use a port from 1 to 65535.");
+              setConfirming(true);
+            }}
+          >
+            <FloatingField
+              label="Port on 127.0.0.1"
+              className="grow mono"
+              inputMode="numeric"
+              value={input}
+              hint={problem}
+              aria-invalid={problem !== undefined}
+              showValidity={false}
+              onChange={(e) => {
+                setInput(e.target.value);
+                setProblem(undefined);
+              }}
+            />
+            <Button
+              type="submit"
+              variant="outline"
+              iconLeft={<Laptop size={14} />}
+              disabled={input.trim() === ""}
+            >
+              Allow…
+            </Button>
+          </form>
+        ) : (
+          <>
+            <div className="row">
+              <CopyField
+                className="grow mono"
+                label="URL in the cage"
+                value={`http://${GUEST_HOST}:${port}`}
+              />
+              <Button
+                variant="ghost"
+                iconLeft={<X size={14} />}
+                onClick={() => run(() => setHostPort(cageId, null))}
+              >
+                Remove
+              </Button>
+            </div>
+            <p className="muted">
+              This grant lets the agent send plain HTTP to 127.0.0.1:{port}
+              of this Mac. Offline or a Block rule for {GUEST_HOST} still
+              blocks it. Remove blocks the next request. A response that
+              streams now continues to its end.
+            </p>
+          </>
+        )}
+        <Confirm
+          open={confirming}
+          title={`Allow port ${valid ? wanted : ""} of this Mac?`}
+          confirmLabel="Allow"
+          onConfirm={grant}
+          onCancel={() => setConfirming(false)}
+        >
+          <div className="stack">
+            <p className="warn row">
+              <TriangleAlert size={14} />
+              The service acts as your Mac user. The agent can do all that the
+              service lets a local client do.
+            </p>
+            <p>
+              Only plain HTTP to 127.0.0.1 (IPv4) goes through. HTTPS,
+              WebSocket and a service that listens on ::1 only do not work.
+              No credential is added.
+            </p>
+          </div>
+        </Confirm>
+      </CardBody>
+    </Card>
   );
 }
