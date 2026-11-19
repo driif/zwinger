@@ -57,6 +57,8 @@ pub struct EditorPrefs {
 pub struct TerminalPrefs {
     /// A CSS font-family list.
     pub font_family: String,
+    #[serde(default)]
+    pub ligatures: bool,
     /// In CSS pixels.
     pub font_size: f64,
     pub line_height: f64,
@@ -111,6 +113,7 @@ impl Default for TerminalPrefs {
         Self {
             font_family: r#""JetBrainsMono Nerd Font", "MesloLGS NF", ui-monospace, SFMono-Regular, Menlo, monospace"#
                 .into(),
+            ligatures: false,
             font_size: 13.0,
             line_height: 1.2,
             cursor_style: CursorStyle::Bar,
@@ -202,6 +205,7 @@ mod tests {
             theme: "my-theme".into(),
             follow_system: true,
             rail_width: 300,
+            terminal: TerminalPrefs { ligatures: true, ..TerminalPrefs::default() },
             ..Prefs::default()
         };
         prefs.set(changed.clone()).unwrap();
@@ -259,6 +263,14 @@ mod tests {
     }
 
     #[test]
+    fn terminal_prefs_without_ligatures_load_with_ligatures_off() {
+        let path = path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"terminal":{"fontFamily":"Menlo"}}"#).unwrap();
+        assert!(!Preferences::load(path).get().terminal.ligatures);
+    }
+
+    #[test]
     fn terminal_numbers_out_of_range_are_clamped_on_load() {
         let path = path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -310,6 +322,7 @@ mod tests {
 
     #[test]
     fn the_new_fields_have_camel_case_names() {
+        assert!(!TerminalPrefs::default().ligatures);
         let json = serde_json::to_value(Prefs::default()).unwrap();
         assert_eq!(
             json,
@@ -325,6 +338,7 @@ mod tests {
                 "sidebarFontSize": null,
                 "terminal": {
                     "fontFamily": TerminalPrefs::default().font_family,
+                    "ligatures": false,
                     "fontSize": 13.0,
                     "lineHeight": 1.2,
                     "cursorStyle": "bar",

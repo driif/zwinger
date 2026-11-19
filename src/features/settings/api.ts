@@ -171,6 +171,7 @@ export type CursorStyle = "block" | "bar" | "underline";
 export interface TerminalPrefs {
   /** A CSS font-family list. */
   fontFamily: string;
+  ligatures: boolean;
   fontSize: number;
   lineHeight: number;
   cursorStyle: CursorStyle;

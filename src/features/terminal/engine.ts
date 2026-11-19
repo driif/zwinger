@@ -1,6 +1,7 @@
 import type { ITheme, Terminal } from "@xterm/xterm";
 import type { ISearchOptions, SearchAddon } from "@xterm/addon-search";
 import type { WebglAddon } from "@xterm/addon-webgl";
+import type { LigaturesAddon } from "@xterm/addon-ligatures";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TerminalColors } from "../appearance/api";
 import type { TerminalPrefs } from "../settings/api";
@@ -30,6 +31,8 @@ interface Live {
   term: Terminal;
   el: HTMLElement;
   fit: () => void;
+  ligatures?: LigaturesAddon;
+  ligaturesGeneration: number;
 }
 
 let look: Look | undefined;
@@ -73,10 +76,30 @@ function style({ el }: Live, { prefs, colors }: Look) {
   el.style.background = colors.background;
 }
 
+async function setLigatures(entry: Live, enabled: boolean) {
+  const generation = ++entry.ligaturesGeneration;
+  entry.ligatures?.dispose();
+  entry.ligatures = undefined;
+  entry.term.refresh(0, entry.term.rows - 1);
+  if (!enabled) return;
+
+  try {
+    const { LigaturesAddon } = await import("@xterm/addon-ligatures");
+    if (generation !== entry.ligaturesGeneration || !look?.prefs.ligatures || !live.has(entry)) return;
+    const addon = new LigaturesAddon();
+    entry.term.loadAddon(addon);
+    entry.ligatures = addon;
+    entry.term.refresh(0, entry.term.rows - 1);
+  } catch {
+    // A failed addon load must not prevent the terminal from drawing text.
+  }
+}
+
 /** Restyles all open terminals. A new terminal takes the look too. */
 export function setLook(prefs: TerminalPrefs, colors: TerminalColors) {
   const key = JSON.stringify([prefs, colors]);
   if (key === lookKey) return;
+  const ligaturesChanged = look?.prefs.ligatures !== prefs.ligatures;
   lookKey = key;
   look = { prefs, colors };
   for (const entry of live) {
@@ -87,6 +110,7 @@ export function setLook(prefs: TerminalPrefs, colors: TerminalColors) {
       // The terminal keeps its old options.
     }
     style(entry, look);
+    if (ligaturesChanged) void setLigatures(entry, prefs.ligatures);
     entry.fit();
   }
 }
@@ -168,9 +192,10 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
     markSized();
     fitted = { rows: term.rows, cols: term.cols };
   };
-  const entry: Live = { term, el, fit: fitNow };
+  const entry: Live = { term, el, fit: fitNow, ligaturesGeneration: 0 };
   style(entry, look!);
   live.add(entry);
+  if (look!.prefs.ligatures) void setLigatures(entry, true);
   const observer = new ResizeObserver(fitNow);
   observer.observe(el);
 
@@ -211,6 +236,8 @@ export async function openTerminal(el: HTMLElement, onFind: () => void): Promise
       markSized();
       observer.disconnect();
       el.removeEventListener("wheel", scrollPane, { capture: true });
+      entry.ligaturesGeneration++;
+      entry.ligatures?.dispose();
       live.delete(entry);
       releaseWebgl();
       term.dispose();

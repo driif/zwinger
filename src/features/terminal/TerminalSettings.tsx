@@ -112,6 +112,7 @@ export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
             {notes.map((note) => <p key={note} className="muted">{note}</p>)}
           </div>
           <Field label="Font family" value={terminal.fontFamily} onSave={(fontFamily) => save({ fontFamily })} />
+          <LiquidSwitch label="Font ligatures" checked={terminal.ligatures} onChange={(ligatures) => save({ ligatures })} />
           <div className="row">
             {(Object.keys(NUMBERS) as NumberSetting[]).map((setting) => (
               <NumberField key={setting} setting={setting} value={terminal[setting]} onSave={saveNumber(setting)} />

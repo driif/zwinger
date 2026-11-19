@@ -38,6 +38,10 @@ The change applies at once and persists after a restart.
 ## Terminal
 
 **Settings > Terminal** sets the font, cursor, colors and keys of all terminals. Changes apply at once.
+**Font ligatures** is off by default. Turn it on with a ligature font such as Fira Code or JetBrains Mono.
+A font without ligatures shows the same text.
+The Mac app joins common supported operators such as `->`, `=>` and `===`. Other ligatures in the selected font,
+such as `&&` and `||`, may stay separate. No font permissions are required.
 
 The numeric settings have these limits:
 
