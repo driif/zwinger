@@ -21,7 +21,7 @@ use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, TerminalKind};
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
-use crate::session::{Pos, Session, VmChoice};
+use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
 use crate::task_runs;
 use crate::terminal::{AgentState, Terminal, TerminalFolder, TerminalView};
@@ -932,6 +932,13 @@ impl<R: SandboxRuntime> Manager<R> {
         })
     }
 
+    pub fn set_viewport(&self, session_id: &str, viewport: Option<Viewport>) -> Result<()> {
+        self.edit_session(session_id, |s, _| {
+            s.set_viewport(viewport);
+            Ok(())
+        })
+    }
+
     /// Applies `edit` to the stored session and persists it; `edit` gets
     /// the effective cage of the session, if it has one. The change is kept
     /// only if the save succeeds. A running VM keeps its applied config
@@ -1269,13 +1276,14 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
     })
 }
 
-/// A new name, layout, task, terminal list, editor, unprompted setting or
+/// A new name, layout, viewport, task, terminal list, editor, unprompted setting or
 /// network rule is used at once, so it needs no restart. A change of the session's
 /// cage or VM choice is not checked here.
 fn session_changed(old: &Session, session: &Session) -> bool {
     Session {
         name: session.name.clone(),
         layout: session.layout.clone(),
+        viewport: session.viewport,
         tasks: session.tasks.clone(),
         terminals: session.terminals.clone(),
         pane_layout: session.pane_layout.clone(),
@@ -1312,7 +1320,7 @@ mod tests {
     use crate::cage::lifecycle::Confirmed;
     use crate::cage::testing::*;
     use crate::error::Member;
-    use crate::session::VmChoice;
+    use crate::session::{Viewport, VmChoice};
     use crate::workspaces::{self, Arrangement};
 
     #[test]
@@ -1519,6 +1527,43 @@ mod tests {
         let list = manager.list();
         assert!(!list.cages[0].shared().pending_restart);
         assert_eq!(list.sessions[0].session.layout.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_viewport_is_per_project_and_keeps_the_layout() {
+        let (manager, _, a) = manager();
+        manager.start(&a).await.unwrap();
+        let pos = [("harness".to_owned(), Pos { x: 1.0, y: 2.0 })];
+        let view = Viewport { x: -10.5, y: 20.25, zoom: 1.5 };
+        manager.set_layout(&a, Some(pos.clone().into())).unwrap();
+        manager.set_viewport(&a, Some(view)).unwrap();
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        manager.set_layout(&a, Some(pos.clone().into())).unwrap();
+        // A second project of the same cage.
+        let cage = manager.list().sessions[0].session.cage.clone();
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.set_session_cage(&b, cage.as_deref()).unwrap();
+
+        let reloaded = Manager::new(
+            FakeRuntime::default(),
+            Store::new(manager.store.dir().to_owned()),
+            vault(),
+            temp_dir(),
+            host(),
+        )
+        .unwrap();
+        for list in [manager.list(), reloaded.list()] {
+            let session = |id: &str| list.sessions.iter().find(|s| s.session.id == id).unwrap().session.clone();
+            assert_eq!(session(&b).cage, cage);
+            assert_eq!((session(&a).layout, session(&a).viewport), (pos.clone().into(), Some(view)));
+            assert_eq!((session(&b).layout.len(), session(&b).viewport), (0, None));
+        }
+
+        // A reset clears both in one edit.
+        manager.set_layout(&a, None).unwrap();
+        let list = manager.list();
+        let session = &list.sessions.iter().find(|s| s.session.id == a).unwrap().session;
+        assert!(session.layout.is_empty() && session.viewport.is_none());
     }
 
     #[tokio::test]

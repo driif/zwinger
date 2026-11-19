@@ -191,6 +191,12 @@ Your prompt and your own prompt hooks stay as they are.
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You
 can drag the nodes. zwinger saves their positions. **Reset layout** clears them.
 
+A new map fits all its nodes in the view, also when the window changes size. When you pan, zoom with the wheel or a
+pinch, or use **Zoom in**, **Zoom out** or **Fit view**, zwinger saves that view for the project. The map opens at the
+saved view each time, also after a restart, and keeps it when the window changes size, also when some nodes are outside
+the view. Each project has its own view, also when two projects share a cage. **Reset layout** also clears the saved
+view, and the map fits its nodes again.
+
 Drop a folder from Finder inside the project boundary to start a mount of that folder in the project settings. While
 you drag the folder over the boundary, the boundary is highlighted. Outside the boundary, the map does not accept the
 folder.

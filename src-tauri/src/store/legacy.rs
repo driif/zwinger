@@ -85,6 +85,7 @@ impl Project {
             pane_layout: self.pane_layout,
             tasks: self.tasks,
             layout: self.layout,
+            viewport: None,
         };
         let cage = Cage {
             id: self.id,

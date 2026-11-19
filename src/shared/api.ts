@@ -171,6 +171,13 @@ export interface Pos {
   y: number;
 }
 
+/** The pan and zoom of a map. */
+export interface Viewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
 export interface TaskAgent {
   kind: AgentKind;
   /** `null` uses the default model of the CLI. */
@@ -219,6 +226,8 @@ export interface SessionView {
   tasks: Task[];
   /** The map positions that the user dragged, by node id. */
   layout: Record<string, Pos>;
+  /** The map pan and zoom that the user chose. `null`: the map fits its nodes. */
+  viewport: Viewport | null;
   /** The live terminal processes. */
   processes: TerminalView[];
   /** The hosts that the session's agents need, with the proxy's decision on each. */

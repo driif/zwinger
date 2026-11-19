@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { AgentState, CageView, call, CredentialSource, Pos, SessionView, StartPhase, FolderReport, Workspace } from "../../shared/api";
+import { AgentState, CageView, call, CredentialSource, Pos, SessionView, StartPhase, FolderReport, Viewport, Workspace } from "../../shared/api";
 
 export interface Sessions {
   sessions: SessionView[];
@@ -30,9 +30,13 @@ export const deleteWorkspace = (id: string) => call<void>("delete_workspace", { 
 export const arrangeWorkspaces = (workspaces: Pick<Workspace, "id" | "sessions">[]) =>
   call<void>("arrange_workspaces", { workspaces });
 
-/** `null` restores the auto layout. */
+/** `null` restores the auto layout and clears the viewport. */
 export const setLayout = (sessionId: string, layout: Record<string, Pos> | null) =>
   call<void>("set_layout", { sessionId, layout });
+
+/** `null` lets the map fit its nodes. */
+export const setViewport = (sessionId: string, viewport: Viewport | null) =>
+  call<void>("set_viewport", { sessionId, viewport });
 
 /** The canonical folder of a host path: a link resolves to its target. */
 export const resolveFolder = (path: string) =>

@@ -308,6 +308,7 @@ pub fn run() {
             commands::sessions::delete_workspace,
             commands::sessions::arrange_workspaces,
             commands::sessions::set_layout,
+            commands::sessions::set_viewport,
             commands::terminal::reorder_terminals,
             commands::terminal::set_pane_layout,
             commands::terminal::attach_session,

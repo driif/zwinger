@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::cage;
 use crate::cage::manager::Listing;
 use crate::error::Result;
-use crate::session::Pos;
+use crate::session::{Pos, Viewport};
 use crate::workspaces::{Arrangement, Workspace};
 
 use super::Managed;
@@ -57,6 +57,11 @@ pub fn arrange_workspaces(manager: Managed<'_>, workspaces: Vec<Arrangement>) ->
 #[tauri::command]
 pub fn set_layout(manager: Managed<'_>, session_id: String, layout: Option<BTreeMap<String, Pos>>) -> Result<()> {
     manager.set_layout(&session_id, layout)
+}
+
+#[tauri::command]
+pub fn set_viewport(manager: Managed<'_>, session_id: String, viewport: Option<Viewport>) -> Result<()> {
+    manager.set_viewport(&session_id, viewport)
 }
 
 #[tauri::command]

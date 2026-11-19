@@ -16,6 +16,8 @@ const COMMAND_LIMIT: usize = 4096;
 const LAYOUT_LIMIT: usize = 1000;
 /// The deepest split of a pane layout.
 const PANE_DEPTH: usize = 8;
+/// The zoom range of a saved map viewport. It contains the zoom range of the map.
+const ZOOM_RANGE: std::ops::RangeInclusive<f64> = 0.1..=4.0;
 
 /// One host folder with its terminals, its pane layout and its tasks. Its
 /// cage is the sandbox config that a VM runs.
@@ -56,6 +58,9 @@ pub struct Session {
     /// The map positions that the user dragged, by node id.
     #[serde(default)]
     pub layout: BTreeMap<String, Pos>,
+    /// The map pan and zoom that the user chose. `None`: the map fits its nodes.
+    #[serde(default)]
+    pub viewport: Option<Viewport>,
 }
 
 /// The shared VM of the cage, or a VM of the session alone.
@@ -74,6 +79,13 @@ pub enum VmChoice {
 pub struct Pos {
     pub x: f64,
     pub y: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
 }
 
 /// The saved record of a shell or agent terminal. It stays when its process ends.
@@ -206,6 +218,7 @@ impl Session {
             pane_layout: None,
             tasks: Vec::new(),
             layout: BTreeMap::new(),
+            viewport: None,
         })
     }
 
@@ -215,14 +228,26 @@ impl Session {
         Ok(())
     }
 
-    /// Keeps only finite positions. `None` restores the auto layout.
+    /// Keeps only finite positions. `None` restores the auto layout and
+    /// clears the viewport, so the map fits the restored nodes.
     pub fn set_layout(&mut self, layout: Option<BTreeMap<String, Pos>>) {
+        if layout.is_none() {
+            self.viewport = None;
+        }
         self.layout = layout
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, p)| p.x.is_finite() && p.y.is_finite())
             .take(LAYOUT_LIMIT)
             .collect();
+    }
+
+    /// A viewport with a value that is not finite is dropped. The zoom is
+    /// clamped. `None` lets the map fit its nodes.
+    pub fn set_viewport(&mut self, viewport: Option<Viewport>) {
+        self.viewport = viewport
+            .filter(|v| v.x.is_finite() && v.y.is_finite() && v.zoom.is_finite())
+            .map(|v| Viewport { zoom: v.zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end()), ..v });
     }
 
     /// Adds a terminal at the end and returns its id.
@@ -402,5 +427,27 @@ mod tests {
         assert_eq!(session.layout.keys().collect::<Vec<_>>(), ["harness"]);
         session.set_layout(None);
         assert!(session.layout.is_empty());
+    }
+
+    #[test]
+    fn set_viewport_keeps_finite_values_and_clamps_the_zoom() {
+        let dir = std::env::temp_dir().join(format!("zwinger-viewport-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::new(dir.to_str().unwrap(), Some("c".into()), []).unwrap();
+        let view = Viewport { x: -2791.75, y: 1299.625, zoom: 0.5 };
+        session.set_viewport(Some(view));
+        assert_eq!(session.viewport, Some(view));
+        session.set_viewport(Some(Viewport { zoom: 99.0, ..view }));
+        assert_eq!(session.viewport, Some(Viewport { zoom: 4.0, ..view }));
+        session.set_viewport(Some(Viewport { x: f64::NAN, ..view }));
+        assert_eq!(session.viewport, None);
+
+        // A reset clears the positions and the viewport together.
+        session.set_viewport(Some(view));
+        session.layout = [("harness".to_owned(), Pos { x: 1.0, y: 2.0 })].into();
+        session.set_layout(Some(BTreeMap::new()));
+        assert_eq!(session.viewport, Some(view));
+        session.set_layout(None);
+        assert_eq!(session.viewport, None);
     }
 }

@@ -198,7 +198,7 @@ mod tests {
     use crate::cage::{Bound, FileId, HostAgentUse, Mount};
     use crate::runtime::TerminalKind;
     use crate::secrets::{Origin, Places};
-    use crate::session::{PaneNode, Pos, SplitDirection, Task, TaskAgent, TerminalRecord, VmChoice};
+    use crate::session::{PaneNode, Pos, SplitDirection, Task, TaskAgent, TerminalRecord, Viewport, VmChoice};
 
     fn data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zwinger-store-{}", uuid::Uuid::new_v4()));
@@ -219,6 +219,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), (Vec::new(), Vec::new()));
         let mut session = Session::new(data_dir().to_str().unwrap(), Some("c".into()), []).unwrap();
         session.layout = [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into();
+        session.viewport = Some(Viewport { x: -374.25, y: 812.5, zoom: 0.75 });
         let cage = Cage::new("c".into(), "proj".into());
         store.save_cages(std::slice::from_ref(&cage)).unwrap();
         store.save_sessions(std::slice::from_ref(&session)).unwrap();
@@ -239,6 +240,8 @@ mod tests {
         assert_eq!(sessions.iter().map(|s| s.cage.as_deref()).collect::<Vec<_>>(), [Some("c"), None]);
         // A session saved before project editors follows the app default.
         assert!(sessions.iter().all(|s| s.editor.is_none()));
+        // A session saved before map viewports fits its map.
+        assert!(sessions.iter().all(|s| s.viewport.is_none()));
 
         store.save_cages(&[]).unwrap();
         assert!(matches!(store.load(), Err(Error::MissingCage { cage, .. }) if cage == "c"));
@@ -324,6 +327,7 @@ mod tests {
                 workdir: "/workspace".into(),
             }],
             layout: [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into(),
+            viewport: None,
         };
         let cage = Cage {
             id: "p-1".into(),
@@ -446,6 +450,7 @@ mod tests {
         assert_eq!(session.editor, None);
         assert!(session.layout.is_empty() && session.tasks.is_empty() && session.terminals.is_empty());
         assert_eq!(session.pane_layout, None);
+        assert_eq!(session.viewport, None);
         assert!(cage.logins.is_empty() && cage.host_agents.is_empty());
         assert_eq!(cage.network.default, DefaultAction::Block);
         assert!(cage.agents_unprompted);
