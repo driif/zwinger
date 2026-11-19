@@ -631,7 +631,7 @@ mod tests {
     }
 
     /// Waits for the real login shell to print the line. If asked, waits for its clean exit too.
-    async fn print_history_line(manager: &Manager<FakeRuntime>, process: &str, line: &str, exit: bool) {
+    async fn print_shell_line(manager: &Manager<FakeRuntime>, process: &str, line: &str, exit: bool) {
         let (token, mut rx) = attach(manager, process);
         let end = if exit { "exit\n" } else { "" };
         manager.write(process, format!("printf '{line}\\n'\n{end}").into_bytes()).unwrap();
@@ -670,7 +670,7 @@ mod tests {
         let (manager, _, id) = manager();
         let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminal = terminal_ids(&manager)[0].clone();
-        print_history_line(&manager, &process, "first-history-line", false).await;
+        print_shell_line(&manager, &process, "first-history-line", false).await;
         manager.kill_host_sessions();
         let first = manager.terminal_history(&id, &terminal).unwrap();
         assert!(String::from_utf8_lossy(&first[0]).contains("first-history-line"));
@@ -687,7 +687,7 @@ mod tests {
         .unwrap();
         assert_eq!(reloaded.terminal_history(&id, &terminal), Some(first.clone()));
         let process = reloaded.reopen_terminal(&id, &terminal, 24, 80).await.unwrap();
-        print_history_line(&reloaded, &process, "second-history-line", false).await;
+        print_shell_line(&reloaded, &process, "second-history-line", false).await;
         reloaded.kill_host_sessions();
         let second = reloaded.terminal_history(&id, &terminal).unwrap();
         assert_eq!(second.len(), 2);
@@ -703,7 +703,7 @@ mod tests {
         let second = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminals = terminal_ids(&manager);
         for (process, line) in [(&first, "alpha-only"), (&second, "bravo-only")] {
-            print_history_line(&manager, process, line, false).await;
+            print_shell_line(&manager, process, line, false).await;
         }
         manager.kill_host_sessions();
         let reloaded = Manager::new(
@@ -726,7 +726,7 @@ mod tests {
         let (manager, _, id) = manager();
         let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         let terminal = terminal_ids(&manager)[0].clone();
-        print_history_line(&manager, &process, "exited-history", true).await;
+        print_shell_line(&manager, &process, "exited-history", true).await;
         manager.kill_host_sessions();
         assert!(
             String::from_utf8_lossy(&manager.terminal_history(&id, &terminal).unwrap()[0]).contains("exited-history")
@@ -834,7 +834,7 @@ mod tests {
         for gone in ["terminal", "project"] {
             let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
             let terminal = terminal_ids(&manager).last().unwrap().clone();
-            print_history_line(&manager, &process, "orphan-line", false).await;
+            print_shell_line(&manager, &process, "orphan-line", false).await;
             // A Close or Delete removed the record, and its process is not retired yet.
             let saved = {
                 let mut state = lock(&manager.state);
@@ -1459,14 +1459,7 @@ mod tests {
         let terminal = terminal_ids(&manager)[0].clone();
         manager.close_terminal(&other, &terminal).unwrap();
         assert!(lock(&manager.state).session(&id).unwrap().terminal(&terminal).is_ok());
-        let (_, mut rx) = attach(&manager, &process);
-        manager.write(&process, b"printf 'still-alive\\n'\n".to_vec()).unwrap();
-        let mut seen = String::new();
-        while !seen.contains("still-alive\r\n") {
-            if let PtyEvent::Output(bytes) = next(&mut rx).await {
-                seen.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
+        print_shell_line(&manager, &process, "still-alive", false).await;
         manager.close_terminal(&id, &terminal).unwrap();
         assert!(matches!(manager.write(&process, b"x".to_vec()), Err(Error::ProcessNotFound)));
     }
