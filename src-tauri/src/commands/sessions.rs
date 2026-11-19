@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 
+use tauri::ipc::Channel;
+use tauri::{State, Webview};
+
 use crate::cage;
 use crate::cage::manager::Listing;
 use crate::error::Result;
+use crate::folder_watch::FolderWatches;
 use crate::session::{Pos, Viewport};
 use crate::workspaces::{Arrangement, Workspace};
 
@@ -89,6 +93,32 @@ pub fn set_project_accent(manager: Managed<'_>, session_id: String, accent: Opti
 #[tauri::command]
 pub fn list_folders(manager: Managed<'_>, session_id: String) -> Result<Vec<String>> {
     manager.list_folders(&session_id)
+}
+
+/// Sends the folders of the project now and on each change, until
+/// `unwatch_folders`, a new page in the webview, or its close. `None` while
+/// the project folder cannot be read.
+#[tauri::command]
+pub fn watch_folders(
+    manager: Managed<'_>,
+    watches: State<'_, FolderWatches>,
+    webview: Webview,
+    session_id: String,
+    on_event: Channel<Option<Vec<String>>>,
+) -> Result<u64> {
+    let root = manager.session_folder(&session_id)?;
+    watches.watch(webview.label(), root, move |folders| on_event.send(folders).is_ok())
+}
+
+#[tauri::command]
+pub fn unwatch_folders(watches: State<'_, FolderWatches>, token: u64) {
+    watches.remove(token);
+}
+
+/// Reads the folders of a watch again now. An error if the watch has ended.
+#[tauri::command]
+pub fn rescan_folders(watches: State<'_, FolderWatches>, token: u64) -> Result<()> {
+    watches.rescan(token)
 }
 
 /// Confirms the session folder and the mounts of its cage.

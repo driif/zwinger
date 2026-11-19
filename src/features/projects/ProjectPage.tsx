@@ -14,7 +14,6 @@ import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
   Detection,
-  listFolders,
   putHostAgent,
   removeGuestLogin,
   removeHostAgent,
@@ -23,6 +22,7 @@ import { confirmPaths, setClaudeToken } from "./api";
 import { expiresSoon } from "./tokenExpiry";
 import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
+import { useProjectFolders } from "./useProjectFolders";
 import { RunSummary } from "../tasks/api";
 import {
   AGENT_NAMES,
@@ -333,39 +333,21 @@ export function ProjectPage({
   ...terminal
 }: Props) {
   const status = vmCage?.status ?? { state: "stopped" };
-  const [listed, setListed] = useState<{ id: string; folders: string[] }>();
-  const [reloads, setReloads] = useState(0);
+  const { folders, reload } = useProjectFolders(session);
   /** The host notices that the user dismissed in the current running period of a project. */
   const [dismissed, setDismissed] = useState<{ session: string; notices: string[] }>();
   if (dismissed?.session === session.id && status.state !== "running") setDismissed(undefined);
   const hidden = dismissed?.session === session.id ? dismissed.notices : [];
-  const folders = listed?.id === session.id ? listed.folders : undefined;
   // The tab that shows again after a terminal or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
   const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
   if (isTab && view.kind !== tab) setTab(view.kind);
 
-  // Folders change outside the app, so the list reloads on focus and after each edit.
-  useEffect(() => {
-    let live = true;
-    const id = session.id;
-    listFolders(id).then((folders) => live && setListed({ id, folders }), () => {});
-    return () => {
-      live = false;
-    };
-  }, [session.id, reloads]);
-
-  useEffect(() => {
-    const reload = () => setReloads((n) => n + 1);
-    window.addEventListener("focus", reload);
-    return () => window.removeEventListener("focus", reload);
-  }, []);
-
   const edit: Run = (action) =>
     run(() =>
       action().then((result) => {
-        setReloads((n) => n + 1);
+        reload();
         return result;
       }),
     );

@@ -9219,6 +9219,7 @@ dependencies = [
  "libc",
  "lru",
  "microsandbox",
+ "notify",
  "plist",
  "portable-pty",
  "psl",

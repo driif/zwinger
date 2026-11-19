@@ -53,6 +53,8 @@ pub enum Error {
     RunState(&'static str),
     #[error("the run cannot write its artifacts to {0}: {1}")]
     MirrorUnwritable(String, String),
+    #[error("zwinger cannot follow the folders of the project: {0}")]
+    FolderWatch(String),
     #[error("not a round folder: {0}")]
     NotRound(String),
     #[error("the order must name each item once")]

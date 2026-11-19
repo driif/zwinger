@@ -31,6 +31,21 @@ export const setProjectAccent = (sessionId: string, accent: string | null) => {
 export const listFolders = (sessionId: string) =>
   call<string[]>("list_folders", { sessionId });
 
+/**
+ * Sends the folders of the project now and on each change, or undefined while
+ * the project folder cannot be read. Resolves to the token for `unwatchFolders`.
+ */
+export const watchFolders = (sessionId: string, onFolders: (folders: string[] | undefined) => void) =>
+  call<number>("watch_folders", {
+    sessionId,
+    onEvent: new Channel<string[] | null>((folders) => onFolders(folders ?? undefined)),
+  });
+
+export const unwatchFolders = (token: number) => call<void>("unwatch_folders", { token });
+
+/** Tells the watch to read the folders again now. Fails if the watch has ended. */
+export const rescanFolders = (token: number) => call<void>("rescan_folders", { token });
+
 export const addMount = (
   cageId: string,
   host: string,

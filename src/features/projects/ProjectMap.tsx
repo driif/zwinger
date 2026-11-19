@@ -178,7 +178,7 @@ interface Props {
   cage: CageView;
   /** The cage of the session's VM. */
   vmCage: VmCage | null;
-  /** `undefined` until the folders of this session are listed. */
+  /** `undefined` until the folders of this session are listed, and while its folder cannot be read. */
   folders?: string[];
   /** The cage's network events, oldest first. */
   events: NetEvent[];
@@ -349,7 +349,8 @@ function MapFlow({
   }
 
   // Positions of nodes that no longer exist are dropped. Folder nodes are
-  // unknown until the folders are listed, so their positions stay until then.
+  // unknown until the folders are listed or while the project folder cannot
+  // be read, so their positions stay meanwhile.
   useEffect(() => {
     const ids = new Set(map.nodes.map((n) => n.id));
     const keep = (id: string) => ids.has(id) || (folders === undefined && id.startsWith("folder:"));

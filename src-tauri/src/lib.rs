@@ -6,6 +6,7 @@ mod commands;
 mod editor;
 mod editor_icons;
 mod error;
+mod folder_watch;
 mod host_agents;
 mod instance;
 mod legacy_keychain;
@@ -31,7 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, Wry};
+use tauri::webview::PageLoadEvent;
+use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, WindowEvent, Wry};
 
 use crate::bootstrap::{Bootstrap, Check, Level, Phase, Step};
 use crate::cage::manager::{Manager, SessionView};
@@ -222,6 +224,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
+        .on_window_event(|window, event| {
+            if let WindowEvent::Destroyed = event
+                && let Some(watches) = window.try_state::<folder_watch::FolderWatches>()
+            {
+                watches.drop_owner(window.label());
+            }
+        })
+        // A reload, also after a crash of the web content process, loses the
+        // React cleanup, so the watches of the old page end here.
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Started
+                && let Some(watches) = webview.try_state::<folder_watch::FolderWatches>()
+            {
+                watches.drop_owner(webview.label());
+            }
+        })
         .setup(|app| {
             // Must stay first: a second instance must not touch the data or
             // reap the VMs of the first.
@@ -311,6 +329,7 @@ pub fn run() {
             app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
             app.manage(commands::tasks::Watches::default());
+            app.manage(folder_watch::FolderWatches::default());
             app.manage(editor_icons::EditorIcons::default());
             Ok(())
         })
@@ -337,6 +356,9 @@ pub fn run() {
             commands::sessions::set_project_editor,
             commands::sessions::set_project_accent,
             commands::sessions::list_folders,
+            commands::sessions::watch_folders,
+            commands::sessions::unwatch_folders,
+            commands::sessions::rescan_folders,
             commands::cages::add_mount,
             commands::cages::remove_mount,
             commands::cages::set_mount_readonly,

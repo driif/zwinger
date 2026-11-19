@@ -1129,9 +1129,13 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(lock(&self.state).session(session_id)?.editor.clone())
     }
 
+    /// The project folder of the session on this Mac.
+    pub fn session_folder(&self, session_id: &str) -> Result<PathBuf> {
+        Ok(lock(&self.state).session(session_id)?.folder.clone())
+    }
+
     pub fn list_folders(&self, session_id: &str) -> Result<Vec<String>> {
-        let folder = lock(&self.state).session(session_id)?.folder.clone();
-        cage::list_folders(&folder)
+        cage::list_folders(&self.session_folder(session_id)?)
     }
 
     /// Adds the host agent to the cage, or changes it: its runtime, and
