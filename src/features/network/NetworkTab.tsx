@@ -27,7 +27,6 @@ import {
   NetStage,
   NetTest,
   putRule,
-  removeRule,
   Service,
   setHostPort,
   setNetworkDefault,
@@ -48,6 +47,7 @@ import type { Intent, Run } from "../../App";
 import { NetworkActivity } from "./NetworkActivity";
 import { RuleCredentials } from "./RuleCredentials";
 import { errorMessage } from "../../shared/errorMessage";
+import { removeRuleWithUndo } from "../../shared/undo";
 import {
   covers,
   credentialHosts,
@@ -490,7 +490,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
                       variant="ghost"
                       aria-label={`Remove ${ruleLabel(rule, catalog)}`}
                       iconLeft={<X size={14} />}
-                      onClick={() => run(() => removeRule(id, rule.id))}
+                      onClick={() => removeRuleWithUndo(run, id, rule.id, ruleLabel(rule, catalog))}
                     />
                   </div>
                   {expanded === rule.id && (

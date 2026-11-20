@@ -1,5 +1,6 @@
 use crate::cage;
 use crate::cage::network::{LibraryCredential, NetTest};
+use crate::cage::undo::Removal;
 use crate::error::Result;
 use crate::network::{self, DefaultAction, Inject, RuleDraft, Service, Source};
 use crate::proxy::log::Entry;
@@ -51,8 +52,9 @@ pub fn list_net_events(manager: Managed<'_>, vm_key: String) -> Result<Vec<Entry
 
 // The credential commands are async, so the vault file I/O does not block the main thread.
 
+/// The receipt can undo the removal for a short time.
 #[tauri::command]
-pub async fn remove_rule(manager: Managed<'_>, cage_id: String, rule_id: String) -> Result<()> {
+pub async fn remove_rule(manager: Managed<'_>, cage_id: String, rule_id: String) -> Result<Removal> {
     manager.remove_rule(&cage_id, &rule_id)
 }
 

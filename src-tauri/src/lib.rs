@@ -318,6 +318,15 @@ pub fn run() {
                     Ok(manager) => {
                         connect(&handle, &manager);
                         handle.manage(manager);
+                        // The undo receipts expire also while the app is idle.
+                        let sweeper = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut tick = tokio::time::interval(Duration::from_secs(1));
+                            loop {
+                                tick.tick().await;
+                                sweeper.state::<Manager<Microsandbox>>().sweep_undo();
+                            }
+                        });
                         startup.set(&handle, Phase::Ready, checks, Some(Step::Ready));
                     }
                     Err(e) => {
@@ -361,6 +370,7 @@ pub fn run() {
             commands::sessions::rescan_folders,
             commands::cages::add_mount,
             commands::cages::remove_mount,
+            commands::cages::undo_removal,
             commands::cages::set_mount_readonly,
             commands::network::network_catalog,
             commands::network::proxy_ca_fingerprint,

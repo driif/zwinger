@@ -11,6 +11,7 @@ use crate::cage::history::{self, StartHistory, StartRecord};
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
+use crate::cage::undo::Undo;
 use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE, vm_state};
 use crate::error::{Error, Member, Result};
 use crate::host_agents::HostAgents;
@@ -79,6 +80,9 @@ pub struct Manager<R: SandboxRuntime> {
     /// value) after a restore that did not end. Until the vault is seen to
     /// hold it, starts and edits that use the account fail.
     pub(crate) unsettled: Mutex<HashMap<Account, Option<VaultEntry>>>,
+    /// The removals that can still be undone. Take it after `secret_edit`
+    /// and never while `state` is held.
+    pub(crate) undo: Mutex<Undo>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
@@ -491,6 +495,7 @@ impl<R: SandboxRuntime> Manager<R> {
             reap_gate: tokio::sync::Mutex::new(()),
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
+            undo: Mutex::default(),
             state: Arc::new(Mutex::new(State {
                 sessions,
                 cages,
@@ -978,6 +983,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             (cage, own_keys)
         };
+        lock(&self.undo).purge(id);
         self.save_history();
         let mut result = Ok(());
         // The library values stay for the other cages and for later use.
@@ -1086,21 +1092,32 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn add_mount(&self, cage_id: &str, host: &str, guest: &str, readonly: bool) -> Result<()> {
+        self.put_mount(cage_id, |c, sessions| {
+            c.add_mount(sessions, host, guest, readonly)?;
+            Ok(c.mounts.len() - 1)
+        })
+    }
+
+    /// Saves the mount that `put` adds, with the checks of each new mount:
+    /// the reserved app data, the overlaps and the harness mount of
+    /// [`Cage::insert_mount`], and [`Bound::check`] in [`Self::edit_cage`].
+    /// `put` returns the index of the new mount.
+    pub(crate) fn put_mount(
+        &self,
+        cage_id: &str,
+        put: impl FnOnce(&mut Cage, &[&Session]) -> Result<usize>,
+    ) -> Result<()> {
         let reserved = self.reserved();
         self.edit_cage(cage_id, |c, sessions| {
-            c.add_mount(sessions, host, guest, readonly)?;
+            let index = put(c, sessions)?;
             // The new mount first: an old mount must not hide its own error.
-            let new = c.mounts.last().expect("add_mount pushed the mount");
+            let new = &c.mounts[index];
             if let Some(dir) = cage::reserved_overlap(&new.host, &reserved) {
                 return Err(Error::AppDataOverlap(new.host.display().to_string(), dir.display().to_string()));
             }
             c.check_app_data(&reserved)?;
             sessions.iter().try_for_each(|session| Bound { session, cage: c }.check_app_data(&reserved))
         })
-    }
-
-    pub fn remove_mount(&self, cage_id: &str, guest: &str) -> Result<()> {
-        self.edit_cage(cage_id, |c, sessions| c.remove_mount(sessions, guest))
     }
 
     pub fn set_mount_readonly(&self, cage_id: &str, guest: &str, readonly: bool) -> Result<()> {
@@ -1178,7 +1195,7 @@ impl<R: SandboxRuntime> Manager<R> {
             c.put_host_agent(used, login);
             Ok(())
         })?;
-        self.publish(cage_id, None);
+        self.publish(cage_id, &[]);
         if kind == AgentKind::Claude {
             // The login off removed the token credential; its local value goes too.
             self.drop_unused(cage_id, cage::claude_token_refs())?;
@@ -1194,7 +1211,7 @@ impl<R: SandboxRuntime> Manager<R> {
             c.remove_host_agent(kind);
             Ok(())
         })?;
-        self.publish(cage_id, None);
+        self.publish(cage_id, &[]);
         if kind == AgentKind::Claude {
             self.drop_unused(cage_id, cage::claude_token_refs())?;
         }

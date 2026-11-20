@@ -23,7 +23,7 @@ const BASIC_MARK: &str = "{basic:";
 /// The longest template.
 const TEMPLATE_LIMIT: usize = 512;
 /// The most rules of a cage.
-const RULE_LIMIT: usize = 500;
+pub(crate) const RULE_LIMIT: usize = 500;
 /// The most credentials of one rule.
 const CREDENTIAL_LIMIT: usize = 16;
 /// Header fields that a credential may not set: the proxy or HTTP owns them.

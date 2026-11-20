@@ -2,7 +2,7 @@ import { CSSProperties, lazy, ReactNode, Suspense, useEffect, useRef, useState }
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
-import { Button, Card } from "@driif/motiv";
+import { Button, Card, Toaster } from "@driif/motiv";
 import { Check, Plus, RotateCw, ShieldOff, TriangleAlert } from "lucide-react";
 import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
@@ -1250,6 +1250,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         )}
         {error && <p className="status danger mono">{error}</p>}
       </main>
+      <Toaster />
     </div>
   );
 }

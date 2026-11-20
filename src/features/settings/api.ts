@@ -1,5 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
-import { AgentKind, call, HostAgentUse } from "../../shared/api";
+import { call, type AgentKind, type HostAgentUse, type Removal } from "../../shared/api.ts";
 
 export const setHarness = (sessionId: string, harness: string | null) =>
   call<void>("set_harness", { sessionId, harness });
@@ -53,8 +53,9 @@ export const addMount = (
   readonly: boolean,
 ) => call<void>("add_mount", { cageId, host, guest, readonly });
 
+/** The receipt can undo the removal with `undoRemoval` until it expires. */
 export const removeMount = (cageId: string, guest: string) =>
-  call<void>("remove_mount", { cageId, guest });
+  call<Removal>("remove_mount", { cageId, guest });
 
 export const setMountReadonly = (
   cageId: string,

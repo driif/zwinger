@@ -8,6 +8,16 @@ export const BACKEND_LOST = "backend-lost";
 export const revealMainWindow = (backgroundColor: string) =>
   call<void>("reveal_main_window", { backgroundColor });
 
+/** The receipt of a rule or mount removal. `undoRemoval` with its token restores the removal for `expiresInMs`. */
+export interface Removal {
+  token: string;
+  expiresInMs: number;
+}
+
+/** Restores a removal of the cage. It fails after the receipt expires, or when the restore would conflict. */
+export const undoRemoval = (cageId: string, token: string) =>
+  call<void>("undo_removal", { cageId, token });
+
 let lostCalls = 0;
 
 /** Every command goes through here. Three rejections in a row that are not `{ code, message }` mean that the backend is gone. */

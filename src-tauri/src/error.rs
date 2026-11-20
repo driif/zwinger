@@ -138,6 +138,10 @@ pub enum Error {
     WorkspacesLocked(String),
     #[error("mount not found")]
     MountNotFound,
+    #[error("the removal can no longer be undone")]
+    UndoExpired,
+    #[error("the removal cannot be undone: {0}")]
+    UndoConflict(String),
     #[error("terminal process not found")]
     ProcessNotFound,
     #[error("terminal not found")]

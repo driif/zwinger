@@ -12,12 +12,13 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
-import { addMount, removeMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
+import { addMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
 import { setCageResources } from "./api";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
+import { removeMountWithUndo } from "../../shared/undo";
 import { phaseName } from "../projects/StartProgress";
 import { direction, duration, trendSummary } from "./startTrend";
 
@@ -190,7 +191,7 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
                   variant="ghost"
                   aria-label={`Remove ${m.guest}`}
                   iconLeft={<X size={14} />}
-                  onClick={() => run(() => removeMount(cage.id, m.guest))}
+                  onClick={() => removeMountWithUndo(run, cage.id, m.guest)}
                 />
               </li>
             ))}

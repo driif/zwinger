@@ -6,6 +6,7 @@ pub(crate) mod progress;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;
+pub(crate) mod undo;
 pub(crate) mod vm_state;
 
 use std::path::{Component, Path, PathBuf};
@@ -312,12 +313,32 @@ impl Cage {
     pub fn add_mount(&mut self, sessions: &[&Session], host: &str, guest: &str, readonly: bool) -> Result<()> {
         let (host, id) = host_dir_with_id(host)?;
         let guest = guest_path(guest)?;
-        if self.mounts.iter().any(|m| m.guest == guest) {
-            return Err(Error::DuplicateMount(guest));
+        self.place_mount(sessions, Mount { host, id: Some(id), guest, readonly }, self.mounts.len())
+    }
+
+    /// Inserts `mount` at `index`, or at the end if `index` is past it, with
+    /// the checks of [`Self::add_mount`]. The guest path must already be in
+    /// its canonical form: a stored mount is never rewritten. An error leaves
+    /// the mounts as they were.
+    pub fn insert_mount(&mut self, sessions: &[&Session], mount: Mount, index: usize) -> Result<()> {
+        if guest_path(&mount.guest)? != mount.guest {
+            return Err(Error::InvalidGuestPath(mount.guest));
         }
-        self.keep_harness_mount(sessions, |c| c.mounts.push(Mount { host, id: Some(id), guest, readonly }))?;
+        self.place_mount(sessions, mount, index)
+    }
+
+    /// The checks of [`Self::insert_mount`] after the guest path check. An
+    /// old config can hold a guest path that is not canonical, such as
+    /// `/mnt/a/`: it still takes `/mnt/a`.
+    fn place_mount(&mut self, sessions: &[&Session], mount: Mount, index: usize) -> Result<()> {
+        let taken = |m: &Mount| normalize(&m.guest).map_or(m.guest == mount.guest, |p| p == Path::new(&mount.guest));
+        if self.mounts.iter().any(taken) {
+            return Err(Error::DuplicateMount(mount.guest));
+        }
+        let index = index.min(self.mounts.len());
+        self.keep_harness_mount(sessions, |c| c.mounts.insert(index, mount))?;
         sessions.iter().try_for_each(|session| Bound { session, cage: self }.check_overlap()).inspect_err(|_| {
-            self.mounts.pop();
+            self.mounts.remove(index);
         })
     }
 

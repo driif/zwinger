@@ -1,11 +1,10 @@
 import { CommandMenu, CommandMenuItem } from "@driif/motiv";
 import { Ref } from "react";
 import {
-  removeRule,
   setNetworkDefault,
   setOffline,
 } from "../features/network/api";
-import { removeMount, setMountReadonly } from "../features/settings/api";
+import { setMountReadonly } from "../features/settings/api";
 import { SessionCage, SessionView } from "./api";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
@@ -14,6 +13,7 @@ import { isDefaultEditor, LaunchAction, launchActions, projectEditors, projectLa
 import { Editors } from "../features/launcher/api";
 import type { Detection } from "../features/settings/api";
 import { shortcutLabel, ShortcutAction } from "./useShortcuts";
+import { removeMountWithUndo, removeRuleWithUndo } from "./undo";
 
 interface Props {
   ref: Ref<HTMLDivElement>;
@@ -152,7 +152,7 @@ export function CommandBar({
     );
     for (const rule of network.rules) {
       const label = rule.target.kind === "host" ? rule.target.host : rule.target.id;
-      commands.push({ id: `rule-${rule.id}`, label: `Remove network rule ${label}`, onSelect: () => run(() => removeRule(id, rule.id)) });
+      commands.push({ id: `rule-${rule.id}`, label: `Remove network rule ${label}`, onSelect: () => removeRuleWithUndo(run, id, rule.id, label) });
     }
     for (const mount of mounts) {
       commands.push({
@@ -160,7 +160,7 @@ export function CommandBar({
         label: `Make ${mount.guest} ${mount.readonly ? "read-write" : "read-only"}`,
         onSelect: () => run(() => setMountReadonly(id, mount.guest, !mount.readonly)),
       });
-      commands.push({ id: `unmount-${mount.guest}`, label: `Remove mount ${mount.guest}`, onSelect: () => run(() => removeMount(id, mount.guest)) });
+      commands.push({ id: `unmount-${mount.guest}`, label: `Remove mount ${mount.guest}`, onSelect: () => removeMountWithUndo(run, id, mount.guest) });
     }
   }
   commands.push(

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
 use crate::cage::manager::{Manager, Vm, lock};
+use crate::cage::undo::{Kept, RemovedRule};
 use crate::cage::{self, CLAUDE_TOKEN, Cage, HostAgentUse, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::network::{Action, Credential, DefaultAction, Inject, NetworkPolicy, RuleDraft, Source, Target};
@@ -51,22 +52,22 @@ impl<R: SandboxRuntime> Manager<R> {
             out = Some(edit(&mut c.network)?);
             Ok(())
         })?;
-        self.publish(id, None);
+        self.publish(id, &[]);
         Ok(out.expect("the edit ran"))
     }
 
     /// Sends the stored policy to the proxy of each VM of the cage, in one
-    /// step with the new `value` of a credential.
-    pub(crate) fn publish(&self, id: &str, value: Option<(&CredentialRef, SecretValue)>) {
+    /// step with the new `values` of its credentials.
+    pub(crate) fn publish(&self, id: &str, values: &[(CredentialRef, SecretValue)]) {
         let state = lock(&self.state);
         let Ok(cage) = state.cage(id) else {
             return;
         };
         for live in state.lives_of(id) {
-            live.edit(|policy, values| {
+            live.edit(|policy, held| {
                 *policy = cage.network.clone();
-                if let Some((key, value)) = &value {
-                    values.insert((*key).clone(), value.clone());
+                for (key, value) in values {
+                    held.insert(key.clone(), value.clone());
                 }
             });
         }
@@ -96,17 +97,60 @@ impl<R: SandboxRuntime> Manager<R> {
         })
     }
 
-    /// Adds or changes a rule. Returns its id.
+    /// Adds or changes a rule. Returns its id. It takes `secret_edit`, so it
+    /// cannot run during the steps of a rule removal or an undo.
     pub fn put_rule(&self, id: &str, draft: RuleDraft) -> Result<String> {
+        let _edit = lock(&self.secret_edit);
         self.edit_network(id, |n| n.put_rule(draft))
     }
 
-    /// Saves the config first, then deletes the values that no other rule
-    /// uses, so that a failure leaves a value with no credential.
-    pub fn remove_rule(&self, id: &str, rule_id: &str) -> Result<()> {
-        let _edit = lock(&self.secret_edit);
-        let removed = self.edit_network(id, |n| n.remove_rule(rule_id))?;
-        self.drop_unused(id, removed.credentials.iter().map(Credential::key))
+    /// Removes the rule. The caller holds `secret_edit`. First it reads the
+    /// stored value of each local credential of the rule, also a value that
+    /// another rule still uses. Then it saves the config and sends the new
+    /// policy to the running proxies. Last it deletes the values that no
+    /// other rule uses. It does not roll back: a failed delete keeps the
+    /// value, which no credential uses, and the next app start deletes it.
+    /// Returns the rule, its index and the read values, for an undo.
+    pub(crate) fn take_rule(&self, id: &str, rule_id: &str) -> Result<RemovedRule> {
+        let credentials = {
+            let state = lock(&self.state);
+            let cage = state.cage(id)?;
+            cage.network.rules.iter().find(|r| r.id == rule_id).ok_or(Error::RuleNotFound)?.credentials.clone()
+        };
+        let owner = Owner::cage(id);
+        let mut values = Vec::new();
+        for credential in credentials.iter().filter(|c| c.source.is_local()) {
+            self.settle(&owner, &credential.name)?;
+            let entry = self.vault.entry(&owner, &credential.name)?;
+            values.push(Kept { name: credential.name.clone(), entry });
+        }
+        let mut taken = None;
+        self.edit_cage(id, |c, _| {
+            let index = c.network.rules.iter().position(|r| r.id == rule_id).ok_or(Error::RuleNotFound)?;
+            let claude_login = c.host_agent(AgentKind::Claude).is_some_and(|a| a.login);
+            taken = Some((c.network.remove_rule(rule_id)?, index, claude_login));
+            Ok(())
+        })?;
+        let (rule, index, claude_login) = taken.expect("the edit ran");
+        self.publish(id, &[]);
+        let (network, lives) = {
+            let state = lock(&self.state);
+            match state.cage(id) {
+                Ok(cage) => (cage.network.clone(), state.lives_of(id)),
+                // A concurrent cage delete removed the values.
+                Err(_) => return Ok(RemovedRule { rule, index, claude_login, values }),
+            }
+        };
+        for key in rule.credentials.iter().map(Credential::key).filter(|k| !network.uses(k)) {
+            for live in &lives {
+                live.set_value(&key, None);
+            }
+            let held = values.iter().any(|k| k.name == key.name && k.entry.is_some());
+            if key.source.is_local() && held && self.vault.delete(&owner, &key.name).is_err() {
+                eprintln!("rule removal: cannot delete the unused value {}; the next app start deletes it", key.name);
+            }
+        }
+        Ok(RemovedRule { rule, index, claude_login, values })
     }
 
     /// Removes the values of `keys` that no credential of the cage uses from
@@ -273,7 +317,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
         };
         // A request must not see the new rule with the old value.
-        self.publish(id, Some((key, value)));
+        self.publish(id, &[(key.clone(), value)]);
         self.drop_unused(id, replaced)
     }
 

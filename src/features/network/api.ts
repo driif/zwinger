@@ -5,6 +5,7 @@ import {
   type CredentialSource,
   type DefaultAction,
   type Inject,
+  type Removal,
   type Target,
 } from "../../shared/api.ts";
 
@@ -43,8 +44,9 @@ export const putRule = (
   rule: { id?: string; target: Target; action: Action },
 ) => call<string>("put_rule", { cageId, rule });
 
+/** The receipt can undo the removal with `undoRemoval` until it expires. */
 export const removeRule = (cageId: string, ruleId: string) =>
-  call<void>("remove_rule", { cageId, ruleId });
+  call<Removal>("remove_rule", { cageId, ruleId });
 
 /**
  * `inject` null removes the credential. `value` null keeps the stored value; a new local name, or a name with no

@@ -87,8 +87,10 @@ each change on the project page.
 
 ## Mounts
 
-A mount is an extra folder on your Mac that you add to a project. It has an absolute path in the cage. This path must
-not overlap `/workspace`. A mount is read-only by default.
+A mount is an extra folder on your Mac that you add to a project. It has an absolute path in the cage. This path cannot
+be `/`, cannot contain `.` or `..`, and cannot be `/workspace`, a folder inside it, `/opt`, `/opt/zwinger` or a folder
+inside `/opt/zwinger`. zwinger removes a trailing slash. Two mounts cannot have the same path. A mount is read-only by
+default.
 
 ![The Mounts form shows the host folder reference, its guest path /mnt/reference, and Read-only selected.](../../assets/read-only-mount.png)
 
@@ -99,6 +101,13 @@ this when you create a project, when you add a mount and at each cage start.
 zwinger keeps the identity of the project folder and of each mount. Each cage start checks them. If a folder changed
 (for example, another folder now has the same path), zwinger does not start the cage. If a folder was missing, you
 must confirm it on the project page before the next start.
+
+The X button of a mount, or **Remove mount** in ⌘K, removes the mount at once. A running VM keeps the mount until its
+next start. After a removal, a notice with **Undo** shows for up to 10 seconds, counted from when the removal is sent.
+If the reply comes too late, no notice shows. **Undo** puts the mount back at its position, with its access and its
+stored folder identity. The undo fails and changes nothing if the guest path is in use again, if the host folder is now
+a different folder, or if the mount fails the checks of a new mount. These checks include the path rules above: an
+older stored mount with a rejected path, or with a trailing slash, does not come back.
 
 ## Terminals
 

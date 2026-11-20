@@ -1,6 +1,7 @@
 use crate::agent::AgentKind;
 use crate::cage::HostAgentUse;
 use crate::cage::lifecycle::Confirmed;
+use crate::cage::undo::Removal;
 use crate::error::Result;
 use crate::network::Source;
 use crate::secrets::SecretValue;
@@ -12,9 +13,16 @@ pub fn add_mount(manager: Managed<'_>, cage_id: String, host: String, guest: Str
     manager.add_mount(&cage_id, &host, &guest, readonly)
 }
 
+/// The receipt can undo the removal for a short time.
 #[tauri::command]
-pub fn remove_mount(manager: Managed<'_>, cage_id: String, guest: String) -> Result<()> {
+pub fn remove_mount(manager: Managed<'_>, cage_id: String, guest: String) -> Result<Removal> {
     manager.remove_mount(&cage_id, &guest)
+}
+
+/// Restores a rule or mount removal of the cage, before its receipt expires.
+#[tauri::command]
+pub async fn undo_removal(manager: Managed<'_>, cage_id: String, token: String) -> Result<()> {
+    manager.undo_removal(&cage_id, &token)
 }
 
 #[tauri::command]

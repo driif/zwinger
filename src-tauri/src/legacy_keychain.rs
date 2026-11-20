@@ -497,7 +497,7 @@ fn import_one<R: SandboxRuntime>(
         _ => return failed(),
     }
     let key = CredentialRef { source: Source::Local, name };
-    manager.publish(&cage, Some((&key, value)));
+    manager.publish(&cage, &[(key, value)]);
     (Row::new(account, outcome), Some(Record::Verified { revision }))
 }
 

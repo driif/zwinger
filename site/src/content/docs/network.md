@@ -26,6 +26,27 @@ The proxy checks each request in this sequence:
 
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
 
+### Remove a rule
+
+The X button of a rule, or **Remove network rule** in ⌘K, removes the rule at once. The next request does not get the
+rule or its credentials. A local credential value that no other rule uses is deleted from the vault. If this delete
+fails, the removal is still done: the value stays unused, and the next app start deletes it.
+
+After a removal, a notice with **Undo** shows for up to 10 seconds, counted from when the removal is sent. If the reply
+comes too late, no notice shows. **Undo** puts the rule back at its position in the same project's cage, with its
+credentials and their stored values. The values are never shown. The undo fails and changes nothing in these cases:
+
+- The rule, or a rule for the same service or host, is in the list again.
+- A local credential has a different value now, or its value was saved again, also with the same text. The undo does
+  not replace it.
+- A credential from the credential library was deleted.
+- The Claude Code setup token came from the Claude Code login, and the login is now off. A token that you set on the
+  rule yourself comes back.
+- The cage has the maximum of 500 rules.
+
+An undo works one time. After 10 seconds from when the removal is sent, or after an app restart, the removal cannot be
+undone.
+
 The rules that the network page edits are the rules of the project's current cage. **Test** and **Activity** apply to
 the VM that runs for the project. After a cage change, that VM uses its old cage until a restart.
 
