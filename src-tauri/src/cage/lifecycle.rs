@@ -11,6 +11,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
+use crate::cage::activity::{self, Source};
 use crate::cage::history::StartRecord;
 use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock};
 use crate::cage::network::placeholders;
@@ -272,7 +273,9 @@ impl<R: SandboxRuntime> Manager<R> {
         }
         timings.add(Phase::Prepare, prepare_took);
         progress.begin(Phase::Proxy);
-        let (proxy, proxy_took) = timed(self.start_proxy(id, &cage, live, tokens)).await;
+        // The proxy and the runtime log of this VM send with one source.
+        let source = lock(&self.state).net.source(id);
+        let (proxy, proxy_took) = timed(self.start_proxy(source.clone(), &cage, live, tokens)).await;
         timings.add(Phase::Proxy, proxy_took);
         let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
@@ -340,7 +343,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let at = Instant::now();
         let net = match &result {
             Ok(vm) => match self.runtime.net_lines(vm).await {
-                Ok(lines) => Some(self.follow_net(id, lines)),
+                Ok(lines) => Some(self.follow_net(source, lines)),
                 Err(e) => {
                     eprintln!("network activity of {id} is not available: {e}");
                     None
@@ -540,10 +543,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.try_migrate_vm_state().await;
     }
 
-    /// Starts the proxy of VM `key`. Its log entries go to the VM's ring and the sink.
+    /// Starts the proxy of a VM. Its log entries go to the network log of `source`.
     pub(crate) async fn start_proxy(
         &self,
-        key: &str,
+        source: Source,
         cage: &Cage,
         live: Arc<Live>,
         tokens: Vec<HostToken>,
@@ -557,18 +560,13 @@ impl<R: SandboxRuntime> Manager<R> {
                 Arc::new(Login::new(secret.name.clone(), secret.hosts.clone(), token, self.host.clone()))
             })
             .collect();
-        let (state, sink, id) = (self.state.clone(), self.net_sink.clone(), key.to_owned());
+        let (state, net, notice) = (self.state.clone(), self.net_sink.clone(), self.notice_sink.clone());
         let config = proxy::Config {
             ca,
             live,
             logins,
             refresh: login::denied_hosts(&cage.logins),
-            sink: Arc::new(move |entry| {
-                let entry = lock(&state).push_net(&id, entry);
-                if let Some(sink) = sink.get() {
-                    sink(&id, &entry);
-                }
-            }),
+            sink: Arc::new(move |entry| activity::record(&state, &net, &notice, &source, entry)),
             resolver: Arc::new(proxy::dial::System),
             #[cfg(test)]
             upstream_root: None,
@@ -624,10 +622,8 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Turns the runtime log lines into the VM's log: the direct
     /// connections that the VM blocked, because a tool ignores the proxy.
-    pub(crate) fn follow_net(&self, id: &str, mut lines: Receiver<String>) -> AbortHandle {
-        let state = self.state.clone();
-        let sink = self.net_sink.clone();
-        let id = id.to_owned();
+    pub(crate) fn follow_net(&self, source: Source, mut lines: Receiver<String>) -> AbortHandle {
+        let (state, net, notice) = (self.state.clone(), self.net_sink.clone(), self.notice_sink.clone());
         tokio::spawn(async move {
             let mut dedupe = Dedupe::default();
             while let Some(line) = lines.recv().await {
@@ -637,10 +633,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 let Some(entry) = Entry::direct(&event).filter(|_| dedupe.keep(&event)) else {
                     continue;
                 };
-                let event = lock(&state).push_net(&id, entry);
-                if let Some(sink) = sink.get() {
-                    sink(&id, &event);
-                }
+                activity::record(&state, &net, &notice, &source, entry);
             }
         })
         .abort_handle()

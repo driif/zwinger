@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::netlog::{NetEvent, NetKind};
 
@@ -13,7 +13,7 @@ pub const DIRECT: &str = "direct";
 /// A longer path is cut.
 const PATH_LIMIT: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Entry {
     /// Per project. The manager sets it.

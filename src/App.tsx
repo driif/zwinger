@@ -35,6 +35,7 @@ import {
   setSessionVm,
   stopCage,
   StopShared,
+  onAppNotices,
   takeAppNotices,
 } from "./features/projects/api";
 import {
@@ -453,7 +454,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }, []);
 
   useEffect(() => {
-    takeAppNotices().then(setAppNotices, (e) => setError(errorMessage(e)));
+    const stop = onAppNotices(pullNotices);
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
   }, []);
 
   const runtimes: Runtimes = {
@@ -517,7 +521,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       const generation = netGeneration.current.get(key);
       listNetEvents(key).then(
         (events) => netGeneration.current.get(key) === generation && addNet(key, events),
-        () => {},
+        (e) => setError(errorMessage(e)),
       );
     }
   }, [keys.join(" "), listening]);
@@ -888,7 +892,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       }),
     );
 
-  /** A restart adds a notice for each terminal that does not reopen. */
+  /** The backend signals each new notice; a restart adds a notice for each terminal that does not reopen. */
   const pullNotices = () =>
     takeAppNotices().then(
       (notes) => notes.length > 0 && setAppNotices((all) => [...all, ...notes]),

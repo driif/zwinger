@@ -140,3 +140,13 @@ export const onStartProgress = (handler: (vmKey: string, phase: StartPhase) => v
 
 /** Each notice comes once, such as the VMs that the app start removed. */
 export const takeAppNotices = () => call<string[]>("take_app_notices");
+
+/**
+ * Calls `pull` at each `app-notices` signal, and once when the listener is on, so no notice
+ * that came before it waits. Resolves to the function that stops the listener.
+ */
+export const onAppNotices = (pull: () => void) =>
+  listen("app-notices", () => pull()).then((unlisten) => {
+    pull();
+    return unlisten;
+  });

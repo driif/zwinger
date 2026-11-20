@@ -1,9 +1,15 @@
+use tauri::{AppHandle, Manager as _};
+use tauri_plugin_dialog::DialogExt as _;
+
 use crate::cage;
+use crate::cage::manager::Manager;
 use crate::cage::network::{LibraryCredential, NetTest};
 use crate::cage::undo::Removal;
-use crate::error::Result;
+use crate::cage::vm_state;
+use crate::error::{Error, Result};
 use crate::network::{self, DefaultAction, Inject, RuleDraft, Service, Source};
 use crate::proxy::log::Entry;
+use crate::runtime::Microsandbox;
 use crate::secrets::SecretValue;
 
 use super::Managed;
@@ -48,6 +54,42 @@ pub fn wildcard_for(host: String) -> Option<String> {
 #[tauri::command]
 pub fn list_net_events(manager: Managed<'_>, vm_key: String) -> Result<Vec<Entry>> {
     manager.list_net_events(&vm_key)
+}
+
+/// Asks for a place and writes the network log of VM `vm_key` there.
+/// `false`: the user cancelled.
+#[tauri::command]
+pub async fn export_net_events(app: AppHandle, vm_key: String) -> Result<bool> {
+    if !vm_state::vm_key(&vm_key) {
+        return Err(Error::BadVmKey(vm_key));
+    }
+    tokio::task::spawn_blocking(move || {
+        let Some(file) =
+            app.dialog().file().add_filter("JSON", &["json"]).set_file_name(export_name(&vm_key)).blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let dest = file.into_path().map_err(std::io::Error::other)?;
+        app.state::<Manager<Microsandbox>>().export_net_events(&vm_key, &dest).map(|()| true)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// The suggested file name of the export of VM `vm_key`. A key over 64
+/// bytes is cut and gets a short hash, so the name stays short enough for
+/// the file system and two long keys still get different names.
+fn export_name(vm_key: &str) -> String {
+    const PREFIX: usize = 64;
+    if vm_key.len() <= PREFIX {
+        return format!("{vm_key}-network.json");
+    }
+    let mut end = PREFIX;
+    while !vm_key.is_char_boundary(end) {
+        end -= 1;
+    }
+    let hash = &cage::activity::file_id(vm_key)[..8];
+    format!("{}-{hash}-network.json", &vm_key[..end])
 }
 
 // The credential commands are async, so the vault file I/O does not block the main thread.
@@ -105,4 +147,20 @@ pub async fn stored_credentials(manager: Managed<'_>, cage_id: String) -> Result
 #[tauri::command]
 pub async fn test_network(manager: Managed<'_>, cage_id: String, host: String) -> Result<NetTest> {
     manager.test_network(&cage_id, &host).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_name;
+
+    #[test]
+    fn the_export_name_of_a_long_key_is_short_and_unique() {
+        assert_eq!(export_name("cage-a"), "cage-a-network.json");
+        let (a, b) = ("a".repeat(255), format!("{}b", "a".repeat(254)));
+        assert!(export_name(&a).len() <= 64 + 22);
+        assert!(export_name(&a).starts_with(&"a".repeat(64)));
+        assert_ne!(export_name(&a), export_name(&b));
+        // A cut never splits a character.
+        assert!(export_name(&format!("{}é{}", "a".repeat(63), "x".repeat(10))).starts_with(&"a".repeat(63)));
+    }
 }

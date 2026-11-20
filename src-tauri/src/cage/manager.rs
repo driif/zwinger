@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -7,6 +7,7 @@ use serde::Serialize;
 use tokio::task::AbortHandle;
 
 use crate::agent::{AgentKind, launch};
+use crate::cage::activity::{self, Activity};
 use crate::cage::history::{self, StartHistory, StartRecord};
 use crate::cage::lifecycle::mounted;
 use crate::cage::network::placeholders;
@@ -28,14 +29,14 @@ use crate::task_runs;
 use crate::terminal::{AgentState, Terminal, TerminalFolder, TerminalView, history as terminal_history};
 use crate::workspaces::{self, Arrangement, Workspace, WorkspaceStore};
 
-/// The network log entries kept per VM.
-pub(crate) const NET_RING: usize = 2000;
-
 /// The runtime home of this app run, as [`Error::NotReaped`] names it.
 const CURRENT_HOME: &str = "~/.zwinger/microsandbox";
 
 /// Gets each new network log entry with its VM key.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
+
+/// Gets a signal when the app has a new notice to take.
+pub type NoticeSink = Box<dyn Fn() + Send + Sync>;
 
 /// Gets the process id and the new agent state of a terminal.
 pub type AgentSink = Box<dyn Fn(&str, Option<AgentState>) + Send + Sync>;
@@ -85,6 +86,7 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) undo: Mutex<Undo>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
+    pub(crate) notice_sink: Arc<OnceLock<NoticeSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
     pub(crate) folder_sink: Arc<OnceLock<FolderSink>>,
     pub(crate) runs: Arc<task_runs::Registry>,
@@ -114,9 +116,9 @@ pub(crate) struct State<V> {
     /// Per VM that starts or runs, the policy and the credential values
     /// of its proxy. An edit of its cage changes them at once.
     pub(crate) live: HashMap<String, Arc<Live>>,
-    /// Per VM key, the last network log entries. They stay after a stop, so
-    /// the user can still allow a blocked host.
-    pub(crate) net: HashMap<String, VecDeque<Entry>>,
+    /// Per VM key, the network log, in memory and on disk. It stays after a
+    /// stop and a restart, so the user can still allow a blocked host.
+    pub(crate) net: Activity,
     /// The generation of the last VM that started. A stop names the
     /// generation it resolved, so a delayed stop cannot hit a later VM.
     pub(crate) generation: u64,
@@ -391,9 +393,16 @@ impl<V> State<V> {
     /// A key is taken while a session stores it, a VM has it, or a cage has
     /// it as its id.
     pub(crate) fn key_taken(&self, key: &str) -> bool {
-        self.vms.contains_key(key)
-            || self.cages.iter().any(|c| c.id == key)
-            || self.sessions.iter().any(|s| matches!(&s.vm, VmChoice::Own { key: k, .. } if k == key))
+        self.keys().any(|k| k == key)
+    }
+
+    /// Each taken key ([`State::key_taken`]). A key can come more than once.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
+        let own = self.sessions.iter().filter_map(|s| match &s.vm {
+            VmChoice::Own { key, .. } => Some(key.as_str()),
+            _ => None,
+        });
+        self.vms.keys().map(String::as_str).chain(self.cages.iter().map(|c| c.id.as_str())).chain(own)
     }
 
     /// Each member id with the current name of its session.
@@ -401,17 +410,6 @@ impl<V> State<V> {
         ids.into_iter()
             .map(|id| Member { name: self.session(&id).map_or_else(|_| id.clone(), |s| s.name.clone()), id })
             .collect()
-    }
-
-    /// Numbers the entry and adds it to the VM's ring.
-    pub(crate) fn push_net(&mut self, key: &str, mut event: Entry) -> Entry {
-        let ring = self.net.entry(key.to_owned()).or_default();
-        event.seq = ring.back().map_or(1, |last| last.seq + 1);
-        if ring.len() == NET_RING {
-            ring.pop_front();
-        }
-        ring.push_back(event.clone());
-        event
     }
 }
 
@@ -471,6 +469,7 @@ impl<R: SandboxRuntime> Manager<R> {
         });
         let workspaces = workspaces::reconcile(stored.clone(), &ids(&sessions));
         let history = StartHistory::load(&store.dir().join(history::FILE));
+        let net = Activity::new(store.dir());
         for w in &workspaces {
             if let Some(cage) = &w.default_cage {
                 store::check_cage(&cages, &format!("workspace {} ({})", w.name, w.id), cage)?;
@@ -481,6 +480,20 @@ impl<R: SandboxRuntime> Manager<R> {
         {
             eprintln!("the workspaces could not be saved: {e}");
         }
+        let mut state = State {
+            sessions,
+            cages,
+            workspaces,
+            vms: HashMap::new(),
+            terminals: Vec::new(),
+            live: HashMap::new(),
+            net,
+            generation: 0,
+            joining: HashSet::new(),
+            history,
+        };
+        let taken = state.keys().map(activity::file_id).collect();
+        state.net.prune(&taken);
         Ok(Self {
             runtime,
             store,
@@ -496,19 +509,9 @@ impl<R: SandboxRuntime> Manager<R> {
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
             undo: Mutex::default(),
-            state: Arc::new(Mutex::new(State {
-                sessions,
-                cages,
-                workspaces,
-                vms: HashMap::new(),
-                terminals: Vec::new(),
-                live: HashMap::new(),
-                net: HashMap::new(),
-                generation: 0,
-                joining: HashSet::new(),
-                history,
-            })),
+            state: Arc::new(Mutex::new(state)),
             net_sink: Arc::new(OnceLock::new()),
+            notice_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
             folder_sink: Arc::new(OnceLock::new()),
             runs: Arc::default(),
@@ -539,6 +542,11 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Only the first sink counts.
     pub fn set_net_sink(&self, sink: NetSink) {
         let _ = self.net_sink.set(sink);
+    }
+
+    /// Only the first sink counts.
+    pub fn set_notice_sink(&self, sink: NoticeSink) {
+        let _ = self.notice_sink.set(sink);
     }
 
     /// Only the first sink counts.
@@ -703,10 +711,11 @@ impl<R: SandboxRuntime> Manager<R> {
         self.changeable_state_dir(key)?;
         state.vms.remove(key);
         state.live.remove(key);
-        state.net.remove(key);
+        let removed = state.net.remove(key);
         // The caller saves it after it releases the state lock.
         state.history.remove(key);
-        self.remove_vm_dirs(key)
+        let dirs = self.remove_vm_dirs(key);
+        removed.and(dirs)
     }
 
     /// Deletes the agent state, the wrappers and the profiles of VM `key`.
@@ -937,7 +946,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// changes nothing.
     pub fn delete_cage(&self, id: &str) -> Result<()> {
         let _edit = lock(&self.secret_edit);
-        let (cage, own_keys) = {
+        let (cage, own_keys, mut result) = {
             let mut state = lock(&self.state);
             let cage = state.cage(id)?.clone();
             let in_use = |reason: String| Err(Error::CageInUse(cage.name.clone(), reason));
@@ -975,17 +984,20 @@ impl<R: SandboxRuntime> Manager<R> {
             let cages: Vec<Cage> = state.cages.iter().filter(|c| c.id != id).cloned().collect();
             self.store.save_cages(&cages)?;
             state.cages = cages;
+            let mut result = Ok(());
             for key in keys {
                 state.vms.remove(&key);
                 state.live.remove(&key);
-                state.net.remove(&key);
+                let removed = state.net.remove(&key);
+                if result.is_ok() {
+                    result = removed;
+                }
                 state.history.remove(&key);
             }
-            (cage, own_keys)
+            (cage, own_keys, result)
         };
         lock(&self.undo).purge(id);
         self.save_history();
-        let mut result = Ok(());
         // The library values stay for the other cages and for later use.
         for credential in cage.network.credentials().into_iter().filter(|c| c.source.is_local()) {
             if let Err(e) = self.vault.delete(&Owner::cage(id), &credential.name)
@@ -1321,11 +1333,16 @@ impl<R: SandboxRuntime> Manager<R> {
     /// The app notices, such as the VMs that the app start removed. Each
     /// notice is returned once.
     pub fn take_app_notices(&self) -> Vec<String> {
-        std::mem::take(&mut *lock(&self.app_notices))
+        let mut notices = std::mem::take(&mut *lock(&self.app_notices));
+        notices.extend(lock(&self.state).net.take_notices());
+        notices
     }
 
     pub fn add_app_notice(&self, notice: String) {
         lock(&self.app_notices).push(notice);
+        if let Some(sink) = self.notice_sink.get() {
+            sink();
+        }
     }
 }
 
@@ -2594,7 +2611,7 @@ mod tests {
         let own = format!("{a}-2");
         manager.start(&a).await.unwrap();
         let login = put_codex_login(&manager, &own);
-        lock(&manager.state).push_net(
+        lock(&manager.state).net.record(
             &own,
             Entry::direct(&crate::netlog::parse(&dns_denied("2999-01-01T00:00:00Z", "a.io")).unwrap()).unwrap(),
         );

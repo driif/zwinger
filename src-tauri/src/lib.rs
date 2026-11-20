@@ -188,6 +188,12 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     manager.set_net_sink(Box::new(move |vm_key, event| {
         let _ = handle.emit("net-event", serde_json::json!({ "vmKey": vm_key, "event": event }));
     }));
+    // No payload: the app takes the notices from the queue, which stays the
+    // only source, so a signal before the listener loses nothing.
+    let handle = app.clone();
+    manager.set_notice_sink(Box::new(move || {
+        let _ = handle.emit("app-notices", ());
+    }));
     let handle = app.clone();
     manager.set_agent_sink(Box::new(move |process_id, state| {
         let _ = handle.emit("agent-state", serde_json::json!({ "processId": process_id, "state": state }));
@@ -387,6 +393,7 @@ pub fn run() {
             commands::network::test_network,
             commands::network::wildcard_for,
             commands::network::list_net_events,
+            commands::network::export_net_events,
             commands::cages::start_cage,
             commands::cages::stop_cage,
             commands::cages::restart_cage,

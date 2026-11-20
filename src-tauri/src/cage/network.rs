@@ -40,8 +40,19 @@ pub struct NetTest {
 impl<R: SandboxRuntime> Manager<R> {
     /// The network log of VM `key`. It stays after a stop.
     pub fn list_net_events(&self, key: &str) -> Result<Vec<Entry>> {
-        let state = lock(&self.state);
-        Ok(state.net.get(key).map(|ring| ring.iter().cloned().collect()).unwrap_or_default())
+        lock(&self.state).net.events(key)
+    }
+
+    /// Writes the network log of VM `key` to `dest` as one JSON file.
+    pub fn export_net_events(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        let events = lock(&self.state).net.events(key)?;
+        let export = serde_json::json!({
+            "version": 1,
+            "vmKey": key,
+            "exportedAt": crate::proxy::log::now_ms(),
+            "events": events,
+        });
+        crate::store::write(dest, &export)
     }
 
     /// Applies `edit` to the network policy and saves it. Each running
@@ -624,7 +635,9 @@ mod tests {
         net_closed(&runtime, 1).await;
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
-        assert!(lock(&manager.state).net.is_empty());
+        assert!(manager.list_net_events(&id).unwrap().is_empty());
+        let log = format!("{}.jsonl", cage::activity::file_id(&id));
+        assert!(!manager.store.dir().join(cage::activity::DIR).join(log).exists());
     }
 
     #[tokio::test]

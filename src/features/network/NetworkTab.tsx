@@ -235,6 +235,7 @@ export function NetworkTab({
       <div ref={activity}>
         <NetworkActivity
           cage={cage}
+          vmKey={session.vmKey}
           running={running}
           events={events}
           catalog={catalog}

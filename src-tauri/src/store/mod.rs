@@ -294,6 +294,174 @@ pub(crate) fn open_data_file(dir: &Path, name: &str) -> Result<Option<File>> {
     open_regular(&fd, name, &dir.join(name))
 }
 
+/// Opens the private folder `name` of the trusted folder `parent` with no
+/// link followed, and makes it with mode 0700 if it is missing. An
+/// existing folder must be ours, and gets mode 0700.
+pub(crate) fn open_private_dir(parent: &Path, name: &str) -> std::io::Result<OwnedFd> {
+    std::fs::create_dir_all(parent)?;
+    let parent = rustix::fs::open(parent, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
+    match rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let dir = rustix::fs::openat(&parent, name, dir_flags(), Mode::empty())?;
+    make_private(&dir, name, 0o700)?;
+    Ok(dir)
+}
+
+/// Checks that the open entry `name` is ours, and removes the group and
+/// other permissions of an entry that has them, so its mode is `mode`.
+fn make_private(fd: &OwnedFd, name: &str, mode: u32) -> std::io::Result<()> {
+    let stat = rustix::fs::fstat(fd)?;
+    if stat.st_uid != euid() {
+        return Err(std::io::Error::other(format!("{name} belongs to another user")));
+    }
+    if u32::from(stat.st_mode) & 0o777 != mode {
+        rustix::fs::fchmod(fd, Mode::from_raw_mode(mode as _))?;
+    }
+    Ok(())
+}
+
+/// Opens the regular file `name` of `dir` to append to it, and makes it
+/// with mode 0600 if it is missing. It follows no link and does not wait
+/// on a special file, such as a FIFO. An existing file must be ours with
+/// one link, and gets mode 0600.
+pub(crate) fn open_append(dir: &OwnedFd, name: &str) -> std::io::Result<File> {
+    let flags =
+        OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::openat(dir, name, flags, Mode::from_raw_mode(0o600))?;
+    let stat = rustix::fs::fstat(&fd)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::other(format!("{name} is not a regular file")));
+    }
+    single_link(name, &stat)?;
+    make_private(&fd, name, 0o600)?;
+    Ok(File::from(fd))
+}
+
+/// An entry of a private folder that [`open_private_read`] found.
+pub(crate) enum PrivateEntry {
+    Missing,
+    /// A link, FIFO, socket or device: it has no data of ours.
+    Special,
+    File(File),
+}
+
+/// Checks that the entry `name` of `dir` (seen with no link followed) is
+/// ours, and gives it mode `mode` if it is a `kind` with a different mode.
+fn own_entry(dir: &OwnedFd, name: &str, kind: FileType, mode: u32) -> std::io::Result<Option<rustix::fs::Stat>> {
+    let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if stat.st_uid != euid() {
+        return Err(std::io::Error::other(format!("{name} belongs to another user")));
+    }
+    if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+        single_link(name, &stat)?;
+    }
+    if FileType::from_raw_mode(stat.st_mode) == kind && u32::from(stat.st_mode) & 0o777 != mode {
+        rustix::fs::chmodat(dir, name, Mode::from_raw_mode(mode as _), AtFlags::SYMLINK_NOFOLLOW)?;
+    }
+    Ok(Some(stat))
+}
+
+/// Refuses a regular file with more than one name: a hard link can be a
+/// file outside of the private folder, which a read, a mode change or an
+/// append must not touch.
+fn single_link(name: &str, stat: &rustix::fs::Stat) -> std::io::Result<()> {
+    if stat.st_nlink > 1 {
+        return Err(std::io::Error::other(format!("{name} has more than one link")));
+    }
+    Ok(())
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuses `fd` if it is not the entry `stat` that [`own_entry`] checked:
+/// the entry changed between the check and the open.
+fn same_entry(fd: &OwnedFd, name: &str, stat: &rustix::fs::Stat) -> std::io::Result<()> {
+    let open = rustix::fs::fstat(fd)?;
+    if (open.st_dev, open.st_ino, open.st_uid) != (stat.st_dev, stat.st_ino, stat.st_uid) {
+        return Err(std::io::Error::other(format!("{name} changed while it was opened")));
+    }
+    Ok(())
+}
+
+/// Opens the existing private folder `name` of `parent` with no link
+/// followed. It must be our folder, and it gets mode 0700. `None`: it or
+/// `parent` is missing. A folder of another user is not opened or changed.
+pub(crate) fn open_private_existing_dir(parent: &Path, name: &str) -> std::io::Result<Option<OwnedFd>> {
+    let parent = match rustix::fs::open(parent, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(stat) = own_entry(&parent, name, FileType::Directory, 0o700)? else {
+        return Ok(None);
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(std::io::Error::other(format!("{name} is not a folder")));
+    }
+    let dir = rustix::fs::openat(&parent, name, dir_flags(), Mode::empty())?;
+    same_entry(&dir, name, &stat)?;
+    Ok(Some(dir))
+}
+
+/// Opens the entry `name` of the private folder `dir` to read it, with no
+/// link followed and no wait on a FIFO. A regular file must be ours, and
+/// gets mode 0600 before it opens. A file of another user, a file with
+/// more than one link, or a folder, is an error and is not read or changed.
+pub(crate) fn open_private_read(dir: &OwnedFd, name: &str) -> std::io::Result<PrivateEntry> {
+    let Some(stat) = own_entry(dir, name, FileType::RegularFile, 0o600)? else {
+        return Ok(PrivateEntry::Missing);
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile => {}
+        FileType::Directory => return Err(std::io::Error::other(format!("{name} is a folder"))),
+        _ => return Ok(PrivateEntry::Special),
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = rustix::fs::openat(dir, name, flags, Mode::empty())?;
+    same_entry(&fd, name, &stat)?;
+    Ok(PrivateEntry::File(File::from(fd)))
+}
+
+/// Deletes the entry `name` of `dir` if it is ours. A missing entry is no
+/// error. An entry of another user stays, and is an error.
+pub(crate) fn remove_own(dir: &OwnedFd, name: &str) -> std::io::Result<()> {
+    let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if stat.st_uid != euid() {
+        return Err(std::io::Error::other(format!("{name} belongs to another user")));
+    }
+    match rustix::fs::unlinkat(dir, name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Renames `from` to `to` in `dir`, over an existing `to`. A missing `from` is no error.
+pub(crate) fn rename_in(dir: &OwnedFd, from: &str, to: &str) -> std::io::Result<()> {
+    match rustix::fs::renameat(dir, from, dir, to) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Replaces `name` of `dir` with a new private file that holds `bytes`
+/// ([`publish`]), with no sync.
+pub(crate) fn replace_in(dir: &OwnedFd, name: &str, bytes: &[u8]) -> Result<()> {
+    publish(dir, name, true, |file| file.write_all(bytes)).map(drop)
+}
+
 /// Publishes a private file and syncs both its contents and its directory entry.
 pub(crate) fn write_synced<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<()> {
     let dir = open_dir(dir)?.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;

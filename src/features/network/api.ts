@@ -112,6 +112,9 @@ export interface NetEvent {
 /** The events that the backend keeps for the VM, oldest first. */
 export const listNetEvents = (vmKey: string) => call<NetEvent[]>("list_net_events", { vmKey });
 
+/** Asks for a place and writes the network log there. `false`: the user cancelled. */
+export const exportNetEvents = (vmKey: string) => call<boolean>("export_net_events", { vmKey });
+
 /** Resolves to the function that stops the listener. */
 export const onNetEvent = (
   handler: (vmKey: string, event: NetEvent) => void,

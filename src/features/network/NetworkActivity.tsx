@@ -1,7 +1,7 @@
 import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
-import { Ban, Check, KeyRound, Play, X } from "lucide-react";
+import { Ban, Check, Download, KeyRound, Play, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { NetEvent, putRule, Service, setHostPort, wildcardFor } from "./api";
+import { exportNetEvents, NetEvent, putRule, Service, setHostPort, wildcardFor } from "./api";
 import { Action, CageView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
@@ -40,6 +40,8 @@ interface Group {
 interface Props {
   /** The effective cage: a rule that the view adds goes to it. `null`: the view adds no rules. */
   cage: CageView | null;
+  /** The key of the session's VM. `null`: the session has no VM key. */
+  vmKey: string | null;
   /** The session's VM runs. */
   running: boolean;
   events: NetEvent[];
@@ -49,7 +51,7 @@ interface Props {
   run: Run;
 }
 
-export function NetworkActivity({ cage, running, events, catalog, onStart, run }: Props) {
+export function NetworkActivity({ cage, vmKey, running, events, catalog, onStart, run }: Props) {
   const [filter, setFilter] = useState("all");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
@@ -157,6 +159,18 @@ export function NetworkActivity({ cage, running, events, catalog, onStart, run }
         title="Activity"
         titleAs="h2"
         description="The requests of the session's VM, by host. The newest host is first."
+        actions={
+          vmKey && (
+            <Button
+              size="sm"
+              variant="ghost"
+              iconLeft={<Download size={14} />}
+              onClick={() => run(() => exportNetEvents(vmKey))}
+            >
+              Export
+            </Button>
+          )
+        }
       />
       <CardBody className="stack">
         <FilterChips

@@ -93,6 +93,42 @@ The network page groups the requests by host. The newest host is first. For each
 
 The log keeps the names of the query parameters, never their values, headers or bodies.
 
+### Retention
+
+Each VM keeps its log after a stop and after you quit zwinger. The log keeps about the last 1000 to 2000 requests of
+the VM. It has two files of at most 1000 requests and 2 MiB each. When the newer file is full, the older file goes.
+The log is in the zwinger data folder, in `activity/`, which only your user can read. Each file has a hashed name, so
+the name does not show the VM key. If a saved file is over these limits, zwinger reads only about its first 2 MiB. From that
+part, it keeps the newest requests that fit, and writes the files again at the next request. Requests after that part of
+such a file are lost. The agent in the VM cannot read the log. zwinger makes the folder and the files
+private again when it reads them. It does not read or delete a folder or file of a different user. It does not read,
+change or write a log file that has a second name (a hard link), because that name can be a file in a different folder.
+
+One request in the log can have at most 16 KiB. zwinger does not log a larger request, and a notice tells you this
+once for each VM. The network rules still apply to it.
+
+Each request has a number. At the next start, zwinger skips a saved line with a number above 2^53 − 1. If the last
+saved number is that limit, zwinger does not log new requests of the VM, and a notice tells you this once. Remove the
+cage or its VM to start a new log.
+
+zwinger writes each request when it happens, but does not wait for the disk. If the Mac or zwinger crashes, the last
+requests can be lost. At the next start, zwinger skips a line that is broken and keeps the others. If zwinger cannot
+write the log, a notice names the file. The requests then show until you quit zwinger, and the rules still apply.
+
+If zwinger cannot read the saved log, the page shows an error and zwinger does not change the file. New requests show
+until you quit zwinger, from number 1, but zwinger does not save them, and a notice tells you this. Fix the file, then
+restart zwinger.
+
+The log goes when you delete its cage or its session, or when a session goes back to the shared VM. A new VM with the
+same key starts with an empty log.
+
+### Export
+
+**Export** saves the whole log of the session's VM as a JSON file, at a place that you pick. The file has the same
+data as the page: hosts, paths with query names only, statuses, sizes, decisions and credential names. It has no
+credential values. Check the hosts and paths before you share the file. If zwinger cannot read the saved log, Export
+shows an error and writes no file.
+
 ## Credentials
 
 A credential is a named value, for example `GITHUB_TOKEN`, that an Allow rule gives to its hosts. The agent sees only
