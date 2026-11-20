@@ -1,4 +1,4 @@
-import { Button, IconButton, IconButtonGroup } from "@driif/motiv";
+import { Badge, Button, IconButton, IconButtonGroup } from "@driif/motiv";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   Background,
@@ -12,6 +12,7 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
+  useNodesInitialized,
   useNodesState,
   useReactFlow,
   useStoreApi,
@@ -108,16 +109,23 @@ function fit(text: string, width: number, charWidth: number) {
 function ItemNode({ data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
   const { icon: Icon } = data;
   return (
-    <div className={`map-node ${data.tone ?? ""}`} title={data.title}>
+    <div className={`map-node ${data.tone ?? ""} ${data.count === undefined ? "" : "metric"}`} title={data.title}>
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <Icon size={14} />
-      <span className="map-label">{fit(data.label, width - 36 - data.badges.length * 44, data.charWidth ?? 0)}</span>
+      {/* 46 px: the icon, the padding and the activity dot in the top-right corner. */}
+      <span className="map-label">{fit(data.label, width - 46 - data.badges.length * 44, data.charWidth ?? 0)}</span>
       {data.badges.map((badge) => (
         <span key={badge} className={`map-badge ${badge}`}>
           {badge}
         </span>
       ))}
       {data.active && <span className="map-activity" aria-label="recent traffic" />}
+      {data.count !== undefined && (
+        <span className="map-metric">
+          <Badge>{data.count}</Badge>
+          {data.bytes && <Badge>{data.bytes}</Badge>}
+        </span>
+      )}
       <Handle type="source" position={Position.Right} isConnectable={false} />
     </div>
   );
@@ -145,24 +153,21 @@ const nodeTypes: NodeTypes = {
 };
 
 /** `onStart` runs before a control moves the viewport. `onView` gets the viewport when the control has moved it. */
-function MapControls({ onStart, onView }: { onStart: () => void; onView: (viewport: Viewport) => void }) {
-  const { zoomIn, zoomOut, setViewport, getViewport, getNodes, getNodesBounds } = useReactFlow();
-  const store = useStoreApi();
+function MapControls({ onStart, onView, onFit }: {
+  onStart: () => void;
+  onView: (viewport: Viewport) => void;
+  onFit: () => Promise<boolean>;
+}) {
+  const { zoomIn, zoomOut, getViewport } = useReactFlow();
   const then = (move: () => Promise<boolean>) => {
     onStart();
     move().then(() => onView(getViewport()));
-  };
-  // The fit of `fitView` waits for the next node update, which does not come when the map closes first. This fit moves
-  // the map at once, with the same values as `fitView`.
-  const fit = () => {
-    const { width, height, minZoom, maxZoom } = store.getState();
-    return setViewport(getViewportForBounds(getNodesBounds(getNodes()), width, height, minZoom, maxZoom, 0.1));
   };
   return (
     <IconButtonGroup label="Map view">
       <IconButton icon={<Plus size={14} />} label="Zoom in" onClick={() => then(zoomIn)} />
       <IconButton icon={<Minus size={14} />} label="Zoom out" onClick={() => then(zoomOut)} />
-      <IconButton icon={<Maximize size={14} />} label="Fit view" onClick={() => then(fit)} />
+      <IconButton icon={<Maximize size={14} />} label="Fit view" onClick={() => then(onFit)} />
     </IconButtonGroup>
   );
 }
@@ -253,7 +258,8 @@ function MapFlow({
   metrics,
   container,
 }: Props & { metrics: MapMetrics; container: RefObject<HTMLDivElement | null> }) {
-  const { fitView, setViewport: moveTo } = useReactFlow<MapNode>();
+  const { getNodes, getNodesBounds, setViewport: moveTo } = useReactFlow<MapNode>();
+  const store = useStoreApi();
   const [now, setNow] = useState(Date.now);
   const latest = events[events.length - 1]?.at ?? 0;
   const catalog = useCatalog();
@@ -301,6 +307,20 @@ function MapFlow({
     [session, cage, vmCage, layout, folders, events, catalog, now, metrics],
   );
   const [nodes, setNodes, onNodesChange] = useNodesState<MapNode>(map.nodes);
+  const nodesInitialized = useNodesInitialized();
+
+  // Panels cover the canvas but are outside the nodes bounds. Reserve the legend's actual bottom area for every fit.
+  function fitMap() {
+    const { width, height, minZoom, maxZoom } = store.getState();
+    const box = container.current!;
+    const legend = box.querySelector<HTMLElement>(".map-legend");
+    const bottomPadding = legend
+      ? Math.max(0, box.getBoundingClientRect().bottom - legend.getBoundingClientRect().top)
+      : 0;
+    return moveTo(
+      getViewportForBounds(getNodesBounds(getNodes()), width, Math.max(1, height - bottomPadding), minZoom, maxZoom, 0.1),
+    );
+  }
 
   // Keeps the current node objects, with their measured size, unless something
   // that they show changed. A dragged node stays where the user holds it.
@@ -336,7 +356,7 @@ function MapFlow({
       setChoice(stored);
       // After the nodes go back to their stored positions, and after a fit that is still queued, such as the fit of
       // a reset.
-      requestAnimationFrame(() => fitView().then(() => stored.viewport && moveTo(stored.viewport)));
+      requestAnimationFrame(() => fitMap().then(() => stored.viewport && moveTo(stored.viewport)));
     };
     restorers.set(session.id, restore);
     return () => {
@@ -376,30 +396,42 @@ function MapFlow({
     dropGesture();
     choose({ layout: {}, viewport: null }, () => setLayout(session.id, null));
     // After the nodes go back to their auto positions.
-    requestAnimationFrame(() => fitView());
+    requestAnimationFrame(() => fitMap());
   }
 
   // With no chosen viewport, the map fits the box when it shows and when the box
   // resizes. A chosen viewport stays, also when nodes are outside the box.
+  // The observer does not depend on node readiness: `useNodesInitialized` changes inside React Flow's own node
+  // ResizeObserver delivery, and an observer created there gives a "ResizeObserver loop" error in WebKit.
   const fits = viewport === null;
+  const nodesInitializedRef = useRef(nodesInitialized);
+  nodesInitializedRef.current = nodesInitialized;
+  const check = () => {
+    const box = container.current;
+    if (!nodesInitializedRef.current || !box || box.clientWidth === 0 || box.clientHeight === 0) return;
+    fitMap();
+  };
   useEffect(() => {
     if (!visible || !fits) return;
     const box = container.current!;
-    const check = () => {
-      if (box.clientWidth === 0 || box.clientHeight === 0) return;
-      fitView();
-    };
-    let frame = requestAnimationFrame(check);
+    let frame = 0;
     const observer = new ResizeObserver(() => {
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(check);
     });
     observer.observe(box);
+    const legend = box.querySelector(".map-legend");
+    if (legend) observer.observe(legend);
     return () => {
       observer.disconnect();
       cancelAnimationFrame(frame);
     };
-  }, [visible, fits]);
+  }, [visible, fits, map.hasSecrets]);
+  useEffect(() => {
+    if (!visible || !fits || !nodesInitialized) return;
+    const frame = requestAnimationFrame(check);
+    return () => cancelAnimationFrame(frame);
+  }, [visible, fits, nodesInitialized]);
 
   const onDrop = useRef(onDropFolder);
   onDrop.current = onDropFolder;
@@ -455,7 +487,7 @@ function MapFlow({
     >
       <Background variant={BackgroundVariant.Dots} />
       <Panel position="bottom-left">
-        <MapControls onStart={dropGesture} onView={chooseView} />
+        <MapControls onStart={dropGesture} onView={chooseView} onFit={fitMap} />
       </Panel>
       <Panel position="top-right">
         <Button

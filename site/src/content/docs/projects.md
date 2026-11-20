@@ -272,6 +272,20 @@ saved view each time, also after a restart, and keeps it when the window changes
 the view. Each project has its own view, also when two projects share a cage. **Reset layout** also clears the saved
 view, and the map fits its nodes again.
 
+Each host node on the right shows a count of the matching entries in the Activity that zwinger keeps for the VM of the
+project. Projects that share a VM see the same counts. The count includes only the kept entries, not all traffic since
+the VM started: when old entries leave the Activity, the count goes down. The counts stay when the VM stops. A node
+counts the entries to its current target hosts, also entries that a rule blocked: a rule counts the hosts that its
+domains or wildcards cover, a service counts each entry once, the host-port node counts only its own port, and a
+recently blocked host counts only its blocked entries. Host case and a trailing dot do not change the match. Two
+nodes can count the same entry, so do not add the counts of the nodes for a total. **Everything else** and
+**Host · LAN · metadata** show no count.
+
+The second badge shows the body bytes of the proxy requests: ↑ sent, ↓ received. The proxy measures only the request
+and response bodies, not headers. A blocked direct connection has no measured bytes, so a node with only direct
+entries shows no byte badge. Hold the pointer on a node, or use a screen reader, for the full numbers: proxy requests,
+direct connections, and bytes sent, received and in total.
+
 Drop a folder from Finder inside the project boundary to start a mount of that folder in the project settings. While
 you drag the folder over the boundary, the boundary is highlighted. Outside the boundary, the map does not accept the
 folder.

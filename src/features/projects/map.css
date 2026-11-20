@@ -224,3 +224,18 @@
   height: calc(var(--motiv-space) * 3.5);
   padding: 0;
 }
+
+/* A host node shows its count and bytes in a second row, under the label. */
+.map-node.metric {
+  height: auto;
+  flex-wrap: wrap;
+  row-gap: 0;
+  padding-block: var(--motiv-space);
+}
+
+.map-metric {
+  flex-basis: 100%;
+  display: flex;
+  gap: var(--motiv-space);
+  padding-left: calc(14px + var(--motiv-space) * 1.5);
+}

@@ -31,6 +31,10 @@ export interface ItemData extends Record<string, unknown> {
   badges: string[];
   /** Traffic in the last 10 s. */
   active?: boolean;
+  /** The retained entries of the VM that match the host node. */
+  count?: number;
+  /** The body bytes of the matching proxy requests. Absent when no proxy request matches. */
+  bytes?: string;
   jump?: Jump;
 }
 
@@ -45,6 +49,47 @@ export interface MapMetrics {
   rowHeight: number;
   space: number;
   charWidth: number;
+}
+
+const canon = (host: string) => host.toLowerCase().replace(/\.+$/, "");
+
+const tally = () => ({ proxy: 0, direct: 0, up: 0, down: 0 });
+type Tally = ReturnType<typeof tally>;
+
+function addEvent(total: Tally, event: NetEvent) {
+  if (event.method === null) {
+    total.direct++;
+  } else {
+    total.proxy++;
+    total.up += event.up;
+    total.down += event.down;
+  }
+}
+
+const UNITS = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB", "RB", "QB"];
+function size(bytes: number) {
+  let value = bytes;
+  let unit = 0;
+  while (value >= 999.5 && unit < UNITS.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${unit === 0 || value >= 10 ? Math.round(value) : value.toFixed(1)} ${UNITS[unit]}`;
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function withMetric(data: ItemData, { proxy, direct, up, down }: Tally): ItemData {
+  const bytes = proxy
+    ? `; proxy body bytes, request and response bodies without headers: ${size(up)} sent, ${size(down)} received, ${size(up + down)} total`
+    : "";
+  const none = direct ? `. A blocked direct connection has no measured body bytes` : "";
+  return {
+    ...data,
+    count: proxy + direct,
+    bytes: proxy ? `↑${size(up)} ↓${size(down)}` : undefined,
+    title: `${data.title}. Retained activity of this VM: ${plural(proxy, "proxy request")}, ${plural(direct, "blocked direct connection")}${bytes}${none}`,
+  };
 }
 
 const under = (path: string, base: string) => path === base || path.startsWith(`${base}/`);
@@ -77,6 +122,19 @@ export function mapLayout(
   const { network } = cage;
   const runtimes = vm?.runtimes ?? [];
   const state = vm?.status.state ?? "stopped";
+  const canonicalEvents = events.map((event) => ({ event, host: canon(event.host) }));
+  const hosts = new Map<string, { all: Tally; blocked: Tally }>();
+  const hostPortTotal = tally();
+  for (const { event, host } of canonicalEvents) {
+    let totals = hosts.get(host);
+    if (!totals) {
+      totals = { all: tally(), blocked: tally() };
+      hosts.set(host, totals);
+    }
+    addEvent(totals.all, event);
+    if (!event.allowed) addEvent(totals.blocked, event);
+    if (host === GUEST_HOST && event.port === network.hostPort) addEvent(hostPortTotal, event);
+  }
   const nodes: MapNode[] = [];
   const edges: Edge[] = [];
   const at = (id: string, x: number, y: number) => session.layout[id] ?? { x, y };
@@ -250,10 +308,10 @@ export function mapLayout(
   });
 
   let ny = TOP;
-  const host = (id: string, data: ItemData, blocked?: boolean) => {
-    outer(id, NET_X, ny, NET_W, { ...data, jump: "network" });
+  const host = (id: string, data: ItemData, blocked: boolean, total?: Tally) => {
+    outer(id, NET_X, ny, NET_W, { ...(total ? withMetric(data, total) : data), jump: "network" });
     edge("boundary", id, blocked);
-    ny += ROW;
+    ny += total ? ROW + H + metrics.space * 2 : ROW;
   };
   // The default is the edge style of "everything else".
   const closed = network.offline || network.default === "block";
@@ -279,6 +337,15 @@ export function mapLayout(
     const domains = ruleDomains(rule, catalog);
     const keys = [...(rule.credentials ?? []).map((c) => c.name), ...loginsOf(domains).map((l) => l.name)];
     const blocked = rule.action === "block" || network.offline;
+    const targets = domains.map(canon);
+    const total = tally();
+    for (const [hostName, values] of hosts) {
+      if (!targets.some((target) => covers(target, hostName))) continue;
+      total.proxy += values.all.proxy;
+      total.direct += values.all.direct;
+      total.up += values.all.up;
+      total.down += values.all.down;
+    }
     host(
       `rule:${rule.id}`,
       {
@@ -290,6 +357,7 @@ export function mapLayout(
         active: active(`rule:${label}`),
       },
       blocked,
+      total,
     );
   }
   if (network.hostPort !== undefined) {
@@ -312,6 +380,7 @@ export function mapLayout(
         active: active("host-port"),
       },
       network.offline || block !== undefined,
+      hostPortTotal,
     );
   }
   // A host login that no rule names is shown on its own, as nothing else names it.
@@ -330,6 +399,7 @@ export function mapLayout(
           badges: ["key"],
         },
         !ok,
+        hosts.get(canon(loginHost))?.all ?? tally(),
       );
     }
   ny += GAP;
@@ -346,10 +416,10 @@ export function mapLayout(
   );
   const blockedHosts = [
     ...new Set(
-      events
-        .filter((e) => !e.allowed && recent(e, BLOCKED_MS))
+      canonicalEvents
+        .filter(({ event }) => !event.allowed && recent(event, BLOCKED_MS))
         .reverse()
-        .map((e) => e.host),
+        .map(({ host }) => host),
     ),
   ].slice(0, BLOCKED_CAP);
   for (const denied of blockedHosts)
@@ -361,9 +431,10 @@ export function mapLayout(
         title: `${denied} was blocked in the last minute`,
         tone: "denied",
         badges: [],
-        active: events.some((e) => !e.allowed && recent(e, ACTIVE_MS) && e.host === denied),
+        active: canonicalEvents.some(({ event, host }) => !event.allowed && recent(event, ACTIVE_MS) && host === denied),
       },
       true,
+      hosts.get(denied)!.blocked,
     );
 
   for (const [id, label, x] of [
