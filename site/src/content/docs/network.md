@@ -26,6 +26,22 @@ The proxy checks each request in this sequence:
 
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
 
+### Allow from the map
+
+On a project's Overview map, drag from the cage gateway to **New host or service**, an eligible exact host node, or
+empty space. An exact host node fills in that host. The new target or empty space opens a draft where you can enter a
+host or select a service. The **Allow host** button above
+the map gives keyboard access to the same draft. Review the target and the current cage, then select **Save Allow
+rule**. **Cancel** leaves the rules as they were. A failed save keeps the draft and shows the error. A saved rule is
+shown on the map after the configuration updates; a draw alone does not save a rule.
+
+The review tells you when Offline or another Block rule still prevents access. Saving an Allow rule does not turn off
+Offline or remove a Block rule. If the target has a Block rule with credentials, the review names those credentials;
+you must acknowledge that they become active before you can save the change. The same review opens from **Review Allow**
+on a Block rule with credentials. The review edits the project's current
+cage, which can differ from the cage of its old running VM. A rule change applies to the next request in the cage that
+you edited. A VM that still runs the old cage uses the new cage after a restart.
+
 ### Remove a rule
 
 The X button of a rule, or **Remove network rule** in ⌘K, removes the rule at once. The next request does not get the

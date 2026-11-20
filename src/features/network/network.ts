@@ -29,6 +29,19 @@ const ICONS: Record<string, LucideIcon> = {
 export const serviceIcon = (service?: Service) =>
   (service && ICONS[service.icon]) ?? Globe;
 
+const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
+
+/** Format only; the backend also rejects public suffixes. */
+export function domainError(input: string) {
+  const domain = input.trim().toLowerCase();
+  const host = domain.startsWith("*.") ? domain.slice(2) : domain;
+  const labels = host.split(".");
+  if (host.length > 253) return "Longer than 253 characters.";
+  if (labels.length < 2) return "Needs at least two labels, like example.com.";
+  if (!labels.every((l) => LABEL.test(l)))
+    return "Use only letters, digits, hyphens and dots, with no scheme, path or port.";
+}
+
 let catalog: Promise<Service[]> | undefined;
 
 /** The service catalog of the app. It does not change while the app runs. */

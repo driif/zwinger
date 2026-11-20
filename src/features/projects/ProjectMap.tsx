@@ -18,17 +18,17 @@ import {
   useStoreApi,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Maximize, Minus, Network, Plus } from "lucide-react";
+import { FolderPlus, Maximize, Minus, Network, Plus } from "lucide-react";
 import { RefObject, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { NetEvent } from "../network/api";
-import { setLayout, setViewport } from "./api";
+import { resolveFolder, setLayout, setViewport } from "./api";
 import { isRoundFolder } from "../tasks/api";
 import { folderDrop, resolveFolderTarget } from "./folderDrop";
 import { CageView, Pos, SessionView, Viewport, VmCage } from "../../shared/api";
 import { useCatalog } from "../network/network";
 import type { Run } from "../../App";
 import { CageMark } from "../../shared/CageMark";
-import { BoundaryData, ItemData, Jump, MapMetrics, MapNode, mapLayout } from "./mapLayout";
+import { BoundaryData, ItemData, Jump, MapEdit, MapMetrics, MapNode, mapEdit, mapLayout } from "./mapLayout";
 import "./map.css";
 
 const BLOCKED_MS = 60_000;
@@ -106,11 +106,11 @@ function fit(text: string, width: number, charWidth: number) {
   return text.length > max ? `…${text.slice(-(max - 1))}` : text;
 }
 
-function ItemNode({ data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
+function ItemNode({ id, data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
   const { icon: Icon } = data;
   return (
     <div className={`map-node ${data.tone ?? ""} ${data.count === undefined ? "" : "metric"}`} title={data.title}>
-      <Handle type="target" position={Position.Left} isConnectable={false} />
+      <Handle type="target" position={Position.Left} isConnectable={id === "new-host" || !!data.hostTarget} />
       <Icon size={14} />
       {/* 46 px: the icon, the padding and the activity dot in the top-right corner. */}
       <span className="map-label">{fit(data.label, width - 46 - data.badges.length * 44, data.charWidth ?? 0)}</span>
@@ -126,7 +126,7 @@ function ItemNode({ data, width = 0 }: NodeProps<Node<ItemData, "item">>) {
           {data.bytes && <Badge>{data.bytes}</Badge>}
         </span>
       )}
-      <Handle type="source" position={Position.Right} isConnectable={false} />
+      <Handle type="source" position={Position.Right} isConnectable={id === "source:new-folder"} />
     </div>
   );
 }
@@ -139,7 +139,8 @@ function BoundaryNode({ data }: NodeProps<Node<BoundaryData, "boundary">>) {
         <span className="map-title">{data.name}</span>
         <span className="map-state">microVM · {data.state}</span>
       </div>
-      <Handle type="source" position={Position.Right} isConnectable={false} className="map-gateway">
+      <Handle type="target" position={Position.Left} className="map-mount-target" />
+      <Handle type="source" position={Position.Right} className="map-gateway">
         <Network size={14} />
       </Handle>
     </div>
@@ -190,8 +191,9 @@ interface Props {
   visible: boolean;
   run: Run;
   onJump: (tab: Jump) => void;
+  onEdit: (edit: MapEdit) => void;
   /** A folder from Finder was dropped on the project boundary. */
-  onDropFolder: (path: string) => void;
+  onDropFolder: (path: string, host: string) => void;
 }
 
 /** Host paths on the left, the microVM in the middle, egress on the right. The user can drag the nodes. */
@@ -254,6 +256,7 @@ function MapFlow({
   visible,
   run,
   onJump,
+  onEdit,
   onDropFolder,
   metrics,
   container,
@@ -435,16 +438,34 @@ function MapFlow({
 
   const onDrop = useRef(onDropFolder);
   onDrop.current = onDropFolder;
+  const runRef = useRef(run);
+  runRef.current = run;
   useEffect(() => {
+    // The map remounts for each project and cage, so a drop that resolves after unmount is stale.
+    let live = true;
     const stop = getCurrentWebview().onDragDropEvent(async ({ payload }) => {
       if (payload.type !== "drop" || payload.paths.length === 0) return;
       const target = resolveFolderTarget(payload.position.toLogical(window.devicePixelRatio));
       if (target?.kind !== "map" || !container.current?.contains(target.element)) return;
+      const dropped = payload.paths[0];
+      const drop = onDrop.current;
       // The App listener opens the room of a round folder.
-      if (await isRoundFolder(payload.paths[0])) return;
-      onDrop.current(payload.paths[0]);
+      if (await isRoundFolder(dropped)) return;
+      if (!live) return;
+      runRef.current(async () => {
+        let host: string;
+        try {
+          host = await resolveFolder(dropped);
+        } catch (e) {
+          if (!live) return;
+          throw e;
+        }
+        if (!live) return;
+        drop(dropped, host);
+      });
     });
     return () => {
+      live = false;
       stop.then((unlisten) => unlisten());
     };
   }, []);
@@ -452,44 +473,14 @@ function MapFlow({
   const jump = (node?: MapNode) => node?.type === "item" && node.data.jump && onJump(node.data.jump);
 
   return (
-    <ReactFlow<MapNode>
-      nodes={nodes}
-      edges={map.edges}
-      nodeTypes={nodeTypes}
-      onNodesChange={onNodesChange}
-      onNodeDragStop={(_, __, dragged) =>
-        save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
-      }
-      onNodeClick={(_, node) => jump(node)}
-      // Only a pan, wheel or pinch has an event. A click on the pane does not move the map.
-      onMove={(event, next) => {
-        folderDrop.refresh();
-        if (!event || event === replaced.current) return;
-        input.current = event;
-        gesture.current = next;
-      }}
-      onMoveEnd={(event, end) => {
-        if (!event || event === replaced.current || !gesture.current) return;
-        gesture.current = end;
-        endGesture.current();
-      }}
-      onKeyDown={(event) => {
-        if (event.key !== "Enter") return;
-        const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
-        jump(nodes.find((n) => n.id === id));
-      }}
-      nodesConnectable={false}
-      elementsSelectable={false}
-      deleteKeyCode={null}
-      minZoom={0.3}
-      defaultViewport={initial ?? undefined}
-      fitView={initial === null}
-    >
-      <Background variant={BackgroundVariant.Dots} />
-      <Panel position="bottom-left">
-        <MapControls onStart={dropGesture} onView={chooseView} onFit={fitMap} />
-      </Panel>
-      <Panel position="top-right">
+    <>
+      <div className="row end map-actions">
+        <Button size="sm" variant="outline" iconLeft={<FolderPlus size={14} />} onClick={() => onEdit({ kind: "mount" })}>
+          Add mount
+        </Button>
+        <Button size="sm" variant="outline" iconLeft={<Network size={14} />} onClick={() => onEdit({ kind: "addRule" })}>
+          Allow host
+        </Button>
         <Button
           size="sm"
           variant="outline"
@@ -498,16 +489,70 @@ function MapFlow({
         >
           Reset layout
         </Button>
-      </Panel>
-      {map.hasSecrets && (
-        <Panel position="bottom-right" className="map-legend">
-          <p className="row">
-            <span className="map-badge key">key</span> gets a credential
-            <span className="map-node warn map-swatch" /> login host that the rules block
-          </p>
-          <p>The agent sees $MSB_…, the proxy adds the real value.</p>
+      </div>
+      <ReactFlow<MapNode>
+        nodes={nodes}
+        edges={map.edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onNodeDragStop={(_, __, dragged) =>
+          save({ ...layout, ...Object.fromEntries(dragged.map((node) => [node.id, node.position])) })
+        }
+        onNodeClick={(_, node) => jump(node)}
+        isValidConnection={(connection) => !!mapEdit(connection.source, connection.target, map.nodes)}
+        onConnect={(connection) => {
+          const edit = mapEdit(connection.source, connection.target, map.nodes);
+          if (edit) onEdit(edit);
+        }}
+        onConnectEnd={(event, state) => {
+          if (state.fromNode?.id !== "boundary" || state.fromHandle?.type !== "source" || state.toNode || !state.from || !state.to) return;
+          if (Math.hypot(state.to.x - state.from.x, state.to.y - state.from.y) < 24) return;
+          const point = event instanceof MouseEvent ? event : event.changedTouches.item(0);
+          if (!point) return;
+          const under = document.elementFromPoint(point.clientX, point.clientY);
+          if (!under || !container.current?.contains(under) || !under.closest(".react-flow__pane") ||
+            under.closest(".react-flow__node, .react-flow__panel, .react-flow__edge")) return;
+          onEdit({ kind: "addRule" });
+        }}
+        // Only a pan, wheel or pinch has an event. A click on the pane does not move the map.
+        onMove={(event, next) => {
+          folderDrop.refresh();
+          if (!event || event === replaced.current) return;
+          input.current = event;
+          gesture.current = next;
+        }}
+        onMoveEnd={(event, end) => {
+          if (!event || event === replaced.current || !gesture.current) return;
+          gesture.current = end;
+          endGesture.current();
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter") return;
+          const id = (event.target as HTMLElement).closest(".react-flow__node")?.getAttribute("data-id");
+          jump(nodes.find((n) => n.id === id));
+        }}
+        nodesConnectable
+        connectOnClick={false}
+        elementsSelectable={false}
+        deleteKeyCode={null}
+        minZoom={0.3}
+        defaultViewport={initial ?? undefined}
+        fitView={initial === null}
+      >
+        <Background variant={BackgroundVariant.Dots} />
+        <Panel position="bottom-left">
+          <MapControls onStart={dropGesture} onView={chooseView} onFit={fitMap} />
         </Panel>
-      )}
-    </ReactFlow>
+        {map.hasSecrets && (
+          <Panel position="bottom-right" className="map-legend">
+            <p className="row">
+              <span className="map-badge key">key</span> gets a credential
+              <span className="map-node warn map-swatch" /> login host that the rules block
+            </p>
+            <p>The agent sees $MSB_…, the proxy adds the real value.</p>
+          </Panel>
+        )}
+      </ReactFlow>
+    </>
   );
 }

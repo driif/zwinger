@@ -38,6 +38,7 @@ import { libraryCredentials } from "../settings/api";
 import { time } from "../settings/HostAgentsSettings";
 import { decide, ruleMatches, useCatalog } from "../network/network";
 import type { Intent, Pane, Run, Runtimes, TabView, View } from "../../App";
+import type { MapEdit } from "./mapLayout";
 import { NetworkTab } from "../network/NetworkTab";
 import { SettingsTab } from "../settings/SettingsTab";
 import { TaskDialog } from "../tasks/TaskDialog";
@@ -252,7 +253,8 @@ interface Props {
   onIntentDone: () => void;
   onNetSeen: (seq: number) => void;
   /** A folder from Finder was dropped on the project boundary of the map. */
-  onDropFolder: (path: string) => void;
+  onDropFolder: (path: string, host: string, projectId: string, cageId: string) => void;
+  onMapIntent: (projectId: string, cageId: string, edit: MapEdit) => void;
   runtimes: Runtimes;
   /** The agents on this Mac. */
   detection?: Detection;
@@ -311,6 +313,7 @@ export function ProjectPage({
   onIntentDone,
   onNetSeen,
   onDropFolder,
+  onMapIntent,
   runtimes,
   detection,
   adding,
@@ -333,6 +336,10 @@ export function ProjectPage({
   ...terminal
 }: Props) {
   const status = vmCage?.status ?? { state: "stopped" };
+  const currentIntent = intent?.projectId === session.id && intent.cageId === (cage?.id ?? null) ? intent : undefined;
+  useEffect(() => {
+    if (intent && !currentIntent) onIntentDone();
+  }, [intent, currentIntent, onIntentDone]);
   const { folders, reload } = useProjectFolders(session);
   /** The host notices that the user dismissed in the current running period of a project. */
   const [dismissed, setDismissed] = useState<{ session: string; notices: string[] }>();
@@ -527,7 +534,7 @@ export function ProjectPage({
                     {cage ? (
                       <Suspense>
                         <ProjectMap
-                          key={session.id}
+                          key={`${session.id}:${cage.id}`}
                           session={session}
                           cage={cage}
                           vmCage={vmCage}
@@ -536,7 +543,8 @@ export function ProjectPage({
                           visible={isTab && tab === "overview"}
                           run={run}
                           onJump={jump}
-                          onDropFolder={onDropFolder}
+                          onEdit={(edit) => onMapIntent(session.id, cage.id, edit)}
+                          onDropFolder={(path, host) => onDropFolder(path, host, session.id, cage.id)}
                         />
                       </Suspense>
                     ) : (
@@ -599,7 +607,7 @@ export function ProjectPage({
                     noCage={noCage}
                     events={events}
                     run={edit}
-                    intent={tab === "network" ? intent : undefined}
+                    intent={tab === "network" ? currentIntent : undefined}
                     onIntentDone={onIntentDone}
                     active={isTab && tab === "network"}
                     onSeen={onNetSeen}
@@ -617,7 +625,7 @@ export function ProjectPage({
                     editors={editors}
                     runtimes={runtimes}
                     run={edit}
-                    intent={tab === "settings" ? intent : undefined}
+                    intent={tab === "settings" ? currentIntent : undefined}
                     onIntentDone={onIntentDone}
                   />
                 ),

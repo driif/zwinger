@@ -1,8 +1,8 @@
 import type { Edge, Node } from "@xyflow/react";
-import { Ban, Bot, Folder, FolderOpen, FolderSymlink, Globe, KeyRound, Laptop, type LucideIcon, Package, UserCog } from "lucide-react";
+import { Ban, Bot, Folder, FolderOpen, FolderPlus, FolderSymlink, Globe, KeyRound, Laptop, type LucideIcon, Package, Plus, UserCog } from "lucide-react";
 import { GUEST_HOST, type NetEvent, type Service } from "../network/api.ts";
-import { AGENT_NAMES, type AgentKind, type CageView, type SessionView, type VmCage } from "../../shared/api.ts";
-import { covers, decide, ruleDomains, ruleLabel, ruleMatches, serviceIcon, serviceOf } from "../network/network.ts";
+import { AGENT_NAMES, type AgentKind, type CageView, type SessionView, type Target, type VmCage } from "../../shared/api.ts";
+import { covers, decide, domainError, ruleDomains, ruleLabel, ruleMatches, serviceIcon, serviceOf } from "../network/network.ts";
 
 const HOST_X = 16;
 const HOST_W = 230;
@@ -36,6 +36,7 @@ export interface ItemData extends Record<string, unknown> {
   /** The body bytes of the matching proxy requests. Absent when no proxy request matches. */
   bytes?: string;
   jump?: Jump;
+  hostTarget?: string;
 }
 
 export interface BoundaryData extends Record<string, unknown> {
@@ -44,6 +45,20 @@ export interface BoundaryData extends Record<string, unknown> {
 }
 
 export type MapNode = Node<ItemData, "item"> | Node<BoundaryData, "boundary"> | Node<{ label: string }, "caption">;
+
+export type MapEdit = { kind: "mount" } | { kind: "addRule"; target?: Target };
+
+export function mapEdit(source: string, target: string | null, nodes: MapNode[]): MapEdit | undefined {
+  if (source === "boundary") {
+    if (target === null) return { kind: "addRule" };
+    if (target === "new-host" && nodes.some((node) => node.id === target)) return { kind: "addRule" };
+    const node = nodes.find((item) => item.id === target);
+    if (node?.type === "item" && node.data.hostTarget)
+      return { kind: "addRule", target: { kind: "host", host: node.data.hostTarget } };
+  }
+  if (source === "source:new-folder" && target === "boundary" && nodes.some((node) => node.id === source))
+    return { kind: "mount" };
+}
 
 export interface MapMetrics {
   rowHeight: number;
@@ -243,6 +258,14 @@ export function mapLayout(
     });
     edge(`source:${mount.guest}`, `mount:${mount.guest}`);
   }
+  y += ROW;
+  outer("source:new-folder", HOST_X, y, HOST_W, {
+    icon: FolderPlus,
+    label: "New folder from this Mac…",
+    title: "Draw to the cage boundary to mount a folder from this Mac",
+    tone: "muted",
+    badges: [],
+  });
   // Not user mounts: zwinger binds its own copy of each agent runtime, and the agent cannot change it.
   y += GAP;
   const fromMac = (kind: AgentKind) => cage.hostAgents.some((a) => a.kind === kind);
@@ -329,6 +352,14 @@ export function mapLayout(
     },
     closed,
   );
+  outer("new-host", NET_X, ny, NET_W, {
+    icon: Plus,
+    label: "New host or service…",
+    title: "Draw from the cage gateway to review an Allow rule",
+    tone: "muted",
+    badges: [],
+  });
+  ny += ROW;
   const loginsOf = (domains: string[]) =>
     cage.logins.filter((l) => l.hosts.some((h) => domains.some((d) => covers(d, h))));
   for (const rule of network.rules) {
@@ -355,6 +386,8 @@ export function mapLayout(
         tone: rule.action === "block" ? "denied" : undefined,
         badges: keys.length ? ["key"] : [],
         active: active(`rule:${label}`),
+        hostTarget: rule.action === "block" && rule.target.kind === "host" && !rule.target.host.startsWith("*.") && !domainError(canon(rule.target.host))
+          ? canon(rule.target.host) : undefined,
       },
       blocked,
       total,
@@ -397,6 +430,7 @@ export function mapLayout(
           title: ok ? `${loginHost} gets the ${agent} login` : `${loginHost} gets the ${agent} login, but it is blocked`,
           tone: ok ? undefined : "warn",
           badges: ["key"],
+          hostTarget: !domainError(canon(loginHost)) ? canon(loginHost) : undefined,
         },
         !ok,
         hosts.get(canon(loginHost))?.all ?? tally(),
@@ -432,6 +466,7 @@ export function mapLayout(
         tone: "denied",
         badges: [],
         active: canonicalEvents.some(({ event, host }) => !event.allowed && recent(event, ACTIVE_MS) && host === denied),
+        hostTarget: !domainError(denied) && !/^\d+(?:\.\d+){3}$/.test(denied) ? denied : undefined,
       },
       true,
       hosts.get(denied)!.blocked,

@@ -264,7 +264,21 @@ the selected app. IntelliJ IDEA, WebStorm, RustRover, PyCharm and GoLand open it
 ## Map
 
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You
-can drag the nodes. zwinger saves their positions. **Reset layout** clears them.
+can drag the nodes. zwinger saves their positions. **Reset layout** in the toolbar above the canvas clears them.
+
+To add a mount, drag from **New folder from this Mac** to the handle on the left edge of the cage boundary.
+The folder picker opens in Settings. Choose a folder on your Mac, then review its host folder, guest path and access.
+Access starts at **Read-only**. Select **Mount** to save, or **Cancel** to leave the cage as it was. A failed save keeps
+the draft and shows the error. A new mount appears on the map only after it is saved. With the keyboard, use
+**Add mount** in the toolbar above the canvas to open the same picker and draft. The mount takes effect in a running VM after a restart.
+
+To allow a host, drag from the gateway on the right edge of the cage boundary to **New host or service**, to an
+eligible exact host on the right, or to empty space inside the map. A draw that ends outside the map or after the
+project's cage changes is canceled. Review the Allow rule on the Network page before you save it.
+**Allow host** in the toolbar above the canvas opens the same review with the keyboard. A click on a handle alone changes nothing. You
+can cancel either draft. The map shows saved policy, so an unsaved or failed draw adds no lasting edge. The map is
+editable only when the project has a cage. After a cage change, the draft names the project's current cage; the old
+running VM keeps its old cage until a restart.
 
 A new map fits all its nodes in the view, also when the window changes size. When you pan, zoom with the wheel or a
 pinch, or use **Zoom in**, **Zoom out** or **Fit view**, zwinger saves that view for the project. The map opens at the
@@ -288,4 +302,4 @@ direct connections, and bytes sent, received and in total.
 
 Drop a folder from Finder inside the project boundary to start a mount of that folder in the project settings. While
 you drag the folder over the boundary, the boundary is highlighted. Outside the boundary, the map does not accept the
-folder.
+folder. If you change the project or its cage before the mount draft opens, the drop is canceled, also when you come back.

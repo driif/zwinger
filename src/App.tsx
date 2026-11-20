@@ -73,6 +73,7 @@ import {
   SessionView,
   TerminalFolder,
   TerminalKind,
+  Target,
   // The component that shows the sessions is also named Workspace.
   Workspace as WorkspaceGroup,
 } from "./shared/api";
@@ -96,6 +97,7 @@ import { errorCode, errorDetail, errorMessage, isBackendError } from "./shared/e
 import { LOST_TITLE, ReloadScreen, useBackendLost } from "./shared/Recover";
 import { CageMark } from "./shared/CageMark";
 import { CagesPage } from "./features/cages/CagesPage";
+import type { MapEdit } from "./features/projects/mapLayout";
 
 const TaskRoom = lazy(() => import("./features/tasks/TaskRoom").then((m) => ({ default: m.TaskRoom })));
 
@@ -151,10 +153,15 @@ interface Ask {
 export interface Intent {
   kind: "rename" | "mount" | "harness" | "delete" | "addRule";
   at: number;
+  projectId: string;
+  cageId: string | null;
   /** For `mount`: the canonical folder that was dropped on the map. */
   host?: string;
   /** For `mount`: the dropped path, which can be a link to `host`. */
   dropped?: string;
+  /** For a map rule draw: an exact host shown on the map. */
+  target?: Target;
+  map?: true;
 }
 
 /** A dropped folder: the dropped path, its canonical folder and the workspace of the row it was dropped on. */
@@ -545,6 +552,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const joined: SessionCage[] = sessions.map((session) => sessionCage(session, cages));
   const selected = joined.find((j) => j.session.id === selectedId) ?? joined[0];
   const session = selected?.session;
+  const selectedIdentity = useRef<{ projectId?: string; cageId?: string | null }>({});
+  selectedIdentity.current = { projectId: session?.id, cageId: selected?.cage?.id ?? null };
   /** The terminal view shows, and no other screen covers it. */
   const terminalShows = !!session && view.kind === "terminal" && !showSettings && !showCages && !roundFolder;
   const liveProcess = (target: SessionView, terminalId: string) =>
@@ -847,12 +856,17 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   // Tauri sends no `over` event while the pointer does not move, so a page change tests the last point again.
   useEffect(() => folderDrop.refresh(), [view, settingsTab, showCages, roundFolder, session?.id]);
 
-  const dropMount = (dropped: string) =>
-    run(async () => {
-      const host = await resolveFolder(dropped);
-      setView({ kind: "settings" });
-      setIntent({ kind: "mount", host, dropped, at: Date.now() });
-    });
+  function dropMount(dropped: string, host: string, projectId: string, cageId: string) {
+    if (selectedIdentity.current.projectId !== projectId || selectedIdentity.current.cageId !== cageId) return;
+    setView({ kind: "settings" });
+    setIntent({ kind: "mount", host, dropped, projectId, cageId, at: Date.now() });
+  }
+
+  function startMapIntent(projectId: string, cageId: string, edit: MapEdit) {
+    if (selectedIdentity.current.projectId !== projectId || selectedIdentity.current.cageId !== cageId) return;
+    setView({ kind: edit.kind === "mount" ? "settings" : "network" });
+    setIntent({ ...edit, projectId, cageId, map: true, at: Date.now() });
+  }
 
   function cycle(step: number) {
     if (sessionPanes.length === 0) return;
@@ -968,8 +982,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     run(() => (vmCage?.status.state === "running" ? vm.stop(session.id) : vm.start(session.id)));
 
   function startIntent(kind: Intent["kind"]) {
+    if (!selected) return;
     setView({ kind: kind === "addRule" ? "network" : "settings" });
-    setIntent({ kind, at: Date.now() });
+    setIntent({ kind, projectId: selected.session.id, cageId: selected.cage?.id ?? null, at: Date.now() });
   }
 
   /**
@@ -1217,9 +1232,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             view={view}
             onView={setView}
             intent={intent}
-            onIntentDone={() => setIntent(undefined)}
+            onIntentDone={() => setIntent((current) => current === intent ? undefined : current)}
             onNetSeen={(seq) => vmCage && setLastSeen((current) => ({ ...current, [vmCage.key]: seq }))}
             onDropFolder={dropMount}
+            onMapIntent={startMapIntent}
             runtimes={runtimes}
             detection={detection}
             adding={adding[session.id]}

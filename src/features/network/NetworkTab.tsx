@@ -7,7 +7,9 @@ import {
   CopyField,
   FloatingField,
   LiquidSwitch,
+  Select,
   SegmentedControl,
+  SpringCheckbox,
 } from "@driif/motiv";
 import {
   Ban,
@@ -51,6 +53,7 @@ import { removeRuleWithUndo } from "../../shared/undo";
 import {
   covers,
   credentialHosts,
+  domainError,
   ruleDomains,
   ruleLabel,
   serviceIcon,
@@ -66,19 +69,6 @@ const ALWAYS_BLOCKED = [
   { label: "Cloud metadata", hint: "169.254.169.254, fd00:ec2::254" },
   { label: "Token refresh of the host logins", hint: "the Mac renews them" },
 ];
-
-const LABEL = /^(?!-)[a-z0-9-]{1,63}(?<!-)$/;
-
-/** Format only; the backend also rejects public suffixes. */
-function domainError(input: string) {
-  const domain = input.trim().toLowerCase();
-  const host = domain.startsWith("*.") ? domain.slice(2) : domain;
-  const labels = host.split(".");
-  if (host.length > 253) return "Longer than 253 characters.";
-  if (labels.length < 2) return "Needs at least two labels, like example.com.";
-  if (!labels.every((l) => LABEL.test(l)))
-    return "Use only letters, digits, hyphens and dots, with no scheme, path or port.";
-}
 
 interface Props {
   session: SessionView;
@@ -214,6 +204,7 @@ export function NetworkTab({
 
       {cage ? (
         <CageRules
+          key={cage.id}
           session={session}
           cage={cage}
           catalog={catalog}
@@ -291,6 +282,11 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
   const [adding, setAdding] = useState<"service" | "host">();
   const [host, setHost] = useState("");
   const [problem, setProblem] = useState<string>();
+  const [mapDraft, setMapDraft] = useState<Target>();
+  const [mapProblem, setMapProblem] = useState<string>();
+  const [reviewCredentials, setReviewCredentials] = useState(false);
+  const [mapSaving, setMapSaving] = useState(false);
+  const savingMap = useRef(false);
   const [expanded, setExpanded] = useState<string>();
   const [credentialsOf, setCredentialsOf] = useState<string>();
   const hostField = useRef<HTMLInputElement>(null);
@@ -298,7 +294,13 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
   useEffect(() => {
     if (intent?.kind !== "addRule") return;
     onIntentDone();
-    setAdding("host");
+    if (intent.map) {
+      setMapDraft(intent.target ?? { kind: "host", host: "" });
+      setMapProblem(undefined);
+      setReviewCredentials(false);
+    } else {
+      setAdding("host");
+    }
   }, [intent]);
 
   useEffect(() => {
@@ -333,6 +335,36 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
         (r) => r.target.kind === "service" && r.target.id === s.id,
       ),
   );
+  const target = mapDraft?.kind === "host"
+    ? { kind: "host" as const, host: mapDraft.host.trim().toLowerCase() }
+    : mapDraft?.id ? mapDraft : undefined;
+  const existing = target && network.rules.find((rule) =>
+    rule.target.kind === target.kind && (target.kind === "host"
+      ? rule.target.kind === "host" && rule.target.host.toLowerCase().replace(/\.+$/, "") === target.host.replace(/\.+$/, "")
+      : rule.target.kind === "service" && rule.target.id === target.id));
+  const domains = target?.kind === "host" ? [target.host] : catalog.find((service) => service.id === target?.id)?.domains ?? [];
+  const remainingBlocks = network.rules.filter((rule) => rule.action === "block" && rule.id !== existing?.id &&
+    domains.some((domain) => ruleDomains(rule, catalog).some((blocked) => covers(blocked, domain) || covers(domain, blocked))));
+  const credentials = existing?.action === "block" ? existing.credentials ?? [] : [];
+
+  function saveMapRule(event: FormEvent) {
+    event.preventDefault();
+    if (!target || savingMap.current) return;
+    if (target.kind === "host") {
+      const error = domainError(target.host);
+      if (error) return setMapProblem(error);
+    }
+    if (existing?.action === "allow" || (credentials.length > 0 && !reviewCredentials)) return;
+    savingMap.current = true;
+    setMapSaving(true);
+    run(() => putRule(id, { id: existing?.id, target, action: "allow" }).then(
+      () => setMapDraft(undefined),
+      (error) => setMapProblem(errorMessage(error)),
+    ).finally(() => {
+      savingMap.current = false;
+      setMapSaving(false);
+    }));
+  }
 
   return (
     <>
@@ -376,6 +408,77 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
           description="The exceptions to the default."
         />
         <CardBody className="stack">
+          {mapDraft && (
+            <Card variant="subtle" padding="md">
+              <CardHeader title="Review Allow rule" titleAs="h3" description={`Allow a target in cage ${cage.name}.`} />
+              <CardBody className="stack">
+                <form className="stack" onSubmit={saveMapRule}>
+                  <SegmentedControl
+                    label="Target type"
+                    options={[{ value: "host", label: "Host" }, { value: "service", label: "Service" }]}
+                    value={mapDraft.kind}
+                    onChange={(kind) => {
+                      if (mapSaving) return;
+                      setMapDraft(kind === "host" ? { kind: "host", host: "" } : { kind: "service", id: "" });
+                      setMapProblem(undefined);
+                      setReviewCredentials(false);
+                    }}
+                  />
+                  {mapDraft.kind === "host" ? (
+                    <FloatingField
+                      label="Host"
+                      className="mono"
+                      value={mapDraft.host}
+                      hint={mapProblem}
+                      aria-invalid={mapProblem !== undefined}
+                      showValidity={false}
+                      disabled={mapSaving}
+                      onChange={(event) => {
+                        setMapDraft({ kind: "host", host: event.target.value });
+                        setMapProblem(undefined);
+                        setReviewCredentials(false);
+                      }}
+                    />
+                  ) : (
+                    <Select
+                      label="Service"
+                      options={[{ value: "", label: "Choose a service" }, ...catalog.map((service) => ({ value: service.id, label: service.name }))]}
+                      value={mapDraft.id}
+                      disabled={mapSaving}
+                      onChange={(value) => {
+                        setMapDraft({ kind: "service", id: value });
+                        setMapProblem(undefined);
+                        setReviewCredentials(false);
+                      }}
+                    />
+                  )}
+                  {mapProblem && mapDraft.kind === "service" && <p className="danger">{mapProblem}</p>}
+                  {target && existing && (
+                    <p>
+                      This target has a {existing.action === "block" ? "Block" : "Allow"} rule.
+                      {existing.action === "block" && " Saving changes that rule to Allow."}
+                    </p>
+                  )}
+                  {network.offline && <p className="warn">Offline still blocks all requests after this save.</p>}
+                  {remainingBlocks.length > 0 && (
+                    <p className="warn">Other Block rules still take priority for matching hosts: {remainingBlocks.map((rule) => ruleLabel(rule, catalog)).join(", ")}.</p>
+                  )}
+                  {credentials.length > 0 && (
+                    <SpringCheckbox
+                      label={`I reviewed that allowing this rule activates ${credentials.map((credential) => credential.name).join(", ")}.`}
+                      checked={reviewCredentials}
+                      disabled={mapSaving}
+                      onChange={(event) => setReviewCredentials(event.target.checked)}
+                    />
+                  )}
+                  <div className="row end">
+                    <Button variant="ghost" disabled={mapSaving} onClick={() => setMapDraft(undefined)}>Cancel</Button>
+                    <Button type="submit" loading={mapSaving} disabled={mapSaving || !target || existing?.action === "allow" || (credentials.length > 0 && !reviewCredentials)}>Save Allow rule</Button>
+                  </div>
+                </form>
+              </CardBody>
+            </Card>
+          )}
           {blockedNeeds.map((need) => {
             const name =
               catalog.find((s) => s.id === need.service)?.name ?? need.service;
@@ -474,17 +577,21 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() =>
-                        run(() =>
+                      onClick={() => {
+                        if (other === "allow" && credentials.length > 0) {
+                          setMapDraft(rule.target);
+                          setMapProblem(undefined);
+                          setReviewCredentials(false);
+                        } else run(() =>
                           putRule(id, {
                             id: rule.id,
                             target: rule.target,
                             action: other,
                           }),
-                        )
-                      }
+                        );
+                      }}
                     >
-                      {other === "allow" ? "Allow" : "Block"}
+                      {other === "allow" ? credentials.length > 0 ? "Review Allow" : "Allow" : "Block"}
                     </Button>
                     <Button
                       size="sm"

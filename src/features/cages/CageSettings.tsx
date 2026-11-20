@@ -11,8 +11,9 @@ import {
 } from "@driif/motiv";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, X } from "lucide-react";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { addMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
+import { resolveFolder } from "../projects/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
 import { setCageResources } from "./api";
 import type { Intent, Run, Runtimes } from "../../App";
@@ -64,6 +65,9 @@ interface Props {
 /** The settings of a cage: its mounts and its agent runtimes. All sessions of the cage share them. */
 export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
   const [draft, setDraft] = useState<MountDraft>();
+  const [picking, setPicking] = useState(false);
+  const [mountSaving, setMountSaving] = useState(false);
+  const saving = useRef(false);
   const [resources, setResources] = useState<ResourcesDraft>({});
   const saved = cage.resources;
   // A field with no draft shows the saved value, so a save elsewhere shows at once.
@@ -88,12 +92,19 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
   }
 
   async function pickMount() {
-    const host = await open({ directory: true, title: "Mount a folder into the cage" });
-    if (host !== null) draftMount(host);
+    if (picking) return;
+    setPicking(true);
+    try {
+      const chosen = await open({ directory: true, title: "Mount a folder into the cage" });
+      if (chosen !== null) draftMount(await resolveFolder(chosen), chosen);
+    } finally {
+      setPicking(false);
+    }
   }
 
   useEffect(() => {
     if (intent?.kind !== "mount") return;
+    if (draft || picking) return;
     // A folder dropped on the map comes with its canonical path.
     if (intent.host) draftMount(intent.host, intent.dropped);
     else run(pickMount);
@@ -101,14 +112,19 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
 
   function confirmMount(event: FormEvent) {
     event.preventDefault();
-    if (!draft) return;
+    if (!draft || saving.current) return;
     const error = guestError(draft.guest);
     if (error) return setDraft({ ...draft, error });
+    saving.current = true;
+    setMountSaving(true);
     run(() =>
       addMount(cage.id, draft.host, draft.guest, draft.readonly).then(
         () => setDraft(undefined),
         (e) => setDraft({ ...draft, error: errorMessage(e) }),
-      ),
+      ).finally(() => {
+        saving.current = false;
+        setMountSaving(false);
+      }),
     );
   }
 
@@ -124,7 +140,7 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
               size="sm"
               variant="outline"
               iconLeft={<FolderPlus size={14} />}
-              disabled={draft !== undefined}
+              disabled={draft !== undefined || picking}
               onClick={() => run(pickMount)}
             >
               Add mount
@@ -149,6 +165,7 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
                 hint={draft.error}
                 aria-invalid={draft.error !== undefined}
                 showValidity={false}
+                disabled={mountSaving}
                 onChange={(e) => setDraft({ ...draft, guest: e.target.value, error: undefined })}
               />
               <SegmentedControl
@@ -158,13 +175,13 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
                   { value: "rw", label: "Read-write" },
                 ]}
                 value={draft.readonly ? "ro" : "rw"}
-                onChange={(v) => setDraft({ ...draft, readonly: v === "ro", error: undefined })}
+                onChange={(v) => !mountSaving && setDraft({ ...draft, readonly: v === "ro", error: undefined })}
               />
               <div className="row end">
-                <Button size="sm" variant="ghost" onClick={() => setDraft(undefined)}>
+                <Button size="sm" variant="ghost" disabled={mountSaving} onClick={() => setDraft(undefined)}>
                   Cancel
                 </Button>
-                <Button size="sm" type="submit">
+                <Button size="sm" type="submit" loading={mountSaving} disabled={mountSaving}>
                   Mount
                 </Button>
               </div>

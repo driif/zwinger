@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CageView, Rule, SessionView } from "../../shared/api.ts";
 import { GUEST_HOST, type NetEvent, type Service } from "../network/api.ts";
-import { type ItemData, mapLayout } from "./mapLayout.ts";
+import { type ItemData, mapEdit, mapLayout } from "./mapLayout.ts";
 
 const session = {
   name: "Example",
@@ -62,6 +62,42 @@ const withRules = (rules: Rule[], extra: Partial<CageView["network"]> = {}): Cag
 const hostRule = (id: string, host: string): Rule => ({ id, target: { kind: "host", host }, action: "allow" });
 const data = (c: CageView, events: NetEvent[], id: string, catalog: Service[] = [], now = 0) =>
   mapLayout(session, c, null, [], events, catalog, now, metrics).nodes.find((n) => n.id === id)?.data as ItemData | undefined;
+
+test("only the new folder node can draw a mount to the cage boundary", () => {
+  const map = mapLayout(session, cage, null, ["src"], [], [], 0, metrics);
+  assert.equal(map.nodes.find((n) => n.id === "source:new-folder")?.type, "item");
+  assert.deepEqual(mapEdit("source:new-folder", "boundary", map.nodes), { kind: "mount" });
+  assert.equal(mapEdit("workspace", "boundary", map.nodes), undefined);
+  assert.equal(mapEdit("folder:src", "boundary", map.nodes), undefined);
+  assert.equal(mapEdit("source:new-folder", "workspace", map.nodes), undefined);
+  assert.equal(map.edges.some((edge) => edge.source === "source:new-folder"), false);
+  const saved = { ...cage, mounts: [{ host: "/tmp/data", guest: "/mnt/data", readonly: true, id: null }] };
+  const next = mapLayout(session, saved, null, ["src"], [], [], 0, metrics);
+  assert.equal(next.edges.some((edge) => edge.source === "source:/mnt/data" && edge.target === "mount:/mnt/data"), true);
+});
+
+test("the gateway targets only eligible exact hosts and a blank canvas", () => {
+  const rules: Rule[] = [
+    { id: "exact", target: { kind: "host", host: "blocked.test" }, action: "block" },
+    { id: "wild", target: { kind: "host", host: "*.wild.test" }, action: "block" },
+    { id: "service", target: { kind: "service", id: "svc" }, action: "block" },
+  ];
+  const map = mapLayout(session, withRules(rules), null, [], [direct(1, "fresh.test"), direct(2, "127.0.0.1")], [], 10, metrics);
+  assert.deepEqual(mapEdit("boundary", "rule:exact", map.nodes), { kind: "addRule", target: { kind: "host", host: "blocked.test" } });
+  assert.deepEqual(mapEdit("boundary", "denied:fresh.test", map.nodes), { kind: "addRule", target: { kind: "host", host: "fresh.test" } });
+  assert.deepEqual(mapEdit("boundary", "new-host", map.nodes), { kind: "addRule" });
+  assert.deepEqual(mapEdit("boundary", null, map.nodes), { kind: "addRule" });
+  assert.equal(map.edges.some((edge) => edge.target === "new-host"), false);
+  assert.equal(map.edges.some((edge) => edge.target === "rule:new"), false);
+  const saved = mapLayout(session, withRules([...rules, hostRule("new", "fresh.test")]), null, [], [], [], 10, metrics);
+  assert.equal(saved.edges.some((edge) => edge.source === "boundary" && edge.target === "rule:new"), true);
+  assert.equal(mapEdit("boundary", "rule:new", saved.nodes), undefined);
+  for (const target of ["default", "group:blocked", "host-port", "rule:wild", "rule:service", "folder:src", "denied:absent", "denied:127.0.0.1"])
+    assert.equal(mapEdit("boundary", target, map.nodes), undefined);
+  assert.equal(map.edges.some((edge) => edge.target === "denied:fresh.test"), true);
+  assert.equal(map.edges.some((edge) => edge.target === "rule:exact"), true);
+  assert.equal(map.edges.some((edge) => edge.target === "rule:wild"), true);
+});
 
 test("a wildcard counts its apex and subdomains, at the domain boundary", () => {
   const events = [
