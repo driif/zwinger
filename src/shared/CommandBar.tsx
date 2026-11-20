@@ -1,5 +1,4 @@
 import { CommandMenu, CommandMenuItem } from "@driif/motiv";
-import { Ref } from "react";
 import {
   setNetworkDefault,
   setOffline,
@@ -16,7 +15,8 @@ import { shortcutLabel, ShortcutAction } from "./useShortcuts";
 import { removeMountWithUndo, removeRuleWithUndo } from "./undo";
 
 interface Props {
-  ref: Ref<HTMLDivElement>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   sessions: SessionView[];
   /** The selected session and its cage. */
   selected?: SessionCage;
@@ -43,7 +43,8 @@ interface Props {
 }
 
 export function CommandBar({
-  ref,
+  open,
+  onOpenChange,
   sessions,
   selected,
   panes,
@@ -172,5 +173,5 @@ export function CommandBar({
     if (other.id !== selected?.session.id)
       commands.push({ id: `project-${other.id}`, label: `Switch to ${other.name}`, onSelect: () => onSelect(other.id) });
 
-  return <CommandMenu ref={ref} className="command-bar" hotkey placeholder="Actions" commands={commands} />;
+  return <CommandMenu open={open} onOpenChange={onOpenChange} className="command-bar" hotkey placeholder="Actions" commands={commands} />;
 }

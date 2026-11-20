@@ -320,6 +320,7 @@ export function AppSettings({
       </header>
       <ElasticTabs
         className="tabs"
+        fill
         label="Settings"
         tabs={TABS}
         value={tab}

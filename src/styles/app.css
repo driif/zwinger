@@ -250,12 +250,8 @@ p {
   box-shadow: 0 0 0 1px var(--motiv-color-border);
 }
 
-/* Layout only: the tab panels fill the page and scroll on their own. */
+/* `fill` makes the tab panels fill the page and scroll on their own. */
 .tabs {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
   gap: calc(var(--motiv-space) * 3);
 }
 
@@ -263,15 +259,8 @@ p {
   display: none;
 }
 
-.tabs .motiv-elastic-tabs__panels {
-  flex: 1;
-  min-height: 0;
-  grid-template-rows: minmax(0, 1fr);
-}
-
-.tabs .motiv-elastic-tabs__panel {
-  min-height: 0;
-  overflow-y: auto;
+.tabs .overview,
+.tabs .tab-body {
   padding-bottom: var(--zw-page-pad);
 }
 

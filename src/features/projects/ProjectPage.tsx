@@ -496,6 +496,7 @@ export function ProjectPage({
           </div>
           <ElasticTabs
               className="tabs"
+              fill
               hidden={!isTab}
               label="Project"
               tabs={TABS}

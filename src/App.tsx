@@ -276,7 +276,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const copies = useRef(0);
   const [ask, setAsk] = useState<Ask>();
   const [intent, setIntent] = useState<Intent>();
-  const commandBar = useRef<HTMLDivElement>(null);
+  const [commandsOpen, setCommandsOpen] = useState(false);
   const refreshes = useRef(0);
   const agentVersion = useRef(0);
   const agentEvents = useRef(new Map<string, { state: AgentState | null; version: number }>());
@@ -984,8 +984,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     );
 
   const actions: Record<ShortcutAction, () => void> = {
-    // The command menu has no open prop. A click with no pointer opens it and focuses the first item.
-    commands: () => commandBar.current?.querySelector("button")?.click(),
+    commands: () => setCommandsOpen((open) => !open),
     newProject: () => run(newProject),
     newShell: () => run(() => newSession({ type: "host" })),
     newVmShell: () => run(() => newSession({ type: "shell" })),
@@ -1056,7 +1055,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         }}
       >
         <CommandBar
-          ref={commandBar}
+          open={commandsOpen}
+          onOpenChange={setCommandsOpen}
           sessions={joined.map((j) => j.session)}
           selected={selected}
           panes={sessionPanes}
