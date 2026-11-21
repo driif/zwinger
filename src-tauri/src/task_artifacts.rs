@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use crate::agent::cli::{iso, now_ms};
 use crate::error::{Error, Result};
+use crate::task_runs::EXTERNAL;
 
 /// A larger file of a round is not read.
 const FILE_LIMIT: u64 = 8 << 20;
@@ -89,16 +90,20 @@ pub struct Stage {
     pub started: Option<String>,
 }
 
-/// One message of the round: `{from, to, kind, body}`, so a bridge such as
-/// A2A can expose it later.
+/// One message of the round: `{from, to, kind, body}`, which the A2A
+/// bridge exposes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
+    /// Stable: the source of the message in the round, such as
+    /// `turns/plan-opus.json` or `messages.jsonl#3` (a line from 1).
+    pub id: String,
+    /// An agent name, `run`, `user` or `a2a`.
     pub from: String,
     /// An agent name, `all` or `user`.
     pub to: String,
     /// `plan`, `reply`, `tiebreak`, `implementation`, `gates`, `review`,
-    /// `revision`, `final`, `user`, `answer` or `event`.
+    /// `revision`, `final`, `user`, `answer`, `external` or `event`.
     pub kind: String,
     pub stage: String,
     pub at: Option<String>,
@@ -445,6 +450,7 @@ pub fn is_round(dir: &Path) -> bool {
 // --- projection ------------------------------------------------------------
 
 struct Event {
+    line: usize,
     at: String,
     kind: String,
     detail: String,
@@ -527,15 +533,17 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         let value: Value = serde_json::from_slice(files.get(name)?.1?).ok()?;
         value.is_object().then_some(value)
     };
-    let lines = |name: &str| -> Vec<Value> {
+    // Each object line with its line number from 1, which stays the same as the file grows.
+    let lines = |name: &str| -> Vec<(usize, Value)> {
         let Some((_, Some(bytes))) = files.get(name) else {
             return Vec::new();
         };
         // The last line can be half written.
         bytes
             .split(|&b| b == b'\n')
-            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-            .filter(Value::is_object)
+            .enumerate()
+            .filter_map(|(i, line)| Some((i + 1, serde_json::from_slice::<Value>(line).ok()?)))
+            .filter(|(_, value)| value.is_object())
             .collect()
     };
     let mtime = |name: &str| files.get(name).map(|(secs, _)| iso(secs * 1000));
@@ -566,7 +574,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
     let events: Vec<Event> = lines("events.jsonl")
         .iter()
-        .map(|e| Event { at: text(&e["at"]), kind: text(&e["kind"]), detail: text(&e["detail"]) })
+        .map(|(line, e)| Event { line: *line, at: text(&e["at"]), kind: text(&e["kind"]), detail: text(&e["detail"]) })
         .collect();
 
     // Stages, from the `stage` events.
@@ -634,18 +642,25 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
     // Agents' turns and positions.
     let mut messages = Vec::new();
-    let mut message =
-        |from: &str, to: String, kind: &str, stage: &str, at: Option<String>, summary_of: &str, body: String| {
-            messages.push(Message {
-                from: from.to_owned(),
-                to,
-                kind: kind.to_owned(),
-                stage: stage.to_owned(),
-                at,
-                summary: summary(summary_of),
-                body,
-            });
-        };
+    let mut message = |id: String,
+                       from: &str,
+                       to: String,
+                       kind: &str,
+                       stage: &str,
+                       at: Option<String>,
+                       summary_of: &str,
+                       body: String| {
+        messages.push(Message {
+            id,
+            from: from.to_owned(),
+            to,
+            kind: kind.to_owned(),
+            stage: stage.to_owned(),
+            at,
+            summary: summary(summary_of),
+            body,
+        });
+    };
     let mut positions = Vec::new();
     for agent in &agents {
         let name = format!("turns/plan-{agent}.json");
@@ -660,7 +675,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             strings(&plan["touches"]).join(", "),
             strings(&plan["risks"]).join("; "),
         );
-        message(agent, "all".to_owned(), "plan", "plan", mtime(&name), &text(&plan["plan"]), body);
+        message(name.clone(), agent, "all".to_owned(), "plan", "plan", mtime(&name), &text(&plan["plan"]), body);
         positions.push(Position {
             agent: agent.clone(),
             plan: text(&plan["plan"]),
@@ -687,7 +702,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 if conceded.is_empty() { "nothing".to_owned() } else { conceded.join("; ") },
             );
             let stage = format!("exchange-{n}");
-            message(agent, peer(agent), "reply", &stage, mtime(&name), &text(&reply["message"]), body);
+            message(name.clone(), agent, peer(agent), "reply", &stage, mtime(&name), &text(&reply["message"]), body);
             let plan = text(&reply["plan"]);
             if let Some(position) = positions.iter_mut().find(|p| p.agent == *agent) {
                 if !plan.is_empty() {
@@ -717,7 +732,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         let by = events.iter().find_map(|e| e.detail.strip_prefix("tiebreak by ")).and_then(known);
         let from = by.or_else(|| agents.first().cloned()).unwrap_or_else(|| "tiebreak".to_owned());
         let body = format!("**Implementer:** {}\n\n{}", t.implementer.as_deref().unwrap_or("?"), t.why);
-        message(&from, "all".to_owned(), "tiebreak", "tiebreak", mtime("tiebreak.json"), &t.why, body);
+        let id = "tiebreak.json".to_owned();
+        message(id, &from, "all".to_owned(), "tiebreak", "tiebreak", mtime("tiebreak.json"), &t.why, body);
     }
 
     // The implementer, in the order that the round decides it.
@@ -813,6 +829,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             }
         }
         message(
+            "implementation.json".to_owned(),
             &from,
             peer(&from),
             "implementation",
@@ -845,7 +862,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            message("run", "all".to_owned(), "gates", stage, mtime(file), &line, format!("{line}.\n\n{body}"));
+            let id = file.to_owned();
+            message(id, "run", "all".to_owned(), "gates", stage, mtime(file), &line, format!("{line}.\n\n{body}"));
         }
     }
 
@@ -880,7 +898,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             body.push_str(&format!("\n- [{}] `{}{line}` — {}", f.severity, f.file, f.what));
         }
         let to = implementer.clone().unwrap_or_else(|| "all".to_owned());
-        message(&from, to, "review", "crossreview", mtime("crossreview.json"), &review.message, body);
+        let id = "crossreview.json".to_owned();
+        message(id, &from, to, "review", "crossreview", mtime("crossreview.json"), &review.message, body);
     }
     if let Some(r) = json("revision.json") {
         let from = implementer.clone().unwrap_or_else(|| "implementer".to_owned());
@@ -892,7 +911,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             body.push_str(&format!("\n- declined: {} → {}", text(&f["finding"]), text(&f["why_not"])));
         }
         let to = reviewer.clone().unwrap_or_else(|| "all".to_owned());
-        message(&from, to, "revision", "revise", mtime("revision.json"), &text(&r["message"]), body);
+        let id = "revision.json".to_owned();
+        message(id, &from, to, "revision", "revise", mtime("revision.json"), &text(&r["message"]), body);
     }
 
     let blocking_of = |value: &Value| -> Vec<Blocking> {
@@ -921,7 +941,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         for b in &review.blocking {
             body.push_str(&format!("\n- blocking: {} ({})", b.what, b.at));
         }
-        message(agent, "user".to_owned(), "final", "final", mtime(&name), &review.task_met, body);
+        message(name.clone(), agent, "user".to_owned(), "final", "final", mtime(&name), &review.task_met, body);
         finals.push(review);
     }
     let outcome = manifest.as_ref().map(|m| Outcome {
@@ -933,11 +953,17 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         base: m["base"].as_str().map(str::to_owned),
     });
 
-    for entry in lines("messages.jsonl") {
-        let kind = if entry["kind"] == "answer" { "answer" } else { "user" };
+    for (line, entry) in lines("messages.jsonl") {
+        // The sender of a contribution is fixed: the line cannot name the user or an agent.
+        let (from, kind) = match entry["kind"].as_str() {
+            Some("answer") => ("user", "answer"),
+            Some("external") => (EXTERNAL, "external"),
+            _ => ("user", "user"),
+        };
         let body = text(&entry["body"]);
         let stage = text(&entry["stage"]);
-        message("user", "all".to_owned(), kind, &stage, Some(text(&entry["at"])), &body, body.clone());
+        let id = format!("messages.jsonl#{line}");
+        message(id, from, "all".to_owned(), kind, &stage, Some(text(&entry["at"])), &body, body.clone());
     }
 
     // Notable events, at the stage that was active then.
@@ -993,7 +1019,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         );
         if shown {
             let body = format!("**{}** — {}", event.kind.replace('_', " "), event.detail);
-            message("run", "all".to_owned(), "event", &current, Some(event.at.clone()), &event.detail, body);
+            let id = format!("events.jsonl#{}", event.line);
+            message(id, "run", "all".to_owned(), "event", &current, Some(event.at.clone()), &event.detail, body);
         }
     }
 
@@ -1171,7 +1198,8 @@ impl RoundWriter {
         }
     }
 
-    pub fn append(&self, name: &str, value: &Value) {
+    /// Adds a line to the file. Returns false if the write failed.
+    pub fn append(&self, name: &str, value: &Value) -> bool {
         let mut line = value.to_string().into_bytes();
         line.push(b'\n');
         let path = self.dir.join(name);
@@ -1182,7 +1210,9 @@ impl RoundWriter {
             }
             f.write_all(&line)
         });
+        let ok = written.is_ok();
         self.record(&path, written);
+        ok
     }
 
     /// Adds an event with the start of `detail`. Near its limit,

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use serde::Serialize;
 use tokio::task::AbortHandle;
 
+use crate::a2a;
 use crate::agent::{AgentKind, launch};
 use crate::cage::activity::{self, Activity};
 use crate::cage::history::{self, StartHistory, StartRecord};
@@ -90,6 +91,8 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
     pub(crate) folder_sink: Arc<OnceLock<FolderSink>>,
     pub(crate) runs: Arc<task_runs::Registry>,
+    /// The A2A shares of the runs.
+    pub(crate) shares: a2a::Shares,
     /// Serializes run starts, so two starts cannot take the same run name.
     pub(crate) run_start: Mutex<()>,
     /// The stage limits of new task runs.
@@ -515,6 +518,7 @@ impl<R: SandboxRuntime> Manager<R> {
             agent_sink: Arc::new(OnceLock::new()),
             folder_sink: Arc::new(OnceLock::new()),
             runs: Arc::default(),
+            shares: a2a::Shares::default(),
             run_start: Mutex::new(()),
             run_config: task_runs::Config::default(),
             host,
@@ -1318,6 +1322,7 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         self.save_history();
         self.runs.forget(session_id, None);
+        self.shares.forget(session_id, None);
         match std::fs::remove_dir_all(self.data.join("tasks").join(session_id)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => wiped,

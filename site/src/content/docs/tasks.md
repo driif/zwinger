@@ -69,6 +69,66 @@ A cage stop cancels its runs. A run does not continue after an app restart.
 
 **Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it.
 
+## Share a run over A2A
+
+A tool on your Mac can read a run and send advisory messages to it with the
+[A2A protocol](https://a2a-protocol.org/) 1.0. Sharing is off by default.
+
+1. Open the room of a run that started in this app session.
+2. Select **Share over A2A**. The room shows the **A2A share** card: the URL, the task ID, the token and a `curl`
+   example. Each field has a copy button.
+3. Give these details to the tool. To end the access, select **Stop sharing**.
+
+The share is local only. It listens on `127.0.0.1` with a port that macOS assigns. Other computers and the cages cannot
+connect to it. The token is in memory only: zwinger does not write it to a file or a log. The share ends when you stop
+it, when you remove the run's task or project, and when you quit zwinger. After a restart, sharing is off. A new share
+has a new port and a new token, so old details do not open it. A round folder that you open from your Mac cannot be
+shared.
+
+The share uses the HTTP+JSON binding of A2A 1.0 with polling. Each request, except for the Agent Card, needs the
+headers `Authorization: Bearer <token>` and `A2A-Version: 1.0`.
+
+| Request | Result |
+|---|---|
+| `GET /.well-known/agent-card.json` | The Agent Card. It names no run and needs no token. |
+| `GET /tasks/<task ID>?historyLength=<n>` | The run as an A2A task: its state and its messages, oldest first. |
+| `GET /tasks` | A list with the shared run only. |
+| `POST /message:send` | An advisory message to the run. |
+
+Each message in the task history has a stable `messageId` and two parts: the Markdown text, and a data part with
+`from`, `to`, `kind`, `stage`, `at` and `body`. The `body` is the same text as the first part. For example:
+
+```json
+{"data": {"from": "a2a", "to": "all", "kind": "external", "stage": "plan", "at": "2026-11-21T09:30:00.000Z",
+          "body": "The cache also needs a fix."}, "mediaType": "application/json"}
+```
+
+The task state is `TASK_STATE_WORKING` while the run works or is paused,
+`TASK_STATE_INPUT_REQUIRED` while it waits for your answers, and then `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED` or
+`TASK_STATE_CANCELED`. An ended run stays readable until you stop sharing.
+
+To send an advisory message, use the task ID of the share and text parts only:
+
+```sh
+curl -X POST "$URL/message:send" \
+  -H 'A2A-Version: 1.0' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/a2a+json' \
+  -d '{"message": {"messageId": "note-1", "role": "ROLE_USER", "taskId": "'"$TASK"'",
+       "parts": [{"text": "The cache also needs a fix."}]}}'
+```
+
+The reply is a message that says `applied` (the round has the message) or `queued` (the run applies it at its next
+step). The room shows the message from `a2a` with the label **external · advisory**. The prompts of the following
+stages show it in a separate section with a lower priority than your messages and the plan. An advisory message
+cannot answer open questions, select the implementer, cancel the run or approve a result. It counts against the same
+limits as your messages: 16 KiB per message, and 32 messages and 64 KiB per run. If you send the same `messageId` with
+the same text again, the run does not add it again. The same `messageId` with a different text is an error. An ended
+run refuses each message, also a repeated one. If the run cannot write a message to its record, it refuses that message
+and each message after it, also a retry with the same `messageId`, with `UnsupportedOperationError`. The run then
+ends with `TASK_STATE_FAILED`.
+
+Streaming, push notifications, cancel and the extended Agent Card are not available. They return
+`UnsupportedOperationError` or `PushNotificationNotSupportedError`.
+
 ## Records
 
 zwinger writes the files of each run to its app data on the Mac, under the session ID. The cage cannot write there,

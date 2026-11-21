@@ -1,5 +1,5 @@
-import { Button, Card, SegmentedControl, StepProgress, Textarea } from "@driif/motiv";
-import { ArrowUp, FileDiff, Pause, Pencil, Play, Square } from "lucide-react";
+import { Button, Card, CardBody, CardHeader, CopyField, SegmentedControl, StepProgress, Textarea } from "@driif/motiv";
+import { ArrowUp, Cable, FileDiff, Pause, Pencil, Play, Square, Unplug } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   controlTaskRun,
@@ -7,9 +7,13 @@ import {
   Room,
   RoomSource,
   RunControl,
+  RunShare,
   RunStatus,
   RunSummary,
+  shareTaskRun,
   startTaskRun,
+  stopTaskRunShare,
+  taskRunShare,
   unwatchRoom,
   runDiff,
   watchRoom,
@@ -57,6 +61,10 @@ export function TaskRoom(props: Props) {
   const [draft, setDraft] = useState("");
   const [diff, setDiff] = useState<string>();
   const diffRequests = useRef(latestRequest()).current;
+  const [share, setShare] = useState<RunShare | null>(null);
+  const [sharing, setSharing] = useState(false);
+  // A share result of an earlier run must not show its credential on this one, also after A→B→A.
+  const shareRequests = useRef(latestRequest()).current;
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -65,8 +73,18 @@ export function TaskRoom(props: Props) {
     setLive({});
     setDiff(undefined);
     diffRequests.drop();
+    setShare(null);
+    setSharing(false);
+    shareRequests.drop();
     setError(undefined);
     if (!source) return;
+    if (source.kind === "run") {
+      const isCurrent = shareRequests.next();
+      taskRunShare(source.sessionId, source.taskId, source.run).then(
+        (found) => isCurrent() && setShare(found),
+        (e) => isCurrent() && setError(errorMessage(e)),
+      );
+    }
     let token: number | undefined;
     let closed = false;
     watchRoom(source, (event) => {
@@ -121,6 +139,25 @@ export function TaskRoom(props: Props) {
     );
   };
   const control = (c: RunControl) => inApp && run && act(() => controlTaskRun(inApp.session.id, inApp.task.id, run, c));
+  const toggleShare = () => {
+    if (!inApp || !run) return;
+    const isCurrent = shareRequests.next();
+    setError(undefined);
+    setSharing(true);
+    const ids = [inApp.session.id, inApp.task.id, run] as const;
+    (share ? stopTaskRunShare(...ids).then(() => null) : shareTaskRun(...ids)).then(
+      (next) => {
+        if (!isCurrent()) return;
+        setShare(next);
+        setSharing(false);
+      },
+      (e) => {
+        if (!isCurrent()) return;
+        setError(errorMessage(e));
+        setSharing(false);
+      },
+    );
+  };
   const start = () =>
     inApp &&
     act(async () => {
@@ -213,6 +250,18 @@ export function TaskRoom(props: Props) {
             </Button>
           </>
         )}
+        {inApp && run && status !== null && (
+          <Button
+            size="sm"
+            variant="outline"
+            iconLeft={share ? <Unplug size={14} /> : <Cable size={14} />}
+            loading={sharing}
+            title={share ? undefined : "Let a tool on this Mac read this run and send advisory messages over A2A"}
+            onClick={toggleShare}
+          >
+            {share ? "Stop sharing" : "Share over A2A"}
+          </Button>
+        )}
         {inApp && (
           <>
             <Button size="sm" variant="ghost" iconLeft={<Pencil size={14} />} onClick={inApp.onEdit}>
@@ -303,6 +352,26 @@ export function TaskRoom(props: Props) {
             </form>
           </div>
           <aside className="room-side stack">
+            {share && (
+              <Card variant="outlined" padding="sm">
+                <CardHeader
+                  title="A2A share"
+                  titleAs="h2"
+                  description="Local only. A tool on this Mac that has the token can read this run and send advisory messages to its next stages. The share ends when you stop it, remove the run or quit zwinger."
+                />
+                <CardBody className="stack">
+                  <CopyField className="mono" label="Copy the URL" value={share.url} />
+                  <CopyField className="mono" label="Copy the task ID" value={share.taskId} display={`Task ${share.taskId}`} />
+                  <CopyField className="mono" label="Copy the token" value={share.token} display="Token ••••••••" />
+                  <CopyField
+                    className="mono"
+                    label="Copy a curl example"
+                    value={`curl -H 'A2A-Version: 1.0' -H 'Authorization: Bearer ${share.token}' '${share.url}/tasks/${share.taskId}?historyLength=5'`}
+                    display="curl example (has the token)"
+                  />
+                </CardBody>
+              </Card>
+            )}
             <Positions room={room} />
             <Disagreements room={room} />
             <Verdicts room={room} />

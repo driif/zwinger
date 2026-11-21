@@ -49,6 +49,8 @@ pub enum Error {
     TaskRunning,
     #[error("run not found")]
     RunNotFound,
+    #[error("only a run of this app session can be shared")]
+    RunNotShareable,
     #[error("the run cannot do this now: {0}")]
     RunState(&'static str),
     #[error("the run cannot write its artifacts to {0}: {1}")]

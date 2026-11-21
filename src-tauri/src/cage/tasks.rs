@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::a2a::ShareInfo;
 use crate::agent::AgentKind;
 use crate::cage::Mount;
 use crate::cage::manager::{Manager, Vm, blocking, in_guest_folder, lock};
@@ -31,6 +32,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let slug = lock(&self.state).session(id)?.task(task_id)?.slug.clone();
         self.edit_session(id, |s, _| s.remove_task(task_id))?;
         self.runs.forget(id, Some(task_id));
+        self.shares.forget(id, Some(task_id));
         match std::fs::remove_dir_all(self.task_dir(id, &slug)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
@@ -121,6 +123,13 @@ impl<R: SandboxRuntime> Manager<R> {
 
     pub fn control_task_run(&self, id: &str, task_id: &str, run: &str, control: Control) -> Result<()> {
         self.run_handle(id, task_id, run).ok_or(Error::RunNotFound)?.control(control)
+    }
+
+    /// Starts an A2A share of a run of this app session, or returns the
+    /// share that runs.
+    pub fn share_task_run(&self, id: &str, task_id: &str, run: &str) -> Result<ShareInfo> {
+        let dir = self.round_dir(id, task_id, run)?;
+        self.shares.start(id, task_id, run, dir, || self.run_handle(id, task_id, run))
     }
 
     /// The run of this app session, if it is one.

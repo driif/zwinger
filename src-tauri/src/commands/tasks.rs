@@ -7,6 +7,7 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tokio::task::AbortHandle;
 
+use crate::a2a::ShareInfo;
 use crate::cage;
 use crate::cage::tasks::RunSummary;
 use crate::error::Result;
@@ -51,6 +52,29 @@ pub async fn list_task_runs(manager: Managed<'_>, session_id: String) -> Result<
 #[tauri::command]
 pub async fn run_diff(manager: Managed<'_>, session_id: String, task_id: String, run: String) -> Result<String> {
     manager.run_diff(&session_id, &task_id, &run).await
+}
+
+/// Starts an A2A share of the run, or returns the share that runs. Async, so
+/// its listener starts on the tokio runtime.
+#[tauri::command]
+pub async fn share_task_run(
+    manager: Managed<'_>,
+    session_id: String,
+    task_id: String,
+    run: String,
+) -> Result<ShareInfo> {
+    manager.share_task_run(&session_id, &task_id, &run)
+}
+
+#[tauri::command]
+pub fn task_run_share(manager: Managed<'_>, session_id: String, task_id: String, run: String) -> Option<ShareInfo> {
+    manager.shares.get(&session_id, &task_id, &run)
+}
+
+/// Ends the share: its credential and its port stop at once.
+#[tauri::command]
+pub fn stop_task_run_share(manager: Managed<'_>, session_id: String, task_id: String, run: String) {
+    manager.shares.stop(&session_id, &task_id, &run);
 }
 
 /// True if the folder looks like a duo round, so a drop opens its room.

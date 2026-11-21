@@ -54,6 +54,29 @@ export const listTaskRuns = (sessionId: string) =>
 export const runDiff = (sessionId: string, taskId: string, run: string) =>
   call<string>("run_diff", { sessionId, taskId, run });
 
+/** A local A2A share of a run: a tool on this Mac connects with these details. */
+export interface RunShare {
+  /** The base URL of the A2A HTTP+JSON interface on 127.0.0.1. */
+  url: string;
+  cardUrl: string;
+  /** The A2A task ID of the run. */
+  taskId: string;
+  contextId: string;
+  /** The bearer credential of this share. */
+  token: string;
+}
+
+/** Starts the share of a run of this app session, or resolves to the share that runs. */
+export const shareTaskRun = (sessionId: string, taskId: string, run: string) =>
+  call<RunShare>("share_task_run", { sessionId, taskId, run });
+
+export const taskRunShare = (sessionId: string, taskId: string, run: string) =>
+  call<RunShare | null>("task_run_share", { sessionId, taskId, run });
+
+/** Ends the share: its credential stops at once. */
+export const stopTaskRunShare = (sessionId: string, taskId: string, run: string) =>
+  call<void>("stop_task_run_share", { sessionId, taskId, run });
+
 /** True if the folder looks like a duo round, so a drop opens its room. */
 export const isRoundFolder = (path: string) =>
   call<boolean>("is_round_folder", { path });
@@ -83,6 +106,8 @@ export interface RoomStage {
 
 /** One typed message of a round. `body` is Markdown. */
 export interface RoomMessage {
+  /** Stable: the source of the message in the round. */
+  id: string;
   from: string;
   to: string;
   kind: string;

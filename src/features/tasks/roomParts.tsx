@@ -2,6 +2,7 @@ import { Accordion, Button, Card, CardBody, CardHeader, ProgressRing } from "@dr
 import {
   Activity,
   Bot,
+  Cable,
   Braces,
   CircleCheck,
   CircleX,
@@ -14,7 +15,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { cancelRuntimeInstall, RuntimeView } from "../settings/api";
-import { Blocking, Room, RoomMessage } from "./api";
+import { Blocking, Room } from "./api";
 import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import type { Runtimes } from "../../App";
 import { Block, ChatState, Message, textOf, ToolRun } from "./agentChat";
@@ -119,6 +120,7 @@ export function MessageView({ message, results, tools }: { message: Message; res
 function iconOf(name: string): LucideIcon {
   if (name === "user") return User;
   if (name === "run") return Activity;
+  if (name === "a2a") return Cable;
   return AGENT_ICONS[name as AgentKind] ?? Bot;
 }
 
@@ -142,16 +144,16 @@ export function elapsed(ms: number) {
 /** The messages of the round, in order. Each one opens to its full text. */
 export function Timeline({ room }: { room: Room }) {
   const label = (id: string) => room.stages.find((s) => s.id === id)?.label ?? id;
-  const key = (m: RoomMessage) => `${m.stage}|${m.kind}|${m.from}|${m.at}|${m.summary}`;
   return (
     <Accordion
       multiple
       headingLevel={3}
       items={room.messages.map((m) => ({
-        id: key(m),
+        id: m.id,
         title: (
           <span className={`row room-message ${m.kind === "event" ? "muted" : ""}`}>
             <AgentName name={m.from} />
+            {m.kind === "external" && <span className="room-chip">external · advisory</span>}
             {m.to !== "all" && <span className="muted">→ {m.to}</span>}
             <span className="room-chip">{label(m.stage)}</span>
             <span className="grow room-summary">{m.summary}</span>

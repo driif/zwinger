@@ -1,3 +1,4 @@
+mod a2a;
 mod agent;
 mod appearance;
 mod bootstrap;
@@ -427,6 +428,9 @@ pub fn run() {
             commands::tasks::control_task_run,
             commands::tasks::list_task_runs,
             commands::tasks::run_diff,
+            commands::tasks::share_task_run,
+            commands::tasks::task_run_share,
+            commands::tasks::stop_task_run_share,
             commands::tasks::is_round_folder,
             commands::tasks::watch_room,
             commands::tasks::unwatch_room,
@@ -487,6 +491,7 @@ pub fn run() {
         // shells and stop the VMs here, before the process exits.
         RunEvent::Exit => {
             if let Some(manager) = app.try_state::<Manager<Microsandbox>>() {
+                manager.shares.stop_all();
                 manager.kill_host_sessions();
                 tauri::async_runtime::block_on(manager.stop_all(STOP_ALL_LIMIT));
             }
