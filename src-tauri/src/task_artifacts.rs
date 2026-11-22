@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,6 @@ use crate::task_runs::EXTERNAL;
 /// A larger file of a round is not read.
 const FILE_LIMIT: u64 = 8 << 20;
 const SUMMARY_CHARS: usize = 200;
-/// The poll of a round folder: fast after a change, slower while nothing changes.
-const POLL: Duration = Duration::from_millis(500);
-const POLL_SLOW: Duration = Duration::from_millis(1500);
 /// What a reader keeps of a round folder.
 const READ_FILES: usize = 64;
 const READ_BYTES: u64 = 32 << 20;
@@ -46,7 +43,9 @@ const EVENTS_RESERVE: u64 = 64 << 10;
 const ESSENTIAL: [&str; 4] = ["stage", "done", "cancelled", "run_failed"];
 /// The exchange turns that a round shows before it has more.
 pub const TURNS: u32 = 2;
-const TURNS_DIR: &str = "turns";
+pub(crate) const TURNS_DIR: &str = "turns";
+/// A full scan checks its cancel flag after this many directory entries.
+const CANCEL_EVERY: u64 = 4096;
 
 /// The order of the stages. `exchange` repeats once per turn.
 const STAGES: [&str; 9] =
@@ -267,16 +266,27 @@ fn nofollow_dir(dir: &Path) -> Option<OwnedFd> {
     rustix::fs::open(dir, flags, Mode::empty()).ok()
 }
 
-/// The modification time and the size of a regular file, else `None`.
-type Stamp = (i64, i64, u64);
+/// The identity, the times and the size of a regular file, else `None`.
+/// Equal stamps mean an unchanged file, also after an atomic replacement
+/// with the same size and modification time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    modified: (i64, i64),
+    changed: (i64, i64),
+    size: u64,
+    dev: u64,
+    ino: u64,
+}
 
 fn stamp_at(dir: &OwnedFd, name: &str) -> Option<Stamp> {
     let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
-    (FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile).then_some((
-        stat.st_mtime as i64,
-        stat.st_mtime_nsec as i64,
-        stat.st_size as u64,
-    ))
+    (FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile).then_some(Stamp {
+        modified: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+        changed: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        size: stat.st_size as u64,
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+    })
 }
 
 /// The file, if it is a regular file of at most `FILE_LIMIT` bytes.
@@ -296,7 +306,7 @@ fn read_at(dir: &OwnedFd, name: &str) -> Option<Vec<u8>> {
 /// What a reader does with a file name of a round, by its relative name:
 /// `Some(true)` reads it, `Some(false)` only keeps its name (a plan prompt
 /// names its agent), `None` skips it.
-fn known(key: &str) -> Option<bool> {
+pub(crate) fn known(key: &str) -> Option<bool> {
     const ROOT: [&str; 12] = [
         "run.json",
         "checkpoint.json",
@@ -326,25 +336,48 @@ fn known(key: &str) -> Option<bool> {
     }
 }
 
+/// A known file of a round, as the reader keeps it.
+struct Entry {
+    stamp: Stamp,
+    bytes: Option<Vec<u8>>,
+    /// The reader tried to read this stamp. A file that is too large or
+    /// cannot be read stays `None` until its stamp changes.
+    tried: bool,
+}
+
 /// A round folder, read again only where a file changed.
 pub struct RoundReader {
     dir: PathBuf,
-    /// By relative name (`turns/plan-opus.json`): its stamp and its bytes.
-    files: BTreeMap<String, (Stamp, Option<Vec<u8>>)>,
+    /// By relative name (`turns/plan-opus.json`).
+    files: BTreeMap<String, Entry>,
+    /// The full scans and the file reads so far, for tests of the work.
+    #[cfg_attr(not(test), allow(dead_code))]
+    scans: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    reads: u64,
 }
 
 impl RoundReader {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, files: BTreeMap::new() }
+        Self { dir, files: BTreeMap::new(), scans: 0, reads: 0 }
     }
 
     /// Reads the known files that are new or changed, up to `READ_FILES`
     /// files and `READ_BYTES` bytes. Returns true if any file came, went or
     /// changed.
     pub fn refresh(&mut self) -> bool {
+        self.scan(&AtomicBool::new(false))
+    }
+
+    /// [`refresh`](Self::refresh), which stops early when `cancel` is set.
+    /// The time is linear in the number of entries of the round folder and
+    /// of `turns`, also of the entries that are not round files.
+    pub fn scan(&mut self, cancel: &AtomicBool) -> bool {
+        self.scans += 1;
         let mut seen = BTreeMap::new();
         let mut changed = false;
         let mut bytes_kept = 0;
+        let mut entries_seen = 0u64;
         for (sub, prefix) in [(None, ""), (Some(TURNS_DIR), "turns/")] {
             let path = match sub {
                 Some(sub) => self.dir.join(sub),
@@ -357,6 +390,11 @@ impl RoundReader {
                 continue;
             };
             for entry in entries.flatten() {
+                // Also before the first entry, so a cancelled scan reads nothing.
+                if entries_seen.is_multiple_of(CANCEL_EVERY) && cancel.load(Ordering::Relaxed) {
+                    return false;
+                }
+                entries_seen += 1;
                 let Ok(name) = entry.file_name().to_str() else {
                     continue;
                 };
@@ -370,21 +408,10 @@ impl RoundReader {
                 let Some(stamp) = stamp_at(&dir, name) else {
                     continue;
                 };
-                let fits = bytes_kept + stamp.2 <= READ_BYTES;
-                // A kept file also counts against the budget: one that no
-                // longer fits is dropped, and one that fits again is read.
-                let bytes = match self.files.remove(&key) {
-                    Some((old, Some(bytes))) if old == stamp && fits => Some(bytes),
-                    Some((old, None)) if old == stamp && !(read && fits) => None,
-                    _ => {
-                        changed = true;
-                        (read && fits).then(|| read_at(&dir, name)).flatten()
-                    }
-                };
-                // A file can grow between the stamp and the read.
-                let bytes = bytes.filter(|b| bytes_kept + b.len() as u64 <= READ_BYTES);
-                bytes_kept += bytes.as_ref().map_or(0, |b| b.len() as u64);
-                seen.insert(key, (stamp, bytes));
+                let old = self.files.remove(&key);
+                let entry = self.next(old, stamp, read, bytes_kept, (&dir, name), &mut changed);
+                bytes_kept += entry.bytes.as_ref().map_or(0, |b| b.len() as u64);
+                seen.insert(key, entry);
             }
         }
         // Each file that is still there was taken out above, so the rest is gone.
@@ -393,9 +420,84 @@ impl RoundReader {
         changed
     }
 
+    /// Reads again only the files of `keys`, which a watcher reported. A
+    /// name that is not a round file is skipped. A new file that does not
+    /// fit in `READ_FILES` waits for the next full scan. Returns true if any
+    /// of the files came, went or changed.
+    pub fn refresh_keys<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) -> bool {
+        let root = nofollow_dir(&self.dir);
+        let turns = root.as_ref().and_then(|_| nofollow_dir(&self.dir.join(TURNS_DIR)));
+        let mut changed = false;
+        for key in keys {
+            let Some(read) = known(key) else {
+                continue;
+            };
+            let (dir, name) = match key.strip_prefix("turns/") {
+                Some(name) => (turns.as_ref(), name),
+                None => (root.as_ref(), key),
+            };
+            let Some((dir, stamp)) = dir.and_then(|dir| Some((dir, stamp_at(dir, name)?))) else {
+                changed |= self.files.remove(key).is_some();
+                continue;
+            };
+            let old = self.files.remove(key);
+            if old.is_none() && self.files.len() >= READ_FILES {
+                continue;
+            }
+            let bytes_kept = self.files.values().filter_map(|e| e.bytes.as_ref()).map(|b| b.len() as u64).sum();
+            let entry = self.next(old, stamp, read, bytes_kept, (dir, name), &mut changed);
+            self.files.insert(key.to_owned(), entry);
+        }
+        changed
+    }
+
+    /// The names of the files that the reader keeps.
+    pub fn keys(&self) -> Vec<String> {
+        self.files.keys().cloned().collect()
+    }
+
+    /// The full scans and the file reads so far.
+    #[cfg(test)]
+    pub fn counts(&self) -> (u64, u64) {
+        (self.scans, self.reads)
+    }
+
+    /// The entry of a file with `stamp`, from its `old` entry. A kept file
+    /// also counts against the budget: one that no longer fits is dropped,
+    /// and one that fits again is read.
+    fn next(
+        &mut self,
+        old: Option<Entry>,
+        stamp: Stamp,
+        read: bool,
+        bytes_kept: u64,
+        (dir, name): (&OwnedFd, &str),
+        changed: &mut bool,
+    ) -> Entry {
+        let fits = bytes_kept + stamp.size <= READ_BYTES;
+        match old {
+            Some(old) if old.stamp == stamp && old.bytes.is_some() && fits => old,
+            Some(old) if old.stamp == stamp && old.bytes.is_none() && (old.tried || !(read && fits)) => old,
+            _ => {
+                *changed = true;
+                let tried = read && fits;
+                let bytes = tried.then(|| {
+                    self.reads += 1;
+                    read_at(dir, name)
+                });
+                // A file can grow between the stamp and the read.
+                let bytes = bytes.flatten().filter(|b| bytes_kept + b.len() as u64 <= READ_BYTES);
+                Entry { stamp, bytes, tried }
+            }
+        }
+    }
+
     pub fn room(&self) -> Room {
-        let files =
-            self.files.iter().map(|(name, (stamp, bytes))| (name.as_str(), (stamp.0, bytes.as_deref()))).collect();
+        let files = self
+            .files
+            .iter()
+            .map(|(name, entry)| (name.as_str(), (entry.stamp.modified.0, entry.bytes.as_deref())))
+            .collect();
         project(&files)
     }
 }
@@ -405,50 +507,6 @@ pub fn read_room(dir: &Path) -> Room {
     let mut reader = RoundReader::new(dir.to_owned());
     reader.refresh();
     reader.room()
-}
-
-/// Polls `dir` and sends the room each time it changes, and once at once.
-/// `extra` adds a value that also counts as a change, such as the state of
-/// an in-app run. Ends when `send` returns false.
-pub async fn watch<X: PartialEq + Send + 'static>(
-    dir: PathBuf,
-    mut extra: impl FnMut() -> X + Send + 'static,
-    mut send: impl FnMut(Room, &X) -> bool + Send + 'static,
-) {
-    let mut reader = RoundReader::new(dir);
-    let mut last: Option<(Room, X)> = None;
-    let mut poll = POLL;
-    loop {
-        let (r, room) = match tokio::task::spawn_blocking(move || {
-            let changed = reader.refresh();
-            let room = changed.then(|| reader.room());
-            (reader, room)
-        })
-        .await
-        {
-            Ok(done) => done,
-            Err(_) => return,
-        };
-        reader = r;
-        poll = if room.is_some() { POLL } else { (poll + POLL).min(POLL_SLOW) };
-        let x = extra();
-        let room = match (room, last.take()) {
-            (Some(room), _) => Some(room),
-            (None, Some((old, old_x))) if old_x != x => Some(old),
-            (None, Some(kept)) => {
-                last = Some(kept);
-                None
-            }
-            (None, None) => Some(Room::default()),
-        };
-        if let Some(room) = room {
-            if !send(room.clone(), &x) {
-                return;
-            }
-            last = Some((room, x));
-        }
-        tokio::time::sleep(poll).await;
-    }
 }
 
 impl Default for Room {
@@ -1797,7 +1855,7 @@ mod tests {
         reader.refresh();
         assert_eq!(reader.files.len(), READ_FILES);
         assert!(reader.files.keys().all(|k| k.starts_with("final-a") || k == "turns/plan-b.prompt.md"));
-        assert!(reader.files.get("turns/plan-b.prompt.md").is_none_or(|(_, b)| b.is_none()));
+        assert!(reader.files.get("turns/plan-b.prompt.md").is_none_or(|e| e.bytes.is_none()));
 
         // The bytes: five files of 7 MiB, of which four fit.
         let dir = temp_dir();
@@ -1806,7 +1864,7 @@ mod tests {
         }
         let mut reader = RoundReader::new(dir);
         reader.refresh();
-        let read: u64 = reader.files.values().filter_map(|(_, b)| b.as_ref()).map(|b| b.len() as u64).sum();
+        let read: u64 = reader.files.values().filter_map(|e| e.bytes.as_ref()).map(|b| b.len() as u64).sum();
         assert_eq!(read, 4 * (7 << 20));
         assert!(read <= READ_BYTES);
 
@@ -1822,9 +1880,35 @@ mod tests {
         std::fs::write(dir.join("final-a.json"), vec![b' '; 7 << 20]).unwrap();
         for _ in 0..3 {
             reader.refresh();
-            let read: u64 = reader.files.values().filter_map(|(_, b)| b.as_ref()).map(|b| b.len() as u64).sum();
+            let read: u64 = reader.files.values().filter_map(|e| e.bytes.as_ref()).map(|b| b.len() as u64).sum();
             assert!(read <= READ_BYTES);
         }
+    }
+
+    #[test]
+    fn a_scan_reads_only_known_files_and_stops_when_cancelled() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("turns")).unwrap();
+        for i in 0..=CANCEL_EVERY {
+            std::fs::write(dir.join(format!("notes-{i}.txt")), "x").unwrap();
+            std::fs::write(dir.join(format!("turns/notes-{i}.txt")), "x").unwrap();
+        }
+        let names = ["events.jsonl", "manifest.json", "turns/plan-opus.prompt.md"];
+        for name in names {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        // A prompt is only stat'ed: its content is not read.
+        let reads = names.iter().filter(|n| known(n) == Some(true)).count() as u64;
+        assert_eq!(reads, 2);
+        let mut reader = RoundReader::new(dir);
+        assert!(!reader.scan(&AtomicBool::new(true)));
+        assert_eq!(reader.counts(), (1, 0), "a cancelled scan reads nothing");
+        assert!(reader.files.is_empty());
+        assert!(reader.scan(&AtomicBool::new(false)));
+        assert_eq!(reader.counts(), (2, reads), "only the known files");
+        assert_eq!(reader.keys(), names.map(String::from));
+        assert!(!reader.scan(&AtomicBool::new(false)));
+        assert_eq!(reader.counts(), (3, reads), "no new content reads");
     }
 
     #[test]
@@ -1840,6 +1924,29 @@ mod tests {
         let room = read_room(&dir);
         assert!(room.stages.len() < 16);
         assert!(room.turns.len() <= 2);
+    }
+
+    #[test]
+    fn a_keyed_refresh_reads_only_its_files_and_matches_a_full_read() {
+        let dir = temp_dir();
+        copy(&sample(), &dir);
+        std::fs::write(dir.join("final-big.json"), vec![b' '; FILE_LIMIT as usize + 1]).unwrap();
+        let mut reader = RoundReader::new(dir.clone());
+        assert!(reader.refresh());
+        let (_, reads) = reader.counts();
+        // A file that is too large is not read again while its stamp stays.
+        assert!(!reader.refresh());
+        assert!(!reader.refresh_keys(["final-big.json"]));
+        assert_eq!(reader.counts(), (2, reads));
+
+        std::fs::remove_file(dir.join("final-sol.json")).unwrap();
+        let events = std::fs::read(dir.join("events.jsonl")).unwrap();
+        // The same size, another inode.
+        std::fs::write(dir.join("events.staged"), &events).unwrap();
+        std::fs::rename(dir.join("events.staged"), dir.join("events.jsonl")).unwrap();
+        assert!(reader.refresh_keys(["final-sol.json", "events.jsonl", "notes.txt"]));
+        assert_eq!(reader.counts(), (2, reads + 1));
+        assert_eq!(reader.room(), read_room(&dir));
     }
 
     #[test]

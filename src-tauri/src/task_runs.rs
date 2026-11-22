@@ -286,6 +286,11 @@ impl RunHandle {
         self.status.borrow().clone()
     }
 
+    /// The status, and each change of it.
+    pub fn status_rx(&self) -> watch::Receiver<Status> {
+        self.status.clone()
+    }
+
     /// Refuses a control that the run cannot do in its state.
     pub fn control(&self, control: Control) -> Result<()> {
         let status = self.status();

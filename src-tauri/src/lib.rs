@@ -16,6 +16,7 @@ mod netlog;
 mod network;
 mod preferences;
 mod proxy;
+mod room_watch;
 mod runtime;
 mod runtimes;
 mod secrets;
@@ -235,19 +236,25 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
         .on_window_event(|window, event| {
-            if let WindowEvent::Destroyed = event
-                && let Some(watches) = window.try_state::<folder_watch::FolderWatches>()
-            {
-                watches.drop_owner(window.label());
+            if let WindowEvent::Destroyed = event {
+                if let Some(watches) = window.try_state::<folder_watch::FolderWatches>() {
+                    watches.drop_owner(window.label());
+                }
+                if let Some(watches) = window.try_state::<room_watch::Watches>() {
+                    watches.drop_owner(window.label());
+                }
             }
         })
         // A reload, also after a crash of the web content process, loses the
         // React cleanup, so the watches of the old page end here.
         .on_page_load(|webview, payload| {
-            if payload.event() == PageLoadEvent::Started
-                && let Some(watches) = webview.try_state::<folder_watch::FolderWatches>()
-            {
-                watches.drop_owner(webview.label());
+            if payload.event() == PageLoadEvent::Started {
+                if let Some(watches) = webview.try_state::<folder_watch::FolderWatches>() {
+                    watches.drop_owner(webview.label());
+                }
+                if let Some(watches) = webview.try_state::<room_watch::Watches>() {
+                    watches.drop_owner(webview.label());
+                }
             }
         })
         .setup(|app| {
@@ -347,7 +354,7 @@ pub fn run() {
             });
             app.manage(host);
             app.manage(runtimes::Runtimes::new(data_dir));
-            app.manage(commands::tasks::Watches::default());
+            app.manage(room_watch::Watches::default());
             app.manage(folder_watch::FolderWatches::default());
             app.manage(editor_icons::EditorIcons::default());
             Ok(())

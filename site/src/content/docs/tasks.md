@@ -71,6 +71,24 @@ that recorded its agents and models still shows them. An older run that recorded
 only the kind, with no model details. A duo round folder from outside
 the app shows its own names with a generic icon and no model details.
 
+The room updates when a file of the round changes. It watches the round folder, its `turns` folder and the folder
+that contains the round. It reads again only the round files that changed, not other files in the folder. A burst of
+changes gives one update, at most 0.5 s after the first change. If the round folder or `turns` is removed or replaced,
+the room shows what is there and watches the new folder. Each time the room reads the whole folder, it also watches the
+folders again. While an agent of an external round writes its live output, the room checks that output about every
+0.5 s, because macOS can report no change while the agent keeps the file open. Other round files update by events.
+Every 30 seconds the room does a light check: it checks the
+two folders and the round files that it shows, and reads the whole folder again only if a folder changed. This finds a
+change that macOS did not report. The check also reads new live output. If the app cannot watch the round folder,
+`turns` or the folder that contains the round, the room does this check every 2 seconds and tries to watch again. The room reads at most 64 round files and 32 MiB. A file larger than 8 MiB is not read. A full
+read of a folder takes longer when the folder has many other files.
+
+If the round folder or `turns` is replaced by a different folder, the room reads nothing from the new folder until it
+reads it completely. Then it clears all live output and shows the live output of the new folder. When macOS reports
+that a round file was added, removed or renamed, the room reads only that file and the next light check does not read
+the whole folder again. A change that macOS did not report in the same moment can then wait until the next change of
+the folder. When an in-app run ends, the room keeps its last status.
+
 **Gates** shows the latest command output and exit codes. The timeline keeps a summary of each completed gate run.
 
 **Show the diff** shows the change of the run: the commits since the run started, then the diff. During a run, it
@@ -135,7 +153,7 @@ The button is not available, and shows why, in these cases:
 An A2A share of the stopped run does not move to the continuation. The continuation has a new A2A task ID. To share it,
 select **Share over A2A** in its room.
 
-**Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it. During an active stage, the room shows public live output from the checked-in Duo runner's Claude stream JSON files. It shows Codex JSON records only when the stream starts with a Codex thread or turn record at its beginning. Legacy Codex stderr shows a diagnostic label and fixed notices when a command runs or a patch applies; it never shows command text, output or reasoning. These notices are not agent replies or verdicts. A Codex stream opened in the middle shows only legacy notices. The room reads the latest 128 KiB when you open a long stream, starts at a complete record, and marks skipped history. It reads up to 64 KiB from each selected file per update. A live record larger than 32 KiB is skipped with a notice. A tool whose result is in that record shows as done. Long streams can clear earlier live output to bound memory. If one participant's file changes or its live history reaches the limit, only that participant's live output clears. A stage or participant change clears all live output. These changes do not affect the saved round result.
+**Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it. During an active stage, the room shows public live output from the checked-in Duo runner's Claude stream JSON files. It shows Codex JSON records only when the stream starts with a Codex thread or turn record at its beginning. Legacy Codex stderr shows a diagnostic label and fixed notices when a command runs or a patch applies; it never shows command text, output or reasoning. These notices are not agent replies or verdicts. A Codex stream opened in the middle shows only legacy notices. The room reads the latest 128 KiB when you open a long stream, starts at a complete record, and marks skipped history. It reads up to 64 KiB from each selected file per update, and continues with the next 64 KiB at the next update. A live record larger than 32 KiB is skipped with a notice. A tool whose result is in that record shows as done. Long streams can clear earlier live output to bound memory. If one participant's file changes or its live history reaches the limit, only that participant's live output clears. A stage or participant change clears all live output. These changes do not affect the saved round result.
 
 ## Share a run over A2A
 

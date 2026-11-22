@@ -247,11 +247,18 @@ pub struct Tick {
     pub reset: bool,
     pub reset_agents: BTreeSet<String>,
     pub records: Vec<(String, Value)>,
+    /// A source has more bytes than `TICK_BYTES` gave: tick again.
+    pub more: bool,
 }
 
 impl Tail {
     pub fn new() -> Self {
         Self { selected: Vec::new(), participants: Vec::new(), stage: None, cursors: BTreeMap::new() }
+    }
+
+    /// True while the active stage has live sources, also before their files exist.
+    pub fn is_live(&self) -> bool {
+        !self.selected.is_empty()
     }
 
     pub fn tick(&mut self, root: &Path, room: &Room) -> Tick {
@@ -261,6 +268,7 @@ impl Tail {
             reset: selected != self.selected || self.participants != room.participants || self.stage != stage,
             reset_agents: BTreeSet::new(),
             records: Vec::new(),
+            more: false,
         };
         if result.reset {
             self.cursors.clear();
@@ -304,6 +312,7 @@ impl Tail {
             let Ok(read) = file.read(&mut bytes) else { continue };
             bytes.truncate(read);
             cursor.offset += read as u64;
+            result.more |= meta.len() > cursor.offset;
             let read_start = cursor.offset - read as u64;
             cursor.modified = (meta.mtime(), meta.mtime_nsec());
             let start = cursor.offset.saturating_sub(OVERLAP);
@@ -903,9 +912,11 @@ mod tests {
         assert!(first.records.iter().any(|(_, r)| r.to_string().contains("skipped")));
         assert!(tail.cursors.values().all(|c| c.partial.len() <= LINE_BYTES));
         assert!(tail.cursors.values().all(|c| c.offset <= 1 + 100 + TICK_BYTES as u64 + 200));
+        assert!(first.more, "a backlog over TICK_BYTES asks for another tick");
         for _ in 0..3 {
             tail.tick(&dir, &room);
         }
+        assert!(!tail.tick(&dir, &room).more);
         assert!(
             tail.cursors
                 .values()

@@ -721,24 +721,21 @@ mod tests {
         // The room of the continuation, as `watch_room` sends it.
         let next = fresh.round_dir(&id, &task_id, "02").unwrap();
         let live = fresh.run_handle(&id, &task_id, "02").unwrap();
-        let (_recent, _records) = live.subscribe();
+        let watches = crate::room_watch::Watches::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let watch = tokio::spawn(crate::task_artifacts::watch(
-            next,
-            move || live.status().state,
-            move |room, state| tx.send((room, *state)).is_ok(),
-        ));
+        let token = watches.watch("main", next, Some(live), false, move |event| tx.send(event).is_ok());
         let (room, state) = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let (room, state) = rx.recv().await.unwrap();
-                if room.stages.iter().any(|s| s.id == "plan" && s.state == "active") {
-                    return (room, state);
+                if let crate::room_watch::RoomEvent::Room { room, run, .. } = rx.recv().await.unwrap()
+                    && room.stages.iter().any(|s| s.id == "plan" && s.state == "active")
+                {
+                    return (room, run.unwrap().state);
                 }
             }
         })
         .await
         .unwrap();
-        watch.abort();
+        watches.retire(token);
         assert!(state.is_live());
         let plan = room.stages.iter().find(|s| s.id == "plan").unwrap();
         assert_eq!(plan.label, "Plan (repeated)");
