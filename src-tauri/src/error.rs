@@ -49,6 +49,10 @@ pub enum Error {
     TaskRunning,
     #[error("run not found")]
     RunNotFound,
+    #[error("the run cannot resume: {0}")]
+    Resume(String),
+    #[error("The app could not read the run record ({0})")]
+    RunRecord(String),
     #[error("only a run of this app session can be shared")]
     RunNotShareable,
     #[error("the run cannot do this now: {0}")]

@@ -30,8 +30,6 @@ const SCAN_LIMIT: usize = 256 << 10;
 const PARSE_LIMIT: Duration = Duration::from_secs(5);
 /// The tools of pi in a read-only stage.
 const PI_READ_TOOLS: &str = "read,grep,find,ls";
-/// The tree of a repository with no commit: the base of a run that started there.
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// The start of each git script. `$1` is the folder that the check covers, `$2` is
 /// the run copy to skip, and `$3` is the base commit.
 const GIT_PRELUDE: &str = r#"scope=$1 art=$2 base=$3
@@ -90,6 +88,38 @@ xargs -0 -r -n1 sh -c '
   grep -Eq "^(error|fatal):" "$1"
   [ "$?" -eq 1 ]
 ' _ "$tmp/error" < "$tmp/paths" || exit 4
+"#;
+/// The snapshot script after `GIT_PRELUDE`: the HEAD, or the empty tree
+/// before the first commit, and the status, a NUL, then the bytes that the
+/// fence hashes. The NUL-framed list of untracked paths is followed by one
+/// content id per path in the same order, so a move of content between
+/// files changes the hash. It ends with code 4 when a git command fails or a path
+/// is gone. `--no-filters` keeps clean filters out of the content ids.
+const SNAPSHOT_SCRIPT: &str = r#"printf 'HEAD %s\n' "$(git rev-parse -q --verify HEAD || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+git status --porcelain=v1 -uall -- "$@" || exit 4
+printf '\0'
+git diff --binary -- "$@" || exit 4
+git diff --cached --binary -- "$@" || exit 4
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/zwinger-snapshot.XXXXXX") || exit 4
+trap 'rm -rf "$tmp"' EXIT
+git ls-files -o --exclude-standard -z -- "$@" > "$tmp/paths" || exit 4
+cat -- "$tmp/paths" || exit 4
+# A link has the id of its exact target bytes, as git stores it. The `x`
+# keeps the trailing newlines of the target from the command substitution. Any other path that is not a
+# file, such as a nested repository, has no content id and fails the snapshot.
+xargs -0 -r sh -c '
+  for path; do
+    if [ -L "$path" ]; then
+      target=$(readlink -n -- "$path" && printf x) || exit 1
+      printf %s "${target%x}" | git hash-object --stdin || exit 1
+    elif [ -f "$path" ]; then
+      git hash-object --no-filters -- "$path" || exit 1
+    else
+      exit 1
+    fi
+  done
+' _ < "$tmp/paths" || exit 4
+git ls-files -s -- "$@" || exit 4
 "#;
 const RETRY: &str = "\n\n---\n\nYour last reply had no valid JSON object. Do not do the work again. \
 Return only the JSON object that the Output section asks for, in a fenced ```json block.";
@@ -325,7 +355,7 @@ pub struct Shell {
 /// of both and of all changes, untracked files included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// The commit, or `EMPTY_TREE` before the first commit.
+    /// The commit, or the empty tree before the first commit.
     pub head: String,
     /// The line `HEAD <commit>`, then the porcelain status.
     pub status: String,
@@ -563,32 +593,38 @@ impl<R: SandboxRuntime> Exec<R> {
         }
     }
 
-    fn git_argv(&self, script: String, base: Option<&str>) -> [String; 7] {
+    /// `exclude` is the folder that git skips, below the work tree.
+    fn git_argv(&self, script: String, exclude: Option<&str>, base: Option<&str>) -> [String; 7] {
         [
             "/bin/sh".to_owned(),
             "-c".to_owned(),
             format!("{GIT_PRELUDE}{script}"),
             "zwinger".to_owned(),
             self.scope.clone(),
-            self.artifacts.clone().unwrap_or_default(),
+            exclude.unwrap_or_default().to_owned(),
             base.unwrap_or_default().to_owned(),
         ]
     }
 
-    /// The git state of the session folder.
-    pub async fn snapshot(&self, cancel: &mut watch::Receiver<bool>) -> Result<Snapshot, SnapshotError> {
-        let script = format!(
-            "printf 'HEAD %s\\n' \"$(git rev-parse -q --verify HEAD || echo {EMPTY_TREE})\"\n\
-             git status --porcelain=v1 -uall -- \"$@\" || exit 4\n\
-             printf '\\0'\n\
-             git diff --binary -- \"$@\" || exit 4\n\
-             git diff --cached --binary -- \"$@\" || exit 4\n\
-             git ls-files -o --exclude-standard -z -- \"$@\" | xargs -0 -r cat --\n\
-             git ls-files -s -- \"$@\" || exit 4"
-        );
+    /// The task folder: it holds the round copies of all runs of the task.
+    fn task_runs(&self) -> Option<&str> {
+        self.artifacts.as_deref().and_then(|a| a.rsplit_once('/')).map(|(task, _)| task)
+    }
+
+    /// The git state of the session folder, without the round copies of
+    /// all runs of the task, so a continuation compares the same files.
+    pub async fn task_snapshot(&self, cancel: &mut watch::Receiver<bool>) -> Result<Snapshot, SnapshotError> {
+        self.snapshot_without(self.task_runs(), cancel).await
+    }
+
+    async fn snapshot_without(
+        &self,
+        exclude: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Snapshot, SnapshotError> {
         let (mut status, mut hash, mut in_status) = (Vec::new(), Sha256::new(), true);
         let ran = self
-            .drive(&self.git_argv(script, None), b"", GIT_LIMIT, cancel, |mut bytes| {
+            .drive(&self.git_argv(SNAPSHOT_SCRIPT.to_owned(), exclude, None), b"", GIT_LIMIT, cancel, |mut bytes| {
                 if in_status {
                     match bytes.iter().position(|&b| b == 0) {
                         Some(i) => {
@@ -631,7 +667,7 @@ impl<R: SandboxRuntime> Exec<R> {
         let base = base.filter(|b| is_commit(b));
         let mut out = Vec::new();
         let ran = self
-            .drive(&self.git_argv(DIFF_SCRIPT.to_owned(), base), b"", GIT_LIMIT, cancel, |bytes| {
+            .drive(&self.git_argv(DIFF_SCRIPT.to_owned(), self.task_runs(), base), b"", GIT_LIMIT, cancel, |bytes| {
                 let room = DIFF_LIMIT.saturating_sub(out.len());
                 out.extend_from_slice(&bytes[..bytes.len().min(room)]);
             })
@@ -736,6 +772,9 @@ mod tests {
 
     use super::*;
 
+    /// The tree of a repository with no commit: the base of a run that started there.
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
     fn agent(kind: AgentKind, model: Option<&str>) -> TaskAgent {
         TaskAgent { kind, model: model.map(str::to_owned) }
     }
@@ -768,6 +807,53 @@ mod tests {
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "?? session/code.txt\n");
     }
 
+    #[test]
+    fn git_scope_excludes_every_round_copy_of_the_task() {
+        let exec = Exec {
+            runtime: crate::runtime::fake::FakeRuntime::default(),
+            vm: Arc::new(crate::runtime::fake::FakeVm { key: "s".into() }),
+            cwd: "/s".into(),
+            scope: "/s".into(),
+            artifacts: Some("/s/.zwinger/tasks/fix/02".into()),
+            pi_host: false,
+            gemini: None,
+            proxy: None,
+        };
+        assert_eq!(exec.task_runs(), Some("/s/.zwinger/tasks/fix"));
+        let repo = temp_repo("task-runs");
+        for run in ["01", "02"] {
+            let copy = repo.join(".zwinger/tasks/fix").join(run);
+            std::fs::create_dir_all(&copy).unwrap();
+            std::fs::write(copy.join("events.jsonl"), "round").unwrap();
+        }
+        std::fs::write(repo.join("code.txt"), "code").unwrap();
+        let task = repo.join(".zwinger/tasks/fix");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{GIT_PRELUDE}git status --porcelain=v1 -uall -- \"$@\""))
+            .arg("zwinger")
+            .arg(&repo)
+            .arg(&task)
+            .arg("")
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        assert_eq!(String::from_utf8(status.stdout).unwrap(), "?? code.txt\n");
+        let diff = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{GIT_PRELUDE}{DIFF_SCRIPT}"))
+            .arg("zwinger")
+            .arg(&repo)
+            .arg(&task)
+            .arg("")
+            .output()
+            .unwrap();
+        assert!(diff.status.success(), "{}", String::from_utf8_lossy(&diff.stderr));
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        assert!(diff.contains("code.txt"), "{diff}");
+        assert!(!diff.contains(".zwinger"), "{diff}");
+    }
+
     fn diff_command(repo: &std::path::Path, base: &str) -> std::process::Command {
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg(format!("{GIT_PRELUDE}{DIFF_SCRIPT}")).arg("zwinger").arg(repo).arg("").arg(base);
@@ -776,9 +862,107 @@ mod tests {
 
     fn temp_repo(name: &str) -> std::path::PathBuf {
         let repo = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&repo).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+        git_init(&repo);
         repo
+    }
+
+    fn git_init(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(path).status().unwrap().success());
+    }
+
+    fn snapshot_command(repo: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(format!("{GIT_PRELUDE}{SNAPSHOT_SCRIPT}")).arg("zwinger").arg(repo).arg("").arg("");
+        command
+    }
+
+    /// The SHA-256 of the bytes after the NUL, which the fence hashes.
+    fn untracked_digest(repo: &std::path::Path) -> [u8; 32] {
+        let output = snapshot_command(repo).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let nul = output.stdout.iter().position(|&b| b == 0).unwrap();
+        Sha256::digest(&output.stdout[nul + 1..]).into()
+    }
+
+    #[test]
+    fn the_snapshot_binds_each_untracked_name_to_its_content() {
+        assert!(SNAPSHOT_SCRIPT.contains(EMPTY_TREE));
+        let repo = temp_repo("snapshot-untracked");
+        std::fs::write(repo.join("a"), "X\nY\n").unwrap();
+        std::fs::write(repo.join("b"), "Z\n").unwrap();
+        let before = untracked_digest(&repo);
+        // The same bytes in the same order, but one line moved to the other file.
+        std::fs::write(repo.join("a"), "X\n").unwrap();
+        std::fs::write(repo.join("b"), "Y\nZ\n").unwrap();
+        assert_ne!(untracked_digest(&repo), before);
+
+        // A dangling link is content: its exact target bytes, with trailing newlines.
+        std::os::unix::fs::symlink("target", repo.join("link")).unwrap();
+        let with_link = untracked_digest(&repo);
+        std::fs::remove_file(repo.join("link")).unwrap();
+        std::os::unix::fs::symlink("target\n", repo.join("link")).unwrap();
+        let with_newline = untracked_digest(&repo);
+        assert_ne!(with_newline, with_link);
+        std::fs::remove_file(repo.join("link")).unwrap();
+        std::os::unix::fs::symlink("target\n\n", repo.join("link")).unwrap();
+        assert_ne!(untracked_digest(&repo), with_newline);
+        std::fs::remove_file(repo.join("link")).unwrap();
+        std::os::unix::fs::symlink("target", repo.join("link")).unwrap();
+        assert_eq!(untracked_digest(&repo), with_link);
+        // The id is the one git stores for the link.
+        let output = snapshot_command(&repo).output().unwrap();
+        let blob = std::process::Command::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(b"target")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains(String::from_utf8_lossy(&blob.stdout).trim()));
+    }
+
+    #[test]
+    fn the_snapshot_fails_when_the_listing_or_a_hash_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = temp_repo("snapshot-fail");
+        std::fs::write(repo.join("a"), "a").unwrap();
+        let bin = repo.join(".git/bin");
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("git");
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+if [ "$1" = ls-files ]; then
+  case " $* " in *" -o "*) exit 1 ;; esac
+fi
+PATH=$ORIGINAL_PATH exec git "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = std::env::var_os("PATH").unwrap();
+        let path = std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&original))).unwrap();
+        let output = snapshot_command(&repo).env("PATH", &path).env("ORIGINAL_PATH", &original).output().unwrap();
+        assert_eq!(output.status.code(), Some(4), "{}", String::from_utf8_lossy(&output.stderr));
+
+        // A nested repository has no content id, so it gives no hash.
+        git_init(&repo.join("nested"));
+        assert_eq!(snapshot_command(&repo).output().unwrap().status.code(), Some(4));
+        std::fs::remove_dir_all(repo.join("nested")).unwrap();
+        assert!(snapshot_command(&repo).output().unwrap().status.success());
+
+        // An untracked file that git cannot read gives no hash.
+        std::fs::set_permissions(repo.join("a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(repo.join("a")).is_err() {
+            assert_eq!(snapshot_command(&repo).output().unwrap().status.code(), Some(4));
+        }
+        std::fs::set_permissions(repo.join("a"), std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]

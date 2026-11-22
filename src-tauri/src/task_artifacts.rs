@@ -272,7 +272,9 @@ fn read_at(dir: &OwnedFd, name: &str) -> Option<Vec<u8>> {
 /// `Some(true)` reads it, `Some(false)` only keeps its name (a plan prompt
 /// names its agent), `None` skips it.
 fn known(key: &str) -> Option<bool> {
-    const ROOT: [&str; 10] = [
+    const ROOT: [&str; 12] = [
+        "run.json",
+        "checkpoint.json",
         "events.jsonl",
         "messages.jsonl",
         "manifest.json",
@@ -435,7 +437,20 @@ pub const NO_GIT_DIFF: &str = "The working dir is not a git work tree, so the ap
 
 /// The diff that the run saved after its last write stage.
 pub fn read_diff(dir: &Path) -> Option<String> {
-    let bytes = read_at(&nofollow_dir(dir)?, "diff.txt")?;
+    let fd = nofollow_dir(dir)?;
+    let checkpoint = read_at(&fd, "checkpoint.json").and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let name = match checkpoint.as_ref() {
+        Some(cp) if cp["artifacts"]["revision-diff.txt"].is_string() => "revision-diff.txt",
+        Some(cp) if cp["artifacts"]["implementation-diff.txt"].is_string() => "implementation-diff.txt",
+        Some(_) => return None,
+        None => "diff.txt",
+    };
+    let bytes = read_at(&fd, name)?;
+    if let Some(cp) = &checkpoint
+        && cp["artifacts"][name] != crate::task_recovery::digest(&bytes)
+    {
+        return None;
+    }
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -454,6 +469,8 @@ struct Event {
     at: String,
     kind: String,
     detail: String,
+    /// The run that this event came from, for an event that a continuation inherited.
+    inherited: Option<String>,
 }
 
 fn text(value: &Value) -> String {
@@ -480,13 +497,14 @@ fn summary(text: &str) -> String {
     }
 }
 
-fn stage_label(id: &str) -> String {
+pub(crate) fn stage_label(id: &str) -> String {
     match id.strip_prefix("exchange-") {
         Some(turn) => format!("Exchange {turn}"),
         None => match id {
             "crossreview" => "Cross review".to_owned(),
             "revision-gates" => "Revision gates".to_owned(),
             "final" => "Final review".to_owned(),
+            "settle" => "Result".to_owned(),
             other => {
                 let mut label = other.to_owned();
                 label[..1].make_ascii_uppercase();
@@ -498,7 +516,7 @@ fn stage_label(id: &str) -> String {
 
 /// The stage id of a `stage` event detail, such as `exchange turn 2` or
 /// `crossreview by sol`.
-fn stage_of(detail: &str) -> Option<String> {
+pub(crate) fn stage_of(detail: &str) -> Option<String> {
     if let Some(turn) = detail.strip_prefix("exchange turn ") {
         return turn.trim().parse::<u32>().ok().map(|n| format!("exchange-{n}"));
     }
@@ -523,13 +541,27 @@ fn turn_of(id: &str) -> u32 {
 }
 
 /// The sort key of a stage: its place and, for an exchange, its turn.
-fn stage_key(id: &str) -> (usize, u32) {
+pub(crate) fn stage_key(id: &str) -> (usize, u32) {
     (stage_index(id), turn_of(id))
 }
 
 /// `files` maps relative names to the mtime in seconds and the bytes, if read.
 fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
+    let checkpoint =
+        files.get("checkpoint.json").and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes.as_ref()?).ok());
+    let cleanup = checkpoint.as_ref().is_some_and(|c| c["cleaning"] == true);
+    let visible = |name: &str| {
+        !cleanup
+            || !(name == "gates.json"
+                || name == "revision-gates.json"
+                || name == "crossreview.json"
+                || name.starts_with("final-"))
+            || checkpoint.as_ref().is_some_and(|c| c["artifacts"][name].is_string())
+    };
     let json = |name: &str| -> Option<Value> {
+        if !visible(name) {
+            return None;
+        }
         let value: Value = serde_json::from_slice(files.get(name)?.1?).ok()?;
         value.is_object().then_some(value)
     };
@@ -542,11 +574,16 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         bytes
             .split(|&b| b == b'\n')
             .enumerate()
+            .take(if cleanup && name == "events.jsonl" {
+                checkpoint.as_ref().and_then(|c| c["events"].as_u64()).unwrap_or_default() as usize
+            } else {
+                usize::MAX
+            })
             .filter_map(|(i, line)| Some((i + 1, serde_json::from_slice::<Value>(line).ok()?)))
             .filter(|(_, value)| value.is_object())
             .collect()
     };
-    let mtime = |name: &str| files.get(name).map(|(secs, _)| iso(secs * 1000));
+    let mtime = |name: &str| visible(name).then(|| files.get(name).map(|(secs, _)| iso(secs * 1000))).flatten();
     let manifest = json("manifest.json");
 
     let mut agents: Vec<String> = Vec::new();
@@ -574,8 +611,27 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
     let events: Vec<Event> = lines("events.jsonl")
         .iter()
-        .map(|(line, e)| Event { line: *line, at: text(&e["at"]), kind: text(&e["kind"]), detail: text(&e["detail"]) })
+        .map(|(line, e)| Event {
+            line: *line,
+            at: text(&e["at"]),
+            kind: text(&e["kind"]),
+            detail: text(&e["detail"]),
+            inherited: e["inherited"].as_str().map(str::to_owned),
+        })
         .collect();
+    // A continuation names the run that it continues, and its first stage
+    // if the source started that stage before it stopped.
+    let repeated = json("run.json")
+        .filter(|r| r["continues"]["repeats"] == true)
+        .and_then(|r| r["continues"]["from"].as_str().map(str::to_owned));
+    let started_in = |inherited: bool| -> BTreeMap<String, String> {
+        events
+            .iter()
+            .filter(|e| e.kind == "stage" && e.inherited.is_some() == inherited)
+            .filter_map(|e| Some((stage_of(&e.detail)?, e.inherited.clone().unwrap_or_default())))
+            .collect()
+    };
+    let (inherited, own) = (started_in(true), started_in(false));
 
     // Stages, from the `stage` events.
     let mut started: Vec<(String, String)> = Vec::new();
@@ -617,8 +673,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             .map(|n| format!("exchange-{n}")),
     );
     // Older rounds have no second gate stage. Show it when a round starts it.
-    let revision_gates =
-        started.iter().any(|(id, _)| id == "revision-gates") || files.contains_key("revision-gates.json");
+    let revision_gates = started.iter().any(|(id, _)| id == "revision-gates")
+        || (visible("revision-gates.json") && files.contains_key("revision-gates.json"));
     ids.extend(STAGES[2..].iter().copied().filter(|id| *id != "revision-gates" || revision_gates).map(str::to_owned));
     let last = started.iter().map(|(s, _)| s).max_by_key(|s| stage_key(s)).cloned();
     let stages = ids
@@ -636,7 +692,13 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 (None, _) if ended.is_some() => "skipped",
                 (None, _) => "pending",
             };
-            Stage { id: id.clone(), label: stage_label(id), state, started: at }
+            let label = match inherited.get(id) {
+                Some(run) if !own.contains_key(id) => format!("{} (from run {run})", stage_label(id)),
+                Some(_) => format!("{} (repeated)", stage_label(id)),
+                None if repeated.as_deref() == Some(id) => format!("{} (repeated)", stage_label(id)),
+                None => stage_label(id),
+            };
+            Stage { id: id.clone(), label, state, started: at }
         })
         .collect();
 
@@ -842,7 +904,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
 
     let mut gates = Vec::new();
     for (stage, file) in [("gates", "gates.json"), ("revision-gates", "revision-gates.json")] {
-        if stage == "revision-gates" && !revision_gates {
+        if !visible(file) || (stage == "revision-gates" && !revision_gates) {
             continue;
         }
         gates = files
@@ -1113,6 +1175,99 @@ fn write_at(dir: &OwnedFd, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
+const DIR_FLAGS: OFlags = OFlags::RDONLY.union(OFlags::NOFOLLOW).union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
+
+/// The folder of `name` below `dir` and its file name. Only one folder
+/// level is allowed (`turns/`), and no link is followed.
+fn open_parent(dir: &Path, name: &str) -> rustix::io::Result<(OwnedFd, String)> {
+    let mut fd = rustix::fs::open(dir, DIR_FLAGS, Mode::empty())?;
+    let file = match name.split_once('/') {
+        Some((sub, file)) => {
+            if sub != TURNS_DIR {
+                return Err(rustix::io::Errno::INVAL);
+            }
+            fd = rustix::fs::openat(&fd, sub, DIR_FLAGS, Mode::empty())?;
+            file
+        }
+        None => name,
+    };
+    if file.is_empty() || file.contains('/') || file == "." || file == ".." {
+        return Err(rustix::io::Errno::INVAL);
+    }
+    Ok((fd, file.to_owned()))
+}
+
+/// Writes the file at once and makes it durable: the temp file is synced,
+/// renamed, then the folder is synced. Data over `FILE_LIMIT` is an error:
+/// this write never keeps only a start.
+fn write_durable_at(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.len() as u64 > FILE_LIMIT {
+        return Err(too_large(bytes.len() as u64));
+    }
+    let (fd, file) = open_parent(dir, name)?;
+    let tmp = format!("{file}.tmp~");
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let mut out = std::fs::File::from(rustix::fs::openat(&fd, tmp.as_str(), flags, Mode::from_raw_mode(0o644))?);
+    if !out.metadata()?.is_file() {
+        return Err(std::io::Error::other(format!("{tmp} is not a regular file")));
+    }
+    out.write_all(bytes)?;
+    out.sync_all()?;
+    rustix::fs::renameat(&fd, tmp.as_str(), &fd, file.as_str())?;
+    rustix::fs::fsync(&fd)?;
+    Ok(())
+}
+
+/// Adds a line to the file and makes it durable before it returns. A file
+/// over `FILE_LIMIT` gets no line.
+pub(crate) fn append_durable(dir: &Path, name: &str, value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string().into_bytes();
+    line.push(b'\n');
+    let (fd, file) = open_parent(dir, name)?;
+    let created =
+        matches!(rustix::fs::statat(&fd, file.as_str(), AtFlags::SYMLINK_NOFOLLOW), Err(rustix::io::Errno::NOENT));
+    let flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let mut out = std::fs::File::from(rustix::fs::openat(&fd, file.as_str(), flags, Mode::from_raw_mode(0o644))?);
+    let metadata = out.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!("{name} is not a regular file")));
+    }
+    let size = metadata.len() + line.len() as u64;
+    if size > FILE_LIMIT {
+        return Err(too_large(size));
+    }
+    out.write_all(&line)?;
+    out.sync_data()?;
+    if created {
+        rustix::fs::fsync(&fd)?;
+    }
+    Ok(())
+}
+
+/// A record of a round folder, such as `run.json` or `turns/plan-opus.json`:
+/// `None` if it does not exist. A link, a file that is not regular, or a
+/// file over `FILE_LIMIT` is an error.
+pub(crate) fn read_record(dir: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, String> {
+    let (fd, file) = match open_parent(dir, name) {
+        Ok(found) => found,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(format!("cannot open {name}: {e}")),
+    };
+    let stat = match rustix::fs::statat(&fd, file.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(format!("cannot read {name}: {e}")),
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!("{name} is not a regular file"));
+    }
+    if stat.st_size as u64 > FILE_LIMIT {
+        return Err(format!("{name} is larger than {} MiB", FILE_LIMIT >> 20));
+    }
+    read_at(&fd, &file).map(Some).ok_or_else(|| format!("cannot read {name}"))
+}
+
 /// The harness copy of a round: a trusted host root and the folders below
 /// it, which the guest can change.
 #[derive(Debug, Clone)]
@@ -1165,6 +1320,37 @@ impl RoundWriter {
         })
     }
 
+    /// The host folder of the round.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Writes a recovery record or an artifact that it names, durably and
+    /// whole. A failure also counts as a failed write of the round.
+    pub fn write_durable(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let written = write_durable_at(&self.dir, name, bytes);
+        let error = written.as_ref().err().map(|e| std::io::Error::new(e.kind(), e.to_string()));
+        self.record(&self.dir.join(name), written);
+        error.map_or(Ok(()), Err)
+    }
+
+    pub fn append_durable(&self, name: &str, value: &Value) -> std::io::Result<()> {
+        let written = append_durable(&self.dir, name, value);
+        let error = written.as_ref().err().map(|e| std::io::Error::new(e.kind(), e.to_string()));
+        self.record(&self.dir.join(name), written);
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Removes a file of the round. A missing file is not an error; another
+    /// failure counts as a failed write of the round.
+    pub fn remove(&self, name: &str) {
+        let path = self.dir.join(name);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            written => self.record(&path, written),
+        }
+    }
+
     /// Why the harness copy is not complete, if it is not.
     pub fn mirror_error(&self) -> Option<&str> {
         self.mirror_error.as_deref()
@@ -1175,10 +1361,20 @@ impl RoundWriter {
         self.failed.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
+    /// Keeps the first failed write. The first one also leaves a best-effort
+    /// `write-failed` line in the budget, so recovery refuses the round even
+    /// if the run stops before it records the failure.
     fn record(&self, path: &Path, written: std::io::Result<()>) {
-        if let Err(e) = written {
-            let why = format!("cannot write {}: {e}", path.display());
-            self.failed.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(why);
+        let Err(e) = written else { return };
+        let why = format!("cannot write {}: {e}", path.display());
+        let first = {
+            let mut failed = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+            let first = failed.is_none();
+            failed.get_or_insert(why);
+            first
+        };
+        if first {
+            let _ = append_durable(&self.dir, crate::task_recovery::BUDGET, &json!({ "kind": "write-failed" }));
         }
     }
 

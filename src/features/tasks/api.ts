@@ -18,6 +18,10 @@ export const removeTask = (sessionId: string, taskId: string) =>
 export const startTaskRun = (sessionId: string, taskId: string) =>
   call<string>("start_task_run", { sessionId, taskId });
 
+/** Continues an ended run in a new run. Resolves to the new run name. */
+export const resumeTaskRun = (sessionId: string, taskId: string, run: string) =>
+  call<string>("resume_task_run", { sessionId, taskId, run });
+
 export type RunControl =
   | { type: "message" | "answer"; text: string }
   | { type: "pause" | "resume" | "cancel" }
@@ -44,6 +48,13 @@ export interface RunSummary {
   stage: string | null;
   ship: boolean | null;
   started: string | null;
+  /** The run that this run continues. */
+  continues: string | null;
+  /** Whether an ended run can continue; null while the run is live. */
+  resume:
+    | { from: string; label: string; repeats: boolean; recheck: string | null }
+    | { unavailable: string }
+    | null;
 }
 
 /** The runs of the session's tasks, oldest first per task. */

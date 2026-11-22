@@ -22,6 +22,7 @@ mod session;
 mod store;
 mod task_agents;
 mod task_artifacts;
+mod task_recovery;
 mod task_runs;
 mod terminal;
 mod updates;
@@ -425,6 +426,7 @@ pub fn run() {
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,
+            commands::tasks::resume_task_run,
             commands::tasks::control_task_run,
             commands::tasks::list_task_runs,
             commands::tasks::run_diff,

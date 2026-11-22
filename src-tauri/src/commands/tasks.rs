@@ -33,6 +33,13 @@ pub async fn start_task_run(manager: Managed<'_>, session_id: String, task_id: S
     manager.start_task_run(&session_id, &task_id)
 }
 
+/// Continues an ended run in a new run. Resolves to the new run name.
+/// Async, so the run's task starts on the tokio runtime.
+#[tauri::command]
+pub async fn resume_task_run(manager: Managed<'_>, session_id: String, task_id: String, run: String) -> Result<String> {
+    manager.resume_task_run(&session_id, &task_id, &run)
+}
+
 #[tauri::command]
 pub fn control_task_run(
     manager: Managed<'_>,

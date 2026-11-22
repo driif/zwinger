@@ -43,7 +43,7 @@ is a violation. Outside a Git work tree, this check is not possible, and the run
 pushes.
 
 The Git check and the change view cover the session folder, even when the Git root is above it. If the working dir is
-in a mount, they cover the working dir in its Git repository instead. They exclude the run's round copy. If the VM
+in a mount, they cover the working dir in its Git repository instead. They exclude every round copy of the current task, so a continuation does not see the copy of its source. If the VM
 contains more than one session, the room shows a note when the run starts: the folder that the Git check covers, and
 that other sessions in the VM can see the task's files. The task form names those sessions.
 
@@ -61,11 +61,66 @@ verdicts and the degraded agents. During a run you can:
 **Gates** shows the latest command output and exit codes. The timeline keeps a summary of each completed gate run.
 
 **Show the diff** shows the change of the run: the commits since the run started, then the diff. During a run, it
-reads the working dir in the VM. After the implementation and after the revision, the run saves the change as
-`diff.txt` in its round. When the run has ended, the room shows this saved diff, also when the cage is stopped. A
-cancelled stage saves no diff. If git fails after the revision, `diff.txt` says so and keeps the last saved diff. For a run with no saved diff, the room reads the working dir if the cage runs.
+reads the working dir in the VM. After the implementation and after the revision, the run saves a separate diff
+and mirrors the latest one as `diff.txt`. When the run has ended, the room shows the diff named by its checkpoint,
+also when the cage is stopped. A cancelled stage saves no diff. If git fails after the revision, the saved revision
+diff says so and keeps the last saved diff. For a run with no saved diff, the room reads the working dir if the cage runs.
+Show the diff reads the working dir that the run recorded when it started, not the current working dir of the task.
 
-A cage stop cancels its runs. A run does not continue after an app restart.
+A cage stop cancels its runs.
+
+## Resume an ended run
+
+A run that stopped before its end can continue. This is also possible after an app restart. Open the room of the run
+and select **Resume from** _stage_. The button names the first stage that runs again.
+
+- The continuation is a new run. Its subtitle says `continues run <NN>`. The stopped run keeps its files and its
+  result.
+- The continuation uses the title, the request, the agents, the gates and the limits that the stopped run started
+  with. A task change after the stop does not change them. An agent with no model uses the default model of its CLI.
+- The completed stages do not run again. The room shows them as done, with `(from run <NN>)`. The continuation has
+  their results, the decisions, your messages and the advisory messages, and the change of the run starts at the same
+  commit.
+- The stage that was active when the run stopped runs again from its start. The room shows it with `(repeated)`. If
+  the run stopped during the parallel plans, the parallel final reviews or the gates, all of them run again. A stage
+  that did not start before the stop has no `(repeated)` mark.
+- The gates, the cross review and the final reviews after the last implementation or revision apply only to the files
+  that they checked. Before the continuation uses them, zwinger compares the commit, the index and the working files
+  with the state that each check saw. If they are different, if zwinger cannot read them, or if the working dir is not
+  in Git, the earliest affected check and the checks after it run again. The room shows the earliest check that may
+  repeat. The continuation removes their old results, so the room shows these stages as not done until they complete
+  again. The stopped run keeps its results. The round copies in `.zwinger/tasks/` do not count as a change.
+- If the run stopped after its final reviews but before it recorded its result, the button is **Resume from Result**.
+  If the files did not change, no agent and no gate runs again: the continuation records the result of the final
+  reviews of the stopped run. If one final reviewer did not approve, the result is no ship.
+- The implementation, the revision and the gates are not run exactly once. If the run stopped in one of them, the
+  agent or the gate starts again with the files as they are now. zwinger does not reset, check out, clean or apply a
+  diff to the working dir.
+- Open questions that did not get an answer before the stop are asked again. If zwinger recorded your answer to the
+  same questions before the stop, the continuation uses it and does not ask again. A selection of the implementer
+  before the stop stays.
+- Your messages and the advisory messages of the stopped run count against the limits of the continuation. zwinger
+  records each accepted message before it queues it. A message that the run accepted, but did not give to the agents
+  before the stop, still counts. It does not reach the agents of the continuation by itself. If an A2A tool sends the
+  same `messageId` with the same text to the continuation, the continuation applies it once, with no new charge. The
+  same `messageId` with a different text is an error. If the run stopped while it wrote a message to its record, only a
+  complete recorded message counts as applied: an accepted message that was not applied stays charged, and zwinger does
+  not restore its text.
+
+The button is not available, and shows why, in these cases:
+
+- The cage does not run. Start the cage first. The continuation uses the current folders and mounts of the cage, not
+  the ones at the time of the stop.
+- Another run of the same task is live. Wait until it ends, or cancel it.
+- A newer run already continues this run. Resume the newer run.
+- The run started before zwinger saved resume records. Start a new run.
+- The resume records of the run are damaged or missing, are from a different app version, or do not agree with the
+  run's files. The same applies when the run could not write its record, also if you cancelled it after that. Start a
+  new run.
+- The run completed all stages and recorded its result.
+
+An A2A share of the stopped run does not move to the continuation. The continuation has a new A2A task ID. To share it,
+select **Share over A2A** in its room.
 
 **Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it.
 
@@ -121,7 +176,8 @@ step). The room shows the message from `a2a` with the label **external · adviso
 stages show it in a separate section with a lower priority than your messages and the plan. An advisory message
 cannot answer open questions, select the implementer, cancel the run or approve a result. It counts against the same
 limits as your messages: 16 KiB per message, and 32 messages and 64 KiB per run. If you send the same `messageId` with
-the same text again, the run does not add it again. The same `messageId` with a different text is an error. An ended
+the same text again, the run applies it only once and does not charge it again. This is also true in a continuation of
+the run. The same `messageId` with a different text is an error. An ended
 run refuses each message, also a repeated one. If the run cannot write a message to its record, it refuses that message
 and each message after it, also a retry with the same `messageId`, with `UnsupportedOperationError`. The run then
 ends with `TASK_STATE_FAILED`.

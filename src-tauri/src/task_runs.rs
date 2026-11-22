@@ -5,14 +5,14 @@
 //! The agents never talk directly. The run is the broker: each reply becomes
 //! a message of the round, and the next stage's prompt includes it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::cli::{iso, now_ms};
@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::runtime::SandboxRuntime;
 use crate::session::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
-use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, TURNS};
+use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, TURNS, append_durable, read_record, stage_key};
+use crate::task_recovery::{self, Checkpoint, Decisions, Fence, Recovered};
 
 const PLAN: &str = include_str!("task_runs/prompts/plan.md");
 const EXCHANGE: &str = include_str!("task_runs/prompts/exchange.md");
@@ -32,10 +33,10 @@ const FINAL: &str = include_str!("task_runs/prompts/final.md");
 /// The live records of the active stage that a late room still gets.
 const RECENT: usize = 2000;
 const LIVE_QUEUE: usize = 1024;
-const MESSAGE_LIMIT: usize = 16 << 10;
+pub(crate) const MESSAGE_LIMIT: usize = 16 << 10;
 /// The user's messages and answers of a run, by count and by bytes.
-const MESSAGES_COUNT: usize = 32;
-const MESSAGES_BYTES: usize = 64 << 10;
+pub(crate) const MESSAGES_COUNT: usize = 32;
+pub(crate) const MESSAGES_BYTES: usize = 64 << 10;
 /// The transcript in a prompt keeps its newest part within this size.
 const TRANSCRIPT_LIMIT: usize = 48 << 10;
 const PROMPT_LIMIT: usize = 256 << 10;
@@ -139,6 +140,21 @@ struct Live {
     recent: Mutex<VecDeque<LiveRecord>>,
 }
 
+const DIFF_FAILED: &str = "The app could not save the diff after ";
+const LAST_DIFF: &str = " This is the last saved diff.\n\n";
+
+/// The last real diff in a saved `diff.txt`: the diff itself, or the
+/// last saved diff that a failed read kept. `None` with no git or no diff.
+fn last_diff(saved: &str) -> Option<String> {
+    if saved == NO_GIT_DIFF {
+        return None;
+    }
+    match saved.strip_prefix(DIFF_FAILED) {
+        Some(failed) => failed.split_once(LAST_DIFF).map(|(_, last)| last.to_owned()),
+        None => Some(saved.to_owned()),
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -177,27 +193,51 @@ impl Cancel {
     }
 }
 
-/// The messages of the user and of A2A clients that a run accepted.
-#[derive(Default)]
+/// The messages of the user and of A2A clients that a run accepted. Each
+/// one is durable in `budget.jsonl` of the round before it counts, so a
+/// continuation keeps the budget that the run used.
 struct Budget {
+    /// The round folder.
+    dir: PathBuf,
     count: usize,
     bytes: usize,
     /// The run accepts no more messages. Set under this lock when a cancel
     /// starts and at the end of the run, so a contribution is queued only
     /// while the run can apply it.
     closed: bool,
-    /// By A2A message id: the digest of its text, and true once it applied.
-    contributions: HashMap<String, ([u8; 32], bool)>,
+    /// By A2A message id: its digest and delivery state.
+    contributions: HashMap<String, (String, Delivery)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Reserved,
+    Queued,
+    Applied,
 }
 
 impl Budget {
-    fn take(&mut self, text: &str) -> Result<()> {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, count: 0, bytes: 0, closed: false, contributions: HashMap::new() }
+    }
+
+    /// Takes a message, or with `external` an A2A contribution and the
+    /// digest of its text. A failed write of the budget takes nothing.
+    fn take(&mut self, text: &str, external: Option<(&str, &str)>) -> Result<()> {
         if text.trim().is_empty() || text.len() > MESSAGE_LIMIT {
             return Err(Error::RunState("the message must have 1 to 16384 bytes"));
         }
         if self.count == MESSAGES_COUNT || self.bytes + text.len() > MESSAGES_BYTES {
             return Err(Error::RunState("the run has the limit of 32 messages and 64 KiB"));
         }
+        let line = match external {
+            None => json!({ "at": iso(now_ms()), "kind": "message", "bytes": text.len() }),
+            Some((id, digest)) => {
+                json!({ "at": iso(now_ms()), "kind": "external", "bytes": text.len(), "ref": id, "digest": digest })
+            }
+        };
+        append_durable(&self.dir, task_recovery::BUDGET, &line)
+            .map_err(|_| Error::RunState("the run cannot record the message"))?;
         self.count += 1;
         self.bytes += text.len();
         Ok(())
@@ -269,7 +309,7 @@ impl RunHandle {
             Control::PickImplementer { agent } if !status.pickable.contains(agent) => {
                 return Err(Error::RunState("only an agent with a plan can implement"));
             }
-            Control::Message { text } | Control::Answer { text } => lock(&self.budget).take(text)?,
+            Control::Message { text } | Control::Answer { text } => lock(&self.budget).take(text, None)?,
             Control::Cancel { reason } => self.stop(reason.clone()),
             Control::Contribute { .. } => return Err(Error::RunState("only an A2A share can contribute")),
             _ => {}
@@ -291,22 +331,26 @@ impl RunHandle {
     /// it fails. It shares the budget of the user's messages. A run that
     /// has ended or stops refuses each message, also a repeated one.
     pub fn contribute(&self, id: &str, text: &str) -> std::result::Result<Contribution, Refusal> {
-        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let digest = task_recovery::digest(text.as_bytes());
         let mut budget = lock(&self.budget);
         if budget.closed || self.cancel.is_set() || !self.status().state.is_live() {
             return Err(Refusal::Ended);
         }
-        if let Some((seen, applied)) = budget.contributions.get(id) {
-            return match (*seen == digest, *applied) {
-                (false, _) => Err(Refusal::Conflict),
-                (true, true) => Ok(Contribution::Applied),
-                (true, false) => Ok(Contribution::Pending),
-            };
+        if let Some((seen, state)) = budget.contributions.get(id) {
+            if *seen != digest {
+                return Err(Refusal::Conflict);
+            }
+            match state {
+                Delivery::Applied => return Ok(Contribution::Applied),
+                Delivery::Queued => return Ok(Contribution::Pending),
+                Delivery::Reserved => {}
+            }
+        } else {
+            budget.take(text, Some((id, &digest))).map_err(|e| match e {
+                Error::RunState(why) => Refusal::Invalid(why),
+                _ => Refusal::Invalid("the message is not valid"),
+            })?;
         }
-        budget.take(text).map_err(|e| match e {
-            Error::RunState(why) => Refusal::Invalid(why),
-            _ => Refusal::Invalid("the message is not valid"),
-        })?;
         let (applied, rx) = oneshot::channel();
         let control = Control::Contribute { id: id.to_owned(), text: text.to_owned(), applied };
         // The run closes the budget before it stops reading, so this send
@@ -314,7 +358,7 @@ impl RunHandle {
         if self.control.send(control).is_err() {
             return Err(Refusal::Ended);
         }
-        budget.contributions.insert(id.to_owned(), (digest, false));
+        budget.contributions.insert(id.to_owned(), (digest, Delivery::Queued));
         Ok(Contribution::Queued(rx))
     }
 
@@ -358,6 +402,16 @@ impl Registry {
     }
 
     pub fn start<R: SandboxRuntime>(&self, spec: Spec<R>) -> Arc<RunHandle> {
+        self.launch(spec, None)
+    }
+
+    /// Starts a continuation: a new run that takes over the state of an
+    /// ended run, and runs its groups from the first one that is not complete.
+    pub fn resume<R: SandboxRuntime>(&self, spec: Spec<R>, recovered: &Recovered) -> Arc<RunHandle> {
+        self.launch(spec, Some(recovered))
+    }
+
+    fn launch<R: SandboxRuntime>(&self, spec: Spec<R>, recovered: Option<&Recovered>) -> Arc<RunHandle> {
         let names = spec.task.agents.clone().map(|a| a.kind.name().to_owned());
         let (control, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(Status {
@@ -380,9 +434,9 @@ impl Registry {
             status,
             live: live.clone(),
             cancel: Arc::new(Cancel { flag: watch::channel(false).0, reason: Mutex::new(None) }),
-            budget: Arc::default(),
+            budget: Arc::new(Mutex::new(Budget::new(spec.writer.dir().to_owned()))),
         });
-        let actor = Actor {
+        let mut actor = Actor {
             io: Io {
                 exec: spec.exec,
                 task: spec.task,
@@ -397,12 +451,17 @@ impl Registry {
                 cancel: handle.cancel.clone(),
                 budget: handle.budget.clone(),
                 transcript: Vec::new(),
+                questions: None,
             },
             control: control_rx,
             run: Default::default(),
+            flow: Flow::default(),
             shared_vm: spec.shared_vm,
         };
-        tokio::spawn(actor.run());
+        if let Some(recovered) = recovered {
+            actor.restore(recovered);
+        }
+        tokio::spawn(actor.run(recovered.is_none()));
         let mut runs = lock(&self.runs);
         runs.retain(|r| !(r.session_id == handle.session_id && r.task_id == handle.task_id && r.run == handle.run));
         runs.push(handle.clone());
@@ -453,6 +512,8 @@ struct Book {
     budget: Arc<Mutex<Budget>>,
     /// The brokered messages of the round, in order.
     transcript: Vec<Entry>,
+    /// While the run waits: the digest of its open questions, for the answer.
+    questions: Option<String>,
 }
 
 /// The fixed sender of A2A contributions. A client cannot choose it, so it
@@ -500,11 +561,47 @@ struct Round {
     diff: Option<String>,
 }
 
+/// What the groups of the run made so far, for the next prompts. A
+/// continuation restores it from the checkpoint.
+#[derive(Default)]
+struct Flow {
+    /// The completed groups, in order.
+    done: Vec<String>,
+    /// By completed agent group: the agents that reported.
+    outcomes: BTreeMap<String, Vec<String>>,
+    /// The files that each completed check group saw.
+    fences: BTreeMap<String, Fence>,
+    /// The snapshot of the last read-only stage, if it was stable.
+    read_fence: Option<Fence>,
+    /// Dropped check files awaiting removal after a downgraded checkpoint.
+    cleanup: Vec<String>,
+    cleaning: bool,
+    /// The digests of the question sets that an inherited answer closed.
+    answered: Vec<String>,
+    /// By relative name: the digest of each artifact of the checkpoint.
+    artifacts: BTreeMap<String, String>,
+    /// The complete lines of `events.jsonl` at the last group boundary.
+    events: usize,
+    plans: [Option<Value>; 2],
+    turns: Vec<[Option<Value>; 2]>,
+    tiebreak: Option<Value>,
+    /// The plan that the implementer builds.
+    plan: String,
+    result: Option<Value>,
+    /// The latest gate results, for a prompt.
+    gates: String,
+    review: Option<Value>,
+    revision: Option<Value>,
+    /// The change that the cross review saw.
+    change: Option<String>,
+}
+
 struct Actor<R: SandboxRuntime> {
     io: Io<R>,
     book: Book,
     control: mpsc::UnboundedReceiver<Control>,
     run: Round,
+    flow: Flow,
     shared_vm: bool,
 }
 
@@ -596,8 +693,20 @@ impl Book {
 
     fn message(&mut self, kind: &'static str, text: String) {
         let stage = self.stage_id();
-        self.writer
-            .append("messages.jsonl", &json!({ "at": iso(now_ms()), "stage": stage, "kind": kind, "body": text }));
+        let mut line = json!({ "at": iso(now_ms()), "stage": stage, "kind": kind, "body": text });
+        if kind == "answer" {
+            line["questions"] = json!(self.questions);
+        }
+        let mut budget = lock(&self.budget);
+        let attempt = json!({ "kind": "apply-start", "digest": task_recovery::digest(text.as_bytes()) });
+        if self.writer.append_durable(task_recovery::BUDGET, &attempt).is_err()
+            || self.writer.append_durable("messages.jsonl", &line).is_err()
+            || self.writer.append_durable(task_recovery::BUDGET, &json!({ "kind": "apply-complete" })).is_err()
+        {
+            budget.closed = true;
+            return;
+        }
+        drop(budget);
         let label = if kind == "answer" { "answer" } else { "message" };
         self.add([Entry {
             from: "user".to_owned(),
@@ -619,9 +728,13 @@ impl Book {
         let line = json!({ "at": iso(now_ms()), "stage": stage, "kind": "external", "from": EXTERNAL, "ref": id, "body": text });
         let shared = self.budget.clone();
         let mut budget = lock(&shared);
-        if self.writer.failure().is_some() || !self.writer.append("messages.jsonl", &line) {
+        let attempt = json!({ "kind": "apply-start", "ref": id });
+        if self.writer.failure().is_some()
+            || self.writer.append_durable(task_recovery::BUDGET, &attempt).is_err()
+            || self.writer.append_durable("messages.jsonl", &line).is_err()
+            || self.writer.append_durable(task_recovery::BUDGET, &json!({ "kind": "apply-complete" })).is_err()
+        {
             budget.closed = true;
-            budget.contributions.remove(&id);
             return;
         }
         self.add([Entry {
@@ -633,7 +746,7 @@ impl Book {
             stage,
         }]);
         if let Some(entry) = budget.contributions.get_mut(&id) {
-            entry.1 = true;
+            entry.1 = Delivery::Applied;
         }
         let _ = applied.send(());
     }
@@ -710,7 +823,7 @@ impl<R: SandboxRuntime> Io<R> {
     }
 
     async fn snapshot(&self) -> std::result::Result<task_agents::Snapshot, SnapshotError> {
-        self.exec.snapshot(&mut self.cancel.clone()).await
+        self.exec.task_snapshot(&mut self.cancel.clone()).await
     }
 
     /// The change since `base`, for the review prompts.
@@ -733,8 +846,13 @@ impl<R: SandboxRuntime> Io<R> {
 }
 
 impl<R: SandboxRuntime> Actor<R> {
-    async fn run(mut self) {
-        let end = self.drive().await;
+    /// A new run makes its empty checkpoint durable before its first
+    /// event, so a missing checkpoint later means lost state.
+    async fn run(mut self, new: bool) {
+        let end = match if new { self.checkpoint(None, &[]) } else { Ok(()) } {
+            Ok(()) => self.drive().await,
+            failed => failed,
+        };
         self.settle(end);
     }
 
@@ -803,8 +921,14 @@ impl<R: SandboxRuntime> Actor<R> {
         }
     }
 
-    async fn run_gates(&mut self, stage: &str) -> std::result::Result<String, Stop> {
+    /// The gates of `stage` (`gates` or `revision-gates`). Their results
+    /// are the gate text of the next prompts.
+    async fn gates(&mut self, stage: &str) -> std::result::Result<(), Stop> {
+        if self.done(stage) {
+            return Ok(());
+        }
         self.stage(stage, stage)?;
+        let before = self.io.exec.task_snapshot(&mut self.io.cancel.clone()).await.ok();
         let io = &self.io;
         let mut results = Vec::new();
         for gate in &io.task.gates {
@@ -823,12 +947,18 @@ impl<R: SandboxRuntime> Actor<R> {
         let results = Value::Array(results);
         self.book.writer.write_json(&format!("{stage}.json"), &results);
         self.book.writer.event("gates", &format!("{passed} of {total} passed"));
-        self.boundary().await?;
-        Ok(if total == 0 {
-            "The task has no gates.".to_owned()
-        } else {
-            format!("```json\n{}\n```", serde_json::to_string_pretty(&results).unwrap_or_default())
-        })
+        self.flow.gates = gates_text(&results);
+        let after = self.io.exec.task_snapshot(&mut self.io.cancel.clone()).await.ok();
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        if let (Some(before), Some(after)) = (before, after)
+            && before == after
+        {
+            self.flow.fences.insert(stage.to_owned(), Self::fence_of(&after));
+        }
+        self.checkpoint(Some(stage), &[format!("{stage}.json")])?;
+        self.boundary().await
     }
 
     /// Starts a stage: its event, its status, and a clean live stream.
@@ -877,7 +1007,8 @@ impl<R: SandboxRuntime> Actor<R> {
     }
 
     /// Waits until the user answers the open questions.
-    async fn wait_answers(&mut self, questions: &[String]) -> std::result::Result<(), Stop> {
+    async fn wait_answers(&mut self, questions: &[String], asked: String) -> std::result::Result<(), Stop> {
+        self.book.questions = Some(asked);
         self.book.writer.write("open-questions.txt", questions.join("\n").as_bytes());
         self.book.writer.event("waiting", &format!("open questions: {}", questions.len()));
         self.book.set(|s| s.state = RunState::Waiting);
@@ -893,6 +1024,7 @@ impl<R: SandboxRuntime> Actor<R> {
                 return Err(Stop::Cancelled);
             }
         }
+        self.book.questions = None;
         self.book.writer.event("answered", "by the user");
         self.book.set(|s| s.state = RunState::Running);
         Ok(())
@@ -924,8 +1056,9 @@ impl<R: SandboxRuntime> Actor<R> {
     }
 
     /// Runs read-only work and reports a change of the repository that the
-    /// check saw meanwhile. It does not know who made the change.
-    async fn read_only<T>(&mut self, stage: &str, work: impl AsyncFnOnce(&Io<R>) -> T) -> T {
+    /// check saw meanwhile. It does not know who made the change. The base
+    /// that the first check finds is durable before the work starts.
+    async fn read_only<T>(&mut self, stage: &str, work: impl AsyncFnOnce(&Io<R>) -> T) -> std::result::Result<T, Stop> {
         let before = self.io.snapshot().await;
         if let Ok(snapshot) = &before
             && self.run.base.is_none()
@@ -934,6 +1067,7 @@ impl<R: SandboxRuntime> Actor<R> {
             self.run.base = Some(snapshot.head.clone());
             let base = self.run.base.clone();
             self.book.set(|s| s.base = base);
+            self.checkpoint(None, &[])?;
         }
         let out = during(&mut self.book, &mut self.control, &self.io.names, work(&self.io)).await;
         let check = match before {
@@ -945,12 +1079,15 @@ impl<R: SandboxRuntime> Actor<R> {
             Err(e) => Err(e),
         };
         if self.book.cancelled() {
-            return out;
+            return Ok(out);
         }
+        self.flow.read_fence = None;
         match check {
             Ok((before, after)) => {
                 self.run.detection = Some(true);
-                if before.hash != after.hash {
+                if before == after {
+                    self.flow.read_fence = Some(Self::fence_of(&after));
+                } else {
                     let mut changed: Vec<&str> =
                         after.status.lines().filter(|l| !before.status.lines().any(|b| b == *l)).collect();
                     changed.extend(before.status.lines().filter(|l| !after.status.lines().any(|a| a == *l)));
@@ -970,7 +1107,7 @@ impl<R: SandboxRuntime> Actor<R> {
             }
             Err(SnapshotError::NotGit) => {}
         }
-        out
+        Ok(out)
     }
 
     fn violation(&mut self, detail: String) {
@@ -978,11 +1115,332 @@ impl<R: SandboxRuntime> Actor<R> {
         self.run.violations.push(detail);
     }
 
-    async fn drive(&mut self) -> std::result::Result<(), Stop> {
-        let a = self.name(0);
-        self.book.writer.write("task.md", format!("# {}\n\n{}\n", self.io.task.title, self.io.task.request).as_bytes());
+    fn done(&self, group: &str) -> bool {
+        self.flow.done.iter().any(|g| g == group)
+    }
 
-        // 1. Blind plans, in parallel.
+    /// Marks `group` complete, or with `None` only saves the decisions, and
+    /// makes the checkpoint durable with the digests of `files`. The files
+    /// are made durable first. A round with a failed write cannot mark a
+    /// group complete, and a failed checkpoint write fails the run.
+    fn checkpoint(&mut self, group: Option<&str>, files: &[String]) -> std::result::Result<(), Stop> {
+        let writer = &self.book.writer;
+        let failed = || Stop::Failed(writer.failure().unwrap_or_else(|| "cannot write the checkpoint".to_owned()));
+        if writer.failure().is_some() {
+            return Err(failed());
+        }
+        for name in files {
+            let bytes = match read_record(writer.dir(), name) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Err(Stop::Failed(format!("{name} is missing at the checkpoint"))),
+                Err(why) => return Err(Stop::Failed(why)),
+            };
+            writer.write_durable(name, &bytes).map_err(|_| failed())?;
+            self.flow.artifacts.insert(name.clone(), task_recovery::digest(&bytes));
+        }
+        // A checkpoint inside a group keeps the events of the last boundary,
+        // so a continuation does not inherit the start of a partial group.
+        if let Some(group) = group {
+            self.flow.events = match read_record(writer.dir(), "events.jsonl") {
+                Ok(bytes) => bytes.unwrap_or_default().iter().filter(|&&b| b == b'\n').count(),
+                Err(why) => return Err(Stop::Failed(why)),
+            };
+            self.flow.done.push(group.to_owned());
+        }
+        let checkpoint = Checkpoint {
+            groups: self.flow.done.clone(),
+            outcomes: self.flow.outcomes.clone(),
+            decisions: self.decisions(),
+            artifacts: self.flow.artifacts.clone(),
+            events: self.flow.events,
+            fences: self.flow.fences.clone(),
+            cleanup: self.flow.cleanup.clone(),
+            cleaning: self.flow.cleaning,
+            ..Checkpoint::empty()
+        };
+        let bytes = serde_json::to_vec_pretty(&checkpoint).map_err(|e| Stop::Failed(e.to_string()))?;
+        let writer = &self.book.writer;
+        writer
+            .write_durable(task_recovery::CHECKPOINT, &bytes)
+            .map_err(|_| Stop::Failed(writer.failure().unwrap_or_else(|| "cannot write the checkpoint".to_owned())))
+    }
+
+    fn decisions(&self) -> Decisions {
+        let names = &self.io.names;
+        let status = self.book.status.borrow();
+        Decisions {
+            planned: self.run.planned.iter().map(|&i| names[i].clone()).collect(),
+            picked: status.picked.clone().filter(|_| status.decided),
+            implementer: self.run.implementer.map(|i| names[i].clone()),
+            verdict: self.run.verdict.clone(),
+            base: self.run.base.clone(),
+            detection: self.run.detection,
+            backlog: self.run.backlog.clone(),
+            violations: self.run.violations.clone(),
+        }
+    }
+
+    /// Takes over the state of an ended run: the completed groups, their
+    /// decisions and artifacts, the transcript, the messages and the budget.
+    fn restore(&mut self, recovered: &Recovered) {
+        let checkpoint = &recovered.checkpoint;
+        let decisions = &checkpoint.decisions;
+        let names = self.io.names.clone();
+        let index = |name: &String| names.iter().position(|n| n == name);
+        let json = |name: &str| recovered.artifacts.get(name).and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        let done = |group: &str| checkpoint.groups.iter().any(|g| g == group);
+        self.flow.done = checkpoint.groups.clone();
+        self.flow.outcomes = checkpoint.outcomes.clone();
+        self.flow.fences = checkpoint.fences.clone();
+        self.flow.cleanup = checkpoint.cleanup.clone();
+        self.flow.cleaning = checkpoint.cleaning;
+        self.flow.artifacts = checkpoint.artifacts.clone();
+        self.flow.events = checkpoint.events;
+        self.run.planned = decisions.planned.iter().filter_map(index).collect();
+        self.run.implementer = decisions.implementer.as_ref().and_then(index);
+        self.run.verdict = decisions.verdict.clone();
+        self.run.base = decisions.base.clone();
+        self.run.detection = decisions.detection;
+        self.run.backlog = decisions.backlog.clone();
+        self.run.violations = decisions.violations.clone();
+
+        let mut entries = Vec::new();
+        if done("plan") {
+            self.flow.plans = names.clone().map(|n| json(&format!("turns/plan-{n}.json")));
+            entries.extend(opening(&names, &self.flow.plans));
+        }
+        for turn in (1..).take_while(|n| done(&format!("exchange-{n}"))) {
+            let replies = names.clone().map(|n| json(&format!("turns/t{turn}-{n}.json")));
+            entries.extend(turn_entries(&names, turn, &replies));
+            self.flow.turns.push(replies);
+        }
+        if done("tiebreak") {
+            self.flow.tiebreak = json("tiebreak.json");
+            if let Some(t) = &self.flow.tiebreak
+                && let Some(pick) = index(&text(&t["implementer"]))
+            {
+                entries.push(tiebreak_entry(&names, pick, t));
+            }
+        }
+        if let Some(plan) = recovered.artifacts.get("plan.md") {
+            self.flow.plan = String::from_utf8_lossy(plan).into_owned();
+        }
+        self.flow.result = json("implementation.json");
+        let diff = if done("revise") { "revision-diff.txt" } else { "implementation-diff.txt" };
+        self.run.diff = recovered.artifacts.get(diff).and_then(|b| last_diff(&String::from_utf8_lossy(b)));
+        self.flow.gates = gate_result(done).and_then(json).as_ref().map(gates_text).unwrap_or_default();
+        self.flow.review = json("crossreview.json");
+        self.flow.revision = json("revision.json");
+        let finals = checkpoint.outcomes.get("final").filter(|_| done("final")).into_iter().flatten();
+        self.run.finals = finals.filter_map(|n| Some((index(n)?, json(&format!("final-{n}.json"))?))).collect();
+
+        // The budget of the source is the start of this budget. An accepted
+        // contribution with no message line stays reserved: a retry with the
+        // same id and text applies it once, with no new charge.
+        let mut budget = lock(&self.book.budget);
+        for line in recovered.ledger.iter().filter(|l| l["kind"] == "message" || l["kind"] == "external") {
+            budget.count += 1;
+            budget.bytes += line["bytes"].as_u64().unwrap_or_default() as usize;
+            if let (Some(id), Some(digest)) = (line["ref"].as_str(), line["digest"].as_str()) {
+                let applied = recovered.messages.iter().any(|m| m["kind"] == "external" && m["ref"] == id);
+                budget.contributions.insert(
+                    id.to_owned(),
+                    (digest.to_owned(), if applied { Delivery::Applied } else { Delivery::Reserved }),
+                );
+            }
+        }
+        drop(budget);
+        // The messages of the source are the applied ones: each one has its line.
+        for line in &recovered.messages {
+            let body = text(&line["body"]);
+            let stage = text(&line["stage"]);
+            let (from, kind, title) = match line["kind"].as_str() {
+                Some("external") => (EXTERNAL, "external", format!("advisory message, during {stage}")),
+                Some("answer") => {
+                    self.flow.answered.push(text(&line["questions"]));
+                    ("user", "answer", format!("answer, during {stage}"))
+                }
+                _ => ("user", "user", format!("message, during {stage}")),
+            };
+            entries.push(Entry { from: from.to_owned(), to: "all".to_owned(), kind, stage, title, body });
+        }
+        entries.sort_by_key(|e| stage_key(&e.stage));
+        self.book.add(entries);
+
+        let pickable: Vec<String> = self.run.planned.iter().map(|&i| names[i].clone()).collect();
+        let decided = done("decision");
+        // A message before the first stage of the continuation names the last completed stage.
+        let stage = checkpoint.groups.iter().rev().find(|g| *g != "decision").cloned();
+        let picked = if decided { decisions.picked.clone() } else { recovered.picked() };
+        let base = self.run.base.clone();
+        self.book.set(|s| {
+            s.pickable = pickable;
+            s.decided = decided;
+            s.picked = picked;
+            s.base = base;
+            s.stage = stage;
+        });
+    }
+
+    /// The agents of `group` that reported, for the checkpoint.
+    fn outcome(&mut self, group: &str, reported: impl IntoIterator<Item = usize>) {
+        let names = reported.into_iter().map(|i| self.name(i)).collect();
+        self.flow.outcomes.insert(group.to_owned(), names);
+    }
+
+    fn fence_of(snapshot: &task_agents::Snapshot) -> Fence {
+        Fence { head: snapshot.head.clone(), hash: task_recovery::digest(&snapshot.hash) }
+    }
+
+    /// A continuation reuses the checks after the last write stage only if
+    /// the files are the ones that they saw. Else it drops those groups
+    /// and their results, so they run again. The next write stage needs
+    /// no check: the checks after it run anyway.
+    async fn revalidate(&mut self) -> std::result::Result<(), Stop> {
+        if self.flow.cleaning {
+            self.finish_cleanup()?;
+        }
+        if task_recovery::first_check(&self.current_checkpoint()).is_none() {
+            return Ok(());
+        }
+        let current = self.io.exec.task_snapshot(&mut self.io.cancel.clone()).await.ok().map(|s| Self::fence_of(&s));
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let Some(first) = task_recovery::first_invalid(&self.current_checkpoint(), current.as_ref()) else {
+            return Ok(());
+        };
+        let first_index = self.flow.done.iter().position(|g| g == &first).unwrap_or_default();
+        let (kept_events, cut) = self.event_prefix(&first)?;
+        let dropped = self.flow.done.split_off(first_index);
+        self.flow.events = cut;
+        self.flow.cleaning = true;
+        let writer = &self.book.writer;
+        for group in &dropped {
+            let reported = self.flow.outcomes.remove(group).unwrap_or_default();
+            let files = match group.as_str() {
+                "crossreview" => vec!["crossreview.json".to_owned()],
+                "final" => reported.iter().map(|n| format!("final-{n}.json")).collect(),
+                gates => vec![format!("{gates}.json")],
+            };
+            for file in files {
+                self.flow.artifacts.remove(&file);
+                self.flow.cleanup.push(file);
+            }
+            self.flow.fences.remove(group);
+        }
+        if dropped.iter().any(|g| g == "crossreview") {
+            self.run.verdict = None;
+            self.flow.review = None;
+            self.flow.change = None;
+        }
+        self.flow.gates = match gate_result(|g| self.flow.done.iter().any(|d| d == g)) {
+            Some(name) => {
+                let bytes = read_record(writer.dir(), name).map_err(Stop::Failed)?;
+                let Some(bytes) = bytes.filter(|b| self.flow.artifacts.get(name) == Some(&task_recovery::digest(b)))
+                else {
+                    return Err(Stop::Failed(format!("{name} changed after the checkpoint")));
+                };
+                serde_json::from_slice(&bytes).ok().as_ref().map(gates_text).unwrap_or_default()
+            }
+            None => String::new(),
+        };
+        self.run.finals.clear();
+        let stage = self.flow.done.iter().rev().find(|g| *g != "decision").cloned();
+        self.book.set(|s| s.stage = stage);
+        let labels: Vec<String> = dropped.iter().map(|g| crate::task_artifacts::stage_label(g)).collect();
+        // The reduced checkpoint is authoritative before any old event or
+        // result is removed. A crash can therefore resume the cleanup.
+        self.checkpoint(None, &[])?;
+        self.finish_cleanup_with(&kept_events, &labels)
+    }
+
+    fn current_checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            groups: self.flow.done.clone(),
+            outcomes: self.flow.outcomes.clone(),
+            decisions: self.decisions(),
+            artifacts: self.flow.artifacts.clone(),
+            events: self.flow.events,
+            fences: self.flow.fences.clone(),
+            cleanup: self.flow.cleanup.clone(),
+            cleaning: self.flow.cleaning,
+            ..Checkpoint::empty()
+        }
+    }
+
+    fn event_prefix(&self, group: &str) -> std::result::Result<(Vec<u8>, usize), Stop> {
+        let writer = &self.book.writer;
+        let bytes = read_record(writer.dir(), "events.jsonl").map_err(Stop::Failed)?.unwrap_or_default();
+        let lines: Vec<&[u8]> = bytes.split_inclusive(|&b| b == b'\n').collect();
+        let starts = |line: &&[u8]| {
+            serde_json::from_slice::<Value>(line).is_ok_and(|e| {
+                e["kind"] == "stage" && crate::task_artifacts::stage_of(&text(&e["detail"])).as_deref() == Some(group)
+            })
+        };
+        let cut = lines.iter().position(starts).unwrap_or(self.flow.events);
+        Ok((lines[..cut].concat(), cut))
+    }
+
+    fn finish_cleanup(&mut self) -> std::result::Result<(), Stop> {
+        let bytes = read_record(self.book.writer.dir(), "events.jsonl").map_err(Stop::Failed)?.unwrap_or_default();
+        let kept: Vec<u8> = bytes.split_inclusive(|&b| b == b'\n').take(self.flow.events).flatten().copied().collect();
+        self.finish_cleanup_with(&kept, &[])
+    }
+
+    fn finish_cleanup_with(&mut self, kept: &[u8], labels: &[String]) -> std::result::Result<(), Stop> {
+        let writer = &self.book.writer;
+        writer
+            .write_durable("events.jsonl", kept)
+            .map_err(|_| Stop::Failed(writer.failure().unwrap_or_else(|| "cannot write events.jsonl".to_owned())))?;
+        for file in &self.flow.cleanup {
+            writer.remove(file);
+        }
+        if let Some(why) = writer.failure() {
+            return Err(Stop::Failed(why));
+        }
+        if !labels.is_empty() {
+            writer.event(
+                "files_changed",
+                &format!("the files changed after the checks, so these stages run again: {}", labels.join(", ")),
+            );
+        }
+        self.flow.cleanup.clear();
+        self.flow.cleaning = false;
+        self.checkpoint(None, &[])
+    }
+
+    /// The groups of the run, in order. Each group runs, or a continuation
+    /// has it from the checkpoint. A partial group runs again in full.
+    async fn drive(&mut self) -> std::result::Result<(), Stop> {
+        self.book.writer.write("task.md", format!("# {}\n\n{}\n", self.io.task.title, self.io.task.request).as_bytes());
+        self.revalidate().await?;
+        if self.done("plan") && self.shared_vm {
+            let note = shared_vm_note(&self.io.exec.scope);
+            self.book.writer.event("shared_vm", &note);
+        }
+        self.plan().await?;
+        let agreed = self.exchange().await?;
+        let agreed = self.tiebreak(agreed).await?;
+        let implementer = self.decide(agreed).await?;
+        self.implement(implementer).await?;
+        self.gates("gates").await?;
+        self.crossreview(implementer).await?;
+        if self.run.verdict.as_deref() == Some("revise") {
+            self.revise(implementer).await?;
+            // The write stage can change files even if it returns no report.
+            if !self.io.task.gates.is_empty() {
+                self.gates("revision-gates").await?;
+            }
+        }
+        self.finals().await
+    }
+
+    /// 1. Blind plans, in parallel.
+    async fn plan(&mut self) -> std::result::Result<(), Stop> {
+        if self.done("plan") {
+            return Ok(());
+        }
         self.stage("plan", "plan")?;
         if self.shared_vm {
             let note = shared_vm_note(&self.io.exec.scope);
@@ -1003,7 +1461,7 @@ impl<R: SandboxRuntime> Actor<R> {
         for (name, prompt) in self.io.names.iter().zip(&prompts) {
             self.book.writer.write(&format!("turns/plan-{name}.prompt.md"), prompt.as_bytes());
         }
-        let replies = self.read_only("plan", async |io: &Io<R>| io.both("plan", &prompts).await).await;
+        let replies = self.read_only("plan", async |io: &Io<R>| io.both("plan", &prompts).await).await?;
         let mut plans: [Option<Value>; 2] = [None, None];
         for (i, reply) in replies.into_iter().enumerate() {
             let name = self.name(i);
@@ -1024,124 +1482,181 @@ impl<R: SandboxRuntime> Actor<R> {
         let pickable: Vec<String> = self.run.planned.iter().map(|&i| self.name(i)).collect();
         self.book.set(|s| s.pickable = pickable);
         self.book.add(opening(&self.io.names, &plans));
-        self.boundary().await?;
+        self.flow.plans = plans;
+        self.outcome("plan", self.run.planned.clone());
+        let files: Vec<String> =
+            self.run.planned.iter().map(|&i| format!("turns/plan-{}.json", self.name(i))).collect();
+        self.checkpoint(Some("plan"), &files)?;
+        self.boundary().await
+    }
 
-        // 2. Exchange, 3. tiebreak.
-        let mut turns: Vec<[Option<Value>; 2]> = Vec::new();
-        let mut tiebreak = None;
-        let mut implementer = None;
+    /// The exchange turns (stage 2). Returns the implementer that the
+    /// agents agree on, or that a walkover gives.
+    async fn exchange(&mut self) -> std::result::Result<Option<usize>, Stop> {
         if let [only] = self.run.planned[..] {
             // A walkover: nothing was exchanged, so there is no agreement.
-            implementer = Some(only);
-            self.book.writer.event("walkover", &format!("{} proceeds unopposed", self.name(only)));
-        } else {
-            for turn in 1..=self.io.config.turns {
+            if !self.done("decision") {
+                self.book.writer.event("walkover", &format!("{} proceeds unopposed", self.name(only)));
+            }
+            return Ok(Some(only));
+        }
+        for turn in 1..=self.io.config.turns {
+            let id = format!("exchange-{turn}");
+            let restored = self.done(&id);
+            if !restored {
                 if self.picked().is_some() {
                     break;
                 }
-                self.stage(&format!("exchange turn {turn}"), &format!("exchange-{turn}"))?;
-                let prompts = [0, 1].map(|i| {
-                    fit(
-                        EXCHANGE,
-                        &[
-                            ("ME", &self.name(i)),
-                            ("PEER", &self.name(Self::peer(i))),
-                            ("AGENTS", &self.agents_choice()),
-                            ("CONTEXT", &self.context()),
-                            ("MESSAGES", &self.messages()),
-                            ("TRANSCRIPT", &self.transcript()),
-                        ],
-                    )
-                });
-                for (name, prompt) in self.io.names.iter().zip(&prompts) {
-                    self.book.writer.write(&format!("turns/t{turn}-{name}.prompt.md"), prompt.as_bytes());
-                }
-                let stage = format!("exchange-{turn}");
-                let replies = self.read_only(&stage, async |io: &Io<R>| io.both(&stage, &prompts).await).await;
-                let mut replied: [Option<Value>; 2] = [None, None];
-                for (i, reply) in replies.into_iter().enumerate() {
-                    let name = self.name(i);
-                    replied[i] = self.record(i, &format!("turn {turn}"), &format!("turns/t{turn}-{name}"), reply);
-                    if replied[i].is_none() && !self.book.cancelled() {
-                        self.book.writer.event("agent_degraded", &format!("{name} turn {turn} returned no JSON"));
-                    }
-                }
-                if self.book.cancelled() {
-                    return Err(Stop::Cancelled);
-                }
-                self.book.add(turn_entries(&self.io.names, turn, &replied));
-                let converged = converged(&self.io.names, &replied);
-                turns.push(replied);
-                if let Some(pick) = converged {
-                    self.book.writer.event("converged", &format!("turn {turn} on {}", self.name(pick)));
-                    implementer = Some(pick);
-                    break;
-                }
-                self.book.writer.event("no_agreement", &format!("after turn {turn}"));
-                self.boundary().await?;
+                self.exchange_turn(turn).await?;
             }
-            if implementer.is_none() && self.picked().is_none() {
-                self.stage(&format!("tiebreak by {a}"), "tiebreak")?;
-                let prompt = fit(
-                    TIEBREAK,
-                    &[
-                        ("AGENTS", &self.agents_choice()),
-                        ("CONTEXT", &self.context()),
-                        ("MESSAGES", &self.messages()),
-                        ("TRANSCRIPT", &self.transcript()),
-                    ],
-                );
-                self.book.writer.write("tiebreak.prompt.md", prompt.as_bytes());
-                let reply = self
-                    .read_only("tiebreak", async |io: &Io<R>| io.call(0, "tiebreak", Access::Read, &prompt).await)
-                    .await;
-                let Some(json) = self.record(0, "tiebreak", "tiebreak", reply) else {
-                    return Err(if self.book.cancelled() {
-                        Stop::Cancelled
-                    } else {
-                        Stop::Failed("the tiebreak produced nothing".to_owned())
-                    });
-                };
-                let Some(pick) = self.io.names.iter().position(|n| *n == text(&json["implementer"])) else {
-                    return Err(Stop::Failed("the tiebreak named no agent of this run".to_owned()));
-                };
-                self.book.writer.event("decision", &format!("tiebreak chose {}", self.name(pick)));
-                self.book.add([Entry {
-                    from: a.clone(),
-                    to: "all".to_owned(),
-                    kind: "tiebreak",
-                    stage: "tiebreak".to_owned(),
-                    title: "tiebreak".to_owned(),
-                    body: format!("**Implementer:** {}\n\n{}", self.name(pick), text(&json["why"])),
-                }]);
-                implementer = Some(pick);
-                tiebreak = Some(json);
+            let replied = &self.flow.turns[turn as usize - 1];
+            let converged = converged(&self.io.names, replied);
+            let files: Vec<String> = (0..2)
+                .filter(|&i| replied[i].is_some())
+                .map(|i| format!("turns/t{turn}-{}.json", self.name(i)))
+                .collect();
+            if restored {
+                if converged.is_some() {
+                    return Ok(converged);
+                }
+                continue;
+            }
+            self.outcome(&id, (0..2).filter(|&i| replied[i].is_some()).collect::<Vec<_>>());
+            if let Some(pick) = converged {
+                self.book.writer.event("converged", &format!("turn {turn} on {}", self.name(pick)));
+                self.checkpoint(Some(&id), &files)?;
+                return Ok(Some(pick));
+            }
+            self.book.writer.event("no_agreement", &format!("after turn {turn}"));
+            self.checkpoint(Some(&id), &files)?;
+            self.boundary().await?;
+        }
+        Ok(None)
+    }
+
+    async fn exchange_turn(&mut self, turn: u32) -> std::result::Result<(), Stop> {
+        self.stage(&format!("exchange turn {turn}"), &format!("exchange-{turn}"))?;
+        let prompts = [0, 1].map(|i| {
+            fit(
+                EXCHANGE,
+                &[
+                    ("ME", &self.name(i)),
+                    ("PEER", &self.name(Self::peer(i))),
+                    ("AGENTS", &self.agents_choice()),
+                    ("CONTEXT", &self.context()),
+                    ("MESSAGES", &self.messages()),
+                    ("TRANSCRIPT", &self.transcript()),
+                ],
+            )
+        });
+        for (name, prompt) in self.io.names.iter().zip(&prompts) {
+            self.book.writer.write(&format!("turns/t{turn}-{name}.prompt.md"), prompt.as_bytes());
+        }
+        let stage = format!("exchange-{turn}");
+        let replies = self.read_only(&stage, async |io: &Io<R>| io.both(&stage, &prompts).await).await?;
+        let mut replied: [Option<Value>; 2] = [None, None];
+        for (i, reply) in replies.into_iter().enumerate() {
+            let name = self.name(i);
+            replied[i] = self.record(i, &format!("turn {turn}"), &format!("turns/t{turn}-{name}"), reply);
+            if replied[i].is_none() && !self.book.cancelled() {
+                self.book.writer.event("agent_degraded", &format!("{name} turn {turn} returned no JSON"));
             }
         }
-        // The user's pick overrides the exchange.
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        self.book.add(turn_entries(&self.io.names, turn, &replied));
+        self.flow.turns.push(replied);
+        Ok(())
+    }
+
+    /// The tiebreak by the first agent (stage 3), if the exchange found no
+    /// implementer and the user picked none.
+    async fn tiebreak(&mut self, agreed: Option<usize>) -> std::result::Result<Option<usize>, Stop> {
+        if self.done("tiebreak") {
+            let pick = self.flow.tiebreak.as_ref().map(|t| text(&t["implementer"]));
+            return Ok(self.io.names.iter().position(|n| Some(n) == pick.as_ref()));
+        }
+        if agreed.is_some() || self.picked().is_some() {
+            return Ok(agreed);
+        }
+        let a = self.name(0);
+        self.stage(&format!("tiebreak by {a}"), "tiebreak")?;
+        let prompt = fit(
+            TIEBREAK,
+            &[
+                ("AGENTS", &self.agents_choice()),
+                ("CONTEXT", &self.context()),
+                ("MESSAGES", &self.messages()),
+                ("TRANSCRIPT", &self.transcript()),
+            ],
+        );
+        self.book.writer.write("tiebreak.prompt.md", prompt.as_bytes());
+        let reply =
+            self.read_only("tiebreak", async |io: &Io<R>| io.call(0, "tiebreak", Access::Read, &prompt).await).await?;
+        let Some(json) = self.record(0, "tiebreak", "tiebreak", reply) else {
+            return Err(if self.book.cancelled() {
+                Stop::Cancelled
+            } else {
+                Stop::Failed("the tiebreak produced nothing".to_owned())
+            });
+        };
+        let Some(pick) = self.io.names.iter().position(|n| *n == text(&json["implementer"])) else {
+            return Err(Stop::Failed("the tiebreak named no agent of this run".to_owned()));
+        };
+        self.book.writer.event("decision", &format!("tiebreak chose {}", self.name(pick)));
+        self.book.add([tiebreak_entry(&self.io.names, pick, &json)]);
+        self.flow.tiebreak = Some(json);
+        self.outcome("tiebreak", [0]);
+        self.checkpoint(Some("tiebreak"), &["tiebreak.json".to_owned()])?;
+        Ok(Some(pick))
+    }
+
+    /// The decision: the user's pick overrides the exchange. Then the
+    /// plan, and the answers to the open questions.
+    async fn decide(&mut self, agreed: Option<usize>) -> std::result::Result<usize, Stop> {
+        if self.done("decision") {
+            return self.run.implementer.ok_or_else(|| Stop::Failed("the checkpoint has no implementer".to_owned()));
+        }
+        let mut implementer = agreed;
         if let Some(pick) = self.picked() {
             self.book.writer.event("decision", &format!("user chose {}", self.name(pick)));
             implementer = Some(pick);
         }
-        let implementer = implementer.expect("an implementer");
+        let Some(implementer) = implementer else {
+            return Err(Stop::Failed("the run has no implementer".to_owned()));
+        };
         self.run.implementer = Some(implementer);
         self.book.set(|s| s.decided = true);
-        let reviewer = Self::peer(implementer);
-        let (me, peer) = (self.name(implementer), self.name(reviewer));
-
-        let plan = match tiebreak.as_ref().map(|t| text(&t["plan"])).filter(|p| !p.is_empty()) {
+        let flow = &self.flow;
+        let plan = match flow.tiebreak.as_ref().map(|t| text(&t["plan"])).filter(|p| !p.is_empty()) {
             Some(plan) => plan,
-            None => latest_plan(implementer, &plans, &turns),
+            None => latest_plan(implementer, &flow.plans, &flow.turns),
         };
         self.book.writer.write("plan.md", plan.as_bytes());
-        self.book.writer.event("decision", &format!("{me} implements"));
-        let questions = unknowns(tiebreak.as_ref(), &plans, &turns);
+        self.book.writer.event("decision", &format!("{} implements", self.name(implementer)));
+        let questions = unknowns(flow.tiebreak.as_ref(), &flow.plans, &flow.turns);
         if !questions.is_empty() {
-            self.wait_answers(&questions).await?;
+            let asked = task_recovery::digest(questions.join("\n").as_bytes());
+            // The source recorded the answer to these questions, then stopped before its checkpoint.
+            if self.flow.answered.contains(&asked) {
+                self.book.writer.event("answered", "by the recorded answer");
+            } else {
+                self.wait_answers(&questions, asked).await?;
+            }
         }
+        self.flow.plan = plan;
+        self.checkpoint(Some("decision"), &["plan.md".to_owned()])?;
         self.boundary().await?;
+        Ok(implementer)
+    }
 
-        // 4. Implement.
+    /// 4. Implement.
+    async fn implement(&mut self, implementer: usize) -> std::result::Result<(), Stop> {
+        if self.done("implement") {
+            return Ok(());
+        }
+        let me = self.name(implementer);
         self.stage("implement", "implement")?;
         let prompt = fit(
             IMPLEMENT,
@@ -1149,7 +1664,7 @@ impl<R: SandboxRuntime> Actor<R> {
                 ("ME", &me),
                 ("CONTEXT", &self.context()),
                 ("MESSAGES", &self.messages()),
-                ("PLAN", &plan),
+                ("PLAN", &self.flow.plan),
                 ("GATES", &self.gate_list()),
                 ("TRANSCRIPT", &self.transcript()),
             ],
@@ -1171,19 +1686,33 @@ impl<R: SandboxRuntime> Actor<R> {
             self.book.writer.event("agent_degraded", "implementer returned no structured result");
         }
         self.book.writer.event("agent_done", &format!("implement by {me}"));
-        self.save_diff("the implementation").await;
-        self.boundary().await?;
+        self.save_diff("the implementation", "implementation-diff.txt").await;
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let mut files = vec!["implementation-diff.txt".to_owned()];
+        if result.is_some() {
+            files.push("implementation.json".to_owned());
+        }
+        self.outcome("implement", result.is_some().then_some(implementer));
+        self.flow.result = result;
+        self.flow.fences.clear();
+        self.checkpoint(Some("implement"), &files)?;
+        self.boundary().await
+    }
 
-        // 5. Gates.
-        let mut gates_text = self.run_gates("gates").await?;
-
-        // 6. Cross review.
+    /// 6. Cross review.
+    async fn crossreview(&mut self, implementer: usize) -> std::result::Result<(), Stop> {
+        if self.done("crossreview") {
+            return Ok(());
+        }
+        let reviewer = Self::peer(implementer);
+        let (me, peer) = (self.name(implementer), self.name(reviewer));
         self.stage(&format!("crossreview by {peer}"), "crossreview")?;
-        let result_text = result.as_ref().map_or("The implementer returned no report.".to_owned(), |r| {
+        let result_text = self.flow.result.as_ref().map_or("The implementer returned no report.".to_owned(), |r| {
             format!("```json\n{}\n```", serde_json::to_string_pretty(r).unwrap_or_default())
         });
-        let base = self.run.base.clone();
-        let change = self.io.change(base.as_deref()).await;
+        let change = self.io.change(self.run.base.as_deref()).await;
         let prompt = fit(
             CROSSREVIEW,
             &[
@@ -1191,9 +1720,9 @@ impl<R: SandboxRuntime> Actor<R> {
                 ("PEER", &me),
                 ("CONTEXT", &self.context()),
                 ("MESSAGES", &self.messages()),
-                ("PLAN", &plan),
+                ("PLAN", &self.flow.plan),
                 ("RESULT", &result_text),
-                ("GATES", &gates_text),
+                ("GATES", &self.flow.gates),
                 ("TRANSCRIPT", &self.transcript()),
                 ("CHANGE", &change),
             ],
@@ -1201,7 +1730,7 @@ impl<R: SandboxRuntime> Actor<R> {
         self.book.writer.write("crossreview.prompt.md", prompt.as_bytes());
         let reply = self
             .read_only("crossreview", async |io: &Io<R>| io.call(reviewer, "crossreview", Access::Read, &prompt).await)
-            .await;
+            .await?;
         let review = self.record(reviewer, "crossreview", "crossreview", reply);
         if self.book.cancelled() {
             return Err(Stop::Cancelled);
@@ -1217,56 +1746,83 @@ impl<R: SandboxRuntime> Actor<R> {
         };
         self.run.verdict = Some(verdict.to_owned());
         self.book.writer.event("crossreview", verdict);
-        self.boundary().await?;
-
-        // 7. Revise, once.
-        let mut revision = None;
-        if verdict == "revise" {
-            self.stage("revise", "revise")?;
-            let review_text = format!("```json\n{}\n```", serde_json::to_string_pretty(&review).unwrap_or_default());
-            let prompt = fit(
-                REVISE,
-                &[
-                    ("ME", &me),
-                    ("PEER", &peer),
-                    ("CONTEXT", &self.context()),
-                    ("MESSAGES", &self.messages()),
-                    ("PLAN", &plan),
-                    ("REVIEW", &review_text),
-                    ("GATES", &self.gate_list()),
-                    ("TRANSCRIPT", &self.transcript()),
-                ],
-            );
-            self.book.writer.write("revise.prompt.md", prompt.as_bytes());
-            let io = &self.io;
-            let reply = during(
-                &mut self.book,
-                &mut self.control,
-                &io.names,
-                io.call(implementer, "revise", Access::Write, &prompt),
-            )
-            .await;
-            revision = self.record(implementer, "revise", "revision", reply);
-            if self.book.cancelled() {
-                return Err(Stop::Cancelled);
-            }
-            if revision.is_none() {
-                self.book.writer.event("agent_degraded", "revision returned no structured result");
-            }
-            self.book.writer.event("agent_done", &format!("revised by {me}"));
-            self.save_diff("the revision").await;
-            self.boundary().await?;
-            // The write stage can change files even if it returns no report.
-            if !self.io.task.gates.is_empty() {
-                gates_text = self.run_gates("revision-gates").await?;
-            }
+        let files = if review.is_some() { vec!["crossreview.json".to_owned()] } else { Vec::new() };
+        self.outcome("crossreview", review.is_some().then_some(reviewer));
+        self.flow.review = review;
+        self.flow.change = Some(change);
+        if let Some(fence) = self.flow.read_fence.take() {
+            self.flow.fences.insert("crossreview".to_owned(), fence);
         }
+        self.checkpoint(Some("crossreview"), &files)?;
+        self.boundary().await
+    }
 
-        // 8. Blind final reviews, in parallel.
+    /// 7. Revise, once.
+    async fn revise(&mut self, implementer: usize) -> std::result::Result<(), Stop> {
+        if self.done("revise") {
+            return Ok(());
+        }
+        let (me, peer) = (self.name(implementer), self.name(Self::peer(implementer)));
+        self.stage("revise", "revise")?;
+        let review_text =
+            format!("```json\n{}\n```", serde_json::to_string_pretty(&self.flow.review).unwrap_or_default());
+        let prompt = fit(
+            REVISE,
+            &[
+                ("ME", &me),
+                ("PEER", &peer),
+                ("CONTEXT", &self.context()),
+                ("MESSAGES", &self.messages()),
+                ("PLAN", &self.flow.plan),
+                ("REVIEW", &review_text),
+                ("GATES", &self.gate_list()),
+                ("TRANSCRIPT", &self.transcript()),
+            ],
+        );
+        self.book.writer.write("revise.prompt.md", prompt.as_bytes());
+        let io = &self.io;
+        let reply = during(
+            &mut self.book,
+            &mut self.control,
+            &io.names,
+            io.call(implementer, "revise", Access::Write, &prompt),
+        )
+        .await;
+        let revision = self.record(implementer, "revise", "revision", reply);
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        if revision.is_none() {
+            self.book.writer.event("agent_degraded", "revision returned no structured result");
+        }
+        self.book.writer.event("agent_done", &format!("revised by {me}"));
+        self.save_diff("the revision", "revision-diff.txt").await;
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let mut files = vec!["revision-diff.txt".to_owned()];
+        if revision.is_some() {
+            files.push("revision.json".to_owned());
+        }
+        self.outcome("revise", revision.is_some().then_some(implementer));
+        self.flow.revision = revision;
+        self.flow.fences.clear();
+        self.checkpoint(Some("revise"), &files)?;
+        self.boundary().await
+    }
+
+    /// 8. Blind final reviews, in parallel.
+    async fn finals(&mut self) -> std::result::Result<(), Stop> {
+        if self.done("final") {
+            return Ok(());
+        }
         self.stage("final review", "final")?;
-        let history = history(review.as_ref(), revision.as_ref());
+        let history = history(self.flow.review.as_ref(), self.flow.revision.as_ref());
         self.book.writer.write("history.md", history.as_bytes());
-        let change = if verdict == "revise" { self.io.change(base.as_deref()).await } else { change };
+        let change = match &self.flow.change {
+            Some(change) if self.run.verdict.as_deref() != Some("revise") => change.clone(),
+            _ => self.io.change(self.run.base.as_deref()).await,
+        };
         let prompts = [0, 1].map(|i| {
             fit(
                 FINAL,
@@ -1275,15 +1831,15 @@ impl<R: SandboxRuntime> Actor<R> {
                     ("PEER", &self.name(Self::peer(i))),
                     ("CONTEXT", &self.context()),
                     ("MESSAGES", &self.messages()),
-                    ("PLAN", &plan),
+                    ("PLAN", &self.flow.plan),
                     ("HISTORY", &history),
-                    ("GATES", &gates_text),
+                    ("GATES", &self.flow.gates),
                     ("TRANSCRIPT", &self.transcript()),
                     ("CHANGE", &change),
                 ],
             )
         });
-        let replies = self.read_only("final", async |io: &Io<R>| io.both("final", &prompts).await).await;
+        let replies = self.read_only("final", async |io: &Io<R>| io.both("final", &prompts).await).await?;
         for (i, reply) in replies.into_iter().enumerate() {
             let name = self.name(i);
             match self.record(i, "final review", &format!("final-{name}"), reply) {
@@ -1297,12 +1853,17 @@ impl<R: SandboxRuntime> Actor<R> {
         if self.book.cancelled() {
             return Err(Stop::Cancelled);
         }
-        Ok(())
+        let files: Vec<String> = self.run.finals.iter().map(|(i, _)| format!("final-{}.json", self.name(*i))).collect();
+        self.outcome("final", self.run.finals.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        if let Some(fence) = self.flow.read_fence.take() {
+            self.flow.fences.insert("final".to_owned(), fence);
+        }
+        self.checkpoint(Some("final"), &files)
     }
 
     /// Saves the change of the run after `stage`, so the room can show it
     /// with no VM. A failed read says so and keeps the last saved diff.
-    async fn save_diff(&mut self, stage: &str) {
+    async fn save_diff(&mut self, stage: &str, artifact: &str) {
         let diff = self.io.exec.diff(self.run.base.as_deref(), &mut self.io.cancel.clone()).await;
         if self.book.cancelled() {
             return;
@@ -1315,13 +1876,14 @@ impl<R: SandboxRuntime> Actor<R> {
             Err(SnapshotError::NotGit) => NO_GIT_DIFF.to_owned(),
             Err(SnapshotError::Failed(why)) => {
                 self.book.writer.event("diff_failed", &format!("after {stage}: {why}"));
-                let failed = format!("The app could not save the diff after {stage} ({why}).");
+                let failed = format!("{DIFF_FAILED}{stage} ({why}).");
                 match &self.run.diff {
-                    Some(last) => format!("{failed} This is the last saved diff.\n\n{last}"),
+                    Some(last) => format!("{failed}{LAST_DIFF}{last}"),
                     None => failed,
                 }
             }
         };
+        self.book.writer.write_durable(artifact, text.as_bytes()).ok();
         self.book.writer.write("diff.txt", text.as_bytes());
     }
 
@@ -1331,10 +1893,11 @@ impl<R: SandboxRuntime> Actor<R> {
         self.io.names.iter().position(|n| *n == picked).filter(|i| self.run.planned.contains(i))
     }
 
-    /// A run whose record has a failed write fails: its round is not complete.
+    /// A run whose record has a failed write fails: its round is not
+    /// complete. The failure wins over a cancel, so the record keeps it.
     fn written(&self, end: std::result::Result<(), Stop>) -> std::result::Result<(), Stop> {
         match (end, self.book.writer.failure()) {
-            (Ok(()), Some(why)) => Err(Stop::Failed(why)),
+            (Ok(()) | Err(Stop::Cancelled), Some(why)) => Err(Stop::Failed(why)),
             (end, _) => end,
         }
     }
@@ -1510,8 +2073,40 @@ fn turn_entries(names: &[String; 2], turn: u32, replies: &[Option<Value>; 2]) ->
         .collect()
 }
 
+/// The tiebreak's choice, as a message of the first agent.
+fn tiebreak_entry(names: &[String; 2], pick: usize, json: &Value) -> Entry {
+    Entry {
+        from: names[0].clone(),
+        to: "all".to_owned(),
+        kind: "tiebreak",
+        stage: "tiebreak".to_owned(),
+        title: "tiebreak".to_owned(),
+        body: format!("**Implementer:** {}\n\n{}", names[pick], text(&json["why"])),
+    }
+}
+
+/// The gate results, for a prompt.
+/// The gate results that the next prompts read: the revision's if it ran.
+fn gate_result(done: impl Fn(&str) -> bool) -> Option<&'static str> {
+    if done("revision-gates") {
+        Some("revision-gates.json")
+    } else if done("gates") {
+        Some("gates.json")
+    } else {
+        None
+    }
+}
+
+fn gates_text(results: &Value) -> String {
+    if results.as_array().is_none_or(Vec::is_empty) {
+        "The task has no gates.".to_owned()
+    } else {
+        format!("```json\n{}\n```", serde_json::to_string_pretty(results).unwrap_or_default())
+    }
+}
+
 /// Both agreed, on the same agent of the run. Anything else is no agreement.
-fn converged(names: &[String; 2], replies: &[Option<Value>; 2]) -> Option<usize> {
+pub(crate) fn converged(names: &[String; 2], replies: &[Option<Value>; 2]) -> Option<usize> {
     let picks: Vec<usize> = replies
         .iter()
         .map(|r| {
@@ -1600,6 +2195,7 @@ pub(crate) mod tests {
     use crate::session::TaskAgent;
     use crate::task_agents::{claude_result_line, codex_result_lines};
     use crate::task_artifacts::{Mirror, read_diff, read_room};
+    use crate::task_recovery::{RunRecord, TaskRuns};
 
     /// What the fake agent does for one call.
     pub(crate) enum Fake {
@@ -1611,9 +2207,9 @@ pub(crate) mod tests {
         After(Arc<Notify>, String),
     }
 
-    type Script = Arc<dyn Fn(&str, Stage, &str) -> Fake + Send + Sync>;
+    pub(crate) type Script = Arc<dyn Fn(&str, Stage, &str) -> Fake + Send + Sync>;
     /// What a shell process does, by its script: a `Reply` is its stdout.
-    type Sh = Arc<dyn Fn(&str) -> Fake + Send + Sync>;
+    pub(crate) type Sh = Arc<dyn Fn(&str) -> Fake + Send + Sync>;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Stage {
@@ -1653,16 +2249,16 @@ pub(crate) mod tests {
     }
 
     /// Git checks find no git work tree and gates pass.
-    fn no_git(script: &str) -> Fake {
+    pub(crate) fn no_git(script: &str) -> Fake {
         if script.contains("git rev-parse") { Fake::Exit(3) } else { Fake::Reply("ok\n".into()) }
     }
 
     /// The calls that the fake saw: of agents, and the argv of each shell.
-    type Seen = (Arc<Mutex<Vec<Call>>>, Arc<Mutex<Vec<Vec<String>>>>);
+    pub(crate) type Seen = (Arc<Mutex<Vec<Call>>>, Arc<Mutex<Vec<Vec<String>>>>);
 
     /// Plays every process that the run opens: shells from `sh`, agents
     /// from the script.
-    fn serve(runtime: &FakeRuntime, sh: Sh, script: Script) -> Seen {
+    pub(crate) fn serve(runtime: &FakeRuntime, sh: Sh, script: Script) -> Seen {
         let seen: Seen = Default::default();
         let (pipes, out) = (runtime.pipes.clone(), seen.clone());
         tokio::spawn(async move {
@@ -1855,6 +2451,9 @@ pub(crate) mod tests {
             workdir: "/workspace".into(),
         };
         let registry = Registry::default();
+        let config = Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } };
+        let writer = RoundWriter::create(dir.clone(), Some(mirror)).unwrap();
+        writer.write_durable(task_recovery::RUN, &serde_json::to_vec(&RunRecord::new(&task, config)).unwrap()).unwrap();
         let handle = registry.start(Spec {
             session_id: "s".into(),
             task,
@@ -1869,8 +2468,8 @@ pub(crate) mod tests {
                 gemini: None,
                 proxy: None,
             },
-            writer: RoundWriter::create(dir.clone(), Some(mirror)).unwrap(),
-            config: Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } },
+            writer,
+            config,
             shared_vm,
         });
         Started { registry, handle, dir, mirror: root.join(".zwinger/tasks/fix/01"), calls, shells }
@@ -2285,7 +2884,7 @@ pub(crate) mod tests {
         assert!(read_room(&run.dir).violations.iter().all(|v| v.agent.is_none()));
         // Only the session folder is checked; its run copy is skipped.
         let shell = run.shells.lock().unwrap()[0].clone();
-        assert_eq!((shell[4].as_str(), shell[5].as_str()), ("/workspace", "/workspace/.zwinger/tasks/fix/01"));
+        assert_eq!((shell[4].as_str(), shell[5].as_str()), ("/workspace", "/workspace/.zwinger/tasks/fix"));
         assert!(!shell[2].contains("**/.zwinger/**"));
     }
 
@@ -2309,8 +2908,9 @@ pub(crate) mod tests {
             strings(&manifest["violations"]),
             ["the read-only check of the stage plan failed: git ended with code 4"]
         );
-        // plan, exchange 1, crossreview and final: two snapshots each.
-        assert_eq!(snapshots.load(Ordering::SeqCst), 8);
+        // plan, exchange 1, crossreview and final: two snapshots each;
+        // gates take their own before and after snapshots.
+        assert_eq!(snapshots.load(Ordering::SeqCst), 10);
     }
 
     #[tokio::test]
@@ -2711,5 +3311,1096 @@ pub(crate) mod tests {
         );
         assert!(prompt.len() <= PROMPT_LIMIT);
         assert!(prompt.contains(&messages));
+    }
+
+    // --- continuation ------------------------------------------------------
+
+    /// A full round: no agreement in turn 1, agreement on claude in turn 2,
+    /// a revise verdict, then a ship.
+    pub(crate) fn full(agent: &str, stage: Stage, prompt: &str) -> Fake {
+        match stage {
+            Stage::Exchange if prompt.contains("Exchange — turn 1") => turn("claude", true),
+            Stage::Exchange => turn("claude", false),
+            Stage::Crossreview => review("revise"),
+            _ => happy(agent, stage, prompt),
+        }
+    }
+
+    /// A git work tree that is clean at `head`. The gates pass.
+    pub(crate) fn git_at(head: &'static str, script: &str) -> Fake {
+        match script {
+            s if is_snapshot(s) => clean(head),
+            s if is_diff(s) => Fake::Reply("the diff".into()),
+            s => no_git(s),
+        }
+    }
+
+    pub(crate) async fn eventually(check: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the condition comes true");
+    }
+
+    /// Continues the ended run 01 of `src` as run 02, with a new fake.
+    pub(crate) fn resume_full(
+        src: &Started,
+        sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+    ) -> Started {
+        let task_dir = src.dir.parent().unwrap().to_owned();
+        let names = vec!["01".to_owned()];
+        let recovered = TaskRuns::read(&task_dir, &names).load("01").unwrap();
+        let runtime = FakeRuntime::default();
+        let (calls, shells) = serve(&runtime, Arc::new(sh), Arc::new(script));
+        let dir = task_dir.join("02");
+        let writer = RoundWriter::create(dir.clone(), None).unwrap();
+        task_recovery::create(&writer, &recovered, "01").unwrap();
+        let registry = Registry::default();
+        let handle = registry.resume(
+            Spec {
+                session_id: "s".into(),
+                task: recovered.record.task("task-1", "fix", "/workspace".into()),
+                run: "02".into(),
+                exec: Exec {
+                    runtime,
+                    vm: Arc::new(FakeVm { key: "s".into() }),
+                    cwd: "/workspace".into(),
+                    scope: "/workspace".into(),
+                    artifacts: Some("/workspace/.zwinger/tasks/fix/02".into()),
+                    pi_host: false,
+                    gemini: None,
+                    proxy: None,
+                },
+                writer,
+                config: recovered.record.config(),
+                shared_vm: false,
+            },
+            &recovered,
+        );
+        Started { registry, handle, dir, mirror: PathBuf::new(), calls, shells }
+    }
+
+    /// The groups in order, with the agent stage of each.
+    const GROUPS: [(&str, Option<Stage>); 10] = [
+        ("plan", Some(Stage::Plan)),
+        ("exchange-1", Some(Stage::Exchange)),
+        ("exchange-2", Some(Stage::Exchange)),
+        ("decision", None),
+        ("implement", Some(Stage::Implement)),
+        ("gates", None),
+        ("crossreview", Some(Stage::Crossreview)),
+        ("revise", Some(Stage::Revise)),
+        ("revision-gates", None),
+        ("final", Some(Stage::Final)),
+    ];
+
+    fn gate_runs(run: &Started) -> usize {
+        run.shells.lock().unwrap().iter().filter(|a| a[2].contains("pnpm build")).count()
+    }
+
+    /// Cancels a full round while the group `at` runs, then continues it.
+    /// The implementation commits: HEAD is `BASE` before it and `COMMIT`
+    /// after it, also in the continuation.
+    async fn interrupted(at: &'static str) -> Started {
+        let hung = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hang_sh, hang_agent) = (hung.clone(), hung.clone());
+        let built = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let head = built.clone();
+        let gates = Arc::new(AtomicUsize::new(0));
+        let sh = move |s: &str| {
+            if s.contains("pnpm build") {
+                let n = gates.fetch_add(1, Ordering::SeqCst) + 1;
+                if (at == "gates" && n == 1) || (at == "revision-gates" && n == 2) {
+                    hang_sh.store(true, Ordering::SeqCst);
+                    return Fake::Hang;
+                }
+            }
+            git_at(if head.load(Ordering::SeqCst) { COMMIT } else { BASE }, s)
+        };
+        let script = move |agent: &str, stage: Stage, prompt: &str| {
+            if stage == Stage::Implement {
+                built.store(true, Ordering::SeqCst);
+            }
+            let second = prompt.contains("Exchange — turn 1");
+            let hang = match (at, stage) {
+                ("plan", Stage::Plan) | ("final", Stage::Final) => agent == "claude",
+                ("exchange-1", Stage::Exchange) => !second,
+                ("exchange-2", Stage::Exchange) => second,
+                ("implement", Stage::Implement) | ("crossreview", Stage::Crossreview) | ("revise", Stage::Revise) => {
+                    true
+                }
+                _ => false,
+            };
+            if hang {
+                hang_agent.store(true, Ordering::SeqCst);
+                return Fake::Hang;
+            }
+            match stage {
+                Stage::Exchange if at == "decision" && second => Fake::Reply(fenced(
+                    json!({ "message": "Ok.", "plan": "P.", "implementer": "claude", "agreed": true, "conceded": [], "unknowns": ["Which database?"], "backlog": [] }),
+                )),
+                _ => full(agent, stage, prompt),
+            }
+        };
+        let src = start_full(Duration::from_secs(5), sh, script);
+        if at == "decision" {
+            until(&src, |s| s.state == RunState::Waiting).await;
+            src.handle.control(Control::Message { text: "Use the cache.".into() }).unwrap();
+            let messages = src.dir.join("messages.jsonl");
+            eventually(|| std::fs::read_to_string(&messages).is_ok_and(|m| m.contains("Use the cache."))).await;
+        } else {
+            eventually(|| hung.load(Ordering::SeqCst)).await;
+        }
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        assert_eq!(settled(&src).await["stopped"], "cancelled by the user");
+
+        let cont = resume_full(&src, |s| git_at(COMMIT, s), full);
+        if at == "decision" {
+            until(&cont, |s| s.state == RunState::Waiting).await;
+            assert_eq!(read_room(&cont.dir).questions, ["Which database?"], "the question is asked again");
+            cont.handle.control(Control::Answer { text: "Postgres.".into() }).unwrap();
+        }
+        cont
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_group_repeats_and_the_completed_groups_are_skipped() {
+        for (k, &(at, stage)) in GROUPS.iter().enumerate() {
+            let cont = interrupted(at).await;
+            let manifest = settled(&cont).await;
+            assert_eq!(manifest["stopped"], Value::Null, "{at}");
+            assert_eq!(manifest["ship"], true, "{at}");
+            assert_eq!(manifest["base"], BASE, "{at}: the base comes from the checkpoint");
+
+            let record: Value = serde_json::from_slice(&std::fs::read(cont.dir.join("run.json")).unwrap()).unwrap();
+            assert_eq!(record["continues"], json!({ "run": "01", "from": at, "repeats": true }), "{at}");
+            // The completed groups do not run again.
+            for &(_, before) in &GROUPS[..k] {
+                if let Some(before) = before
+                    && !(at == "exchange-2" && before == Stage::Exchange)
+                {
+                    assert!(calls_of(&cont, before).is_empty(), "{at}: {before:?} ran again");
+                }
+            }
+            // The interrupted group runs again in full.
+            if let Some(stage) = stage {
+                let calls = match at {
+                    // Turn 1 again, then turn 2.
+                    "exchange-1" => 4,
+                    _ if matches!(stage, Stage::Plan | Stage::Exchange | Stage::Final) => 2,
+                    _ => 1,
+                };
+                assert_eq!(calls_of(&cont, stage).len(), calls, "{at}");
+            }
+            let gates = match k {
+                0..=5 => 2,
+                6..=8 => 1,
+                _ => 0,
+            };
+            assert_eq!(gate_runs(&cont), gates, "{at}");
+            // After the last write stage, the continuation has the saved diff of its source.
+            assert_eq!(read_diff(&cont.dir).as_deref(), Some("the diff"), "{at}");
+            if at == "exchange-2" {
+                let prompt = &calls_of(&cont, Stage::Exchange)[0].prompt;
+                assert!(prompt.contains("Exchange — turn 1"), "the transcript has turn 1");
+            }
+            if at == "decision" {
+                let prompt = &calls_of(&cont, Stage::Implement)[0].prompt;
+                assert_eq!(prompt.matches("Use the cache.").count(), 1, "inherited advice appears once");
+                assert!(prompt.contains("(answer, during exchange-2) Postgres."), "{prompt}");
+            }
+            // The worktree stays as it is: no reset, checkout, clean or apply.
+            for argv in cont.shells.lock().unwrap().iter() {
+                for word in ["git reset", "git checkout", "git clean", "git apply", "git stash"] {
+                    assert!(!argv[2].contains(word), "{at}: {word}");
+                }
+                if is_diff(&argv[2]) {
+                    assert_eq!(argv[6], BASE, "{at}: the diff starts at the original base");
+                }
+            }
+            // The room shows the inherited and the repeated stages.
+            let stages = read_room(&cont.dir).stages;
+            let label = |id: &str| stages.iter().find(|s| s.id == id).map(|s| s.label.clone()).unwrap_or_default();
+            if k > 0 {
+                assert_eq!(label("plan"), "Plan (from run 01)", "{at}");
+            }
+            if at != "decision" {
+                assert!(label(at).ends_with("(repeated)"), "{at}: {}", label(at));
+            }
+            assert!(stages.iter().all(|s| s.state == "done" || s.state == "skipped"), "{at}: {stages:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pick_before_the_decision_carries_over() {
+        let hung = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = hung.clone();
+        let src = start_full(
+            Duration::from_secs(5),
+            |s| git_at(BASE, s),
+            move |agent, stage, prompt| match stage {
+                Stage::Exchange => {
+                    mark.store(true, Ordering::SeqCst);
+                    Fake::Hang
+                }
+                _ => full(agent, stage, prompt),
+            },
+        );
+        eventually(|| hung.load(Ordering::SeqCst)).await;
+        src.handle.control(Control::PickImplementer { agent: "codex".into() }).unwrap();
+        eventually(|| events(&src).iter().any(|(k, _)| k == "pick")).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+
+        let cont = resume_full(&src, |s| git_at(COMMIT, s), full);
+        let manifest = settled(&cont).await;
+        assert_eq!(manifest["implementer"], "codex");
+        assert!(calls_of(&cont, Stage::Exchange).is_empty());
+        assert_eq!(calls_of(&cont, Stage::Implement)[0].agent, "codex");
+        assert_eq!(read_room(&cont.dir).decided_by.as_deref(), Some("user"));
+    }
+
+    #[tokio::test]
+    async fn messages_and_contributions_carry_over_once_with_their_budget() {
+        let src = start(|agent, stage, prompt| match stage {
+            Stage::Implement => Fake::Hang,
+            _ => happy(agent, stage, prompt),
+        });
+        until(&src, |s| s.stage.as_deref() == Some("implement")).await;
+        src.handle.control(Control::Message { text: "Keep it small.".into() }).unwrap();
+        let Ok(Contribution::Queued(applied)) = src.handle.contribute("note-1", "Mind the cache.") else {
+            panic!("the contribution is queued")
+        };
+        applied.await.unwrap();
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+
+        let gate = Arc::new(Notify::new());
+        let held = gate.clone();
+        let cont = resume_full(&src, no_git, move |agent, stage, prompt| match (stage, happy(agent, stage, prompt)) {
+            (Stage::Implement, Fake::Reply(text)) => Fake::After(held.clone(), text),
+            (_, fake) => fake,
+        });
+        assert_eq!(lock(&cont.handle.budget).count, 2);
+        assert!(matches!(cont.handle.contribute("note-1", "Mind the cache."), Ok(Contribution::Applied)));
+        assert_eq!(cont.handle.contribute("note-1", "Other text.").unwrap_err(), Refusal::Conflict);
+        eventually(|| !calls_of(&cont, Stage::Implement).is_empty()).await;
+        gate.notify_one();
+        settled(&cont).await;
+        let prompt = &calls_of(&cont, Stage::Implement)[0].prompt;
+        assert_eq!(prompt.matches("Keep it small.").count(), 1);
+        assert_eq!(prompt.matches("Mind the cache.").count(), 1);
+        let room = read_room(&cont.dir);
+        let kinds: Vec<(&str, &str)> = room
+            .messages
+            .iter()
+            .filter(|m| m.id.starts_with("messages.jsonl"))
+            .map(|m| (m.from.as_str(), m.kind.as_str()))
+            .collect();
+        assert_eq!(kinds, [("user", "user"), ("a2a", "external")]);
+        let lines = std::fs::read_to_string(cont.dir.join("messages.jsonl")).unwrap();
+        assert!(lines.lines().all(|l| serde_json::from_str::<Value>(l).unwrap()["inherited"] == "01"));
+    }
+
+    #[tokio::test]
+    async fn a_damaged_or_unsafe_record_gives_no_resume() {
+        let src = start(|agent, stage, prompt| match stage {
+            Stage::Implement => Fake::Hang,
+            _ => happy(agent, stage, prompt),
+        });
+        until(&src, |s| s.stage.as_deref() == Some("implement")).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+        let task_dir = src.dir.parent().unwrap().to_owned();
+        let names = vec!["01".to_owned()];
+        let load = || TaskRuns::read(&task_dir, &names).load("01").map(|r| (r.from, r.repeats));
+        assert_eq!(load().unwrap(), ("implement".to_owned(), true));
+
+        let file = |name: &str| src.dir.join(name);
+        std::fs::write(file("messages.jsonl"), "").unwrap();
+        let cases: [(&str, &dyn Fn(String) -> String, &str); 8] = [
+            ("messages.jsonl", &|m| m + "{\"partial", "partial line"),
+            (
+                "messages.jsonl",
+                &|m| m + r#"{"at":"t","stage":"plan","kind":"external","from":"a2a","body":"No ref."}"# + "\n",
+                "line 1 of messages.jsonl is damaged",
+            ),
+            (
+                "messages.jsonl",
+                &|m| m + r#"{"at":"t","stage":"plan","kind":"pick","body":"x"}"# + "\n",
+                "line 1 of messages.jsonl is damaged",
+            ),
+            ("messages.jsonl", &|m| m + r#"{"at":"t","kind":"user","body":"x"}"# + "\n", "is damaged"),
+            ("turns/plan-claude.json", &|p| p.replace("Plan", "Other plan"), "changed after the checkpoint"),
+            ("checkpoint.json", &|c| c.replace("\"version\": 2", "\"version\": 3"), "version 3"),
+            ("checkpoint.json", &|c| c.replace("\"decision\"", "\"implement\""), "does not agree"),
+            (
+                "events.jsonl",
+                &|e| e + "{\"at\":\"t\",\"kind\":\"run_failed\",\"detail\":\"cannot write x\"}\n",
+                "could not write",
+            ),
+        ];
+        for (name, change, why) in cases {
+            let before = std::fs::read_to_string(file(name)).unwrap();
+            std::fs::write(file(name), change(before.clone())).unwrap();
+            let error = load().unwrap_err();
+            assert!(error.contains(why), "{name}: {error}");
+            std::fs::write(file(name), before).unwrap();
+        }
+        assert!(load().is_ok());
+
+        // A link is never followed.
+        let plan = file("turns/plan-claude.json");
+        std::fs::rename(&plan, file("plan-copy.json")).unwrap();
+        std::os::unix::fs::symlink(file("plan-copy.json"), &plan).unwrap();
+        assert!(load().unwrap_err().contains("not a regular file"));
+        std::fs::remove_file(&plan).unwrap();
+        std::fs::rename(file("plan-copy.json"), &plan).unwrap();
+
+        std::fs::write(file("run.json"), vec![b' '; (8 << 20) + 1]).unwrap();
+        assert!(load().unwrap_err().contains("larger than 8 MiB"));
+        std::fs::remove_file(file("run.json")).unwrap();
+        assert!(load().unwrap_err().contains("before zwinger saved recovery records"));
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_after_a_write_stage_needs_the_saved_diff() {
+        let src = start(|agent, stage, prompt| match stage {
+            Stage::Crossreview => Fake::Hang,
+            _ => happy(agent, stage, prompt),
+        });
+        until(&src, |s| s.stage.as_deref() == Some("crossreview")).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+        let task_dir = src.dir.parent().unwrap().to_owned();
+        let names = vec!["01".to_owned()];
+        assert!(TaskRuns::read(&task_dir, &names).load("01").is_ok());
+
+        let path = src.dir.join("checkpoint.json");
+        let mut checkpoint: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        checkpoint["artifacts"].as_object_mut().unwrap().remove("implementation-diff.txt").unwrap();
+        std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let error = TaskRuns::read(&task_dir, &names).load("01").unwrap_err();
+        assert!(error.contains("implementation-diff.txt is not in it"), "{error}");
+    }
+
+    #[test]
+    fn the_last_diff_comes_back_from_the_saved_diff() {
+        assert_eq!(last_diff("diff --git a b").as_deref(), Some("diff --git a b"));
+        assert_eq!(last_diff(""), Some(String::new()));
+        assert_eq!(last_diff(NO_GIT_DIFF), None);
+        let failed = format!("{DIFF_FAILED}the revision (git ended with code 5).");
+        assert_eq!(last_diff(&failed), None);
+        assert_eq!(last_diff(&format!("{failed}{LAST_DIFF}the first diff")).as_deref(), Some("the first diff"));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_revision_keeps_the_last_diff_of_its_source() {
+        let src = start_full(
+            Duration::from_secs(5),
+            |s| if is_diff(s) { Fake::Reply("the first diff".into()) } else { no_git(s) },
+            |agent, stage, prompt| match stage {
+                Stage::Crossreview => review("revise"),
+                Stage::Revise => Fake::Hang,
+                _ => happy(agent, stage, prompt),
+            },
+        );
+        until(&src, |s| s.stage.as_deref() == Some("revise")).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+
+        let cont = resume_full(
+            &src,
+            |s| if is_diff(s) { Fake::Exit(5) } else { no_git(s) },
+            |agent, stage, prompt| match stage {
+                Stage::Crossreview => review("revise"),
+                _ => happy(agent, stage, prompt),
+            },
+        );
+        settled(&cont).await;
+        assert_eq!(calls_of(&cont, Stage::Revise).len(), 1);
+        let saved = std::fs::read_to_string(cont.dir.join("diff.txt")).unwrap();
+        assert!(saved.ends_with("This is the last saved diff.\n\nthe first diff"), "{saved}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_checkpoint_write_fails_the_run() {
+        let run = start(happy);
+        // A folder at the temp name makes the durable write fail.
+        std::fs::create_dir(run.dir.join("checkpoint.json.tmp~")).unwrap();
+        std::fs::write(run.dir.join("checkpoint.json.tmp~/x"), "").unwrap();
+        let manifest = settled(&run).await;
+        assert!(manifest["stopped"].as_str().unwrap().starts_with("cannot write"), "{manifest}");
+        assert_eq!(run.handle.status().state, RunState::Failed);
+        assert!(calls_of(&run, Stage::Exchange).is_empty(), "no group after the failed checkpoint");
+    }
+
+    fn load(src: &Started) -> std::result::Result<Recovered, String> {
+        let task_dir = src.dir.parent().unwrap().to_owned();
+        TaskRuns::read(&task_dir, &["01".to_owned()]).load("01")
+    }
+
+    fn edit_json(path: &std::path::Path, change: impl FnOnce(&mut Value)) {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        change(&mut value);
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    fn append(path: &std::path::Path, line: Value) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// A run that a cancel stopped in `stage`.
+    async fn stopped_in(
+        stage: Stage,
+        sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+    ) -> Started {
+        let src =
+            start_full(
+                Duration::from_secs(5),
+                sh,
+                move |agent, s, prompt| {
+                    if s == stage { Fake::Hang } else { script(agent, s, prompt) }
+                },
+            );
+        eventually(|| !calls_of(&src, stage).is_empty()).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&src).await;
+        src
+    }
+
+    #[tokio::test]
+    async fn a_new_run_has_its_checkpoint_before_its_first_event() {
+        let run = start(|_, _, _| Fake::Hang);
+        eventually(|| !calls_of(&run, Stage::Plan).is_empty()).await;
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(run.dir.join("checkpoint.json")).unwrap()).unwrap();
+        assert_eq!(checkpoint["groups"], json!([]));
+        run.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&run).await;
+    }
+
+    #[tokio::test]
+    async fn a_lost_checkpoint_of_a_started_run_gives_no_resume() {
+        let src = stopped_in(Stage::Crossreview, no_git, happy).await;
+        assert_eq!(load(&src).unwrap().from, "gates");
+        std::fs::remove_file(src.dir.join("checkpoint.json")).unwrap();
+        let error = load(&src).unwrap_err();
+        assert!(error.contains("checkpoint.json is missing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn changed_files_repeat_the_checks_after_the_last_write_stage() {
+        let cases: [(&str, fn(&str) -> Fake); 4] = [
+            ("same files", |s| git_at(COMMIT, s)),
+            ("other HEAD", |s| git_at(BASE, s)),
+            ("other worktree or index", |s| {
+                if is_snapshot(s) {
+                    Fake::Reply(format!("HEAD {COMMIT}\n M a.rs\n\0a change"))
+                } else {
+                    git_at(COMMIT, s)
+                }
+            }),
+            ("failed snapshot", |s| if is_snapshot(s) { Fake::Exit(4) } else { git_at(COMMIT, s) }),
+        ];
+        for (case, sh) in cases {
+            let src = stopped_in(Stage::Crossreview, |s| git_at(COMMIT, s), happy).await;
+            let cont = resume_full(&src, sh, happy);
+            settled(&cont).await;
+            let same = case == "same files";
+            assert_eq!(gate_runs(&cont), usize::from(!same), "{case}");
+            assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1, "{case}");
+            assert_eq!(events(&cont).iter().any(|(k, _)| k == "files_changed"), !same, "{case}");
+            let gates = read_room(&cont.dir).stages.into_iter().find(|s| s.id == "gates").unwrap();
+            let label = if same { "Gates (from run 01)" } else { "Gates" };
+            assert_eq!(gates.label, label, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_continuation_outside_git_repeats_the_checks() {
+        let src = stopped_in(Stage::Final, no_git, happy).await;
+        let names = vec!["01".to_owned()];
+        assert_eq!(
+            TaskRuns::read(src.dir.parent().unwrap(), &names).inspect("01"),
+            task_recovery::Resume::Ready {
+                from: "gates".to_owned(),
+                label: "Gates".to_owned(),
+                repeats: true,
+                recheck: Some("Gates".to_owned()),
+            }
+        );
+        let cont = resume_full(&src, no_git, happy);
+        let manifest = settled(&cont).await;
+        assert_eq!(gate_runs(&cont), 1);
+        assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1);
+        assert_eq!(manifest["ship"], true, "{manifest}");
+    }
+
+    /// The source completed its cross review and stopped in the final
+    /// review. The files changed, so the checks run again.
+    async fn repeated_checks(crossreview: fn() -> Fake) -> (Started, Started) {
+        let src = stopped_in(Stage::Final, |s| git_at(COMMIT, s), happy).await;
+        let cont = resume_full(
+            &src,
+            |s| git_at(BASE, s),
+            move |agent, stage, prompt| match stage {
+                Stage::Crossreview => crossreview(),
+                _ => happy(agent, stage, prompt),
+            },
+        );
+        (src, cont)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_repeated_check_shows_no_old_result() {
+        let (src, cont) = repeated_checks(|| Fake::Hang).await;
+        eventually(|| !calls_of(&cont, Stage::Crossreview).is_empty()).await;
+        cont.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&cont).await;
+        assert!(src.dir.join("crossreview.json").exists(), "the source keeps its result");
+        assert!(!cont.dir.join("crossreview.json").exists());
+        let room = read_room(&cont.dir);
+        assert!(room.crossreview.is_none(), "{:?}", room.crossreview);
+        let state = |id: &str| room.stages.iter().find(|s| s.id == id).unwrap().state;
+        assert_ne!(state("crossreview"), "done");
+        assert_eq!(state("gates"), "done");
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(cont.dir.join("checkpoint.json")).unwrap()).unwrap();
+        assert!(checkpoint["artifacts"].get("crossreview.json").is_none(), "{checkpoint}");
+        let runs = ["01".to_owned(), "02".to_owned()];
+        let recovered = TaskRuns::read(cont.dir.parent().unwrap(), &runs).load("02").unwrap();
+        assert_eq!(recovered.from, "crossreview");
+    }
+
+    #[tokio::test]
+    async fn a_degraded_repeated_check_shows_no_old_result() {
+        let (_, cont) = repeated_checks(|| Fake::Exit(1)).await;
+        let manifest = settled(&cont).await;
+        assert_eq!(manifest["crossreview_verdict"], "missing", "{manifest}");
+        let room = read_room(&cont.dir);
+        let verdict = room.crossreview.as_ref().map(|r| r.verdict.clone());
+        assert_ne!(verdict.as_deref(), Some("accept"), "{:?}", room.crossreview);
+    }
+
+    /// The crash window after the final checkpoint: the source has no
+    /// manifest and no `done` event.
+    async fn finals_without_result(ships: [bool; 2], sh: fn(&str) -> Fake) -> Started {
+        let src = start_full(Duration::from_secs(5), sh, move |agent, stage, prompt| match stage {
+            Stage::Final => ship(ships[usize::from(agent == "codex")]),
+            _ => happy(agent, stage, prompt),
+        });
+        settled(&src).await;
+        std::fs::remove_file(src.dir.join("manifest.json")).unwrap();
+        let events = std::fs::read_to_string(src.dir.join("events.jsonl")).unwrap();
+        let kept: Vec<&str> = events.lines().filter(|l| !l.contains("\"kind\":\"done\"")).collect();
+        std::fs::write(src.dir.join("events.jsonl"), kept.join("\n") + "\n").unwrap();
+        src
+    }
+
+    #[tokio::test]
+    async fn a_stop_after_the_final_checkpoint_only_records_the_result() {
+        for ships in [[true, true], [true, false]] {
+            let src = finals_without_result(ships, |s| git_at(COMMIT, s)).await;
+            let recovered = load(&src).unwrap();
+            assert_eq!((recovered.from.as_str(), recovered.repeats), (task_recovery::SETTLE, false));
+            let cont = resume_full(&src, |s| git_at(COMMIT, s), |_, _, _| Fake::Exit(1));
+            let manifest = settled(&cont).await;
+            assert!(cont.calls.lock().unwrap().is_empty(), "no agent runs again");
+            assert_eq!(gate_runs(&cont), 0);
+            assert_eq!(manifest["ship"], ships == [true, true], "{manifest}");
+            assert_eq!(manifest["final_reviewers"], json!(["claude", "codex"]));
+            let stages = read_room(&cont.dir).stages;
+            let ran = stages.iter().filter(|s| s.state != "skipped");
+            assert!(ran.clone().all(|s| s.label.ends_with("(from run 01)") && s.state == "done"), "{stages:?}");
+        }
+        // A run that recorded its result completed all stages.
+        let done = start(happy);
+        settled(&done).await;
+        assert!(load(&done).unwrap_err().contains("completed all stages"));
+    }
+
+    #[tokio::test]
+    async fn a_settle_only_continuation_outside_git_repeats_the_checks() {
+        let src = finals_without_result([true, false], no_git).await;
+        let cont = resume_full(&src, no_git, happy);
+        let manifest = settled(&cont).await;
+        assert_eq!(gate_runs(&cont), 1);
+        assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1);
+        assert_eq!(calls_of(&cont, Stage::Final).len(), 2);
+        assert_eq!(manifest["ship"], true, "the new final reviews decide");
+    }
+
+    #[tokio::test]
+    async fn changed_files_after_the_final_checkpoint_repeat_the_checks() {
+        let src = finals_without_result([true, false], |s| git_at(COMMIT, s)).await;
+        let cont = resume_full(&src, |s| git_at(BASE, s), happy);
+        let manifest = settled(&cont).await;
+        assert_eq!(gate_runs(&cont), 1);
+        assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1);
+        assert_eq!(calls_of(&cont, Stage::Final).len(), 2);
+        assert_eq!(manifest["ship"], true, "the new final reviews decide");
+    }
+
+    #[tokio::test]
+    async fn a_completed_group_needs_the_result_of_each_agent_that_reported() {
+        let src = stopped_in(Stage::Revise, no_git, |agent, stage, prompt| match stage {
+            Stage::Exchange => turn("claude", true),
+            Stage::Crossreview => review("revise"),
+            _ => happy(agent, stage, prompt),
+        })
+        .await;
+        assert_eq!(load(&src).unwrap().from, "revise");
+        let path = src.dir.join("checkpoint.json");
+        let original = std::fs::read(&path).unwrap();
+        let cases: [(&dyn Fn(&mut Value), &str); 7] = [
+            (
+                &|c| drop(c["artifacts"].as_object_mut().unwrap().remove("crossreview.json")),
+                "crossreview.json is not in it",
+            ),
+            (&|c| drop(c["outcomes"].as_object_mut().unwrap().remove("crossreview")), "crossreview has no outcome"),
+            (&|c| c["decisions"]["verdict"] = json!("accept"), "the verdict and crossreview.json"),
+            (&|c| c["outcomes"]["exchange-1"] = json!(["claude"]), "turns/t1-codex.json has no outcome"),
+            (
+                &|c| drop(c["artifacts"].as_object_mut().unwrap().remove("turns/t1-codex.json")),
+                "turns/t1-codex.json is not in it",
+            ),
+            (&|c| c["cleanup"] = json!(["../run.json"]), "cleanup files"),
+            (&|c| drop(c.as_object_mut().unwrap().remove("fences")), "older incompatible recovery format"),
+        ];
+        for (change, why) in cases {
+            edit_json(&path, change);
+            let error = load(&src).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+            std::fs::write(&path, &original).unwrap();
+        }
+        assert!(load(&src).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_budget_is_durable_before_a_message_is_queued() {
+        let src = stopped_in(Stage::Implement, no_git, happy).await;
+        // Three messages reached the round. A fourth was accepted, then the app stopped before it applied.
+        let full = "m".repeat(MESSAGE_LIMIT);
+        for n in 0..3 {
+            append(
+                &src.dir.join("messages.jsonl"),
+                json!({ "at": "t", "stage": "plan", "kind": "user", "body": format!("{n}{}", &full[1..]) }),
+            );
+            append(&src.dir.join("budget.jsonl"), json!({ "at": "t", "kind": "message", "bytes": MESSAGE_LIMIT }));
+            append(
+                &src.dir.join("budget.jsonl"),
+                json!({ "kind": "apply-start", "digest": task_recovery::digest(format!("{n}{}", &full[1..]).as_bytes()) }),
+            );
+            append(&src.dir.join("budget.jsonl"), json!({ "kind": "apply-complete" }));
+        }
+        let late = "l".repeat(MESSAGE_LIMIT);
+        let digest = task_recovery::digest(late.as_bytes());
+        append(
+            &src.dir.join("budget.jsonl"),
+            json!({ "at": "t", "kind": "external", "bytes": MESSAGE_LIMIT, "ref": "late", "digest": digest }),
+        );
+
+        let gate = Arc::new(Notify::new());
+        let held = gate.clone();
+        let cont = resume_full(&src, no_git, move |agent, stage, prompt| match (stage, happy(agent, stage, prompt)) {
+            (Stage::Implement, Fake::Reply(text)) => Fake::After(held.clone(), text),
+            (_, fake) => fake,
+        });
+        let used = {
+            let budget = lock(&cont.handle.budget);
+            (budget.count, budget.bytes)
+        };
+        assert_eq!(used, (4, MESSAGES_BYTES));
+        let Ok(Contribution::Queued(applied)) = cont.handle.contribute("late", &late) else {
+            panic!("the reserved id is queued without a second charge");
+        };
+        applied.await.unwrap();
+        assert_eq!(cont.handle.contribute("late", "Other text.").unwrap_err(), Refusal::Conflict);
+        let refused = cont.handle.control(Control::Message { text: "x".into() }).unwrap_err();
+        assert!(refused.to_string().contains("limit of 32 messages and 64 KiB"), "{refused}");
+        eventually(|| !calls_of(&cont, Stage::Implement).is_empty()).await;
+        gate.notify_one();
+        settled(&cont).await;
+        let prompt = &calls_of(&cont, Stage::Implement)[0].prompt;
+        assert!(!prompt.contains(&late), "the implementation prompt was made before the retry");
+        assert!(calls_of(&cont, Stage::Crossreview)[0].prompt.contains(&late));
+        let ledger = std::fs::read_to_string(cont.dir.join("budget.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 12);
+
+        // A budget line that is missing for a message is damage.
+        let lines = std::fs::read_to_string(src.dir.join("budget.jsonl")).unwrap();
+        let kept: Vec<&str> = lines.lines().skip(1).collect();
+        std::fs::write(src.dir.join("budget.jsonl"), kept.join("\n") + "\n").unwrap();
+        assert!(load(&src).unwrap_err().contains("budget.jsonl is damaged (bytes)"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_budget_write_refuses_the_message_and_takes_nothing() {
+        let gate = Arc::new(Notify::new());
+        let run = held_plan(gate.clone());
+        std::fs::create_dir(run.dir.join("budget.jsonl")).unwrap();
+        let refused = run.handle.control(Control::Message { text: "Keep it small.".into() }).unwrap_err();
+        assert!(refused.to_string().contains("cannot record the message"), "{refused}");
+        assert!(matches!(run.handle.contribute("m-1", "Check the cache."), Err(Refusal::Invalid(_))));
+        assert_eq!(lock(&run.handle.budget).count, 0);
+        assert!(lock(&run.handle.budget).contributions.is_empty());
+        gate.notify_one();
+        settled(&run).await;
+        assert_eq!(run.handle.status().state, RunState::Done, "a refused message does not fail the run");
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_stays_after_a_cancel() {
+        let gate = Arc::new(Notify::new());
+        let run = held_plan(gate.clone());
+        std::fs::create_dir(run.dir.join("messages.jsonl")).unwrap();
+        let Ok(Contribution::Queued(applied)) = run.handle.contribute("m-1", "Check the cache.") else {
+            panic!("a new contribution is queued");
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(5), applied).await.unwrap().is_err());
+        run.handle.control(Control::Cancel { reason: None }).unwrap();
+        gate.notify_one();
+        settled(&run).await;
+        assert_eq!(run.handle.status().state, RunState::Failed);
+        std::fs::remove_dir(run.dir.join("messages.jsonl")).unwrap();
+        assert!(load(&run).unwrap_err().contains("could not write its record"));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_answer_closes_the_same_questions_after_a_stop() {
+        let asked = |agent: &str, stage: Stage, prompt: &str| match stage {
+            Stage::Exchange => Fake::Reply(fenced(
+                json!({ "message": "Ok.", "plan": "P.", "implementer": "claude", "agreed": true, "conceded": [], "unknowns": ["Which database?"], "backlog": [] }),
+            )),
+            _ => happy(agent, stage, prompt),
+        };
+        for (questions, closed) in [("Which database?", true), ("Which cache?", false)] {
+            let src = start(asked);
+            until(&src, |s| s.state == RunState::Waiting).await;
+            src.handle.control(Control::Cancel { reason: None }).unwrap();
+            settled(&src).await;
+            // The answer and all of the budget were recorded, then the app stopped before the decision checkpoint.
+            append(
+                &src.dir.join("messages.jsonl"),
+                json!({ "at": "t", "stage": "exchange-1", "kind": "answer", "body": "Postgres.", "questions": task_recovery::digest(questions.as_bytes()) }),
+            );
+            for _ in 0..MESSAGES_COUNT {
+                append(&src.dir.join("budget.jsonl"), json!({ "at": "t", "kind": "message", "bytes": 9 }));
+            }
+            append(
+                &src.dir.join("budget.jsonl"),
+                json!({ "kind": "apply-start", "digest": task_recovery::digest(b"Postgres.") }),
+            );
+            append(&src.dir.join("budget.jsonl"), json!({ "kind": "apply-complete" }));
+            assert_eq!(load(&src).unwrap().from, "decision");
+
+            let cont = resume_full(&src, no_git, asked);
+            if closed {
+                settled(&cont).await;
+                assert!(!events(&cont).iter().any(|(k, _)| k == "waiting"), "the same questions are not asked again");
+                let prompt = &calls_of(&cont, Stage::Implement)[0].prompt;
+                assert_eq!(prompt.matches("Postgres.").count(), 1);
+                assert_eq!(lock(&cont.handle.budget).count, MESSAGES_COUNT, "no new debit");
+            } else {
+                until(&cont, |s| s.state == RunState::Waiting).await;
+                cont.handle.control(Control::Cancel { reason: None }).unwrap();
+                settled(&cont).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_diff_is_selected_by_the_checkpoint() {
+        let serial = Arc::new(AtomicUsize::new(0));
+        let next = serial.clone();
+        let src = stopped_in(
+            Stage::Final,
+            move |script| {
+                if is_diff(script) {
+                    Fake::Reply(format!("diff {}", next.fetch_add(1, Ordering::SeqCst)))
+                } else {
+                    no_git(script)
+                }
+            },
+            full,
+        )
+        .await;
+        let saved = std::fs::read_to_string(src.dir.join("revision-diff.txt")).unwrap();
+        assert_ne!(saved, std::fs::read_to_string(src.dir.join("implementation-diff.txt")).unwrap());
+        std::fs::write(src.dir.join("diff.txt"), "uncommitted mirror").unwrap();
+        assert_eq!(read_diff(&src.dir).as_deref(), Some(saved.as_str()));
+        assert!(load(&src).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_downgraded_checkpoint_hides_every_cleanup_prefix() {
+        let src = stopped_in(Stage::Final, no_git, happy).await;
+        let path = src.dir.join("checkpoint.json");
+        let mut checkpoint: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let events = std::fs::read_to_string(src.dir.join("events.jsonl")).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        let cut = lines
+            .iter()
+            .position(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|e| e["kind"] == "stage" && e["detail"] == "gates")
+            })
+            .unwrap();
+        checkpoint["groups"].as_array_mut().unwrap().retain(|g| g != "gates" && g != "crossreview");
+        checkpoint["outcomes"].as_object_mut().unwrap().remove("crossreview");
+        checkpoint["decisions"]["verdict"] = Value::Null;
+        for name in ["gates.json", "crossreview.json"] {
+            checkpoint["artifacts"].as_object_mut().unwrap().remove(name);
+        }
+        checkpoint["fences"] = json!({});
+        checkpoint["events"] = json!(cut);
+        checkpoint["cleanup"] = json!(["gates.json", "crossreview.json"]);
+        checkpoint["cleaning"] = json!(true);
+        std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let check = || {
+            let room = read_room(&src.dir);
+            assert!(room.gates.is_empty());
+            assert!(room.crossreview.is_none());
+            assert!(room.stages.iter().find(|s| s.id == "gates").is_some_and(|s| s.state == "pending"));
+            assert_eq!(load(&src).unwrap().from, "gates");
+        };
+        check(); // Checkpoint published; old events and files remain.
+        std::fs::write(src.dir.join("events.jsonl"), lines[..cut].join("\n") + "\n").unwrap();
+        check();
+        std::fs::remove_file(src.dir.join("gates.json")).unwrap();
+        check();
+        std::fs::remove_file(src.dir.join("crossreview.json")).unwrap();
+        check();
+        append(&src.dir.join("events.jsonl"), json!({ "at": "t", "kind": "files_changed", "detail": "repeat" }));
+        check();
+        let cont = resume_full(&src, no_git, happy);
+        settled(&cont).await;
+        assert_eq!(gate_runs(&cont), 1);
+        assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn each_check_uses_its_own_fence() {
+        let crossreview = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_review = crossreview.clone();
+        let mark = crossreview.clone();
+        let src = stopped_in(
+            Stage::Final,
+            move |script| if in_review.load(Ordering::SeqCst) { git_at(BASE, script) } else { git_at(COMMIT, script) },
+            move |agent, stage, prompt| {
+                if stage == Stage::Crossreview {
+                    mark.store(true, Ordering::SeqCst);
+                }
+                happy(agent, stage, prompt)
+            },
+        )
+        .await;
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(src.dir.join("checkpoint.json")).unwrap()).unwrap();
+        assert_ne!(checkpoint["fences"]["gates"], checkpoint["fences"]["crossreview"]);
+        let cont = resume_full(&src, |s| git_at(COMMIT, s), happy);
+        settled(&cont).await;
+        assert_eq!(gate_runs(&cont), 0);
+        assert_eq!(calls_of(&cont, Stage::Crossreview).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_final_review_gets_the_revision_gate_results() {
+        let builds = AtomicUsize::new(0);
+        let src = start_full(
+            Duration::from_secs(5),
+            move |s| {
+                if !s.contains("pnpm build") {
+                    return git_at(COMMIT, s);
+                }
+                match builds.fetch_add(1, Ordering::SeqCst) {
+                    0 => Fake::Exit(37),
+                    _ => Fake::Reply("revision build passed".into()),
+                }
+            },
+            full,
+        );
+        settled(&src).await;
+        // The crash window after the final checkpoint, with no fence for the final review.
+        std::fs::remove_file(src.dir.join("manifest.json")).unwrap();
+        let events = std::fs::read_to_string(src.dir.join("events.jsonl")).unwrap();
+        let kept: Vec<&str> = events.lines().filter(|l| !l.contains("\"kind\":\"done\"")).collect();
+        std::fs::write(src.dir.join("events.jsonl"), kept.join("\n") + "\n").unwrap();
+        edit_json(&src.dir.join("checkpoint.json"), |c| {
+            assert!(c["fences"]["revision-gates"].is_object(), "{c}");
+            c["fences"].as_object_mut().unwrap().remove("final");
+        });
+        assert_eq!(load(&src).unwrap().from, "final");
+
+        let cont = resume_full(&src, |s| git_at(COMMIT, s), full);
+        let manifest = settled(&cont).await;
+        assert_eq!(manifest["stopped"], Value::Null, "{manifest}");
+        assert_eq!(gate_runs(&cont), 0);
+        let finals = calls_of(&cont, Stage::Final);
+        assert_eq!(finals.len(), 2);
+        for call in finals {
+            assert!(call.prompt.contains("revision build passed"), "{}", call.agent);
+            assert!(!call.prompt.contains("\"code\": 37"), "{}", call.agent);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_revision_runs_with_the_original_findings_after_changed_files() {
+        let src = stopped_in(Stage::Revise, |s| git_at(COMMIT, s), full).await;
+        let names = vec!["01".to_owned()];
+        assert_eq!(
+            TaskRuns::read(src.dir.parent().unwrap(), &names).inspect("01"),
+            task_recovery::Resume::Ready {
+                from: "revise".to_owned(),
+                label: "Revise".to_owned(),
+                repeats: true,
+                recheck: None,
+            }
+        );
+        // A second cross review would accept: it must not replace the findings.
+        let cont = resume_full(
+            &src,
+            |s| git_at(BASE, s),
+            |agent, stage, prompt| match stage {
+                Stage::Crossreview => review("accept"),
+                _ => full(agent, stage, prompt),
+            },
+        );
+        let manifest = settled(&cont).await;
+        assert_eq!(manifest["stopped"], Value::Null, "{manifest}");
+        assert!(calls_of(&cont, Stage::Crossreview).is_empty());
+        let revise = calls_of(&cont, Stage::Revise);
+        assert_eq!(revise.len(), 1);
+        assert!(revise[0].prompt.contains("Bug."), "{}", revise[0].prompt);
+        assert_eq!(gate_runs(&cont), 1);
+        assert_eq!(calls_of(&cont, Stage::Final).len(), 2);
+        assert!(!events(&cont).iter().any(|(k, _)| k == "files_changed"));
+        let labels: Vec<(String, String)> = read_room(&cont.dir).stages.into_iter().map(|s| (s.id, s.label)).collect();
+        for (id, label) in [
+            ("gates", "Gates (from run 01)"),
+            ("crossreview", "Cross review (from run 01)"),
+            ("revise", "Revise (repeated)"),
+            ("revision-gates", "Revision gates"),
+            ("final", "Final review"),
+        ] {
+            assert!(labels.contains(&(id.to_owned(), label.to_owned())), "{id}: {labels:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn impossible_budget_lines_block_recovery() {
+        let src = stopped_in(Stage::Plan, no_git, happy).await;
+        let reservation = |bytes: usize| json!({ "kind": "message", "bytes": bytes });
+        let external = |id: &str, bytes: usize, body: &str| json!({ "kind": "external", "ref": id, "bytes": bytes, "digest": task_recovery::digest(body.as_bytes()) });
+        let applied =
+            json!({ "at": "t", "stage": "plan", "kind": "external", "from": "a2a", "ref": "id", "body": "wrong" });
+        let cases = [
+            (vec![reservation(0)], None, "bytes"),
+            (vec![reservation(MESSAGE_LIMIT + 1)], None, "bytes"),
+            (vec![reservation(1); MESSAGES_COUNT + 1], None, "message limit"),
+            (vec![reservation(MESSAGE_LIMIT); 5], None, "message limit"),
+            (vec![external("id", 1, "x"), external("id", 1, "x")], None, "duplicate advisory id"),
+            (
+                vec![
+                    external("id", 5, "right"),
+                    json!({ "kind": "apply-start", "ref": "id" }),
+                    json!({ "kind": "apply-complete" }),
+                ],
+                Some(applied.clone()),
+                "digest",
+            ),
+            (
+                vec![
+                    external("id", 6, "wrong"),
+                    json!({ "kind": "apply-start", "ref": "id" }),
+                    json!({ "kind": "apply-complete" }),
+                ],
+                Some(applied),
+                "bytes",
+            ),
+            // Only the last line can be an interrupted write: the budget lock is held across it.
+            (
+                vec![external("id", 1, "x"), json!({ "kind": "apply-start", "ref": "id" }), external("id2", 1, "y")],
+                None,
+                "unmatched apply-start",
+            ),
+            (
+                vec![
+                    external("id", 1, "x"),
+                    json!({ "kind": "apply-start", "ref": "id" }),
+                    json!({ "kind": "apply-start", "ref": "id" }),
+                ],
+                None,
+                "unmatched apply-start",
+            ),
+        ];
+        for (ledger, message, why) in cases {
+            let content = ledger.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+            std::fs::write(src.dir.join("budget.jsonl"), content).unwrap();
+            if let Some(message) = message {
+                std::fs::write(src.dir.join("messages.jsonl"), message.to_string() + "\n").unwrap();
+            } else {
+                let _ = std::fs::remove_file(src.dir.join("messages.jsonl"));
+            }
+            let error = load(&src).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+
+        // After a killed message write, only no new line or one matching new line is possible.
+        let user = |body: &str| json!({ "at": "t", "stage": "plan", "kind": "user", "body": body }).to_string() + "\n";
+        let ledger =
+            [reservation(1), reservation(1), json!({ "kind": "apply-start", "digest": task_recovery::digest(b"x") })];
+        let content = ledger.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+        std::fs::write(src.dir.join("budget.jsonl"), content).unwrap();
+        for (messages, why) in [
+            (user("y"), "not the message that the run was writing"),
+            (user("x") + &user("x"), "after an interrupted message write"),
+            (user("x") + "{\"partial", "partial line"),
+        ] {
+            std::fs::write(src.dir.join("messages.jsonl"), messages).unwrap();
+            let error = load(&src).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+        for (messages, ledger) in [("", 2), ("{\"partial", 2), (user("x").as_str(), 4)] {
+            std::fs::write(src.dir.join("messages.jsonl"), messages).unwrap();
+            assert_eq!(load(&src).unwrap().ledger.len(), ledger, "{messages}");
+        }
+
+        // Each applied user message uses its own reservation of its size, made before its apply-start.
+        let start = |body: &str| json!({ "kind": "apply-start", "digest": task_recovery::digest(body.as_bytes()) });
+        let complete = json!({ "kind": "apply-complete" });
+        let long = "l".repeat(100);
+        for (ledger, messages, why) in [
+            (vec![reservation(1), start(&long), complete.clone()], user(&long), Some("bytes")),
+            (
+                vec![reservation(1), start("a"), complete.clone(), start("b"), complete.clone()],
+                user("a") + &user("b"),
+                Some("bytes"),
+            ),
+            (
+                vec![reservation(1), reservation(2), start("bb"), complete.clone(), start("a"), complete.clone()],
+                user("bb") + &user("a"),
+                None,
+            ),
+            (vec![reservation(7), reservation(1), start("x"), complete.clone()], user("x"), None),
+        ] {
+            let content = ledger.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+            std::fs::write(src.dir.join("budget.jsonl"), content).unwrap();
+            std::fs::write(src.dir.join("messages.jsonl"), &messages).unwrap();
+            match why {
+                Some(why) => {
+                    let error = load(&src).unwrap_err();
+                    assert!(error.contains(&format!("budget.jsonl is damaged ({why})")), "{messages}: {error}");
+                }
+                None => assert!(load(&src).is_ok(), "{messages}"),
+            }
+        }
     }
 }

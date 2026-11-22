@@ -683,7 +683,10 @@ mod tests {
 
     use super::*;
     use crate::task_artifacts::read_room;
-    use crate::task_runs::tests::{Fake, Stage, Started, calls_of, happy, plan, settled, start, until};
+    use crate::task_runs::Control;
+    use crate::task_runs::tests::{
+        Fake, Stage, Started, calls_of, happy, no_git, plan, resume_full, settled, start, until,
+    };
 
     /// A run whose first plan waits for the gate, and its share.
     fn shared(gate: Arc<Notify>) -> (Started, Shares, ShareInfo) {
@@ -985,5 +988,33 @@ mod tests {
         .await
         .expect("the share releases the run");
         assert!(matches!(shares.start("s", "task-1", "01", run.dir.clone(), || None), Err(Error::RunNotShareable)));
+    }
+
+    #[tokio::test]
+    async fn the_old_task_stays_terminal_and_a_continuation_has_a_new_identity() {
+        let run = start(|agent, stage, prompt| match stage {
+            Stage::Implement => Fake::Hang,
+            _ => happy(agent, stage, prompt),
+        });
+        let shares = Shares::default();
+        let handle = run.handle.clone();
+        let old = shares.start("s", "task-1", "01", run.dir.clone(), || Some(handle)).unwrap();
+        until(&run, |s| s.stage.as_deref() == Some("implement")).await;
+        run.handle.control(Control::Cancel { reason: None }).unwrap();
+        settled(&run).await;
+
+        let next = resume_full(&run, no_git, happy);
+        settled(&next).await;
+        let handle = next.handle.clone();
+        let new = shares.start("s", "task-1", "02", next.dir.clone(), || Some(handle)).unwrap();
+        assert_ne!(new.task_id, old.task_id);
+        assert_ne!(new.token, old.token);
+        let (_, task) = Client::new(&old).get(&format!("/tasks/{}", old.task_id)).await;
+        assert_eq!(task["status"]["state"], "TASK_STATE_CANCELED", "the old task stays terminal");
+        let (_, task) = Client::new(&new).get(&format!("/tasks/{}", new.task_id)).await;
+        assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+        let stale = Client { info: &new, token: Some(&old.token), version: Some(VERSION) };
+        assert_eq!(stale.get(&format!("/tasks/{}", new.task_id)).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(Client::new(&old).get(&format!("/tasks/{}", new.task_id)).await.0, StatusCode::NOT_FOUND);
     }
 }

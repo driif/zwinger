@@ -1,10 +1,11 @@
 import { Button, Card, CardBody, CardHeader, CopyField, SegmentedControl, StepProgress, Textarea } from "@driif/motiv";
-import { ArrowUp, Cable, FileDiff, Pause, Pencil, Play, Square, Unplug } from "lucide-react";
+import { ArrowUp, Cable, FileDiff, Pause, Pencil, Play, RotateCcw, Square, Unplug } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   controlTaskRun,
   isLive,
   Room,
+  resumeTaskRun,
   RoomSource,
   RunControl,
   RunShare,
@@ -65,7 +66,12 @@ export function TaskRoom(props: Props) {
   const [sharing, setSharing] = useState(false);
   // A share result of an earlier run must not show its credential on this one, also after A→B→A.
   const shareRequests = useRef(latestRequest()).current;
+  // A Resume reply belongs to the room that sent it: a later selection or an unmount makes it stale.
+  const resumeRequests = useRef(latestRequest()).current;
+  const [resuming, setResuming] = useState(false);
   const [now, setNow] = useState(Date.now());
+
+  useEffect(() => resumeRequests.drop, [sourceKey]);
 
   useEffect(() => {
     setRoom(undefined);
@@ -76,6 +82,7 @@ export function TaskRoom(props: Props) {
     setShare(null);
     setSharing(false);
     shareRequests.drop();
+    setResuming(false);
     setError(undefined);
     if (!source) return;
     if (source.kind === "run") {
@@ -122,6 +129,17 @@ export function TaskRoom(props: Props) {
   const cageRunning = inApp?.cageRunning;
   const liveRun = status !== null && isLive(status.state);
   const canStart = inApp && cageRunning && !runs.some((r) => isLive(r.state));
+  const summary = runs.find((r) => r.run === run);
+  const resumable = summary?.resume && !liveRun ? summary.resume : undefined;
+  const resumeBlocked = !resumable
+    ? undefined
+    : "unavailable" in resumable
+      ? `${resumable.unavailable[0].toUpperCase()}${resumable.unavailable.slice(1)}.`
+      : !cageRunning
+        ? "Start the cage first"
+        : !canStart
+          ? "Another run of this task is live"
+          : undefined;
 
   const act = (work: () => Promise<unknown>) => {
     setError(undefined);
@@ -164,6 +182,29 @@ export function TaskRoom(props: Props) {
       const next = await startTaskRun(inApp.session.id, inApp.task.id);
       inApp.onRun(next);
     });
+  const resume = () => {
+    if (!inApp || !run) return;
+    const isCurrent = resumeRequests.next();
+    setError(undefined);
+    setResuming(true);
+    // The run list of this task changes also when the user left the room before the reply.
+    const refresh = inApp.onRunsChange;
+    resumeTaskRun(inApp.session.id, inApp.task.id, run).then(
+      (next) => {
+        refresh();
+        if (!isCurrent()) return;
+        setResuming(false);
+        inApp.onRun(next);
+      },
+      (e) => {
+        // From task_recovery.rs: a newer run already continues this one.
+        if (errorMessage(e).includes("continues this run")) refresh();
+        if (!isCurrent()) return;
+        setResuming(false);
+        setError(errorMessage(e));
+      },
+    );
+  };
 
   const waiting = status?.state === "waiting";
   const stepInBlocked =
@@ -202,7 +243,7 @@ export function TaskRoom(props: Props) {
             {props.kind === "folder"
               ? "Duo round folder, read-only"
               : run
-                ? `Run ${run} · ${status?.state ?? runs.find((r) => r.run === run)?.state ?? "loading"}${status?.pausing && status.state === "running" ? " · pauses after this stage" : ""}`
+                ? `Run ${run}${summary?.continues ? ` · continues run ${summary.continues}` : ""} · ${status?.state ?? runs.find((r) => r.run === run)?.state ?? "loading"}${status?.pausing && status.state === "running" ? " · pauses after this stage" : ""}`
                 : "No run yet"}
           </p>
         </div>
@@ -267,6 +308,24 @@ export function TaskRoom(props: Props) {
             <Button size="sm" variant="ghost" iconLeft={<Pencil size={14} />} onClick={inApp.onEdit}>
               Edit task
             </Button>
+            {resumable && (
+              <Button
+                size="sm"
+                variant="secondary"
+                iconLeft={<RotateCcw size={14} />}
+                disabled={resumeBlocked !== undefined}
+                loading={resuming}
+                title={
+                  resumeBlocked ??
+                  ("from" in resumable && resumable.repeats
+                    ? `${resumable.label} started before the run stopped. It runs again in full.`
+                    : undefined)
+                }
+                onClick={resume}
+              >
+                {"from" in resumable ? `Resume from ${resumable.label}` : "Resume"}
+              </Button>
+            )}
             <Button
               size="sm"
               iconLeft={<Play size={14} />}
@@ -279,6 +338,11 @@ export function TaskRoom(props: Props) {
           </>
         )}
       </header>
+      {resumable && "from" in resumable && resumable.recheck && (
+        <p className="muted">
+          If the files changed or cannot be verified since {resumable.recheck}, {resumable.recheck} and later checks run again first.
+        </p>
+      )}
       {error && <p className="danger mono">{error}</p>}
       {total && <p className="muted">Total time {total}</p>}
       {room && steps.length > 0 && (
