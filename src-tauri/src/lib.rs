@@ -7,6 +7,7 @@ mod commands;
 mod editor;
 mod editor_icons;
 mod error;
+mod external_live;
 mod folder_watch;
 mod host_agents;
 mod instance;

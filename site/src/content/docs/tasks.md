@@ -135,7 +135,7 @@ The button is not available, and shows why, in these cases:
 An A2A share of the stopped run does not move to the continuation. The continuation has a new A2A task ID. To share it,
 select **Share over A2A** in its room.
 
-**Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it.
+**Open round folder…** shows a round folder from your Mac in the room. You can read it, but you cannot change it. During an active stage, the room shows public live output from the checked-in Duo runner's Claude stream JSON files. It shows Codex JSON records only when the stream starts with a Codex thread or turn record at its beginning. Legacy Codex stderr shows a diagnostic label and fixed notices when a command runs or a patch applies; it never shows command text, output or reasoning. These notices are not agent replies or verdicts. A Codex stream opened in the middle shows only legacy notices. The room reads the latest 128 KiB when you open a long stream, starts at a complete record, and marks skipped history. It reads up to 64 KiB from each selected file per update. A live record larger than 32 KiB is skipped with a notice. A tool whose result is in that record shows as done. Long streams can clear earlier live output to bound memory. If one participant's file changes or its live history reaches the limit, only that participant's live output clears. A stage or participant change clears all live output. These changes do not affect the saved round result.
 
 ## Share a run over A2A
 

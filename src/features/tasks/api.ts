@@ -149,6 +149,7 @@ export interface Room {
   agents: string[];
   participants: RoomParticipant[];
   stages: RoomStage[];
+  activeActor: string | null;
   messages: RoomMessage[];
   positions: {
     agent: string;
@@ -218,8 +219,9 @@ export type RoomSource =
   | { kind: "folder"; path: string };
 
 export type RoomEvent =
-  | { type: "room"; room: Room; run: RunStatus | null }
-  | { type: "live"; agent: string; stage: string; record: AgentRecord };
+  | { type: "room"; generation: number; room: Room; run: RunStatus | null }
+  | { type: "reset"; generation: number; sequence: number; agent: string }
+  | { type: "live"; generation: number; sequence: number; agent: string; stage: string; record: AgentRecord };
 
 /** Sends the room now and on each change. Resolves to the token for `unwatchRoom`. */
 export const watchRoom = (

@@ -15,7 +15,8 @@ export interface Message {
   isError?: boolean;
   stopReason?: string;
   errorMessage?: string;
-  timestamp: number;
+  timestamp?: number;
+  id?: string;
 }
 
 export interface ToolRun {
@@ -52,7 +53,8 @@ export const initialChat: ChatState = { messages: [], tools: {}, running: false,
 
 export function textOf(content: Message["content"]) {
   if (typeof content === "string") return content;
-  return (content ?? []).map((b) => (b.type === "text" ? b.text : "")).join("");
+  if (!Array.isArray(content)) return "";
+  return content.map((b) => (b?.type === "text" && typeof b.text === "string" ? b.text : "")).join("");
 }
 
 interface StreamEvent {
@@ -77,7 +79,8 @@ function stream(partial: Message | undefined, event: StreamEvent): Message {
     case "text_delta":
     case "text_end": {
       const text = block?.type === "text" ? block.text : "";
-      content[i] = { type: "text", text: event.content ?? text + (event.delta ?? "") };
+      // Keep the latest text, so a long live message stays bounded and still updates.
+      content[i] = { type: "text", text: (event.content ?? text + (event.delta ?? "")).slice(-16384) };
       break;
     }
     case "thinking_start":
@@ -132,7 +135,17 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
   }
 }
 
-const same = (a: Message, b: Message) => a.role === b.role && a.timestamp === b.timestamp;
+const same = (a: Message, b: Message) =>
+  a.role === b.role &&
+  (a.id && b.id ? a.id === b.id :
+    a.timestamp !== undefined && b.timestamp !== undefined ? a.timestamp === b.timestamp :
+      a.role === "toolResult" && a.toolCallId !== undefined && a.toolCallId === b.toolCallId);
+
+function withTool(state: ChatState, id: string, run: ToolRun): ChatState {
+  const tools = { ...state.tools, [id]: run };
+  for (const old of Object.keys(tools).slice(0, -100)) delete tools[old];
+  return { ...state, tools };
+}
 
 function apply(state: ChatState, record: AgentRecord): ChatState {
   const r = record as Record<string, any>;
@@ -149,18 +162,15 @@ function apply(state: ChatState, record: AgentRecord): ChatState {
       return {
         ...state,
         // A record from before the base can hold a message that the base has.
-        messages: state.messages.some((m) => same(m, r.message)) ? state.messages : [...state.messages, r.message],
+        messages: state.messages.some((m) => same(m, r.message)) ? state.messages : [...state.messages, r.message].slice(-100),
         partial: r.message.role === "assistant" ? undefined : state.partial,
       };
     case "tool_execution_start":
-      return { ...state, tools: { ...state.tools, [r.toolCallId]: { status: "running", output: "" } } };
+      return withTool(state, r.toolCallId, { status: "running", output: "" });
     case "tool_execution_update":
-      return { ...state, tools: { ...state.tools, [r.toolCallId]: { status: "running", output: toolOutput(r.partialResult) } } };
+      return withTool(state, r.toolCallId, { status: "running", output: toolOutput(r.partialResult) });
     case "tool_execution_end":
-      return {
-        ...state,
-        tools: { ...state.tools, [r.toolCallId]: { status: r.isError ? "error" : "done", output: toolOutput(r.result) } },
-      };
+      return withTool(state, r.toolCallId, { status: r.isError ? "error" : "done", output: toolOutput(r.result) });
     case "queue_update":
       return { ...state, queue: [...r.steering, ...r.followUp] };
     case "compaction_start":

@@ -60,6 +60,8 @@ pub struct Room {
     /// The participants, in the order of the round.
     pub participants: Vec<RoomParticipant>,
     pub stages: Vec<Stage>,
+    /// The participant named by the active stage event, when it names one.
+    pub active_actor: Option<String>,
     /// The typed messages of the round, in order.
     pub messages: Vec<Message>,
     /// What each agent wants to build now.
@@ -736,6 +738,12 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             Stage { id: id.clone(), label, state, started: at }
         })
         .collect();
+    let active_actor = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "stage")
+        .and_then(|e| e.detail.strip_prefix("crossreview by "))
+        .and_then(known);
 
     // Agents' turns and positions.
     let mut messages = Vec::new();
@@ -1133,6 +1141,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         agents: agents.clone(),
         participants: roster,
         stages,
+        active_actor,
         messages,
         positions,
         turns,

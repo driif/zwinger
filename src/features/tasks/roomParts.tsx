@@ -57,9 +57,11 @@ export function InstallControl({ runtime, runtimes }: { runtime: RuntimeView; ru
 }
 
 /** The values that tell one tool call from another. */
-function summary(args: Record<string, unknown>) {
-  const main = args.command ?? args.path ?? args.file_path ?? args.pattern ?? args.url;
-  return typeof main === "string" ? main : JSON.stringify(args);
+function summary(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+  const values = args as Record<string, unknown>;
+  const main = values.command ?? values.path ?? values.file_path ?? values.pattern ?? values.url;
+  return typeof main === "string" ? main : JSON.stringify(values);
 }
 
 function ToolCard({ call, result, run }: { call: Extract<Block, { type: "toolCall" }>; result?: Message; run?: ToolRun }) {
@@ -97,9 +99,9 @@ export function MessageView({ message, results, tools }: { message: Message; res
   if (message.role !== "assistant") return null;
   return (
     <div className="msg assistant">
-      {(message.content as Block[]).map((block, i) => {
-        if (block?.type === "text") return <Markdown key={i} text={block.text} />;
-        if (block?.type === "thinking")
+      {(Array.isArray(message.content) ? message.content : []).map((block, i) => {
+        if (block?.type === "text" && typeof block.text === "string") return <Markdown key={i} text={block.text} />;
+        if (block?.type === "thinking" && typeof block.thinking === "string")
           return (
             <Accordion
               key={i}
@@ -107,7 +109,7 @@ export function MessageView({ message, results, tools }: { message: Message; res
               items={[{ id: "thinking", title: <span className="muted">Thinking</span>, content: <Markdown text={block.thinking} /> }]}
             />
           );
-        if (block?.type === "toolCall")
+        if (block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string")
           return <ToolCard key={block.id} call={block} result={results.get(block.id)} run={tools[block.id]} />;
         return null;
       })}
@@ -176,7 +178,7 @@ export function LiveEntry({ agent, room, chat, since }: { agent: string; room: R
   const results = new Map<string, Message>(
     messages.filter((m) => m.role === "toolResult" && m.toolCallId).map((m) => [m.toolCallId!, m]),
   );
-  const shown = [...messages.filter((m) => m.role === "assistant").slice(-3), ...(chat?.partial ? [chat.partial] : [])];
+  const shown = [...messages.filter((m) => m.role === "assistant" || m.role === "notice").slice(-4), ...(chat?.partial ? [chat.partial] : [])];
   return (
     <Card variant="subtle" padding="sm" className="stack">
       <p className="row">
@@ -186,6 +188,7 @@ export function LiveEntry({ agent, room, chat, since }: { agent: string; room: R
       {shown.map((message, i) => (
         <MessageView key={i} message={message} results={results} tools={chat?.tools ?? {}} />
       ))}
+      {chat?.status && <p className="muted">{chat.status}</p>}
     </Card>
   );
 }

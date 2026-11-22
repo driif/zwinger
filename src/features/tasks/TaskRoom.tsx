@@ -55,10 +55,13 @@ export function TaskRoom(props: Props) {
         ? { kind: "run", sessionId: props.session.id, taskId: props.task.id, run }
         : undefined;
   const sourceKey = JSON.stringify(source ?? null);
+  const currentSource = useRef(sourceKey);
+  currentSource.current = sourceKey;
 
   const [room, setRoom] = useState<Room>();
   const [status, setStatus] = useState<RunStatus | null>(null);
   const [live, setLive] = useState<Record<string, { stage: string; chat: ChatState }>>({});
+  const liveOrder = useRef({ generation: -1, sequence: -1 });
   const [error, setError] = useState<string>();
   const [draft, setDraft] = useState("");
   const [diff, setDiff] = useState<string>();
@@ -78,6 +81,7 @@ export function TaskRoom(props: Props) {
     setRoom(undefined);
     setStatus(null);
     setLive({});
+    liveOrder.current = { generation: -1, sequence: -1 };
     setDiff(undefined);
     diffRequests.drop();
     setShare(null);
@@ -96,9 +100,24 @@ export function TaskRoom(props: Props) {
     let token: number | undefined;
     let closed = false;
     watchRoom(source, (event) => {
+      if (closed || sourceKey !== currentSource.current || event.generation < liveOrder.current.generation) return;
+      if (event.generation > liveOrder.current.generation) {
+        liveOrder.current = { generation: event.generation, sequence: -1 };
+        setLive({});
+      }
       if (event.type === "room") {
         setRoom(event.room);
         setStatus(event.run);
+        return;
+      }
+      if (event.sequence <= liveOrder.current.sequence) return;
+      liveOrder.current.sequence = event.sequence;
+      if (event.type === "reset") {
+        setLive((current) => {
+          const next = { ...current };
+          delete next[event.agent];
+          return next;
+        });
         return;
       }
       const { agent, stage, record } = event;
@@ -111,7 +130,7 @@ export function TaskRoom(props: Props) {
         if (closed) unwatchRoom(t);
         else token = t;
       },
-      (e) => setError(errorMessage(e)),
+      (e) => { if (!closed && sourceKey === currentSource.current) setError(errorMessage(e)); },
     );
     return () => {
       closed = true;
