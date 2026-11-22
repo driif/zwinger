@@ -692,7 +692,7 @@ pub mod fake {
             Ok(Pty { input, events })
         }
 
-        async fn open_pipe(&self, _: &FakeVm, argv: &[String], _: &str) -> Result<Pipe> {
+        async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str) -> Result<Pipe> {
             let (input, stdin) = mpsc::channel(PIPE_QUEUE);
             let (out, events) = mpsc::channel(PIPE_QUEUE);
             if (argv == ["node", "--version"] || argv == launch::trust_argv())
@@ -739,6 +739,7 @@ pub mod fake {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
+            self.cwds.lock().unwrap().push(cwd.to_owned());
             self.pipes.lock().unwrap().push(FakePipe { argv: argv.to_vec(), stdin, out });
             Ok(Pipe { input, events })
         }
