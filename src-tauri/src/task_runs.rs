@@ -21,6 +21,7 @@ use crate::runtime::SandboxRuntime;
 use crate::session::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
 use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, TURNS, append_durable, read_record, stage_key};
+use crate::task_participants::participants;
 use crate::task_recovery::{self, Checkpoint, Decisions, Fence, Recovered};
 
 const PLAN: &str = include_str!("task_runs/prompts/plan.md");
@@ -412,7 +413,7 @@ impl Registry {
     }
 
     fn launch<R: SandboxRuntime>(&self, spec: Spec<R>, recovered: Option<&Recovered>) -> Arc<RunHandle> {
-        let names = spec.task.agents.clone().map(|a| a.kind.name().to_owned());
+        let names = participants(&spec.task.agents).map(|p| p.id);
         let (control, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status) = watch::channel(Status {
             state: RunState::Running,
@@ -1966,6 +1967,7 @@ impl<R: SandboxRuntime> Actor<R> {
         json!({
             "task": self.io.task.slug,
             "title": self.io.task.title,
+            "participants": participants(&self.io.task.agents),
             "implementer": self.run.implementer.map(|i| names[i].clone()),
             "reviewer": self.run.implementer.map(|i| names[1 - i].clone()),
             "planned": self.run.planned.iter().map(|i| names[*i].clone()).collect::<Vec<_>>(),
@@ -2193,7 +2195,7 @@ pub(crate) mod tests {
     use crate::runtime::fake::{FakePipe, FakeRuntime, FakeVm};
     use crate::runtime::{PipeEvent, PipeInput};
     use crate::session::TaskAgent;
-    use crate::task_agents::{claude_result_line, codex_result_lines};
+    use crate::task_agents::{claude_result_line, codex_result_lines, pi_result_line};
     use crate::task_artifacts::{Mirror, read_diff, read_room};
     use crate::task_recovery::{RunRecord, TaskRuns};
 
@@ -2300,15 +2302,19 @@ pub(crate) mod tests {
                 argv: pipe.argv.clone(),
                 prompt: prompt.clone(),
             });
+            let lines = |text: &str| {
+                let bytes = match agent {
+                    "codex" => codex_result_lines(text),
+                    "pi" => pi_result_line(text),
+                    _ => claude_result_line(text),
+                };
+                String::from_utf8(bytes).unwrap()
+            };
             match script(agent, stage, &prompt) {
-                Fake::Reply(text) if agent == "codex" => {
-                    Fake::Reply(String::from_utf8(codex_result_lines(&text)).unwrap())
-                }
-                Fake::Reply(text) => Fake::Reply(String::from_utf8(claude_result_line(&text)).unwrap()),
+                Fake::Reply(text) => Fake::Reply(lines(&text)),
                 Fake::After(gate, text) => {
                     gate.notified().await;
-                    let lines = if agent == "codex" { codex_result_lines(&text) } else { claude_result_line(&text) };
-                    Fake::Reply(String::from_utf8(lines).unwrap())
+                    Fake::Reply(lines(&text))
                 }
                 other => other,
             }
@@ -2348,7 +2354,7 @@ pub(crate) mod tests {
         ))
     }
 
-    fn turn(implementer: &str, agreed: bool) -> Fake {
+    pub(crate) fn turn(implementer: &str, agreed: bool) -> Fake {
         Fake::Reply(fenced(
             json!({ "message": "My reply.", "plan": format!("Agreed plan by {implementer}."), "implementer": implementer, "agreed": agreed, "conceded": ["a point"], "unknowns": [], "backlog": [] }),
         ))
@@ -2431,6 +2437,20 @@ pub(crate) mod tests {
         script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
         shared_vm: bool,
     ) -> Started {
+        let agents = [
+            TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
+            TaskAgent { kind: AgentKind::Codex, model: None },
+        ];
+        start_agents(agents, idle, sh, script, shared_vm)
+    }
+
+    fn start_agents(
+        agents: [TaskAgent; 2],
+        idle: Duration,
+        sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+        shared_vm: bool,
+    ) -> Started {
         let runtime = FakeRuntime::default();
         let (calls, shells) = serve(&runtime, Arc::new(sh), Arc::new(script));
         let dir = temp_dir().join("01");
@@ -2443,10 +2463,7 @@ pub(crate) mod tests {
             slug: "fix".into(),
             title: "Fix it".into(),
             request: "Fix the bug.".into(),
-            agents: [
-                TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
-                TaskAgent { kind: AgentKind::Codex, model: None },
-            ],
+            agents,
             gates: vec!["pnpm build".into()],
             workdir: "/workspace".into(),
         };
@@ -2577,6 +2594,280 @@ pub(crate) mod tests {
         assert!(stages.contains(&("gates".to_owned(), "done")));
         assert!(stages.contains(&("revise".to_owned(), "skipped")));
         assert!(stages.contains(&("final".to_owned(), "done")));
+    }
+
+    /// A pair of one kind with the models `a` and `b`. `script` gets the
+    /// participant id from the prompt instead of the kind.
+    pub(crate) fn start_pair(
+        kind: AgentKind,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+    ) -> Started {
+        let agents = ["a", "b"].map(|m| TaskAgent { kind, model: Some(format!("provider/model.{m}")) });
+        let me = |prompt: &str| {
+            let id = prompt.split("You are `").nth(1).and_then(|rest| rest.split('`').next());
+            id.unwrap_or("tiebreak").to_owned()
+        };
+        start_agents(
+            agents,
+            Duration::from_secs(5),
+            no_git,
+            move |_, stage, prompt| script(&me(prompt), stage, prompt),
+            false,
+        )
+    }
+
+    fn model_of(call: &Call) -> &str {
+        call.argv.iter().find(|a| a.starts_with("provider/model.")).map(String::as_str).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_same_kind_pair_keeps_two_participants_through_the_run() {
+        let run = start_pair(AgentKind::Codex, |me, stage, prompt| match stage {
+            Stage::Plan => plan("codex-2"),
+            Stage::Exchange => turn("codex-2", true),
+            Stage::Final => Fake::Reply(fenced(
+                json!({ "ship": true, "blocking": [], "residual": [], "task_met": format!("Yes, says {me}.") }),
+            )),
+            _ => happy(me, stage, prompt),
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["implementer"], "codex-2");
+        assert_eq!(manifest["reviewer"], "codex-1");
+        assert_eq!(manifest["planned"], json!(["codex-1", "codex-2"]));
+        assert_eq!(manifest["final_reviewers"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["task_met"], json!({ "codex-1": "Yes, says codex-1.", "codex-2": "Yes, says codex-2." }));
+        assert_eq!(manifest["ship"], true);
+        assert_eq!(
+            manifest["participants"],
+            json!([
+                { "id": "codex-1", "kind": "codex", "model": "provider/model.a" },
+                { "id": "codex-2", "kind": "codex", "model": "provider/model.b" },
+            ])
+        );
+        for id in ["codex-1", "codex-2"] {
+            for file in [format!("turns/plan-{id}.json"), format!("turns/t1-{id}.json"), format!("final-{id}.json")] {
+                assert!(run.dir.join(&file).is_file(), "{file}");
+            }
+        }
+        // Each slot gets its own model and prompt, in parallel stages too.
+        for stage in [Stage::Plan, Stage::Exchange, Stage::Final] {
+            let mut seen: Vec<(String, bool)> = calls_of(&run, stage)
+                .iter()
+                .map(|c| (model_of(c).to_owned(), c.prompt.contains("You are `codex-1`")))
+                .collect();
+            seen.sort();
+            assert_eq!(seen, [("provider/model.a".to_owned(), true), ("provider/model.b".to_owned(), false)]);
+        }
+        let implement = calls_of(&run, Stage::Implement);
+        assert_eq!((implement.len(), model_of(&implement[0])), (1, "provider/model.b"));
+        let review = calls_of(&run, Stage::Crossreview);
+        assert_eq!((review.len(), model_of(&review[0])), (1, "provider/model.a"));
+        assert!(review[0].prompt.contains("`codex-2` is the implementer"));
+
+        let room = read_room(&run.dir);
+        assert_eq!(room.agents, ["codex-1", "codex-2"]);
+        assert_eq!(room.participants[1].model.as_deref(), Some("provider/model.b"));
+        assert_eq!(room.finals.len(), 2);
+        let replies: Vec<(&str, &str)> =
+            room.messages.iter().filter(|m| m.kind == "reply").map(|m| (m.from.as_str(), m.to.as_str())).collect();
+        assert_eq!(replies, [("codex-1", "codex-2"), ("codex-2", "codex-1")]);
+    }
+
+    #[tokio::test]
+    async fn a_same_kind_slot_retries_on_its_own_while_the_peer_runs() {
+        // claude-1 holds its plan and final until claude-2 retries, so the retries overlap its calls.
+        let (plan_gate, final_gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let (plan_held, final_held) = (plan_gate.clone(), final_gate.clone());
+        let tries = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let run = start_pair(AgentKind::Claude, move |me, stage, prompt| {
+            let (gate, index) = match stage {
+                Stage::Plan => (&plan_held, 0),
+                Stage::Final => (&final_held, 1),
+                Stage::Exchange => return turn("claude-1", true),
+                _ => return happy(me, stage, prompt),
+            };
+            let reply = match stage {
+                Stage::Plan => fenced(
+                    json!({ "plan": format!("Plan of {me}."), "claim": "claude-1", "touches": [], "risks": [], "unknowns": [], "backlog": [] }),
+                ),
+                _ => fenced(
+                    json!({ "ship": true, "blocking": [], "residual": [], "task_met": format!("Yes, says {me}.") }),
+                ),
+            };
+            if me == "claude-1" {
+                return Fake::After(gate.clone(), reply);
+            }
+            if tries[index].fetch_add(1, Ordering::SeqCst) == 0 {
+                return Fake::Reply(format!("{me} forgot the block."));
+            }
+            gate.notify_one();
+            Fake::Reply(reply)
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["planned"], json!(["claude-1", "claude-2"]));
+        assert_eq!(manifest["implementer"], "claude-1");
+
+        for (stage, label) in [(Stage::Plan, "plan"), (Stage::Final, "final")] {
+            let calls = calls_of(&run, stage);
+            let of = |model: &str| calls.iter().filter(|c| model_of(c) == model).cloned().collect::<Vec<_>>();
+            let (first, second) = (of("provider/model.a"), of("provider/model.b"));
+            assert_eq!((first.len(), second.len()), (1, 2), "{stage:?}");
+            assert!(first[0].prompt.contains("You are `claude-1`"), "{stage:?}");
+            assert!(second.iter().all(|c| c.prompt.contains("You are `claude-2`")), "{stage:?}");
+            assert!(!first[0].prompt.contains("Your last reply had no valid JSON object."), "{stage:?}");
+            assert!(!second[0].prompt.contains("Your last reply had no valid JSON object."), "{stage:?}");
+            assert!(second[1].prompt.contains("Your last reply had no valid JSON object."), "{stage:?}");
+            let retries: Vec<String> = events(&run).into_iter().filter(|(k, _)| k == "retry").map(|(_, d)| d).collect();
+            assert!(retries.iter().any(|d| d.starts_with(&format!("claude-2 {label}"))), "{retries:?}");
+            assert!(!retries.iter().any(|d| d.starts_with(&format!("claude-1 {label}"))), "{retries:?}");
+        }
+
+        let read = |file: &str| std::fs::read_to_string(run.dir.join(file)).unwrap();
+        for (me, peer) in [("claude-1", "claude-2"), ("claude-2", "claude-1")] {
+            for (base, own, other) in [
+                (format!("turns/plan-{me}"), format!("Plan of {me}."), format!("Plan of {peer}.")),
+                (format!("final-{me}"), format!("Yes, says {me}."), format!("Yes, says {peer}.")),
+            ] {
+                for file in [format!("{base}.raw"), format!("{base}.json")] {
+                    let text = read(&file);
+                    assert!(text.contains(&own), "{file}");
+                    assert!(!text.contains(&other), "{file}");
+                    assert!(!text.contains("forgot the block"), "{file}");
+                }
+            }
+        }
+        assert_eq!(
+            manifest["task_met"],
+            json!({ "claude-1": "Yes, says claude-1.", "claude-2": "Yes, says claude-2." })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pi_pair_runs_with_the_second_slot_as_implementer() {
+        let run = start_pair(AgentKind::Pi, |me, stage, prompt| match stage {
+            Stage::Plan => plan("pi-2"),
+            Stage::Exchange => turn("pi-2", true),
+            _ => happy(me, stage, prompt),
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(run.handle.status().state, RunState::Done);
+        assert_eq!(manifest["implementer"], "pi-2");
+        assert_eq!(manifest["reviewer"], "pi-1");
+        assert_eq!(manifest["planned"], json!(["pi-1", "pi-2"]));
+        assert_eq!(manifest["ship"], true);
+        assert_eq!(
+            manifest["participants"],
+            json!([
+                { "id": "pi-1", "kind": "pi", "model": "provider/model.a" },
+                { "id": "pi-2", "kind": "pi", "model": "provider/model.b" },
+            ])
+        );
+        assert!(run.calls.lock().unwrap().iter().all(|c| c.agent == "pi"));
+        for stage in [Stage::Plan, Stage::Final] {
+            let mut models: Vec<String> = calls_of(&run, stage).iter().map(|c| model_of(c).to_owned()).collect();
+            models.sort();
+            assert_eq!(models, ["provider/model.a", "provider/model.b"], "{stage:?}");
+        }
+        let implement = calls_of(&run, Stage::Implement);
+        assert_eq!((implement.len(), model_of(&implement[0])), (1, "provider/model.b"));
+        assert!(!implement[0].argv.contains(&"--tools".to_owned()));
+        let review = calls_of(&run, Stage::Crossreview);
+        assert_eq!((review.len(), model_of(&review[0])), (1, "provider/model.a"));
+        assert!(review[0].argv.contains(&"--tools".to_owned()));
+
+        let room = read_room(&run.dir);
+        assert_eq!(room.agents, ["pi-1", "pi-2"]);
+        let participants: Vec<_> =
+            room.participants.iter().map(|p| (p.kind, p.model.as_deref(), p.model_recorded)).collect();
+        assert_eq!(
+            participants,
+            [
+                (Some(AgentKind::Pi), Some("provider/model.a"), true),
+                (Some(AgentKind::Pi), Some("provider/model.b"), true),
+            ]
+        );
+        assert_eq!(room.implementer.as_deref(), Some("pi-2"));
+        assert_eq!(room.finals.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_same_kind_tiebreak_is_the_first_slot_and_can_pick_the_second() {
+        let run = start_pair(AgentKind::Claude, |me, stage, prompt| match stage {
+            Stage::Plan => plan(me),
+            Stage::Exchange => turn(me, false),
+            Stage::Tiebreak => Fake::Reply(fenced(
+                json!({ "implementer": "claude-2", "why": "It named the files.", "plan": "The tiebreak plan.", "open_questions": [] }),
+            )),
+            _ => happy(me, stage, prompt),
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["implementer"], "claude-2");
+        let tiebreak = calls_of(&run, Stage::Tiebreak);
+        assert_eq!((tiebreak.len(), model_of(&tiebreak[0])), (1, "provider/model.a"));
+        let implement = calls_of(&run, Stage::Implement);
+        assert_eq!(model_of(&implement[0]), "provider/model.b");
+        assert!(!implement[0].argv.contains(&"--disallowedTools".to_owned()));
+        assert!(calls_of(&run, Stage::Crossreview)[0].argv.contains(&"--disallowedTools".to_owned()));
+        assert_eq!(model_of(&calls_of(&run, Stage::Crossreview)[0]), "provider/model.a");
+        let room = read_room(&run.dir);
+        assert_eq!(room.decided_by.as_deref(), Some("tiebreak"));
+        assert_eq!(room.messages.iter().find(|m| m.kind == "tiebreak").unwrap().from, "claude-1");
+    }
+
+    #[tokio::test]
+    async fn a_user_pick_selects_the_second_slot_of_one_kind() {
+        let gate = Arc::new(Notify::new());
+        let held = gate.clone();
+        let run = start_pair(AgentKind::Claude, move |me, stage, prompt| match stage {
+            Stage::Plan if me == "claude-1" => match plan("claude-1") {
+                Fake::Reply(text) => Fake::After(held.clone(), text),
+                _ => unreachable!(),
+            },
+            Stage::Plan => plan("claude-1"),
+            _ => happy(me, stage, prompt),
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls_of(&run, Stage::Plan).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        run.handle.control(Control::Pause).unwrap();
+        // The kind name is no participant.
+        assert!(run.handle.control(Control::PickImplementer { agent: "claude".into() }).is_err());
+        gate.notify_one();
+        until(&run, |s| s.state == RunState::Paused).await;
+        assert_eq!(run.handle.status().pickable, ["claude-1", "claude-2"]);
+        run.handle.control(Control::PickImplementer { agent: "claude-2".into() }).unwrap();
+        run.handle.control(Control::Resume).unwrap();
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["implementer"], "claude-2");
+        assert_eq!(model_of(&calls_of(&run, Stage::Implement)[0]), "provider/model.b");
+        assert!(events(&run).contains(&("decision".to_owned(), "user chose claude-2".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn a_same_kind_pair_degrades_the_first_slot_and_keeps_the_second() {
+        let run =
+            start_pair(
+                AgentKind::Claude,
+                |me, stage, prompt| {
+                    if me == "claude-1" { Fake::Exit(1) } else { happy(me, stage, prompt) }
+                },
+            );
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["planned"], json!(["claude-2"]));
+        assert_eq!(manifest["degraded"], json!(["claude-1"]));
+        assert_eq!(manifest["implementer"], "claude-2");
+        assert_eq!(manifest["ship"], false);
+        assert_eq!(manifest["final_reviewers"], json!(["claude-2"]));
+        assert!(run.dir.join("turns/plan-claude-2.json").is_file());
+        assert!(!run.dir.join("turns/plan-claude-1.json").exists());
+        let room = read_room(&run.dir);
+        assert_eq!(room.implementer.as_deref(), Some("claude-2"));
+        assert_eq!(room.decided_by.as_deref(), Some("walkover"));
+        assert_eq!(room.finals.len(), 1);
     }
 
     #[tokio::test]

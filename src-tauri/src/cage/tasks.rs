@@ -375,10 +375,6 @@ mod tests {
     async fn tasks_are_saved_and_a_run_needs_a_mounted_agent() {
         let (manager, _runtime, id) = manager();
         let kinds = [AgentKind::Pi, AgentKind::Claude];
-        assert!(matches!(
-            manager.put_task(&id, task_draft(None, "Fix", [AgentKind::Pi, AgentKind::Pi])),
-            Err(Error::InvalidTask(..))
-        ));
         let task_id = manager.put_task(&id, task_draft(None, "Fix the map!", kinds)).unwrap();
         manager.put_task(&id, task_draft(None, "Fix the map", kinds)).unwrap();
         let tasks = manager.list().sessions[0].session.tasks.clone();
@@ -412,6 +408,27 @@ mod tests {
 
         manager.remove_task(&id, &task_id).unwrap();
         assert_eq!(manager.list().sessions[0].session.tasks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_task_can_pair_two_agents_of_one_kind() {
+        let (manager, _runtime, id) = manager();
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
+            let mut draft = task_draft(None, &format!("Pair {}", kind.name()), [kind, kind]);
+            draft.agents[0].model = Some(" provider/model.a ".into());
+            draft.agents[1].model = Some("provider/model.b".into());
+            let task_id = manager.put_task(&id, draft).unwrap();
+            let saved = lock(&manager.state).session(&id).unwrap().task(&task_id).unwrap().agents.clone();
+            assert_eq!(
+                saved.map(|a| (a.kind, a.model)),
+                [(kind, Some("provider/model.a".to_owned())), (kind, Some("provider/model.b".to_owned()))]
+            );
+            // Equal and default models are valid too, and the model checks stay.
+            manager.put_task(&id, task_draft(Some(task_id.clone()), "Defaults", [kind, kind])).unwrap();
+            let mut bad = task_draft(Some(task_id), "Bad", [kind, kind]);
+            bad.agents[1].model = Some("two words".into());
+            assert!(matches!(manager.put_task(&id, bad), Err(Error::InvalidTask(..))));
+        }
     }
 
     #[tokio::test]
@@ -525,6 +542,32 @@ mod tests {
         cancel(&manager, &id, &task_id, "03").await;
         // The source keeps its record.
         assert!(std::fs::read_to_string(round.join("events.jsonl")).unwrap().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn a_same_kind_pair_resumes_with_its_recorded_participants() {
+        let (manager, runtime, id) = manager();
+        serve(&runtime, Arc::new(no_git), Arc::new(|_: &str, _, _: &str| Fake::Hang));
+        runtimes::fake_install(&manager.data, "claude");
+        let mut draft = task_draft(None, "Fix", [AgentKind::Claude, AgentKind::Claude]);
+        draft.agents[0].model = Some("opus".into());
+        draft.agents[1].model = Some("sonnet".into());
+        let task_id = manager.put_task(&id, draft).unwrap();
+        manager.start(&id).await.unwrap();
+        assert_eq!(manager.start_task_run(&id, &task_id).unwrap(), "01");
+        assert_eq!(manager.run_handle(&id, &task_id, "01").unwrap().agents, ["claude-1", "claude-2"]);
+        cancel(&manager, &id, &task_id, "01").await;
+
+        // A later edit to a mixed pair does not change the participants of the run.
+        manager.put_task(&id, task_draft(Some(task_id.clone()), "Fix", [AgentKind::Pi, AgentKind::Claude])).unwrap();
+        assert_eq!(manager.resume_task_run(&id, &task_id, "01").unwrap(), "02");
+        assert_eq!(manager.run_handle(&id, &task_id, "02").unwrap().agents, ["claude-1", "claude-2"]);
+        let round = manager.round_dir(&id, &task_id, "02").unwrap();
+        assert_eq!(record(&round)["agents"][1]["model"], "sonnet");
+        let room = task_artifacts::read_room(&round);
+        assert_eq!(room.agents, ["claude-1", "claude-2"]);
+        assert_eq!(room.participants[0].model.as_deref(), Some("opus"));
+        cancel(&manager, &id, &task_id, "02").await;
     }
 
     fn guest_folder(manager: &Manager<FakeRuntime>, id: &str) -> String {

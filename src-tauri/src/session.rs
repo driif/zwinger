@@ -169,7 +169,7 @@ pub struct Task {
     pub slug: String,
     pub title: String,
     pub request: String,
-    /// Two agents of different kinds. The first one decides a tiebreak.
+    /// Two agents, also of one kind. The first one decides a tiebreak.
     pub agents: [TaskAgent; 2],
     /// Shell lines that the run executes after the implementation.
     pub gates: Vec<String>,
@@ -326,9 +326,6 @@ impl Session {
         let request = draft.request.trim();
         if request.is_empty() || request.len() > REQUEST_LIMIT {
             return Err(invalid(format!("the request must have 1 to {REQUEST_LIMIT} bytes")));
-        }
-        if draft.agents[0].kind == draft.agents[1].kind {
-            return Err(invalid("the two agents must be of different kinds".into()));
         }
         let mut agents = draft.agents.clone();
         for agent in &mut agents {

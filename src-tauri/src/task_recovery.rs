@@ -27,6 +27,7 @@ use sha2::{Digest as _, Sha256};
 use crate::session::{Task, TaskAgent};
 use crate::task_agents::Limits;
 use crate::task_artifacts::{RoundWriter, read_record, stage_label, stage_of};
+use crate::task_participants::participants;
 use crate::task_runs::{Config, MESSAGE_LIMIT, MESSAGES_BYTES, MESSAGES_COUNT, converged};
 
 pub const VERSION: u32 = 2;
@@ -134,8 +135,9 @@ impl RunRecord {
         }
     }
 
+    /// The participant ids of the run, from its recorded agents.
     fn names(&self) -> [String; 2] {
-        self.agents.clone().map(|a| a.kind.name().to_owned())
+        participants(&self.agents).map(|p| p.id)
     }
 }
 
@@ -465,9 +467,6 @@ fn recover(
     checkpoint: Checkpoint,
 ) -> std::result::Result<Recovered, String> {
     let names = record.names();
-    if names[0] == names[1] {
-        return Err(format!("{RUN} is damaged (the two agents are the same kind)"));
-    }
     let mut artifacts = BTreeMap::new();
     for (name, hex) in &checkpoint.artifacts {
         if !allowed(name, &names, record.config.turns) {

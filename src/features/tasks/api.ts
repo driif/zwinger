@@ -1,5 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
-import { call, Task } from "../../shared/api";
+import { AgentKind, call, Task } from "../../shared/api";
 
 /** A pi-shaped record of a task run's live agent output. */
 export type AgentRecord = { type: string } & Record<string, unknown>;
@@ -134,8 +134,20 @@ export interface Blocking {
   where: string;
 }
 
+/** A participant of a run. `kind` is `null` for a name of an external round. */
+export interface RoomParticipant {
+  id: string;
+  kind: AgentKind | null;
+  /** `null` is the configured default model, but only when `modelRecorded` is true. */
+  model: string | null;
+  /** False for an older run or an external round, which saved no model. */
+  modelRecorded: boolean;
+}
+
 export interface Room {
+  /** The participant ids, in order. */
   agents: string[];
+  participants: RoomParticipant[];
   stages: RoomStage[];
   messages: RoomMessage[];
   positions: {

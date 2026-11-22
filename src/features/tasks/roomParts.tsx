@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { cancelRuntimeInstall, RuntimeView } from "../settings/api";
 import { Blocking, Room } from "./api";
+import { participantLabel } from "./roomLabels";
 import { AGENT_NAMES, AgentKind } from "../../shared/api";
 import type { Runtimes } from "../../App";
 import { Block, ChatState, Message, textOf, ToolRun } from "./agentChat";
@@ -116,20 +117,23 @@ export function MessageView({ message, results, tools }: { message: Message; res
   );
 }
 
-/** In-app runs name agents by kind; duo rounds use their own names. */
-function iconOf(name: string): LucideIcon {
+/** The icon of a sender: a fixed role, else the kind of the participant. A name of an external round has no kind. */
+export function iconOf(name: string, room: Room): LucideIcon {
   if (name === "user") return User;
   if (name === "run") return Activity;
   if (name === "a2a") return Cable;
-  return AGENT_ICONS[name as AgentKind] ?? Bot;
+  const kind = room.participants.find((p) => p.id === name)?.kind;
+  return kind ? AGENT_ICONS[kind] : Bot;
 }
 
-export function AgentName({ name }: { name: string }) {
-  const Icon = iconOf(name);
+export function AgentName({ name, room }: { name: string; room: Room }) {
+  const Icon = iconOf(name, room);
+  const participant = room.participants.find((p) => p.id === name && p.kind);
   return (
     <span className="row room-agent">
       <Icon size={14} />
       {name}
+      {participant && <span className="muted">{participantLabel(participant)}</span>}
     </span>
   );
 }
@@ -152,7 +156,7 @@ export function Timeline({ room }: { room: Room }) {
         id: m.id,
         title: (
           <span className={`row room-message ${m.kind === "event" ? "muted" : ""}`}>
-            <AgentName name={m.from} />
+            <AgentName name={m.from} room={room} />
             {m.kind === "external" && <span className="room-chip">external · advisory</span>}
             {m.to !== "all" && <span className="muted">→ {m.to}</span>}
             <span className="room-chip">{label(m.stage)}</span>
@@ -167,7 +171,7 @@ export function Timeline({ room }: { room: Room }) {
 }
 
 /** The streamed output of one agent in the active stage. */
-export function LiveEntry({ agent, chat, since }: { agent: string; chat?: ChatState; since: string }) {
+export function LiveEntry({ agent, room, chat, since }: { agent: string; room: Room; chat?: ChatState; since: string }) {
   const messages = chat?.messages ?? [];
   const results = new Map<string, Message>(
     messages.filter((m) => m.role === "toolResult" && m.toolCallId).map((m) => [m.toolCallId!, m]),
@@ -176,7 +180,7 @@ export function LiveEntry({ agent, chat, since }: { agent: string; chat?: ChatSt
   return (
     <Card variant="subtle" padding="sm" className="stack">
       <p className="row">
-        <AgentName name={agent} />
+        <AgentName name={agent} room={room} />
         <span className="muted grow">working… {since}</span>
       </p>
       {shown.map((message, i) => (
@@ -196,7 +200,7 @@ export function Positions({ room }: { room: Room }) {
         {room.positions.map((p) => (
           <Card key={p.agent} variant="outlined" padding="sm" className="stack">
             <p className="row">
-              <AgentName name={p.agent} />
+              <AgentName name={p.agent} room={room} />
               <span className="muted grow">
                 {p.source} · wants {p.implementer ?? "?"} to implement
               </span>
@@ -321,7 +325,7 @@ export function Verdicts({ room }: { room: Room }) {
         <Card key={f.agent} variant="outlined" padding="sm" className="stack">
           <p className="row">
             {f.ship ? <CircleCheck size={14} className="ok" /> : <CircleX size={14} className="danger" />}
-            <AgentName name={f.agent} />
+            <AgentName name={f.agent} room={room} />
             <strong className="grow">{f.ship ? "ship" : "no ship"}</strong>
           </p>
           <p>{f.taskMet}</p>

@@ -22,6 +22,7 @@ mod session;
 mod store;
 mod task_agents;
 mod task_artifacts;
+mod task_participants;
 mod task_recovery;
 mod task_runs;
 mod terminal;

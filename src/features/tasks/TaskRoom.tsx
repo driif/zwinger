@@ -19,10 +19,11 @@ import {
   runDiff,
   watchRoom,
 } from "./api";
-import { SessionView, Task } from "../../shared/api";
+import { AGENT_NAMES, SessionView, Task } from "../../shared/api";
 import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { latestRequest } from "./diffRequest";
-import { Disagreements, elapsed, Gates, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
+import { Disagreements, elapsed, Gates, iconOf, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
+import { participantLabel } from "./roomLabels";
 import { errorMessage } from "../../shared/errorMessage";
 
 /** An in-app task, or a duo round folder on the host that the room only reads. */
@@ -256,7 +257,9 @@ export function TaskRoom(props: Props) {
           />
         )}
         {liveRun && status && !status.decided &&
-          room?.agents.map((agent) => {
+          room?.participants.map((participant) => {
+            const agent = participant.id;
+            const Icon = iconOf(agent, room);
             const blocked = status.pickable.includes(agent)
               ? undefined
               : status.pickable.length === 0
@@ -267,8 +270,9 @@ export function TaskRoom(props: Props) {
                 key={agent}
                 size="sm"
                 variant={status.picked === agent ? "primary" : "outline"}
+                iconLeft={<Icon size={14} />}
                 disabled={blocked !== undefined}
-                title={blocked}
+                title={blocked ?? participantLabel(participant)}
                 onClick={() => control({ type: "pickImplementer", agent })}
               >
                 {agent} implements
@@ -362,7 +366,10 @@ export function TaskRoom(props: Props) {
         <Card variant="outlined" padding="md" className="stack">
           <p>{inApp.task.request}</p>
           <p className="muted">
-            {inApp.task.agents.map((a) => a.kind + (a.model ? ` (${a.model})` : "")).join(" and ")} work in{" "}
+            {inApp.task.agents
+              .map((a, i) => `Agent ${i + 1}: ${AGENT_NAMES[a.kind]} · ${a.model ?? "default model"}`)
+              .join(" and ")}{" "}
+            work in{" "}
             <span className="mono">{inApp.task.workdir}</span>.{" "}
             {cageRunning ? "Start a run to see them plan." : "Start the cage, then start a run."}
           </p>
@@ -382,7 +389,7 @@ export function TaskRoom(props: Props) {
             {active &&
               room.agents
                 .filter((agent) => live[agent]?.stage === active.id)
-                .map((agent) => <LiveEntry key={agent} agent={agent} chat={live[agent].chat} since={since} />)}
+                .map((agent) => <LiveEntry key={agent} agent={agent} room={room} chat={live[agent].chat} since={since} />)}
             {active && !room.agents.some((agent) => live[agent]?.stage === active.id) && (
               <p className="muted">
                 {active.label}: working… {since}

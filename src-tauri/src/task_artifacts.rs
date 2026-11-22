@@ -19,11 +19,14 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::agent::AgentKind;
 use crate::agent::cli::{iso, now_ms};
 use crate::error::{Error, Result};
+use crate::session::TaskAgent;
+use crate::task_participants::participants;
 use crate::task_runs::EXTERNAL;
 
 /// A larger file of a round is not read.
@@ -52,8 +55,10 @@ const STAGES: [&str; 9] =
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Room {
-    /// The two agent names, in the order of the round.
+    /// The participant ids, in the order of the round.
     pub agents: Vec<String>,
+    /// The participants, in the order of the round.
+    pub participants: Vec<RoomParticipant>,
     pub stages: Vec<Stage>,
     /// The typed messages of the round, in order.
     pub messages: Vec<Message>,
@@ -77,6 +82,24 @@ pub struct Room {
     pub ended: Option<String>,
     /// The time of the end event.
     pub ended_at: Option<String>,
+}
+
+/// A participant as the round records it. `kind` is `None` for a name
+/// that is no provider kind, such as in an external duo round.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomParticipant {
+    pub id: String,
+    pub kind: Option<AgentKind>,
+    pub model: Option<String>,
+    /// False when the round saved no model for this participant, so
+    /// `model: None` does not mean the configured default.
+    #[serde(default = "recorded")]
+    pub model_recorded: bool,
+}
+
+fn recorded() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -586,26 +609,38 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     let mtime = |name: &str| visible(name).then(|| files.get(name).map(|(secs, _)| iso(secs * 1000))).flatten();
     let manifest = json("manifest.json");
 
-    let mut agents: Vec<String> = Vec::new();
-    let mut add = |name: &str| {
-        if !name.is_empty() && !agents.iter().any(|a| a == name) {
-            agents.push(name.to_owned());
+    let roster = roster(manifest.as_ref(), json("run.json").as_ref()).unwrap_or_else(|| {
+        let mut names: Vec<String> = Vec::new();
+        let mut add = |name: &str| {
+            if !name.is_empty() && !names.iter().any(|a| a == name) {
+                names.push(name.to_owned());
+            }
+        };
+        if let Some(m) = &manifest {
+            for name in strings(&m["planned"]).iter().chain(&strings(&m["degraded"])) {
+                add(name);
+            }
         }
-    };
-    if let Some(m) = &manifest {
-        for name in strings(&m["planned"]).iter().chain(&strings(&m["degraded"])) {
+        let mut named: Vec<&str> = files
+            .keys()
+            .filter_map(|k| k.strip_prefix("turns/plan-"))
+            .map(|rest| rest.split('.').next().unwrap_or_default())
+            .collect();
+        named.sort_unstable();
+        for name in named {
             add(name);
         }
-    }
-    let mut named: Vec<&str> = files
-        .keys()
-        .filter_map(|k| k.strip_prefix("turns/plan-"))
-        .map(|rest| rest.split('.').next().unwrap_or_default())
-        .collect();
-    named.sort_unstable();
-    for name in named {
-        add(name);
-    }
+        names
+            .into_iter()
+            .map(|id| RoomParticipant {
+                kind: serde_json::from_value(Value::String(id.clone())).ok(),
+                id,
+                model: None,
+                model_recorded: false,
+            })
+            .collect()
+    });
+    let agents: Vec<String> = roster.iter().map(|p| p.id.clone()).collect();
     let peer = |me: &str| agents.iter().find(|a| *a != me).cloned().unwrap_or_else(|| "all".to_owned());
     let known = |name: &str| agents.iter().any(|a| a == name).then(|| name.to_owned());
 
@@ -1096,6 +1131,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     messages.sort_by_key(|m| (stage_key(&m.stage), m.at.clone()));
     Room {
         agents: agents.clone(),
+        participants: roster,
         stages,
         messages,
         positions,
@@ -1115,6 +1151,24 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         ended: ended.map(str::to_owned),
         ended_at,
     }
+}
+
+/// The participants that a run saved: the roster of its manifest, else the
+/// agents of its `run.json`. A legacy round has neither.
+fn roster(manifest: Option<&Value>, run: Option<&Value>) -> Option<Vec<RoomParticipant>> {
+    let saved = manifest
+        .and_then(|m| serde_json::from_value::<[RoomParticipant; 2]>(m["participants"].clone()).ok())
+        .filter(|[a, b]| a.id != b.id);
+    let recorded = || {
+        let agents = serde_json::from_value::<[TaskAgent; 2]>(run?["agents"].clone()).ok()?;
+        Some(participants(&agents).map(|p| RoomParticipant {
+            id: p.id,
+            kind: Some(p.kind),
+            model: p.model,
+            model_recorded: true,
+        }))
+    };
+    saved.or_else(recorded).map(Vec::from)
 }
 
 /// The highest `t<n>` of the turn files.
@@ -1509,10 +1563,50 @@ mod tests {
     }
 
     #[test]
+    fn the_room_reads_its_participants_from_the_manifest_then_run_json_then_files() {
+        let dir = temp_dir();
+        let plan = json!({ "plan": "P.", "claim": "codex" }).to_string();
+        std::fs::create_dir_all(dir.join("turns")).unwrap();
+        std::fs::write(dir.join("turns/plan-codex.json"), &plan).unwrap();
+        std::fs::write(dir.join("turns/plan-claude.json"), &plan).unwrap();
+        std::fs::write(dir.join("manifest.json"), json!({ "planned": ["claude", "codex"] }).to_string()).unwrap();
+        // A legacy in-app round: names from the manifest, kinds from the names, no models.
+        let room = read_room(&dir);
+        assert_eq!(room.agents, ["claude", "codex"]);
+        let kinds: Vec<_> = room.participants.iter().map(|p| (p.kind, p.model.clone())).collect();
+        assert_eq!(kinds, [(Some(AgentKind::Claude), None), (Some(AgentKind::Codex), None)]);
+        assert!(room.participants.iter().all(|p| !p.model_recorded));
+
+        // An incomplete run: its run.json gives the order and the models.
+        let run = json!({ "agents": [{ "kind": "codex", "model": "o3" }, { "kind": "claude", "model": null }] });
+        std::fs::write(dir.join("run.json"), run.to_string()).unwrap();
+        let room = read_room(&dir);
+        assert_eq!(room.agents, ["codex", "claude"]);
+        assert_eq!(room.participants[0].model.as_deref(), Some("o3"));
+        assert!(room.participants.iter().all(|p| p.model_recorded));
+
+        // The manifest roster wins.
+        let roster = json!([
+            { "id": "pi-1", "kind": "pi", "model": "a/b.c" },
+            { "id": "pi-2", "kind": "pi", "model": null },
+        ]);
+        std::fs::write(dir.join("manifest.json"), json!({ "participants": roster }).to_string()).unwrap();
+        let room = read_room(&dir);
+        assert_eq!(room.agents, ["pi-1", "pi-2"]);
+        assert_eq!(room.participants[0].model.as_deref(), Some("a/b.c"));
+        assert!(room.participants.iter().all(|p| p.model_recorded));
+    }
+
+    #[test]
     fn reads_the_sample_round() {
         assert!(is_round(&sample()));
         let room = read_room(&sample());
         assert_eq!(room.agents, ["opus", "sol"]);
+        assert_eq!(
+            room.participants.iter().map(|p| (p.kind, p.model.clone())).collect::<Vec<_>>(),
+            [(None, None), (None, None)]
+        );
+        assert!(room.participants.iter().all(|p| !p.model_recorded));
         assert_eq!(
             states(&room),
             [

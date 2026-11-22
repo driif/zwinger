@@ -12,8 +12,10 @@ VM shell (⌘⇧T).
 A task has these fields:
 
 - **Title** and **Request**.
-- Two agents of different kinds (pi, Claude Code, Codex), each with an optional model. The first agent decides a
-  tiebreak. Gemini CLI is also available if the cage uses Gemini CLI from the Mac.
+- Two agents (pi, Claude Code, Codex), each with an optional model. **Agent 1** decides a tiebreak. The two agents can
+  be of the same kind, for example Claude Code with `opus` and Claude Code with `sonnet`. The two models are
+  independent: they can also be equal, or empty for the default model of the CLI. Gemini CLI is also available if the
+  cage uses Gemini CLI from the Mac.
 - **Gates**: shell lines that check the result, for example `pnpm build`.
 - **Working dir**: `/workspace`, or a folder below it or below a mount. In a VM with more projects, `/workspace` is the
   project's folder `/workspace/<slug>`.
@@ -57,6 +59,17 @@ verdicts and the degraded agents. During a run you can:
 - select the implementer before the implementation starts.
 - answer open questions. The run waits for the answers.
 - cancel the run.
+
+Each agent of a run has a name. Agents of different kinds use the kind, for example `claude` and `codex`. Two agents of
+the same kind use `claude-1` and `claude-2` (or `codex-1`, `pi-1` and so on), in the order of the task. The name never
+contains the model. The room shows each agent with the icon of its kind, its kind and its model, or `default model`
+if the task gives no model. The default model is the one that the CLI selects; zwinger does not know which model that
+is. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
+
+The room of an earlier run shows the agents and models that the run started with, not the current task. An older run
+that recorded its agents and models still shows them. An older run that recorded no models keeps its names and shows
+only the kind, with no model details. A duo round folder from outside
+the app shows its own names with a generic icon and no model details.
 
 **Gates** shows the latest command output and exit codes. The timeline keeps a summary of each completed gate run.
 

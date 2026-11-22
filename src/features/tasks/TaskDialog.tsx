@@ -32,7 +32,6 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
   const [workdir, setWorkdir] = useState(task?.workdir ?? session.harness ?? "/workspace");
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
-  const sameKind = agents[0].kind === agents[1].kind;
   const vm = session.vmCage === cage.id ? cage.vms.find((v) => v.key === session.vmKey) : undefined;
   // Names need not be unique: drop only one entry for this session.
   const own = vm?.members.indexOf(session.name);
@@ -71,7 +70,7 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
       <Card variant="outlined">
         <CardHeader
           title={task ? `Edit ${task.title}` : "New task"}
-          description="Two agents plan the task, agree on one implementer, build it, run the gates and review the change. The run never commits or pushes."
+          description="Two agents, also of one kind with different models, plan the task, agree on one implementer, build it, run the gates and review the change. The run never commits or pushes."
         />
         <CardBody className="stack">
           <FloatingField label="Title" value={title} maxLength={64} required onChange={(e) => setTitle(e.target.value)} />
@@ -79,7 +78,7 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
           {([0, 1] as const).map((index) => (
             <div key={index} className="row">
               <SegmentedControl
-                label={index === 0 ? "First agent (decides a tiebreak)" : "Second agent"}
+                label={index === 0 ? "Agent 1 (decides a tiebreak)" : "Agent 2"}
                 options={kinds(cage).map((kind) => ({ value: kind, label: AGENT_NAMES[kind] }))}
                 value={agents[index].kind}
                 onChange={(kind) => setAgent(index, { kind: kind as AgentKind })}
@@ -93,7 +92,6 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
               />
             </div>
           ))}
-          {sameKind && <p className="danger">Choose two agents of different kinds.</p>}
           {others.length > 0 && (
             <p className="muted">
               The VM also runs {others.join(", ")}. The agents of a run can read and write their folders too.
@@ -120,7 +118,7 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
           <Button variant="ghost" onClick={() => onDone(taskId)}>
             Cancel
           </Button>
-          <Button type="submit" loading={saving} disabled={sameKind}>
+          <Button type="submit" loading={saving}>
             {task ? "Save" : "Create task"}
           </Button>
         </CardFooter>

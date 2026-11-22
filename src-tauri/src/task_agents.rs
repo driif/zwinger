@@ -759,6 +759,15 @@ pub fn claude_result_line(text: &str) -> Vec<u8> {
     line
 }
 
+/// The stdout line of a pi assistant `message_end` with one text block, for fakes.
+#[cfg(test)]
+pub fn pi_result_line(text: &str) -> Vec<u8> {
+    let message = serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": text }] });
+    let mut line = serde_json::json!({ "type": "message_end", "message": message }).to_string().into_bytes();
+    line.push(b'\n');
+    line
+}
+
 /// The stdout lines of a Codex turn with one agent message, for fakes.
 #[cfg(test)]
 pub fn codex_result_lines(text: &str) -> Vec<u8> {

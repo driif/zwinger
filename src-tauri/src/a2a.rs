@@ -685,7 +685,7 @@ mod tests {
     use crate::task_artifacts::read_room;
     use crate::task_runs::Control;
     use crate::task_runs::tests::{
-        Fake, Stage, Started, calls_of, happy, no_git, plan, resume_full, settled, start, until,
+        Fake, Stage, Started, calls_of, happy, no_git, plan, resume_full, settled, start, start_pair, turn, until,
     };
 
     /// A run whose first plan waits for the gate, and its share.
@@ -813,6 +813,29 @@ mod tests {
         }
         gate.notify_one();
         settled(&run).await;
+        drop(shares);
+    }
+
+    #[tokio::test]
+    async fn the_history_keeps_both_participants_of_one_kind_apart() {
+        let run = start_pair(crate::agent::AgentKind::Claude, |me, stage, prompt| match stage {
+            Stage::Plan => plan("claude-1"),
+            Stage::Exchange => turn("claude-1", true),
+            _ => happy(me, stage, prompt),
+        });
+        settled(&run).await;
+        let shares = Shares::default();
+        let handle = run.handle.clone();
+        let info = shares.start("s", "task-1", "01", run.dir.clone(), || Some(handle)).unwrap();
+        let (_, task) = Client::new(&info).get(&format!("/tasks/{}", info.task_id)).await;
+        let from = |id: &str| {
+            let message = task["history"].as_array().unwrap().iter().find(|m| m["messageId"] == id).unwrap();
+            (message["role"].as_str().unwrap(), message["parts"][1]["data"]["from"].as_str().unwrap())
+        };
+        for id in ["claude-1", "claude-2"] {
+            assert_eq!(from(&format!("turns/plan-{id}.json")), ("ROLE_AGENT", id));
+            assert_eq!(from(&format!("final-{id}.json")), ("ROLE_AGENT", id));
+        }
         drop(shares);
     }
 

@@ -206,7 +206,7 @@ export interface Task {
   slug: string;
   title: string;
   request: string;
-  /** Two agents of different kinds. The first one decides a tiebreak. */
+  /** Two agents, also of one kind. The first one decides a tiebreak. */
   agents: [TaskAgent, TaskAgent];
   gates: string[];
   workdir: string;
