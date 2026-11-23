@@ -35,6 +35,9 @@ pub(crate) struct Terminal {
     pub(crate) terminal_id: Option<String>,
     /// Set for a host shell: its process group, which an app exit kills.
     pub(crate) host_group: Option<host::HostGroup>,
+    /// The last size of its view, as rows and columns. A restart opens the
+    /// terminal again at this size.
+    pub(crate) size: (u16, u16),
 }
 
 impl Terminal {
@@ -96,7 +99,7 @@ impl TerminalFolder {
 
 /// The guest folder that a VM process of `kind` starts in: the applied harness
 /// for an agent, else the session's guest folder.
-fn guest_start(members: &[Session], session_id: &str, kind: TerminalKind) -> Option<String> {
+pub(crate) fn guest_start(members: &[Session], session_id: &str, kind: TerminalKind) -> Option<String> {
     let (member, folder, _) = task_guest_folder(members, session_id)?;
     Some(match (kind, member.harness.as_deref()) {
         (TerminalKind::Agent { .. }, Some(harness)) => in_guest_folder(&folder, harness),
@@ -305,7 +308,7 @@ impl<R: SandboxRuntime> Manager<R> {
             let start = TerminalFolder::host(folder.clone());
             // The last cage check and the spawn hold the state lock, which
             // every cage change also takes: no cage can come in between.
-            return self.register(session_id, terminal_id, kind, start, |state| {
+            return self.register(session_id, terminal_id, kind, start, (rows, cols), |state| {
                 if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
                     return Err(Error::HasCage);
                 }
@@ -334,7 +337,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
         // The VM may have stopped, or stopped and started again, while
         // the process opened. Its stop did not see this process, so kill it.
-        self.register(session_id, terminal_id, kind, start, |state| match state.vms.get(&key) {
+        self.register(session_id, terminal_id, kind, start, (rows, cols), |state| match state.vms.get(&key) {
             Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
             _ => {
                 let _ = pty.input.send(PtyInput::Kill);
@@ -353,6 +356,7 @@ impl<R: SandboxRuntime> Manager<R> {
         terminal_id: Option<&str>,
         kind: TerminalKind,
         start: TerminalFolder,
+        size: (u16, u16),
         open: impl FnOnce(&State<R::Vm>) -> Result<(Pty, Option<host::HostGroup>)>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -390,6 +394,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 output: output.clone(),
                 terminal_id: Some(terminal),
                 host_group,
+                size,
             });
             pty.events
         };
@@ -452,7 +457,11 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<()> {
-        self.send(id, PtyInput::Resize { rows, cols })
+        let mut state = lock(&self.state);
+        let process = state.terminals.iter_mut().find(|t| t.id == id).ok_or(Error::ProcessNotFound)?;
+        process.input.send(PtyInput::Resize { rows, cols }).map_err(|_| Error::SessionClosed)?;
+        process.size = (rows, cols);
+        Ok(())
     }
 
     pub(crate) fn send(&self, id: &str, input: PtyInput) -> Result<()> {
@@ -891,6 +900,7 @@ mod tests {
                     })),
                     terminal_id: Some(terminal.clone()),
                     host_group: None,
+                    size: (24, 80),
                 });
                 terminal
             };

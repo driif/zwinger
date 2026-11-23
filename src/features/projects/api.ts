@@ -55,6 +55,8 @@ export interface Member {
 export interface RestartToAdd {
   cage: string;
   members: Member[];
+  /** The running tasks that the restart cancels, as "<task> in <session>". */
+  tasks: string[];
   generation: number;
 }
 
@@ -62,6 +64,8 @@ export interface RestartToAdd {
 export interface StopShared {
   cage: string;
   members: Member[];
+  /** The running tasks that the stop or restart cancels, as "<task> in <session>". */
+  tasks: string[];
   generation: number;
 }
 

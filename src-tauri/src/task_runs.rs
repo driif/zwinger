@@ -406,6 +406,15 @@ impl Registry {
             .any(|r| r.session_id == session_id && r.task_id == task_id && r.status().state.is_live())
     }
 
+    /// The session and task ids of the live runs of these sessions.
+    pub fn live(&self, session_ids: &[String]) -> Vec<(String, String)> {
+        lock(&self.runs)
+            .iter()
+            .filter(|r| session_ids.contains(&r.session_id) && r.status().state.is_live())
+            .map(|r| (r.session_id.clone(), r.task_id.clone()))
+            .collect()
+    }
+
     pub fn start<R: SandboxRuntime>(&self, spec: Spec<R>) -> Arc<RunHandle> {
         self.launch(spec, None)
     }

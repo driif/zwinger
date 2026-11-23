@@ -53,6 +53,11 @@ in its own cage if it must not see the others.
   old path. If the VM or its projects changed while the question was open, the restart is refused: try again.
 - **Stop.** A stop of a VM with other projects names them and asks first. The stop ends the VM for all of them. If
   the VM or its projects changed while the question was open, the stop is refused: try again.
+- **Running tasks.** Each of these questions also names the running tasks that the stop or restart cancels.
+- **Terminals after a restart.** A VM terminal opens again at the size that it had. An agent that had a conversation
+  continues it, with its continue option (`claude -c`, `codex resume --last`, `pi -c`, `gemini --resume latest`). An
+  agent whose folder moved, or that had no conversation yet, starts a new session. Codex and Gemini CLI do not report
+  their turns to zwinger, so they always continue when their folder stays the same.
 - **Restart after a cage edit.** **Restart** on the project page restarts the VM with all its projects. It asks first
   when the VM has other projects. Their VM terminals open again, and their running tasks are cancelled. After a
   change of the project's cage, **Restart** stops the old VM and starts the new cage for this project only.

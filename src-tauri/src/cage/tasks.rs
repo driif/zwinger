@@ -623,6 +623,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_confirmation_names_the_live_runs_that_it_cancels() {
+        let (manager, id, task_id, _) = ended_run().await;
+        let live =
+            || crate::cage::lifecycle::running_tasks(&lock(&manager.state), &manager.runs, std::slice::from_ref(&id));
+        assert!(live().is_empty(), "an ended run is not cancelled");
+        manager.resume_task_run(&id, &task_id, "01").unwrap();
+        let name = manager.list().sessions[0].session.name.clone();
+        assert_eq!(live(), [format!("Fix in {name}")]);
+        cancel(&manager, &id, &task_id, "02").await;
+        assert!(live().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_ended_run_continues_in_a_new_run_with_its_recorded_values() {
         let (manager, id, task_id, round) = ended_run().await;
         // A task edit after the stop does not change the values of the run.

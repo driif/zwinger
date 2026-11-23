@@ -913,6 +913,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       (e) => setError(errorMessage(e)),
     );
 
+  const cancels = (tasks: string[]) => (tasks.length > 0 ? ` Cancelled tasks: ${tasks.join(", ")}.` : "");
+
   const vm: VmControl = {
     async start(sessionId) {
       try {
@@ -927,7 +929,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           ? ` ${first.name} moves from /workspace to /workspace/${first.slug}, so its agents do not find their history of the old path.`
           : "";
         await confirmFirst(
-          `Restart cage ${add.cage} to add ${name}? The terminals of ${others} reopen; their running tasks are cancelled.${moves}`,
+          `Restart cage ${add.cage} to add ${name}? The terminals of ${others} reopen; their running tasks are cancelled.${moves}${cancels(add.tasks)}`,
           "Restart",
           () => restartCageToAdd(sessionId, add).finally(pullNotices),
         );
@@ -974,7 +976,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       const shared = errorDetail<StopShared>(e, "StopShared");
       if (!shared) throw e;
       const others = shared.members.map((m) => m.name).join(", ");
-      await confirmFirst(`${verb} cage ${shared.cage}? ${say(others)}`, verb, () => act(shared));
+      await confirmFirst(`${verb} cage ${shared.cage}? ${say(others)}${cancels(shared.tasks)}`, verb, () => act(shared));
     }
   }
 

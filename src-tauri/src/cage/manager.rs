@@ -2308,6 +2308,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_restart_reopens_terminals_at_their_size_and_continues_agent_conversations() {
+        let (manager, runtime, a) = manager();
+        manager.start(&a).await.unwrap();
+        let shell = manager.open_session(&a, TerminalKind::Shell, 24, 80).await.unwrap();
+        manager.resize(&shell, 40, 120).unwrap();
+        let talked = manager.open_session(&a, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        manager.write(&talked, b"\x1b]1337;zwinger-agent=done\x07".to_vec()).unwrap();
+        manager.open_session(&a, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock(&manager.output(&talked).unwrap()).osc.agent.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the agent reported a turn");
+
+        runtime.argvs.lock().unwrap().clear();
+        manager.restart(&a, None).await.unwrap();
+        let pi = format!("{}/pi", crate::agent::launch::BIN_DIR);
+        let opened: Vec<Vec<String>> = runtime.argvs.lock().unwrap().clone();
+        let opened: Vec<_> = opened.iter().filter(|argv| argv[0] == pi || argv[0] == "/bin/bash").collect();
+        // Only the agent that had a conversation continues it.
+        assert_eq!(
+            opened,
+            [&vec!["/bin/bash".to_owned(), "-l".to_owned()], &vec![pi.clone(), "-c".to_owned()], &vec![pi.clone()]]
+        );
+        let processes = &manager.list().sessions[0].processes;
+        let manager = &manager;
+        let size = |id: String| async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let ring: Vec<u8> = lock(&manager.output(&id).unwrap()).ring.iter().copied().collect();
+                    if !ring.is_empty() {
+                        return ring;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the terminal printed its size")
+        };
+        assert_eq!(size(processes[0].id.clone()).await, b"40x120", "the shell keeps its size");
+        assert_eq!(size(processes[1].id.clone()).await, b"24x80");
+        assert!(manager.take_app_notices().is_empty());
+
+        // A move to `/workspace/<slug>` starts the agent fresh: its history is per folder.
+        let (manager, runtime, a) = super::super::testing::manager();
+        inherit(&manager, &a);
+        let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
+        manager.start(&a).await.unwrap();
+        manager.open_session(&a, agent(AgentKind::Pi, true), 24, 80).await.unwrap();
+        let Err(Error::RestartToAdd { generation, .. }) = manager.start(&b).await else { panic!("restart to add") };
+        runtime.argvs.lock().unwrap().clear();
+        manager.restart_to_add(&b, std::slice::from_ref(&a), generation).await.unwrap();
+        assert!(runtime.argvs.lock().unwrap().contains(&vec![pi]));
+    }
+
+    #[tokio::test]
     async fn a_reopen_after_a_second_stop_does_not_register_in_a_dead_vm() {
         let (manager, runtime, id) = manager();
         manager.start(&id).await.unwrap();

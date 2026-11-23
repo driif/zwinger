@@ -125,9 +125,9 @@ pub enum Error {
     #[error("this session has no cage; pick a cage for it or a default cage for its workspace")]
     NoCage,
     #[error("cage {cage} runs for {}; restart it to add this session", names(.members))]
-    RestartToAdd { cage: String, members: Vec<Member>, generation: u64 },
+    RestartToAdd { cage: String, members: Vec<Member>, tasks: Vec<String>, generation: u64 },
     #[error("cage {cage} also runs for {}; a stop ends their VM terminals and task runs", names(.members))]
-    StopShared { cage: String, members: Vec<Member>, generation: u64 },
+    StopShared { cage: String, members: Vec<Member>, tasks: Vec<String>, generation: u64 },
     #[error("the sessions of the VM changed; look at them and try again")]
     StaleRestart,
     #[error("this session has a cage, so an agent with no cage does not open in it; open the agent in the cage")]
@@ -344,13 +344,10 @@ impl Serialize for Error {
         map.serialize_entry("code", &self.code())?;
         map.serialize_entry("message", &self.message())?;
         match self {
-            Error::RestartToAdd { cage, members, generation } => map.serialize_entry(
+            Error::RestartToAdd { cage, members, tasks, generation }
+            | Error::StopShared { cage, members, tasks, generation } => map.serialize_entry(
                 "detail",
-                &serde_json::json!({ "cage": cage, "members": members, "generation": generation }),
-            )?,
-            Error::StopShared { cage, members, generation } => map.serialize_entry(
-                "detail",
-                &serde_json::json!({ "cage": cage, "members": members, "generation": generation }),
+                &serde_json::json!({ "cage": cage, "members": members, "tasks": tasks, "generation": generation }),
             )?,
             _ => {}
         }
@@ -377,11 +374,17 @@ mod tests {
         assert_eq!(Error::RunState("paused").code(), "RunState");
         let members = vec![Member { id: "a".into(), name: "A".into() }, Member { id: "b".into(), name: "B".into() }];
         assert_eq!(
-            serde_json::to_value(Error::RestartToAdd { cage: "c".into(), members, generation: 3 }).unwrap(),
+            serde_json::to_value(Error::RestartToAdd { cage: "c".into(), members, tasks: vec![], generation: 3 })
+                .unwrap(),
             json!({
                 "code": "RestartToAdd",
                 "message": "Cage c runs for A, B; restart it to add this session.",
-                "detail": { "cage": "c", "members": [{ "id": "a", "name": "A" }, { "id": "b", "name": "B" }], "generation": 3 },
+                "detail": {
+                    "cage": "c",
+                    "members": [{ "id": "a", "name": "A" }, { "id": "b", "name": "B" }],
+                    "tasks": [],
+                    "generation": 3,
+                },
             })
         );
     }
@@ -390,11 +393,22 @@ mod tests {
     fn a_shared_stop_has_the_members_and_the_generation() {
         let members = vec![Member { id: "b".into(), name: "B".into() }];
         assert_eq!(
-            serde_json::to_value(Error::StopShared { cage: "c".into(), members, generation: 4 }).unwrap(),
+            serde_json::to_value(Error::StopShared {
+                cage: "c".into(),
+                members,
+                tasks: vec!["Fix login in A".into()],
+                generation: 4
+            })
+            .unwrap(),
             json!({
                 "code": "StopShared",
                 "message": "Cage c also runs for B; a stop ends their VM terminals and task runs.",
-                "detail": { "cage": "c", "members": [{ "id": "b", "name": "B" }], "generation": 4 },
+                "detail": {
+                    "cage": "c",
+                    "members": [{ "id": "b", "name": "B" }],
+                    "tasks": ["Fix login in A"],
+                    "generation": 4,
+                },
             })
         );
     }

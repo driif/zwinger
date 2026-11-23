@@ -237,6 +237,11 @@ fn status(kind: AgentKind) -> Status {
     }
 }
 
+/// The agent's wrapper adds hooks that report its state in a terminal.
+pub fn reports_status(kind: AgentKind) -> bool {
+    status_flag(kind).is_some()
+}
+
 /// [`AGENT_OSC`] after its ESC.
 fn agent_osc() -> &'static str {
     std::str::from_utf8(&AGENT_OSC[1..]).expect("ASCII")

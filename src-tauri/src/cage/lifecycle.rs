@@ -30,6 +30,8 @@ use crate::runtime::{Bind, GuestNet, PipeEvent, PipeInput, PtyEvent, PtyInput, S
 use crate::runtimes;
 use crate::secrets::{self, CredentialRef, SecretValue};
 use crate::session::{Session, VmChoice};
+use crate::task_runs::Registry;
+use crate::terminal::{Terminal, guest_start};
 
 pub(crate) const NODE_LIMIT: Duration = Duration::from_secs(15);
 
@@ -53,10 +55,6 @@ pub(crate) const PROBE_ERR: usize = 512;
 
 /// The cages that `stop_all` stops at once.
 pub(crate) const STOP_PARALLEL: usize = 4;
-
-/// The terminal size of a terminal that a restart opens again. The view
-/// sends its own size when it attaches.
-const REOPEN_SIZE: (u16, u16) = (24, 80);
 
 /// How often a running cage looks for agent logins that were made in the guest.
 pub(crate) const GUEST_LOGIN_POLL: Duration = Duration::from_secs(10);
@@ -137,7 +135,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 Vm::Stopping { .. } => return Err(Error::Stopping),
                 Vm::Failed { .. } => return Err(Error::NotRunning),
             };
-            confirm_stop(&state, generation, applied, session_id, confirmed)?;
+            confirm_stop(&state, &self.runs, generation, applied, session_id, confirmed)?;
             let cage = state.cage(&applied.1.id)?.clone();
             let wanted = ids(&applied.0);
             let members = members_of(&state, &wanted, key);
@@ -186,7 +184,7 @@ impl<R: SandboxRuntime> Manager<R> {
             };
             let (members, cage) = claim?;
             // A session that left the VM gets no terminal in it.
-            ended.retain(|(session, _)| members.iter().any(|m| m.id == *session));
+            ended.retain(|e| members.iter().any(|m| m.id == e.session_id));
             self.begin(started, key.to_owned(), members, cage)
         };
         self.boot(session_id, started, claimed).await?;
@@ -194,12 +192,25 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(())
     }
 
-    /// Opens again each terminal that a stop for a restart ended. A terminal
-    /// that does not open stays dormant, and an app notice names it.
-    async fn reopen_ended(&self, ended: Vec<(String, String)>) {
-        let (rows, cols) = REOPEN_SIZE;
-        for (session_id, terminal_id) in ended {
-            match self.reopen_terminal(&session_id, &terminal_id, rows, cols).await {
+    /// Opens again each terminal that a stop for a restart ended, at its last
+    /// size. An agent continues its conversation if it had one and its guest
+    /// folder stays the same: the agents keep their history per folder. A
+    /// terminal that does not open stays dormant, and an app notice names it.
+    async fn reopen_ended(&self, ended: Vec<Ended>) {
+        for Ended { session_id, terminal_id, kind, size: (rows, cols), start } in ended {
+            let kind = match (kind, start) {
+                (TerminalKind::Agent { agent, .. }, Some(start)) => {
+                    let state = lock(&self.state);
+                    let now = match state.vm_of(&session_id) {
+                        Some((_, Vm::Running { applied, .. })) => guest_start(&applied.0, &session_id, kind),
+                        _ => None,
+                    };
+                    TerminalKind::Agent { agent, resume: now.as_ref() == Some(&start) }
+                }
+                (TerminalKind::Agent { agent, .. }, None) => TerminalKind::Agent { agent, resume: false },
+                (kind, _) => kind,
+            };
+            match self.open_terminal(&session_id, Some(&terminal_id), kind, rows, cols).await {
                 // The user closed or opened the terminal meanwhile.
                 Ok(_) | Err(Error::TerminalNotFound | Error::TerminalOpen) => {}
                 Err(e) => {
@@ -670,6 +681,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 return Err(Error::RestartToAdd {
                     cage: cage.name.clone(),
                     members: state.members(ids(&applied.0)),
+                    tasks: running_tasks(&state, &self.runs, &ids(&applied.0)),
                     generation: *generation,
                 });
             }
@@ -864,7 +876,7 @@ impl<R: SandboxRuntime> Manager<R> {
             };
             match vm {
                 Vm::Running { generation, applied, .. } => {
-                    confirm_stop(&state, *generation, applied, session_id, confirmed)?;
+                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed)?;
                     (key.to_owned(), *generation)
                 }
                 Vm::Starting { .. } => return Err(Error::Starting),
@@ -896,7 +908,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             match state.vm_of(session_id) {
                 Some((key, Vm::Running { generation, applied, .. })) => {
-                    confirm_stop(&state, *generation, applied, session_id, confirmed)?;
+                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed)?;
                     let others: Vec<String> = ids(&applied.0).into_iter().filter(|id| id != session_id).collect();
                     Some((key.to_owned(), *generation, others))
                 }
@@ -960,13 +972,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// until the runtime confirms shutdown, so a failed stop leaves the cage
     /// running and the user can retry. With `next`, a stop that succeeds
     /// leaves the cage starting for those members, for a restart. Returns
-    /// the session and terminal ids of the VM terminals that it ended.
-    pub(crate) async fn stop_vm(
-        &self,
-        id: &str,
-        generation: u64,
-        next: Option<Vec<String>>,
-    ) -> Result<Vec<(String, String)>> {
+    /// the VM terminals that it ended.
+    pub(crate) async fn stop_vm(&self, id: &str, generation: u64, next: Option<Vec<String>>) -> Result<Vec<Ended>> {
         let members_of = |state: &State<R::Vm>| match state.vms.get(id) {
             Some(Vm::Running { generation: g, applied, .. }) if *g == generation => Ok(ids(&applied.0)),
             _ => Err(Error::NotRunning),
@@ -991,7 +998,15 @@ impl<R: SandboxRuntime> Manager<R> {
                 if ends {
                     let _ = t.input.send(PtyInput::Kill);
                     if let (None, Some(terminal_id)) = (t.exit_code, &t.terminal_id) {
-                        ended.push((t.session_id.clone(), terminal_id.clone()));
+                        let start =
+                            had_conversation(t).then(|| guest_start(&applied.0, &t.session_id, t.kind)).flatten();
+                        ended.push(Ended {
+                            session_id: t.session_id.clone(),
+                            terminal_id: terminal_id.clone(),
+                            kind: t.kind,
+                            size: t.size,
+                            start,
+                        });
                     }
                 }
                 !ends
@@ -1083,6 +1098,30 @@ fn members_of<V>(state: &State<V>, wanted: &[String], key: &str) -> Vec<Session>
     wanted.iter().filter_map(|id| state.session(id).ok()).filter(uses).cloned().collect()
 }
 
+/// A VM terminal that a stop ended, and what a restart needs to open it again.
+pub(crate) struct Ended {
+    session_id: String,
+    terminal_id: String,
+    kind: TerminalKind,
+    /// The last size of its view.
+    size: (u16, u16),
+    /// The guest folder of an agent's conversation. `None`: no agent, or an
+    /// agent with no conversation yet.
+    start: Option<String>,
+}
+
+/// The agent in the terminal has a conversation to continue: it continued
+/// one, or it reported a turn. An agent with no status hooks reports none,
+/// so it counts as having one.
+fn had_conversation(t: &Terminal) -> bool {
+    match t.kind {
+        TerminalKind::Agent { agent, resume } => {
+            resume || !launch::reports_status(agent) || lock(&t.output).osc.agent.is_some()
+        }
+        _ => false,
+    }
+}
+
 /// The VM and the other members that the user saw when they confirmed a
 /// stop of a shared VM.
 #[derive(Debug, Deserialize)]
@@ -1096,6 +1135,7 @@ pub struct Confirmed {
 /// as a set.
 fn confirm_stop<V>(
     state: &State<V>,
+    runs: &Registry,
     generation: u64,
     applied: &(Vec<Session>, Cage),
     session_id: &str,
@@ -1113,9 +1153,23 @@ fn confirm_stop<V>(
         None if others.is_empty() => Ok(()),
         None => {
             let cage = state.cage(&applied.1.id).map_or_else(|_| applied.1.name.clone(), |c| c.name.clone());
-            Err(Error::StopShared { cage, members: state.members(others), generation })
+            let tasks = running_tasks(state, runs, &ids(&applied.0));
+            Err(Error::StopShared { cage, members: state.members(others), tasks, generation })
         }
     }
+}
+
+/// The running tasks of these sessions, which a stop of their VM cancels:
+/// each as "<task> in <session>".
+pub(crate) fn running_tasks<V>(state: &State<V>, runs: &Registry, session_ids: &[String]) -> Vec<String> {
+    runs.live(session_ids)
+        .into_iter()
+        .filter_map(|(session_id, task_id)| {
+            let session = state.session(&session_id).ok()?;
+            let task = session.tasks.iter().find(|t| t.id == task_id)?;
+            Some(format!("{} in {}", task.title, session.name))
+        })
+        .collect()
 }
 
 /// The name of a terminal kind in a notice.
