@@ -34,6 +34,7 @@ export const BUILT_INS: Theme[] = [
       "--motiv-color-primary": "#0369a1",
       "--motiv-color-on-primary": "#ffffff",
       "--motiv-color-secondary": "#d4ae96",
+      "--zw-mark-accent": "#9c6b4f",
       "--motiv-color-bg": "#f2f1f5",
       "--motiv-color-surface": "#ffffff",
       "--motiv-color-text": "#3b3345",

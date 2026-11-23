@@ -28,6 +28,12 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
       - run: bash scripts/fetch-pi.sh
+      # The adaptive app icon (src-tauri/icons/zwinger.icon) needs actool 26. The default Xcode of macos-15 is 16.
+      - name: Use Xcode 26
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          test -n "$xcode"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -48,3 +54,4 @@ jobs:
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
+      - run: bash scripts/check-adaptive-icon.sh src-tauri/target/release/bundle/macos/zwinger.app

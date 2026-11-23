@@ -2,7 +2,7 @@ import { useId } from "react";
 
 const Z = "M9.5 9.5h5l-5 6h5";
 
-/** The zwinger mark, like the app icon: a cage in the primary color with a Z in the secondary color. */
+/** The zwinger mark, like the app icon: a cage in the primary color with a Z in the mark accent color. */
 export function CageMark({ size }: { size: number }) {
   // The mask cuts a gap in the cage around the Z, so the mark reads on any background.
   const mask = useId();
@@ -27,7 +27,7 @@ export function CageMark({ size }: { size: number }) {
         <path d="M9 4.7V20M12 4v16M15 4.7V20" />
         <path d="M3 20h18" />
       </g>
-      <path d={Z} stroke="var(--motiv-color-secondary)" strokeWidth={2.5} />
+      <path d={Z} stroke="var(--zw-mark-accent)" strokeWidth={2.5} />
     </svg>
   );
 }

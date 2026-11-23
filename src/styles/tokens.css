@@ -6,6 +6,7 @@
   --zw-rail-width: 16rem;
   --zw-icon-button: calc(var(--motiv-space) * 6);
   --zw-icon: calc(var(--motiv-space) * 3.5);
+  --zw-mark-accent: var(--motiv-color-secondary);
 
   --zw-status-idle: var(--motiv-color-border);
   --zw-status-running: var(--motiv-color-success);

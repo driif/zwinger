@@ -1,6 +1,6 @@
 ---
 title: Appearance
-description: Themes, text size, density, sidebar font size, and terminal settings.
+description: Themes, text size, density, sidebar font size, terminal settings, and the app icon.
 ---
 
 Open **Settings > Appearance** (⌘,) to select the look of zwinger.
@@ -35,6 +35,15 @@ built-in theme has the same name. Names that differ only in spaces are the same 
 An import does not select the theme. Click **Use** on its card to apply it.
 
 New windows open directly in the last-used theme. If the saved theme cannot be read, the window opens in zwinger dark.
+
+In **zwinger light**, the Z of the zwinger mark is a darker peach, so the mark is clear at small sizes on a light
+background.
+
+## App icon
+
+On macOS 26 and later, the app icon follows **Icon & widget style** in **System Settings > Appearance**: **Default**
+shows a light tile, **Dark** shows a dark tile, and **Clear** and **Tinted** show a clear or tinted icon. On macOS 14
+and 15, the app icon is the dark tile in all modes.
 
 ## Text size
 
