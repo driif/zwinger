@@ -19,7 +19,7 @@ import {
   removeHostAgent,
 } from "../settings/api";
 import { confirmPaths, setClaudeToken } from "./api";
-import { expiresSoon } from "./tokenExpiry";
+import { ESTIMATE, expiresSoon } from "./tokenExpiry";
 import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
 import { useProjectFolders } from "./useProjectFolders";
@@ -178,8 +178,8 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
               </>
             )}
             {cage.claudeToken?.expiresAt && (
-              <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"}>
-                expires {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
+              <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"} title={ESTIMATE}>
+                expires about {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
                 {expiresSoon(cage.claudeToken.expiresAt) && " · run claude setup-token again"}
               </span>
             )}

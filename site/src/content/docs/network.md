@@ -199,7 +199,9 @@ step that fixes it:
 | It is not a file or a folder, as expected | Move it to a different folder, then try again. |
 
 The app reads vault formats 1, 2 and 3. Reading an older vault keeps its format. The next write saves it in format 3,
-even if you change only a cage credential. Earlier app versions cannot open the upgraded file. Existing values stay
+even if you change only a cage credential. Earlier app versions cannot open the upgraded file: they show an error such as
+`unknown version 2` or `unknown version 3`. There is no downgrade path: keep this version or a later one, because
+they read the file. A save of an unchanged value keeps its saved date. Existing values stay
 with their cages. Shared credentials have a separate section in the file.
 
 :::caution

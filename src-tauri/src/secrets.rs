@@ -284,7 +284,12 @@ impl CredentialRef {
 pub trait Vault: Send + Sync {
     fn put(&self, owner: &Owner, name: &str, entry: &VaultEntry) -> Result<()>;
     fn entry(&self, owner: &Owner, name: &str) -> Result<Option<VaultEntry>>;
+    /// Saves `value` with the date of now. An unchanged dated value is not
+    /// written, so it keeps its date: the Claude token expiry counts from it.
     fn set(&self, owner: &Owner, name: &str, value: &SecretValue) -> Result<()> {
+        if self.entry(owner, name)?.is_some_and(|prior| prior.value == *value && prior.saved_at.is_some()) {
+            return Ok(());
+        }
         self.put(owner, name, &VaultEntry { value: value.clone(), saved_at: Some(now_ms()) })
     }
     #[cfg(test)]
@@ -997,6 +1002,25 @@ pub mod tests {
         assert!(matches!(vault.get(&c("p"), "KEY"), Err(Error::VaultLink { .. })));
         assert!(matches!(vault.set(&c("p"), "KEY", &SecretValue::new("w")), Err(Error::VaultLink { .. })));
         assert!(stale.exists());
+    }
+
+    /// A save of the same value keeps the date, so the shown Claude token
+    /// expiry does not move. A new value or an undated value gets a new date.
+    #[test]
+    fn saving_an_unchanged_value_keeps_its_date() {
+        let (vault, dir) = file_vault();
+        let file = dir.join(VAULT_FILE);
+        fs::write(&file, r#"{"version":3,"values":{"p/KEY":{"value":"v","saved_at":5},"p/OLD":"old"},"library":{}}"#)
+            .unwrap();
+        chmod(&file, 0o600);
+        let saved_at = |name| vault.entry(&c("p"), name).unwrap().unwrap().saved_at;
+
+        vault.set(&c("p"), "KEY", &SecretValue::new("v")).unwrap();
+        assert_eq!(saved_at("KEY"), Some(5));
+        vault.set(&c("p"), "KEY", &SecretValue::new("w")).unwrap();
+        assert!(saved_at("KEY").is_some_and(|at| at > 5));
+        vault.set(&c("p"), "OLD", &SecretValue::new("old")).unwrap();
+        assert!(saved_at("OLD").is_some());
     }
 
     #[test]
