@@ -26,8 +26,10 @@ In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi` and `gemini` are o
 A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,
 **New Gemini CLI** and their **continue last session** actions. An agent that zwinger did not find on your Mac is
 disabled, with the reason "*agent* is not installed on this Mac". The agent starts in the project folder, through your
-login shell, so it gets the `PATH` and `node` of your profile. zwinger uses only an agent binary in an absolute
-folder of `PATH`, so a binary in the project folder never runs.
+login shell, so it gets the `PATH` of your profile. zwinger uses only an agent binary in an absolute folder of
+`PATH`, so a binary in the project folder never runs. pi, Gemini CLI and the npm install of Codex run with the `node`
+of their npm folder (for example `/opt/homebrew/bin/node` or the nvm version that has the package). If that folder has
+no `node` (bun, pnpm or a Homebrew formula), the agent uses the `node` of your `PATH`.
 
 An agent row from the time when the project had a cage also starts on your Mac: **Continue last session** continues
 the last session of the agent on your Mac, not the session in the VM.

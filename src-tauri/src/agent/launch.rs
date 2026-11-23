@@ -111,22 +111,29 @@ pub fn continue_args(kind: AgentKind) -> &'static [&'static str] {
 }
 
 /// The argv of the Mac's install of an agent in a session with no cage
-/// (ADR 0008): the binary that detection ran, or `node <package>/<entry>`.
+/// (ADR 0008): the binary that detection ran, or `<node> <package>/<entry>`.
 /// Nothing isolates it, so it gets no bypass flag, no zwinger wrapper and
 /// no env: the agent uses the Mac's own config and login. `None` if the
 /// detection has no runnable form, or a relative binary, which would resolve
 /// in the session folder or by `PATH`.
 pub fn host_argv(found: &HostAgent, resume: bool) -> Option<Vec<String>> {
+    let node = found.node.as_ref().map(|node| node.to_string_lossy().into_owned());
     let mut argv = match found.kind {
         AgentKind::Claude | AgentKind::Codex => {
-            vec![found.bin.as_ref().filter(|bin| bin.is_absolute())?.to_string_lossy().into_owned()]
+            let bin = found.bin.as_ref().filter(|bin| bin.is_absolute())?.to_string_lossy().into_owned();
+            // Codex's npm link with no node next to it starts `env node`
+            // through the login shell's `PATH`, as before.
+            node.into_iter().chain([bin]).collect()
         }
         AgentKind::Pi | AgentKind::Gemini => {
             let entry = match found.kind {
                 AgentKind::Pi => pi::HOST_ENTRY,
                 _ => found.entry.as_deref()?,
             };
-            vec!["node".to_owned(), found.package.as_ref()?.join(entry).to_string_lossy().into_owned()]
+            // With no node next to the package (bun, pnpm, a Homebrew
+            // formula), the login shell's `PATH` finds `node`, as before.
+            let node = node.unwrap_or_else(|| "node".to_owned());
+            vec![node, found.package.as_ref()?.join(entry).to_string_lossy().into_owned()]
         }
     };
     if resume {
@@ -824,6 +831,7 @@ mod tests {
             package: package.map(PathBuf::from),
             entry: entry.map(str::to_owned),
             bin: bin.map(PathBuf::from),
+            node: None,
         };
         let claude = found(AgentKind::Claude, None, None, Some("/Users/me/.local/share/claude/versions/2.1.310"));
         let codex =
@@ -831,7 +839,13 @@ mod tests {
         let pi =
             found(AgentKind::Pi, Some("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"), None, None);
         let gemini = found(AgentKind::Gemini, Some("/opt/gemini"), Some("bundle/gemini.js"), None);
-        let cases: [(&HostAgent, bool, &[&str]); 8] = [
+        // The node next to the package runs it, not `node` by `PATH`.
+        let node = Some(PathBuf::from("/opt/homebrew/bin/node"));
+        let pi_node = HostAgent { node: node.clone(), ..pi.clone() };
+        let gemini_node = HostAgent { node: node.clone(), ..gemini.clone() };
+        let link = "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js";
+        let codex_node = HostAgent { node, ..found(AgentKind::Codex, None, None, Some(link)) };
+        let cases: [(&HostAgent, bool, &[&str]); 11] = [
             (&claude, false, &["/Users/me/.local/share/claude/versions/2.1.310"]),
             (&claude, true, &["/Users/me/.local/share/claude/versions/2.1.310", "-c"]),
             (&codex, false, &["/usr/bin/codex"]),
@@ -840,6 +854,16 @@ mod tests {
             (&pi, true, &["node", "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js", "-c"]),
             (&gemini, false, &["node", "/opt/gemini/bundle/gemini.js"]),
             (&gemini, true, &["node", "/opt/gemini/bundle/gemini.js", "--resume", "latest"]),
+            (
+                &pi_node,
+                false,
+                &[
+                    "/opt/homebrew/bin/node",
+                    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+                ],
+            ),
+            (&gemini_node, true, &["/opt/homebrew/bin/node", "/opt/gemini/bundle/gemini.js", "--resume", "latest"]),
+            (&codex_node, true, &["/opt/homebrew/bin/node", link, "resume", "--last"]),
         ];
         let forbidden = [
             "--dangerously-skip-permissions",

@@ -49,6 +49,11 @@ pub struct HostAgent {
     /// Codex). A JS agent has none: it runs as `node <package>/<entry>`.
     #[serde(skip)]
     pub bin: Option<PathBuf>,
+    /// The node of the npm prefix that holds the package: a Mac session runs
+    /// pi, Gemini CLI and Codex's npm link with it. `None` if the prefix has
+    /// no node, or the agent is a native binary.
+    #[serde(skip)]
+    pub node: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -110,6 +115,15 @@ fn package(fs: &dyn HostFs, dir: &Path, entry: &str) -> Option<(PathBuf, String)
 
 fn npm(fs: &dyn HostFs, name: &str, entry: &str) -> Option<(PathBuf, String)> {
     npm_roots(fs).iter().find_map(|root| package(fs, &root.join(name), entry))
+}
+
+/// The node of the npm prefix that holds `package`: `<prefix>/bin/node` for
+/// `<prefix>/lib/node_modules` (npm, Homebrew's node, nvm). bun, pnpm and a
+/// Homebrew formula keep no node there.
+fn node_beside(fs: &dyn HostFs, package: &Path) -> Option<PathBuf> {
+    let root = package.ancestors().find(|dir| dir.ends_with("lib/node_modules"))?;
+    let node = root.parent()?.parent()?.join("bin/node");
+    fs.is_file(&node).then_some(node)
 }
 
 /// The npm package, the binary whose `codex --version` ran, and its version:
@@ -208,6 +222,15 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
         let Some((path, version, entry, bin)) = found else {
             continue;
         };
+        let node = match kind {
+            AgentKind::Claude => None,
+            // Only Codex's npm link is a node script; a native `codex` is not.
+            AgentKind::Codex => bin
+                .as_ref()
+                .filter(|bin| bin.starts_with(&path) && bin.extension().is_some_and(|ext| ext == "js"))
+                .and_then(|_| node_beside(fs, &path)),
+            AgentKind::Pi | AgentKind::Gemini => node_beside(fs, &path),
+        };
         let native = matches!(kind, AgentKind::Claude | AgentKind::Codex);
         let source = match native {
             false => Source::Host,
@@ -224,6 +247,7 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
             package: (!native).then_some(path),
             entry,
             bin,
+            node,
             version,
         });
     }
@@ -263,10 +287,12 @@ mod tests {
         fs.file("/opt/homebrew/lib/node_modules/@openai/codex/package.json", r#"{"version":"0.160.0"}"#);
         // The version comes from `codex --version` of the npm link.
         fs.versions.insert("/opt/homebrew/bin/codex".into(), "codex-cli 0.163.0\n".into());
+        fs.file("/opt/homebrew/bin/node", "");
         // nvm: the newest node wins.
         let pi = "/Users/me/.nvm/versions/node/v22.19.0/lib/node_modules/@earendil-works/pi-coding-agent";
         fs.file(&format!("{pi}/package.json"), r#"{"version":"1.4.0"}"#);
         fs.file(&format!("{pi}/dist/cli.js"), "");
+        fs.file("/Users/me/.nvm/versions/node/v22.19.0/bin/node", "");
         let old = "/Users/me/.nvm/versions/node/v20.1.0/lib/node_modules/@earendil-works/pi-coding-agent";
         fs.file(&format!("{old}/package.json"), r#"{"version":"1.0.0"}"#);
         fs.file(&format!("{old}/dist/cli.js"), "");
@@ -298,6 +324,10 @@ mod tests {
         assert_eq!(found.agent(AgentKind::Pi).unwrap().bin, None);
         assert_eq!(found.agent(AgentKind::Pi).unwrap().package.as_deref(), Some(Path::new(pi)));
         assert_eq!(found.agent(AgentKind::Gemini).unwrap().entry.as_deref(), Some("bundle/gemini.js"));
+        // The node of each package's npm prefix. A Homebrew formula and a
+        // native `codex` have none.
+        let nodes: Vec<_> = found.agents.iter().map(|a| a.node.as_deref()).collect();
+        assert_eq!(nodes, [None, None, Some(Path::new("/Users/me/.nvm/versions/node/v22.19.0/bin/node")), None]);
         assert_eq!(found.agent(AgentKind::Codex).unwrap().login, LoginState::None);
         assert!(found.antigravity);
 
@@ -342,6 +372,10 @@ mod tests {
         fs.links.insert("/usr/bin/codex".into(), target.clone());
         let found = detect(&fs, &FakeLogins::default(), 0, &data());
         assert_eq!(found.agent(AgentKind::Codex).unwrap().bin, Some(target));
+        // The npm link is a node script: the node of its prefix runs it.
+        fs.file("/usr/local/bin/node", "");
+        let found = detect(&fs, &FakeLogins::default(), 0, &data());
+        assert_eq!(found.agent(AgentKind::Codex).unwrap().node.as_deref(), Some(Path::new("/usr/local/bin/node")));
     }
 
     #[test]
