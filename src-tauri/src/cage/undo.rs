@@ -256,7 +256,7 @@ impl<R: SandboxRuntime> Manager<R> {
     fn restore_mount(&self, id: &str, mount: &Mount, index: usize) -> Result<()> {
         let display = mount.host.display().to_string();
         let (now, now_id) = cage::host_dir_with_id(&display)?;
-        if now != mount.host || mount.id.is_some_and(|stored| stored != now_id) {
+        if now != mount.host || mount.id.is_some_and(|stored| !stored.same_folder(now_id)) {
             return Err(Error::PathChanged(display));
         }
         self.put_mount(id, |c, sessions| {

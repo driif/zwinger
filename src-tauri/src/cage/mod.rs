@@ -144,6 +144,14 @@ impl FileId {
         use std::os::unix::fs::MetadataExt;
         Self { dev: metadata.dev(), ino: metadata.ino() }
     }
+
+    /// The same folder, compared by inode only. macOS gives a volume its
+    /// device number when it mounts, so `dev` changes after a restart. The
+    /// canonical path, which the callers compare first, already fixes the
+    /// volume.
+    pub fn same_folder(self, other: Self) -> bool {
+        self.ino == other.ino
+    }
 }
 
 impl Cage {
@@ -497,7 +505,7 @@ impl Bound<'_> {
                 return Err(Error::PathUnverified(display));
             };
             let (now, now_id) = host_dir_with_id(&display)?;
-            if now != *path || id != now_id {
+            if now != *path || !id.same_folder(now_id) {
                 return Err(Error::PathChanged(display));
             }
         }
@@ -1072,6 +1080,16 @@ mod tests {
         std::fs::rename(root.join("project"), root.join("was")).unwrap();
         std::fs::create_dir(root.join("project")).unwrap();
         assert!(matches!(project.verify_paths(), Err(Error::PathChanged(p)) if p.ends_with("project")));
+    }
+
+    #[test]
+    fn a_new_device_number_after_a_restart_keeps_the_folder_verified() {
+        let (mut project, root) = project_with_dirs(&["project", "data"]);
+        project.add_mount(&path(&root, "data"), "/mnt/data", true).unwrap();
+        for id in [project.session.folder_id.as_mut().unwrap(), project.cage.mounts[0].id.as_mut().unwrap()] {
+            id.dev += 1;
+        }
+        project.verify_paths().unwrap();
     }
 
     #[test]
