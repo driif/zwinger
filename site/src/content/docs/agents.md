@@ -19,7 +19,8 @@ A Mac shell (⌘T) runs on the Mac with no sandbox. zwinger never types an agent
 In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi` and `gemini` are on the `PATH`.
 
 **Continue last session** starts the agent with its continue option (`claude -c`, `codex resume --last`, `pi -c`,
-`gemini --resume latest`).
+`gemini --resume latest`). It continues a session of the agent terminals only, never a call of a
+[task run](/tasks/#agent-state).
 
 ## Agents with no cage
 

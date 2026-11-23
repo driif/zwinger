@@ -203,6 +203,7 @@ async fn fixture_with(name: &str, curl: bool) -> Fixture {
         pi_host: false,
         gemini: None,
         proxy: None,
+        state: None,
     };
     let dir = root.join("round");
     std::fs::create_dir_all(&dir).unwrap();
@@ -556,6 +557,7 @@ fn clone_exec(exec: &Exec<FakeRuntime>) -> Exec<FakeRuntime> {
         pi_host: false,
         gemini: None,
         proxy: None,
+        state: None,
     }
 }
 

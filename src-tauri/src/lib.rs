@@ -29,6 +29,7 @@ mod task_artifacts;
 mod task_participants;
 mod task_recovery;
 mod task_runs;
+mod task_state;
 mod terminal;
 mod updates;
 mod workspaces;

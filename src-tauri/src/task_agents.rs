@@ -13,7 +13,7 @@ use tokio::time::Instant;
 
 use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
-use crate::session::TaskAgent;
+use crate::task_participants::Participant;
 
 /// How long a killed process has to exit.
 const KILL_WAIT: Duration = Duration::from_secs(10);
@@ -189,10 +189,15 @@ impl std::fmt::Display for Failure {
 /// only. Gemini CLI without `--yolo` refuses the tools that need an approval.
 /// Codex's own sandbox does not work in the VM, so for Codex read-only
 /// is the instruction in the prompt and the check after the stage. `found`
-/// picks the program and sets the proxy env.
-pub fn argv(agent: &TaskAgent, access: Access, found: launch::Found) -> Result<Vec<String>, Failure> {
+/// picks the program and sets the proxy env. `home` is the state root of the call.
+pub fn argv(
+    agent: &Participant,
+    access: Access,
+    found: launch::Found,
+    home: Option<&str>,
+) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
-    let Some(mut argv) = launch::command(agent.kind, found) else {
+    let Some(mut argv) = launch::command(agent.kind, found, home) else {
         return Err(Failure::Start("Gemini CLI is not mounted in the cage".to_owned()));
     };
     match agent.kind {
@@ -399,6 +404,9 @@ pub struct Exec<R: SandboxRuntime> {
     pub gemini: Option<String>,
     /// The URL of the cage's proxy.
     pub proxy: Option<String>,
+    /// The guest folder of the run's agent state: each participant has its
+    /// own state root below it. `None` uses the state of the terminals.
+    pub state: Option<String>,
 }
 
 /// The final text of a call and the error that the CLI reported.
@@ -483,7 +491,7 @@ impl<R: SandboxRuntime> Exec<R> {
     /// One agent call. Returns the final text of the agent.
     pub async fn agent(
         &self,
-        agent: &TaskAgent,
+        agent: &Participant,
         access: Access,
         prompt: &str,
         limits: Limits,
@@ -529,8 +537,9 @@ impl<R: SandboxRuntime> Exec<R> {
                 }
             }
         };
-        let (code, stderr) =
-            self.drive(&argv(agent, access, self.found())?, prompt.as_bytes(), limits, cancel, on_stdout).await?;
+        let home = self.state.as_ref().map(|state| format!("{state}/{}", agent.id));
+        let argv = argv(agent, access, self.found(), home.as_deref())?;
+        let (code, stderr) = self.drive(&argv, prompt.as_bytes(), limits, cancel, on_stdout).await?;
         if let Some(error) = result.error {
             return Err(Failure::Agent(error));
         }
@@ -544,7 +553,7 @@ impl<R: SandboxRuntime> Exec<R> {
     /// gets one retry; a failed process gets none.
     pub async fn call_json(
         &self,
-        agent: &TaskAgent,
+        agent: &Participant,
         access: Access,
         prompt: &str,
         limits: Limits,
@@ -837,8 +846,8 @@ mod tests {
     /// The tree of a repository with no commit: the base of a run that started there.
     const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-    fn agent(kind: AgentKind, model: Option<&str>) -> TaskAgent {
-        TaskAgent { kind, model: model.map(str::to_owned) }
+    fn agent(kind: AgentKind, model: Option<&str>) -> Participant {
+        Participant { id: kind.name().to_owned(), kind, model: model.map(str::to_owned) }
     }
 
     const GEMINI: Option<&str> = Some("/opt/zwinger/host/gemini/bundle/gemini.js");
@@ -880,6 +889,7 @@ mod tests {
             pi_host: false,
             gemini: None,
             proxy: None,
+            state: None,
         };
         assert_eq!(exec.task_runs(), Some("/s/.zwinger/tasks/fix"));
         let repo = temp_repo("task-runs");
@@ -1129,43 +1139,46 @@ PATH=$ORIGINAL_PATH exec git "$@"
 
     #[test]
     fn read_only_stages_pass_the_read_only_flags() {
-        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, found(false, GEMINI)).unwrap();
+        let claude = argv(&agent(AgentKind::Claude, Some("opus")), Access::Read, found(false, GEMINI), None).unwrap();
         assert!(claude.windows(2).any(|w| w == ["--disallowedTools", "Edit,Write,NotebookEdit"]));
         assert!(claude.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(
-            !argv(&agent(AgentKind::Claude, None), Access::Write, found(false, GEMINI))
+            !argv(&agent(AgentKind::Claude, None), Access::Write, found(false, GEMINI), None)
                 .unwrap()
                 .contains(&"--disallowedTools".to_owned())
         );
 
-        let pi = argv(&agent(AgentKind::Pi, None), Access::Read, found(false, GEMINI)).unwrap();
+        let pi = argv(&agent(AgentKind::Pi, None), Access::Read, found(false, GEMINI), None).unwrap();
         assert!(pi.windows(2).any(|w| w == ["--tools", PI_READ_TOOLS]));
         assert_eq!(pi.last().map(String::as_str), Some("-p"));
         assert!(
-            !argv(&agent(AgentKind::Pi, None), Access::Write, found(false, GEMINI))
+            !argv(&agent(AgentKind::Pi, None), Access::Write, found(false, GEMINI), None)
                 .unwrap()
                 .contains(&"--tools".to_owned())
         );
 
-        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, found(false, GEMINI)).unwrap();
-        assert_eq!(codex, argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, found(false, GEMINI)).unwrap());
+        let codex = argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Read, found(false, GEMINI), None).unwrap();
+        assert_eq!(
+            codex,
+            argv(&agent(AgentKind::Codex, Some("gpt-5")), Access::Write, found(false, GEMINI), None).unwrap()
+        );
         assert!(codex.windows(2).any(|w| w == ["-m", "gpt-5"]));
         assert_eq!(codex.last().map(String::as_str), Some("-"));
 
-        let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, found(false, GEMINI)).unwrap();
+        let gemini = argv(&agent(AgentKind::Gemini, None), Access::Read, found(false, GEMINI), None).unwrap();
         assert!(!gemini.contains(&"--yolo".to_owned()));
         assert!(
-            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, GEMINI))
+            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, GEMINI), None)
                 .unwrap()
                 .contains(&"--yolo".to_owned())
         );
         assert_eq!(gemini[3], "/opt/zwinger/host/gemini/bundle/gemini.js");
         assert!(matches!(
-            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, None)),
+            argv(&agent(AgentKind::Gemini, None), Access::Write, found(false, None), None),
             Err(Failure::Start(_))
         ));
 
-        let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, found(true, GEMINI)).unwrap();
+        let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, found(true, GEMINI), None).unwrap();
         assert_eq!(host_pi[2..4], ["node", "/opt/zwinger/host/pi/dist/cli.js"]);
         assert_eq!(pi[..4], ["env", "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/pi/cli.js"]);
     }
@@ -1292,6 +1305,7 @@ mod limit_tests {
             pi_host: false,
             gemini: None,
             proxy: None,
+            state: None,
         };
         (exec, kills)
     }
@@ -1331,8 +1345,8 @@ mod limit_tests {
         }
     }
 
-    fn claude() -> TaskAgent {
-        TaskAgent { kind: AgentKind::Claude, model: None }
+    fn claude() -> Participant {
+        Participant { id: "claude".to_owned(), kind: AgentKind::Claude, model: None }
     }
 
     fn limits(idle: u64, hard: u64) -> Limits {

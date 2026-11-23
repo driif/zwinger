@@ -829,7 +829,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// `TUI_PROBE` has loaded, and is killed. The error is the end of its output.
     pub(crate) async fn probe_tui(&self, vm: &R::Vm, proxy: Option<&str>) -> std::result::Result<(), String> {
         let found = launch::Found { pi_host: true, gemini: None, proxy };
-        let mut argv = launch::command(AgentKind::Pi, found).expect("pi has a program");
+        let mut argv = launch::command(AgentKind::Pi, found, None).expect("pi has a program");
         argv.push("--no-session".to_owned());
         let (rows, cols) = TUI_PROBE_SIZE;
         let mut pty = self.runtime.open_pty(vm, &argv, WORKSPACE, rows, cols).await.map_err(|e| e.to_string())?;

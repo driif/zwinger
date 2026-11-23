@@ -13,8 +13,10 @@ use crate::runtime::SandboxRuntime;
 use crate::session::{Session, Task, TaskDraft};
 use crate::task_agents::{Exec, SnapshotError};
 use crate::task_artifacts::{self, Mirror, OldCopies, RoundWriter};
+use crate::task_participants::{Participant, independent, participants};
 use crate::task_recovery::{self, Recovered, Resume, RunRecord, TaskRuns};
 use crate::task_runs::{self, Control, RunHandle, RunState};
+use crate::task_state;
 
 impl<R: SandboxRuntime> Manager<R> {
     pub fn put_task(&self, id: &str, draft: TaskDraft) -> Result<String> {
@@ -31,7 +33,17 @@ impl<R: SandboxRuntime> Manager<R> {
         if self.runs.is_running(id, task_id) {
             return Err(Error::TaskRunning);
         }
-        let slug = lock(&self.state).session(id)?.task(task_id)?.slug.clone();
+        let (slug, key) = {
+            let state = lock(&self.state);
+            let slug = state.session(id)?.task(task_id)?.slug.clone();
+            (slug, state.vm_of(id).map(|(key, _)| key.to_owned()).or_else(|| state.planned_key(id)))
+        };
+        if let Some(dir) = key.and_then(|key| self.state_dir(&key).ok())
+            && let Err(e) = task_state::remove(&dir, id, &slug)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
         self.edit_session(id, |s, _| s.remove_task(task_id))?;
         self.runs.forget(id, Some(task_id));
         self.shares.forget(id, Some(task_id));
@@ -98,9 +110,10 @@ impl<R: SandboxRuntime> Manager<R> {
         mut record: RunRecord,
         resume: Option<(&Recovered, &str)>,
     ) -> Result<String> {
-        let (vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin, old) = {
+        let (vm, key, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin, old) = {
             let state = lock(&self.state);
             let (member, cage, running, folder, shared) = state.task_cage(id)?;
+            let key = state.vm_of(id).map(|(key, _)| key.to_owned()).ok_or(Error::NotRunning)?;
             let folders: Vec<&Path> = state.sessions.iter().map(|s| s.folder.as_path()).collect();
             let old = old_copies(member, &cage.mounts, &folders);
             task.workdir = in_guest_folder(&folder, &task.workdir);
@@ -118,6 +131,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 .map(|a| self.unmounted(a.kind, host));
             (
                 vm.clone(),
+                key,
                 folder,
                 scope,
                 member.folder.clone(),
@@ -146,6 +160,9 @@ impl<R: SandboxRuntime> Manager<R> {
             return Err(e);
         }
         mirror.check()?;
+        let homes: Vec<Participant> =
+            participants(&task.agents).into_iter().chain(task.options.independent.as_ref().map(independent)).collect();
+        task_state::create(&self.state_dir(&key)?, id, &task.slug, &run, &homes)?;
         let writer = RoundWriter::create(dir.join(&run), Some(mirror))?;
         match resume {
             None => writer.write_durable(task_recovery::RUN, &serde_json::to_vec_pretty(&record)?)?,
@@ -175,6 +192,7 @@ impl<R: SandboxRuntime> Manager<R> {
             pi_host,
             gemini,
             proxy,
+            state: Some(task_state::guest_root(id, &task.slug, &run)),
         };
         let spec = task_runs::Spec {
             session_id: id.to_owned(),
@@ -303,6 +321,7 @@ impl<R: SandboxRuntime> Manager<R> {
             pi_host: false,
             gemini: None,
             proxy: None,
+            state: None,
         };
         // A dropped sender reads as a cancel, so it lives until the diff ends.
         let (_keep, mut cancel) = tokio::sync::watch::channel(false);
@@ -616,6 +635,25 @@ mod tests {
         let handle = manager.run_handle(id, task_id, run).unwrap();
         handle.control(Control::Cancel { reason: None }).unwrap();
         tokio::time::timeout(Duration::from_secs(10), handle.settled()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_run_gets_its_own_agent_state_until_the_next_run_or_the_task_removal() {
+        let (manager, id, task_id, _) = ended_run().await;
+        let key = lock(&manager.state).vm_of(&id).unwrap().0.to_owned();
+        let tasks = manager.state_dir(&key).unwrap().join("tasks").join(&id).join("fix");
+        assert_eq!(manager.start_task_run(&id, &task_id).unwrap(), "02");
+        assert!(tasks.join("02/pi/agent").is_dir());
+        assert!(tasks.join("02/claude/claude/.claude").is_dir());
+        cancel(&manager, &id, &task_id, "02").await;
+
+        assert_eq!(manager.start_task_run(&id, &task_id).unwrap(), "03");
+        assert!(!tasks.join("02").exists());
+        assert!(tasks.join("03/claude").is_dir());
+        cancel(&manager, &id, &task_id, "03").await;
+
+        manager.remove_task(&id, &task_id).unwrap();
+        assert!(!tasks.exists());
     }
 
     fn record(dir: &Path) -> serde_json::Value {

@@ -23,7 +23,7 @@ use crate::session::Task;
 use crate::session::TaskAgent;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
 use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, append_durable, read_record, stage_key};
-use crate::task_participants::{INDEPENDENT, independent, participants};
+use crate::task_participants::{INDEPENDENT, Participant, independent, participants};
 use crate::task_recovery::{self, Checkpoint, Decisions, Fence, INDEPENDENT_GROUP, Recovered};
 
 const PLAN: &str = include_str!("task_runs/prompts/plan.md");
@@ -825,7 +825,9 @@ impl<R: SandboxRuntime> Io<R> {
     async fn call_agent(&self, agent: &TaskAgent, name: &str, stage: &str, access: Access, prompt: &str) -> Reply {
         let live = |record: Value| self.live.send(name, stage, record);
         let mut cancel = self.cancel.clone();
-        let mut reply = self.exec.call_json(agent, access, prompt, self.config.limits, &mut cancel, &live).await;
+        // The id also names the agent state of the call.
+        let who = Participant { id: name.to_owned(), kind: agent.kind, model: agent.model.clone() };
+        let mut reply = self.exec.call_json(&who, access, prompt, self.config.limits, &mut cancel, &live).await;
         // A process that ends because of a cancel, such as with a stopped VM, is no degraded agent.
         if reply.failure.is_some() && *self.cancel.borrow() {
             reply.failure = Some(Failure::Cancelled);
@@ -2640,6 +2642,7 @@ pub(crate) mod tests {
                 pi_host: false,
                 gemini: None,
                 proxy: None,
+                state: None,
             },
             writer,
             config,
@@ -3822,6 +3825,7 @@ pub(crate) mod tests {
                     pi_host: false,
                     gemini: None,
                     proxy: None,
+                    state: None,
                 },
                 writer,
                 config: recovered.record.config(),

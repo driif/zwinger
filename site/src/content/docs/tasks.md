@@ -48,6 +48,14 @@ A run is one execution of a task. It has these stages:
 If an agent fails, the run continues in a degraded mode, and the room shows it. A degraded result is never shown as an
 agreement.
 
+### Agent state
+
+Each agent of a run, also the independent reviewer, has its own agent state for that run. The task calls use the same
+settings, profile and login as the agent terminals of the cage, but not their history. So **Continue last session**,
+`claude -c` or `codex resume --last` in a terminal never continues a task call, and task calls do not show in the
+history of your terminal agents. The state of a run stays in the cage until the next run of the task starts or you
+remove the task.
+
 ### Limits
 
 The idle limit and the hard limit apply to **each process call**, not to a stage or to the run:

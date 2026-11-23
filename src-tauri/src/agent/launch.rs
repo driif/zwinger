@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use super::{AgentKind, claude, codex, gemini, pi};
+use super::{AgentKind, STATE_DIR, claude, codex, gemini, pi};
 use crate::host_agents::detect::HostAgent;
 use crate::terminal::output::AGENT_OSC;
 
@@ -86,17 +86,25 @@ pub fn program(kind: AgentKind, found: Found) -> Option<Vec<String>> {
     })
 }
 
-/// The net env of `found`'s proxy, then the state env of `kind`.
-fn all_env(kind: AgentKind, found: Found) -> Vec<(String, String)> {
+/// The net env of `found`'s proxy, then the state env of `kind`. With
+/// `home`, the state paths are below `home` in place of [`STATE_DIR`].
+fn all_env(kind: AgentKind, found: Found, home: Option<&str>) -> Vec<(String, String)> {
     let mut all = found.proxy.map(net_env).unwrap_or_default();
-    all.extend(env(kind).iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())));
+    all.extend(env(kind).iter().map(|(n, v)| {
+        let value = match (home, v.strip_prefix(STATE_DIR)) {
+            (Some(home), Some(rest)) => format!("{home}{rest}"),
+            _ => (*v).to_owned(),
+        };
+        ((*n).to_owned(), value)
+    }));
     all
 }
 
 /// `env <net env> <state env> <program>`: the start of a headless argv.
-pub fn command(kind: AgentKind, found: Found) -> Option<Vec<String>> {
+/// `home` is the state root of a task call; `None` is the terminal state.
+pub fn command(kind: AgentKind, found: Found, home: Option<&str>) -> Option<Vec<String>> {
     let mut argv = vec!["env".to_owned()];
-    argv.extend(all_env(kind, found).into_iter().map(|(name, value)| format!("{name}={value}")));
+    argv.extend(all_env(kind, found, home).into_iter().map(|(name, value)| format!("{name}={value}")));
     argv.extend(program(kind, found)?);
     Some(argv)
 }
@@ -363,7 +371,7 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
     if kind == AgentKind::Pi {
         program.extend(["--session-dir".to_owned(), pi::SESSION_DIR.to_owned()]);
     }
-    let env: Vec<String> = all_env(kind, found)
+    let env: Vec<String> = all_env(kind, found, None)
         .iter()
         .filter(|(name, _)| name != "NODE_OPTIONS")
         .map(|(name, value)| format!("{name}={}", quote(value)))
@@ -1090,10 +1098,10 @@ mod tests {
     #[test]
     fn headless_commands_and_continue_flags() {
         assert_eq!(
-            command(AgentKind::Claude, Found::default()).unwrap(),
+            command(AgentKind::Claude, Found::default(), None).unwrap(),
             ["env", "IS_SANDBOX=1", "HOME=/opt/zwinger/state/claude", "/opt/zwinger/claude/claude"]
         );
-        let pi = command(AgentKind::Pi, HOST).unwrap();
+        let pi = command(AgentKind::Pi, HOST, None).unwrap();
         assert_eq!(pi[0], "env");
         assert_eq!(
             pi[pi.len() - 3..],
@@ -1108,7 +1116,18 @@ mod tests {
         ] {
             assert!(pi.contains(&var), "{var} is not in {pi:?}");
         }
-        assert_eq!(command(AgentKind::Gemini, Found::default()), None);
+        assert_eq!(command(AgentKind::Gemini, Found::default(), None), None);
+        // A task call keeps the state layout below its own root.
+        let root = "/opt/zwinger/state/tasks/s/fix/01/claude";
+        for (kind, var) in [
+            (AgentKind::Claude, format!("HOME={root}/claude")),
+            (AgentKind::Codex, format!("CODEX_HOME={root}/codex")),
+            (AgentKind::Pi, format!("PI_CODING_AGENT_DIR={root}/agent")),
+            (AgentKind::Gemini, format!("HOME={root}/gemini")),
+        ] {
+            let argv = command(kind, HOST, Some(root)).unwrap();
+            assert!(argv.contains(&var), "{var} is not in {argv:?}");
+        }
         assert_eq!(continue_args(AgentKind::Codex), ["resume", "--last"]);
         assert_eq!(continue_args(AgentKind::Gemini), ["--resume", "latest"]);
     }

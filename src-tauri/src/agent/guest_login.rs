@@ -18,7 +18,7 @@ use crate::host_agents::{self, KINDS, login};
 const FILE_LIMIT: u64 = 1 << 20;
 
 /// The folders below the state dir and the name of the agent's login file.
-fn place(kind: AgentKind) -> (&'static [&'static str], &'static str) {
+pub fn place(kind: AgentKind) -> (&'static [&'static str], &'static str) {
     match kind {
         AgentKind::Claude => (&["claude", ".claude"], ".credentials.json"),
         AgentKind::Codex => (&["codex"], "auth.json"),
