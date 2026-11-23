@@ -102,7 +102,9 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
           ))}
           {others.length > 0 && (
             <p className="muted">
-              The VM also runs {others.join(", ")}. The agents of a run can read and write their folders too.
+              The VM also runs {others.join(", ")}. The agents of a run can read and write their folders too, and those
+              sessions can see this task's files. The Git check of a run covers only{" "}
+              {/^\/workspace(\/|$)/.test(workdir) ? session.guestFolder : workdir}.
             </p>
           )}
           <Textarea

@@ -1288,6 +1288,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 | "mirror_failed"
                 | "decision"
                 | "shared_vm"
+                | "old_copies"
         );
         if shown {
             let body = format!("**{}** — {}", event.kind.replace('_', " "), event.detail);
@@ -1521,6 +1522,83 @@ impl Mirror {
             Ok(())
         });
         probe.map_err(|e| Error::MirrorUnwritable(self.display(), e.to_string()))
+    }
+}
+
+/// What [`remove_old_copies`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OldCopies {
+    pub removed: usize,
+    /// The entries that stay, relative to the copy folder.
+    pub left: Vec<String>,
+}
+
+/// Removes the round copies that earlier builds wrote to a harness folder:
+/// `<root>/<parts>` is that copy folder, and `parts` ends with
+/// `.zwinger/tasks`. `host` is the
+/// host folder of the session's task runs. Only the known layout goes: a
+/// regular file at `<slug>/<run>/[turns/]<name>` whose host round has a
+/// regular file of that name. Then each folder that is empty. Links are not
+/// followed. Each other entry stays and is in `left`.
+pub fn remove_old_copies(root: &Path, parts: &[String], host: &Path) -> OldCopies {
+    let mut found = OldCopies::default();
+    let Some(mut dirs) = nofollow_dir(root).map(|d| vec![d]) else {
+        return found;
+    };
+    for part in parts {
+        match rustix::fs::openat(&dirs[dirs.len() - 1], part.as_str(), DIR_FLAGS, Mode::empty()) {
+            Ok(dir) => dirs.push(dir),
+            Err(_) => return found,
+        }
+    }
+    sweep(&dirs[dirs.len() - 1], host, 0, "", &mut found);
+    // `.zwinger/tasks` goes if it is empty, the harness folder stays.
+    for (parent, part) in dirs.iter().zip(parts).rev().take(2) {
+        if rustix::fs::unlinkat(parent, part.as_str(), AtFlags::REMOVEDIR).is_err() {
+            break;
+        }
+    }
+    found
+}
+
+/// One folder of [`remove_old_copies`]: `depth` 0 holds task slugs, 1 runs,
+/// 2 the round files and `turns`, 3 the turn files.
+fn sweep(dir: &OwnedFd, host: &Path, depth: usize, prefix: &str, found: &mut OldCopies) {
+    let Ok(entries) = Dir::read_from(dir) else {
+        found.left.push(prefix.trim_end_matches('/').to_owned());
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().to_str() else {
+            found.left.push(format!("{prefix}{}", entry.file_name().to_string_lossy()));
+            continue;
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let shown = format!("{prefix}{name}");
+        let on_host = std::fs::symlink_metadata(host.join(name)).ok().map(|m| m.file_type());
+        let kind = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map(|s| FileType::from_raw_mode(s.st_mode));
+        match kind {
+            Ok(FileType::Directory)
+                if (depth < 2 || (depth == 2 && name == TURNS_DIR)) && on_host.is_some_and(|t| t.is_dir()) =>
+            {
+                match rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty()) {
+                    Ok(sub) => sweep(&sub, &host.join(name), depth + 1, &format!("{shown}/"), found),
+                    Err(_) => found.left.push(shown),
+                }
+                // Fails if an entry stays in it.
+                let _ = rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR);
+            }
+            Ok(FileType::RegularFile)
+                if depth >= 2
+                    && on_host.is_some_and(|t| t.is_file())
+                    && rustix::fs::unlinkat(dir, name, AtFlags::empty()).is_ok() =>
+            {
+                found.removed += 1;
+            }
+            _ => found.left.push(shown),
+        }
     }
 }
 
@@ -2231,5 +2309,39 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root.join(".zwinger")).unwrap();
         assert!(matches!(Mirror { root, parts }.check(), Err(Error::MirrorUnwritable(..))));
         assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn old_copies_go_only_in_the_known_layout() {
+        let host = temp_dir();
+        for file in ["fix/01/events.jsonl", "fix/01/turns/plan-a.json", "fix/02/events.jsonl"] {
+            std::fs::create_dir_all(host.join(file).parent().unwrap()).unwrap();
+            std::fs::write(host.join(file), "x").unwrap();
+        }
+        let root = temp_dir();
+        let old = root.join("sub/.zwinger/tasks");
+        let outside = temp_dir();
+        std::fs::write(outside.join("events.jsonl"), "keep").unwrap();
+        for file in ["fix/01/events.jsonl", "fix/01/turns/plan-a.json", "fix/01/notes.md", "other/01/events.jsonl"] {
+            std::fs::create_dir_all(old.join(file).parent().unwrap()).unwrap();
+            std::fs::write(old.join(file), "y").unwrap();
+        }
+        // A link that the guest put in the layout is not followed.
+        std::os::unix::fs::symlink(&outside, old.join("fix/02")).unwrap();
+        let parts = ["sub", ".zwinger", "tasks"].map(str::to_owned);
+        let found = remove_old_copies(&root, &parts, &host);
+        assert_eq!(found.removed, 2);
+        let mut left = found.left;
+        left.sort();
+        assert_eq!(left, ["fix/01/notes.md", "fix/02", "other"]);
+        assert!(!old.join("fix/01/turns").exists());
+        assert_eq!(std::fs::read_to_string(outside.join("events.jsonl")).unwrap(), "keep");
+
+        // With all known files gone, `.zwinger/tasks` goes too, the harness stays.
+        std::fs::remove_dir_all(root.join("sub/.zwinger")).unwrap();
+        std::fs::create_dir_all(old.join("fix/02")).unwrap();
+        std::fs::write(old.join("fix/02/events.jsonl"), "y").unwrap();
+        assert_eq!(remove_old_copies(&root, &parts, &host), OldCopies { removed: 1, left: Vec::new() });
+        assert!(!root.join("sub/.zwinger").exists() && root.join("sub").is_dir());
     }
 }

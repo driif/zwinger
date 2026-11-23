@@ -87,7 +87,8 @@ pushes. After a run that ends with `ship`, you can approve a commit or a PR: see
 The Git check and the change view cover the session folder, even when the Git root is above it. If the working dir is
 in a mount, they cover the working dir in its Git repository instead. They exclude every round copy of the current task, so a continuation does not see the copy of its source. If the VM
 contains more than one session, the room shows a note when the run starts: the folder that the Git check covers, and
-that other sessions in the VM can see the task's files. The task form names those sessions.
+that other sessions in the VM can see the task's files. Before a run, the task form shows the same note: it names those
+sessions and the folder that the Git check covers.
 
 ## Room
 
@@ -324,3 +325,8 @@ zwinger writes the files of each run to its app data on the Mac, under the sessi
 so an agent cannot change a verdict. At each stage, zwinger also writes a copy to
 `.zwinger/tasks/<task>/<run>/` in the session folder. The harness setting does not move this copy. A run starts only
 if zwinger can write it.
+
+Earlier builds wrote this copy to `.zwinger/tasks/` in the harness folder. When a run starts, zwinger removes the old
+copies below the current harness folder: only a file at `<task>/<run>/` or `<task>/<run>/turns/` whose run record on the
+Mac has a file of that name. Then it removes the folders that are empty. Other files stay, and the room shows a note
+that names them.

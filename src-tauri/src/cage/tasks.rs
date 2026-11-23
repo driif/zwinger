@@ -1,18 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 
 use crate::a2a::ShareInfo;
 use crate::agent::AgentKind;
-use crate::cage::Mount;
 use crate::cage::manager::{Manager, Vm, blocking, in_guest_folder, lock};
+use crate::cage::{Mount, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::run_git::{self, Origin};
 use crate::runtime::SandboxRuntime;
-use crate::session::{Task, TaskDraft};
+use crate::session::{Session, Task, TaskDraft};
 use crate::task_agents::{Exec, SnapshotError};
-use crate::task_artifacts::{self, Mirror, RoundWriter};
+use crate::task_artifacts::{self, Mirror, OldCopies, RoundWriter};
 use crate::task_recovery::{self, Recovered, Resume, RunRecord, TaskRuns};
 use crate::task_runs::{self, Control, RunHandle, RunState};
 
@@ -98,9 +98,11 @@ impl<R: SandboxRuntime> Manager<R> {
         mut record: RunRecord,
         resume: Option<(&Recovered, &str)>,
     ) -> Result<String> {
-        let (vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin) = {
+        let (vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin, old) = {
             let state = lock(&self.state);
             let (member, cage, running, folder, shared) = state.task_cage(id)?;
+            let folders: Vec<&Path> = state.sessions.iter().map(|s| s.folder.as_path()).collect();
+            let old = old_copies(member, &cage.mounts, &folders);
             task.workdir = in_guest_folder(&folder, &task.workdir);
             let Vm::Running { vm, runtimes, host, .. } = running else {
                 unreachable!("task_cage returns a running VM")
@@ -125,6 +127,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 host.proxy.clone(),
                 unmounted,
                 origin,
+                old,
             )
         };
         // A continuation keeps the origin of its source: a changed mapping
@@ -154,6 +157,13 @@ impl<R: SandboxRuntime> Manager<R> {
                         writer.write_durable(name, &bytes)?;
                     }
                 }
+            }
+        }
+        if let Some((root, parts)) = old {
+            let found = task_artifacts::remove_old_copies(&root, &parts, &self.data.join("tasks").join(id));
+            let place = parts.iter().fold(root, |path, part| path.join(part));
+            if let Some(note) = old_copies_note(&found, &place) {
+                writer.event("old_copies", &note);
             }
         }
         let exec = Exec {
@@ -356,12 +366,56 @@ pub(crate) fn git_scope(task: &Task, folder: &str, mounts: &[Mount]) -> Result<S
     }
 }
 
+/// Where earlier builds wrote the round copies of a session: `.zwinger/tasks`
+/// below its harness, as a trusted host root and the folders below it.
+/// `None` if the harness is the session folder or a session folder now,
+/// where the copies of today go.
+fn old_copies(member: &Session, mounts: &[Mount], folders: &[&Path]) -> Option<(PathBuf, Vec<String>)> {
+    let harness = Path::new(member.harness.as_deref()?);
+    let (root, rel) = match harness.strip_prefix(WORKSPACE) {
+        Ok(rel) => (member.folder.clone(), rel),
+        Err(_) => {
+            // Earlier builds refused a read-only harness.
+            let mount =
+                mounts.iter().filter(|m| !m.readonly && harness.starts_with(&m.guest)).max_by_key(|m| m.guest.len())?;
+            (mount.host.clone(), harness.strip_prefix(&mount.guest).ok()?)
+        }
+    };
+    if !rel.components().all(|c| matches!(c, Component::Normal(_))) || folders.contains(&root.join(rel).as_path()) {
+        return None;
+    }
+    let mut parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    parts.extend([".zwinger", "tasks"].map(str::to_owned));
+    Some((root, parts))
+}
+
+/// The run note on the old copies at `place`, if any were there.
+fn old_copies_note(found: &OldCopies, place: &Path) -> Option<String> {
+    const SHOWN: usize = 10;
+    let place = place.display();
+    let removed =
+        format!("zwinger removed {} files of round copies that earlier builds wrote to {place}.", found.removed);
+    let left = match found.left.len() {
+        0 => String::new(),
+        n => {
+            let more = if n > SHOWN { format!(" and {} more", n - SHOWN) } else { String::new() };
+            let names = found.left.iter().take(SHOWN).map(String::as_str).collect::<Vec<_>>().join(", ");
+            format!(" These entries in {place} stay, because zwinger cannot prove that it made them: {names}{more}.")
+        }
+    };
+    match (found.removed, found.left.is_empty()) {
+        (0, true) => None,
+        (0, false) => Some(left.trim_start().to_owned()),
+        _ => Some(format!("{removed}{left}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cage::Mount;
     use crate::cage::testing::*;
     use crate::session::{RunOptions, Task, TaskAgent};
-    use crate::task_artifacts::{self, RoundWriter};
+    use crate::task_artifacts::{self, OldCopies, RoundWriter};
     use crate::task_recovery::{self, Resume, RunRecord};
     use crate::task_runs::tests::{Fake, no_git, serve};
     use crate::task_runs::{Contribution, Control, RunState};
@@ -388,6 +442,51 @@ mod tests {
         assert_eq!(scope("/mnt/repo/app").unwrap(), "/mnt/repo/app");
         assert!(matches!(scope("/workspace/ab"), Err(Error::TaskWorkdir(..))));
         assert!(matches!(scope("/workspace/b"), Err(Error::TaskWorkdir(..))));
+    }
+
+    #[test]
+    fn old_copies_are_below_a_harness_that_is_not_a_session_folder() {
+        let (manager, _, _) = manager();
+        let mut member = manager.list().sessions[0].session.clone();
+        member.folder = PathBuf::from("/s");
+        let mounts = [
+            Mount { host: PathBuf::from("/h"), id: None, guest: "/mnt/repo".into(), readonly: false },
+            Mount { host: PathBuf::from("/r"), id: None, guest: "/mnt/ro".into(), readonly: true },
+            Mount { host: PathBuf::from("/o"), id: None, guest: "/mnt/other".into(), readonly: false },
+        ];
+        let folders = [Path::new("/s"), Path::new("/o")];
+        let mut old = |harness: Option<&str>| {
+            member.harness = harness.map(str::to_owned);
+            super::old_copies(&member, &mounts, &folders)
+        };
+        let parts = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(old(None), None);
+        assert_eq!(old(Some("/workspace")), None);
+        assert_eq!(old(Some("/workspace/sub")), Some((PathBuf::from("/s"), parts(&["sub", ".zwinger", "tasks"]))));
+        assert_eq!(old(Some("/mnt/repo/app")), Some((PathBuf::from("/h"), parts(&["app", ".zwinger", "tasks"]))));
+        assert_eq!(old(Some("/mnt/ro")), None);
+        // The folder of another session holds the copies of today.
+        assert_eq!(old(Some("/mnt/other")), None);
+    }
+
+    #[test]
+    fn the_old_copies_note_names_what_stays() {
+        let note = |removed, left: &[&str]| {
+            let found = OldCopies { removed, left: left.iter().map(|s| s.to_string()).collect() };
+            super::old_copies_note(&found, Path::new("/h/.zwinger/tasks"))
+        };
+        assert_eq!(note(0, &[]), None);
+        assert_eq!(
+            note(3, &[]).unwrap(),
+            "zwinger removed 3 files of round copies that earlier builds wrote to /h/.zwinger/tasks."
+        );
+        assert_eq!(
+            note(0, &["fix/01/notes.md"]).unwrap(),
+            "These entries in /h/.zwinger/tasks stay, because zwinger cannot prove that it made them: fix/01/notes.md."
+        );
+        let many: Vec<String> = (0..12).map(|n| n.to_string()).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(note(1, &many).unwrap().ends_with(": 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more."));
     }
 
     #[tokio::test]
