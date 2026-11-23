@@ -469,12 +469,14 @@ impl Bound<'_> {
 
     /// A writable path of another session and its cage may not nest with
     /// any path of this pair, in either direction: a guest of one could then
-    /// swap a folder that the other binds at start.
+    /// swap a folder that the other binds at start. The same folder in both
+    /// is allowed: a guest cannot replace its own mount root, and a start
+    /// checks the identity of each folder.
     pub fn check_overlap_with<'b>(&self, others: impl IntoIterator<Item = Bound<'b>>) -> Result<()> {
         let ours: Vec<&Path> = self.host_paths().map(|(p, _)| p).collect();
         for other in others {
             for (b, _) in other.host_paths().filter(|(_, rw)| *rw) {
-                if let Some(a) = ours.iter().find(|a| a.starts_with(b) || b.starts_with(a)) {
+                if let Some(a) = ours.iter().find(|a| **a != b && (a.starts_with(b) || b.starts_with(a))) {
                     return Err(Error::MountOverlap(a.display().to_string(), b.display().to_string()));
                 }
             }
@@ -961,6 +963,17 @@ mod tests {
         assert!(matches!(inner.bound().check_overlap_with([other.bound()]), Err(Error::MountOverlap(..))));
         let data = Pair::new(&path(&root, "data"));
         data.bound().check_overlap_with([other.bound()]).unwrap();
+    }
+
+    #[test]
+    fn another_projects_folder_can_be_a_writable_mount() {
+        let (mut project, root) = project_with_dirs(&["project", "other/inner"]);
+        project.add_mount(&path(&root, "other"), "/mnt/other", false).unwrap();
+        let other = Pair::new(&path(&root, "other"));
+        project.bound().check_overlap_with([other.bound()]).unwrap();
+        other.bound().check_overlap_with([project.bound()]).unwrap();
+        let inner = Pair::new(&path(&root, "other/inner"));
+        assert!(matches!(inner.bound().check_overlap_with([project.bound()]), Err(Error::MountOverlap(..))));
     }
 
     /// The project of `project_with_dirs` and a second session of its cage at `name`.

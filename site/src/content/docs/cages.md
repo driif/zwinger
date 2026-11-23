@@ -66,6 +66,8 @@ in its own cage if it must not see the others.
 - **Hot mount.** A project cannot join a running VM with no restart yet.
 - **Checks across VMs.** A project folder also must not overlap the folder of a project of the same cage that runs in
   a different VM, such as its own VM.
+- **Projects of other cages.** A folder of this VM must not be inside, or contain, a writable folder of a project of
+  a different cage. The same folder is allowed: you can mount the folder of another project, also as writable.
 
 A start of a stopped VM boots it with only the project that starts it. A project that you delete must not run in a
 VM with other projects: stop that VM first.
