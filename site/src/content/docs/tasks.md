@@ -42,7 +42,7 @@ A task needs a cage. A session with no cage cannot start a task: attach a cage, 
 
 In the stages that must not change files, the run compares the Git state of its folder before and after. A change
 is a violation. Outside a Git work tree, this check is not possible, and the run tells you. A run never commits or
-pushes.
+pushes. After a run that ends with `ship`, you can approve a commit or a PR: see [Commit or open a PR](#commit-or-open-a-pr).
 
 The Git check and the change view cover the session folder, even when the Git root is above it. If the working dir is
 in a mount, they cover the working dir in its Git repository instead. They exclude every round copy of the current task, so a continuation does not see the copy of its source. If the VM
@@ -99,6 +99,64 @@ diff says so and keeps the last saved diff. For a run with no saved diff, the ro
 Show the diff reads the working dir that the run recorded when it started, not the current working dir of the task.
 
 A cage stop cancels its runs.
+
+## Commit or open a PR
+
+`ship` is the verdict of the two agent reviewers. It does not change your repository. After a run that ended with
+`ship`, the room shows **Commit or PR**. Nothing happens in Git until you review the change and approve it there. A2A
+clients and agent messages cannot approve it. The room of a duo round folder from outside the app has no such action.
+
+1. Select **Commit…** or **Open PR…**. zwinger reviews the change in the run's cage VM. The review shows the branch,
+   `HEAD`, the repository, where the steps run, and the changed files below the run's working dir. The run's own
+   records are left out. Each file has its kind (modified, new, deleted, renamed) and its full diff, with a changed
+   file mode.
+2. Select the files. You select whole files, not parts of files. A file that already had changes when the run started
+   is marked: the result takes the whole file, also those changes. If the start state is not known, the review says so.
+3. Write the commit message. For a PR, also write the title, the description and the base branch (default `main`).
+   Each change starts a new review. Then approve with the button at the bottom.
+
+zwinger uses the exact bytes that you reviewed. It does not stage, stash or reset. Files that you did not select keep
+their staged and unstaged changes. If the files, the index or the branch changed after the review, zwinger does
+nothing and asks you to review again. A second click returns the recorded result. It makes no second commit, push
+or PR.
+
+For a PR, zwinger fetches the base branch first. The review shows the commits and the full diff of the PR, also the
+commits that the agents made during the run. Then zwinger commits, pushes the commit to a branch of `origin` (never
+forced), and opens the PR. The commit goes onto your current local branch, so that branch moves to the new commit.
+zwinger does not create or switch a local branch. If the current branch is the base branch, the push writes the
+branch `zwinger/<task>-<run>` of `origin`. The review tells you if that branch of `origin` already exists, and at which
+commit. If the branch of `origin` changes after the review, zwinger does not push.
+
+If the push or the PR fails, the room tells you what is already done, and **Try again** continues from there. The room
+also lists each unfinished operation of the run below **Commit or PR**, also after you close the dialog, select
+another run or restart zwinger. The list shows the commit, whether it is pushed, and the failed step. **Continue**
+goes on from there without a new review. Before **Try again** or **Continue** pushes or opens the PR, zwinger checks
+the repository, its configuration and the push destination again. If the base branch of `origin` moved after the
+review, zwinger stops, because the PR would differ from the review. The commit stays on your local branch. It opens
+no PR if the branch of `origin` no longer has the approved commit. It reports only an open PR with the approved
+branches, title and description as its PR. zwinger never undoes a pushed commit.
+
+All Git and GitHub steps run in the cage VM. zwinger does not use Git, `gh` or credentials on your Mac. The action is
+not available, and the room tells you why, when:
+
+- the cage is stopped. Start the cage.
+- the run is from before this feature, so zwinger does not know the repository at its start.
+- the run's folder is not mapped into the VM as it was at the start of the run, or the repository, `origin` or the
+  branch changed since then.
+
+The review cannot be approved, and it tells you why, when:
+
+- the repository configures hooks, `core.hooksPath`, `core.fsmonitor`, filters, `gpg.*`, commit signing or a
+  credential helper. zwinger does not run them and does not skip them silently. Remove them to use this action.
+  The commits are not signed.
+- Git in the cage has no `user.name` or `user.email`. zwinger never copies your identity from the Mac.
+- a selected file is binary, or the review is too large to show in full.
+- for a PR: `origin` is not an HTTPS GitHub URL, or the cage has no Allow rule for GitHub with a credential. The proxy
+  adds that credential to the push and to the PR request.
+- for a PR: a fetch or push URL of `origin`, after `pushurl` and URL rewrites (`insteadOf`, `pushInsteadOf`), is not
+  the same GitHub repository as `origin`.
+
+zwinger records each approved operation in `operations.jsonl` in the run's records on the Mac.
 
 ## Resume an ended run
 

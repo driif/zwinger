@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use crate::run_git::Origin;
 use crate::session::{Task, TaskAgent};
 use crate::task_agents::Limits;
 use crate::task_artifacts::{RoundWriter, read_record, stage_label, stage_of};
@@ -72,6 +73,9 @@ pub struct RunRecord {
     pub config: RecordedConfig,
     #[serde(default)]
     pub continues: Option<Link>,
+    /// Where the working dir was at the start. A record from before has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +112,7 @@ impl RunRecord {
                 hard_ms: config.limits.hard.as_millis() as u64,
             },
             continues: None,
+            origin: None,
         }
     }
 

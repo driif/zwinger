@@ -235,3 +235,87 @@ export const watchRoom = (
 
 export const unwatchRoom = (token: number) =>
   call<void>("unwatch_room", { token });
+
+export type GitKind = "commit" | "pr";
+
+/** The user's choice for a review of a shipped run. A change asks for a new review. */
+export interface GitRequest {
+  kind: GitKind;
+  /** null selects every changed file that can be selected. */
+  selection: string[] | null;
+  message: string;
+  title: string;
+  body: string;
+  /** The base branch of a PR. Empty: main. */
+  base: string;
+}
+
+export interface GitFile {
+  path: string;
+  /** The old path of a rename. */
+  from: string | null;
+  kind: "modified" | "added" | "deleted" | "renamed" | "untracked" | "unmerged";
+  binary: boolean;
+  staged: boolean;
+  /** null: the state at the start of the run is not known. */
+  dirtyAtStart: boolean | null;
+  selected: boolean;
+  unselectable: string | null;
+  /** The full diff from HEAD to the selected content. */
+  diff: string;
+}
+
+export interface GitOperation {
+  token: string;
+  kind: GitKind;
+  state: "planned" | "committed" | "pushed" | "pr" | "failed" | "stale";
+  sha?: string;
+  ref?: string;
+  url?: string;
+  step?: string;
+  detail?: string;
+}
+
+export interface GitReview {
+  kind: GitKind;
+  /** null: the review cannot be approved; `blocked` says why. */
+  token: string | null;
+  blocked: string[];
+  location: string;
+  mount: string;
+  scope: string;
+  repo: { toplevel: string; gitdir: string; branch: string; head: string; remote: string; base: string };
+  notes: string[];
+  files: GitFile[];
+  pr: {
+    owner: string;
+    repo: string;
+    base: string;
+    head: string;
+    newBranch: boolean;
+    /** The commit of the head branch of origin at the review; empty if it does not exist. */
+    headTip: string;
+    baseTip: string;
+    title: string;
+    body: string;
+    commits: string[];
+    diff: string;
+  } | null;
+  /** The recorded operation of this token, if it ran. */
+  operation: GitOperation | null;
+}
+
+/** Reviews the change of a shipped run in its cage. Rejects with the reason when no git action is available. */
+export const reviewRunGit = (sessionId: string, taskId: string, run: string, request: GitRequest) =>
+  call<GitReview>("review_run_git", { sessionId, taskId, run, request });
+
+/** Runs the approved operation, or resolves to its recorded state. */
+export const applyRunGit = (sessionId: string, taskId: string, run: string, request: GitRequest, token: string) =>
+  call<GitOperation>("apply_run_git", { sessionId, taskId, run, request, token });
+
+export const runGitOperation = (sessionId: string, taskId: string, run: string, token: string) =>
+  call<GitOperation | null>("run_git_operation", { sessionId, taskId, run, token });
+
+/** The unfinished Git operations of the run, from its journal: continue each with its token. */
+export const runGitUnfinished = (sessionId: string, taskId: string, run: string) =>
+  call<GitOperation[]>("run_git_unfinished", { sessionId, taskId, run });

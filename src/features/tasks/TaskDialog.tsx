@@ -70,7 +70,7 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
       <Card variant="outlined">
         <CardHeader
           title={task ? `Edit ${task.title}` : "New task"}
-          description="Two agents, also of one kind with different models, plan the task, agree on one implementer, build it, run the gates and review the change. The run never commits or pushes."
+          description="Two agents, also of one kind with different models, plan the task, agree on one implementer, build it, run the gates and review the change. The run never commits or pushes. After a run that ends with ship, you can review the change and approve a commit or a PR in the room."
         />
         <CardBody className="stack">
           <FloatingField label="Title" value={title} maxLength={64} required onChange={(e) => setTitle(e.target.value)} />

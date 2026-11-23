@@ -17,6 +17,7 @@ mod network;
 mod preferences;
 mod proxy;
 mod room_watch;
+mod run_git;
 mod runtime;
 mod runtimes;
 mod secrets;
@@ -439,6 +440,10 @@ pub fn run() {
             commands::tasks::control_task_run,
             commands::tasks::list_task_runs,
             commands::tasks::run_diff,
+            commands::tasks::review_run_git,
+            commands::tasks::apply_run_git,
+            commands::tasks::run_git_operation,
+            commands::tasks::run_git_unfinished,
             commands::tasks::share_task_run,
             commands::tasks::task_run_share,
             commands::tasks::stop_task_run_share,

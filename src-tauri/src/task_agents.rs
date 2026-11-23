@@ -32,7 +32,7 @@ const PARSE_LIMIT: Duration = Duration::from_secs(5);
 const PI_READ_TOOLS: &str = "read,grep,find,ls";
 /// The start of each git script. `$1` is the folder that the check covers, `$2` is
 /// the run copy to skip, and `$3` is the base commit.
-const GIT_PRELUDE: &str = r#"scope=$1 art=$2 base=$3
+pub(crate) const GIT_PRELUDE: &str = r#"scope=$1 art=$2 base=$3
 cd "$scope" || exit 4
 scope=$(pwd -P) || exit 4
 inside=$(LC_ALL=C git rev-parse --is-inside-work-tree 2>&1) || {
@@ -362,6 +362,16 @@ pub struct Snapshot {
     pub hash: [u8; 32],
 }
 
+/// The end of an app git script.
+#[derive(Debug, Clone)]
+pub struct ScriptOut {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<String>,
+    /// The stdout was longer than its limit.
+    pub truncated: bool,
+}
+
 /// Why a snapshot has no state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
@@ -604,6 +614,49 @@ impl<R: SandboxRuntime> Exec<R> {
             exclude.unwrap_or_default().to_owned(),
             base.unwrap_or_default().to_owned(),
         ]
+    }
+
+    /// Runs one fixed app script after `GIT_PRELUDE`, with `args` as `$a1`,
+    /// `$a2` and so on, and `input` on stdin. Keeps at most `limit` bytes of
+    /// stdout. With `net`, the script reaches the network through the cage's
+    /// proxy. No caller passes a script that the user or an agent wrote.
+    pub async fn git_script(
+        &self,
+        script: &str,
+        args: &[&str],
+        input: &[u8],
+        limit: usize,
+        net: bool,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<ScriptOut, Failure> {
+        let mut head = String::new();
+        if net && let Some(proxy) = &self.proxy {
+            for (name, value) in launch::net_env(proxy) {
+                head.push_str(&format!("export {name}='{}'\n", value.replace('\'', "'\\''")));
+            }
+        }
+        for i in 1..=args.len() {
+            head.push_str(&format!("a{i}=${{{}}}\n", i + 3));
+        }
+        let mut argv = vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("{head}{GIT_PRELUDE}{script}"),
+            "zwinger".to_owned(),
+            self.scope.clone(),
+            self.task_runs().unwrap_or_default().to_owned(),
+            String::new(),
+        ];
+        argv.extend(args.iter().map(|a| (*a).to_owned()));
+        let (mut stdout, mut truncated) = (Vec::new(), false);
+        let (code, stderr) = self
+            .drive(&argv, input, GIT_LIMIT, cancel, |bytes| {
+                let room = limit.saturating_sub(stdout.len());
+                truncated |= bytes.len() > room;
+                stdout.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            })
+            .await?;
+        Ok(ScriptOut { code, stdout, stderr, truncated })
     }
 
     /// The task folder: it holds the round copies of all runs of the task.

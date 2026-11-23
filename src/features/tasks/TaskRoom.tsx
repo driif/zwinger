@@ -24,6 +24,7 @@ import { chatReducer, ChatState, initialChat } from "./agentChat";
 import { latestRequest } from "./diffRequest";
 import { Disagreements, elapsed, Gates, iconOf, LiveEntry, Positions, Timeline, Verdicts } from "./roomParts";
 import { participantLabel } from "./roomLabels";
+import { RunGitAction } from "./RunGitAction";
 import { errorMessage } from "../../shared/errorMessage";
 
 /** An in-app task, or a duo round folder on the host that the room only reads. */
@@ -465,6 +466,9 @@ export function TaskRoom(props: Props) {
             <Positions room={room} />
             <Disagreements room={room} />
             <Verdicts room={room} />
+            {inApp && run && room.ended === "done" && room.outcome?.ship && !liveRun && (
+              <RunGitAction key={sourceKey} sessionId={inApp.session.id} taskId={inApp.task.id} run={run} />
+            )}
             <Gates room={room} />
             {inApp && (
               <section className="stack">

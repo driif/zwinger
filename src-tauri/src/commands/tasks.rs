@@ -7,6 +7,7 @@ use crate::cage;
 use crate::cage::tasks::RunSummary;
 use crate::error::Result;
 use crate::room_watch::{RoomEvent, Watches};
+use crate::run_git::{Operation, Request, Review};
 use crate::session::TaskDraft;
 use crate::task_artifacts;
 use crate::task_runs::Control;
@@ -55,6 +56,55 @@ pub async fn list_task_runs(manager: Managed<'_>, session_id: String) -> Result<
 #[tauri::command]
 pub async fn run_diff(manager: Managed<'_>, session_id: String, task_id: String, run: String) -> Result<String> {
     manager.run_diff(&session_id, &task_id, &run).await
+}
+
+/// Reviews the change of a shipped run for a commit or a PR. A review that
+/// can be approved has a token, which `apply_run_git` takes.
+#[tauri::command]
+pub async fn review_run_git(
+    manager: Managed<'_>,
+    session_id: String,
+    task_id: String,
+    run: String,
+    request: Request,
+) -> Result<Review> {
+    manager.review_run_git(&session_id, &task_id, &run, request).await
+}
+
+/// Runs the operation that the user approved with `token`, or returns its recorded state.
+#[tauri::command]
+pub async fn apply_run_git(
+    manager: Managed<'_>,
+    session_id: String,
+    task_id: String,
+    run: String,
+    request: Request,
+    token: String,
+) -> Result<Operation> {
+    manager.apply_run_git(&session_id, &task_id, &run, request, &token).await
+}
+
+#[tauri::command]
+pub async fn run_git_operation(
+    manager: Managed<'_>,
+    session_id: String,
+    task_id: String,
+    run: String,
+    token: String,
+) -> Result<Option<Operation>> {
+    manager.run_git_operation(&session_id, &task_id, &run, &token).await
+}
+
+/// The unfinished Git operations of the run: a commit whose push or PR did
+/// not finish, or a result that is not known.
+#[tauri::command]
+pub async fn run_git_unfinished(
+    manager: Managed<'_>,
+    session_id: String,
+    task_id: String,
+    run: String,
+) -> Result<Vec<Operation>> {
+    manager.run_git_unfinished(&session_id, &task_id, &run).await
 }
 
 /// Starts an A2A share of the run, or returns the share that runs. Async, so

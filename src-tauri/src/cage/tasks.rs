@@ -8,6 +8,7 @@ use crate::agent::AgentKind;
 use crate::cage::Mount;
 use crate::cage::manager::{Manager, Vm, blocking, in_guest_folder, lock};
 use crate::error::{Error, Result};
+use crate::run_git::{self, Origin};
 use crate::runtime::SandboxRuntime;
 use crate::session::{Task, TaskDraft};
 use crate::task_agents::{Exec, SnapshotError};
@@ -94,10 +95,10 @@ impl<R: SandboxRuntime> Manager<R> {
         &self,
         id: &str,
         mut task: Task,
-        record: RunRecord,
+        mut record: RunRecord,
         resume: Option<(&Recovered, &str)>,
     ) -> Result<String> {
-        let (vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted) = {
+        let (vm, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin) = {
             let state = lock(&self.state);
             let (member, cage, running, folder, shared) = state.task_cage(id)?;
             task.workdir = in_guest_folder(&folder, &task.workdir);
@@ -105,6 +106,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 unreachable!("task_cage returns a running VM")
             };
             let scope = git_scope(&task, &folder, &cage.mounts)?;
+            let origin = Origin::of(&task.workdir, &scope, &folder, &member.folder, &cage.mounts);
             let unmounted = task
                 .agents
                 .iter()
@@ -120,8 +122,14 @@ impl<R: SandboxRuntime> Manager<R> {
                 host.gemini.clone(),
                 host.proxy.clone(),
                 unmounted,
+                origin,
             )
         };
+        // A continuation keeps the origin of its source: a changed mapping
+        // makes its git action unavailable.
+        if resume.is_none() {
+            record.origin = origin;
+        }
         if self.runs.is_running(id, &task.id) {
             return Err(Error::TaskRunning);
         }
@@ -136,7 +144,15 @@ impl<R: SandboxRuntime> Manager<R> {
         let writer = RoundWriter::create(dir.join(&run), Some(mirror))?;
         match resume {
             None => writer.write_durable(task_recovery::RUN, &serde_json::to_vec_pretty(&record)?)?,
-            Some((recovered, source)) => task_recovery::create(&writer, recovered, source)?,
+            Some((recovered, source)) => {
+                task_recovery::create(&writer, recovered, source)?;
+                // The start of the repository belongs to the first run of the chain.
+                for name in [run_git::START, run_git::START_STATUS] {
+                    if let Ok(Some(bytes)) = task_artifacts::read_record(&dir.join(&recovered.source), name) {
+                        writer.write_durable(name, &bytes)?;
+                    }
+                }
+            }
         }
         let exec = Exec {
             runtime: self.runtime.clone(),
@@ -327,7 +343,7 @@ pub(crate) fn run_names(dir: &std::path::Path) -> Vec<String> {
 /// The guest folder that the git check and the diff of a task cover: the
 /// session guest folder when the working dir is in it, else the working dir
 /// in its mount. A working dir in neither is an error.
-fn git_scope(task: &Task, folder: &str, mounts: &[Mount]) -> Result<String> {
+pub(crate) fn git_scope(task: &Task, folder: &str, mounts: &[Mount]) -> Result<String> {
     let workdir = Path::new(&task.workdir);
     if workdir.starts_with(folder) {
         Ok(folder.to_owned())
@@ -545,6 +561,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_actions_need_a_shipped_run_with_a_recorded_start() {
+        use crate::run_git::{Origin, Repo, Request, START};
+
+        let (manager, id, task_id, round) = ended_run().await;
+        let refused =
+            async || manager.review_run_git(&id, &task_id, "01", Request::default()).await.unwrap_err().to_string();
+        assert!(refused().await.contains("only a run that ended with ship"));
+        std::fs::write(round.join("events.jsonl"), "{\"at\":\"t\",\"kind\":\"done\",\"detail\":\"ship=false\"}\n")
+            .unwrap();
+        std::fs::write(round.join("manifest.json"), "{\"ship\": false}").unwrap();
+        assert!(refused().await.contains("only a run that ended with ship"));
+        std::fs::write(round.join("manifest.json"), "{\"ship\": true}").unwrap();
+        assert!(refused().await.contains("state at start unknown"), "{}", refused().await);
+
+        // A recorded start whose folder is not mapped into the VM as it was.
+        let mut written = record(&round);
+        let origin = Origin {
+            host: "/elsewhere".into(),
+            guest: "/workspace".into(),
+            workdir: "/workspace".into(),
+            scope: "/workspace".into(),
+        };
+        written["origin"] = serde_json::to_value(&origin).unwrap();
+        std::fs::write(round.join("run.json"), written.to_string()).unwrap();
+        std::fs::write(round.join(START), serde_json::to_vec(&Repo::default()).unwrap()).unwrap();
+        assert!(refused().await.contains("not mapped into the VM"), "{}", refused().await);
+
+        manager.stop(&id, None).await.unwrap();
+        assert!(refused().await.contains("start the cage"), "{}", refused().await);
+        assert!(manager.run_git_operation(&id, &task_id, "01", "t").await.unwrap().is_none());
+        assert!(manager.run_git_unfinished(&id, &task_id, "01").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_same_kind_pair_resumes_with_its_recorded_participants() {
         let (manager, runtime, id) = manager();
         serve(&runtime, Arc::new(no_git), Arc::new(|_: &str, _, _: &str| Fake::Hang));
@@ -563,6 +613,10 @@ mod tests {
         assert_eq!(manager.resume_task_run(&id, &task_id, "01").unwrap(), "02");
         assert_eq!(manager.run_handle(&id, &task_id, "02").unwrap().agents, ["claude-1", "claude-2"]);
         let round = manager.round_dir(&id, &task_id, "02").unwrap();
+        // The run records where its working dir was, and a continuation keeps it.
+        let first = record(&manager.round_dir(&id, &task_id, "01").unwrap())["origin"].clone();
+        assert_eq!(first["workdir"], guest_folder(&manager, &id));
+        assert_eq!(record(&round)["origin"], first);
         assert_eq!(record(&round)["agents"][1]["model"], "sonnet");
         let room = task_artifacts::read_room(&round);
         assert_eq!(room.agents, ["claude-1", "claude-2"]);

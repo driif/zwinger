@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::cli::{iso, now_ms};
 use crate::error::{Error, Result};
+use crate::run_git;
 use crate::runtime::SandboxRuntime;
 use crate::session::Task;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
@@ -1073,6 +1074,15 @@ impl<R: SandboxRuntime> Actor<R> {
             self.run.base = Some(snapshot.head.clone());
             let base = self.run.base.clone();
             self.book.set(|s| s.base = base);
+            // The repository at the start, for a commit or a PR after the run.
+            self.book.writer.write(run_git::START_STATUS, snapshot.status.as_bytes());
+            if let Some(mut repo) = run_git::start_identity(&self.io.exec, &mut self.io.cancel.clone()).await {
+                repo.base = snapshot.head.clone();
+                let _ = self
+                    .book
+                    .writer
+                    .write_durable(run_git::START, &serde_json::to_vec_pretty(&repo).unwrap_or_default());
+            }
             self.checkpoint(None, &[])?;
         }
         let out = during(&mut self.book, &mut self.control, &self.io.names, work(&self.io)).await;

@@ -53,6 +53,8 @@ pub enum Error {
     Resume(String),
     #[error("The app could not read the run record ({0})")]
     RunRecord(String),
+    #[error("commit or PR is not available: {0}")]
+    RunGit(String),
     #[error("only a run of this app session can be shared")]
     RunNotShareable,
     #[error("the run cannot do this now: {0}")]
