@@ -157,9 +157,12 @@ pub mod fake {
 
     /// Names from a map; each lookup is counted. `loopback` lets a test
     /// reach its own servers on `127.0.0.1`. `interfaces` are the Mac's.
+    /// `ports` sends a host and port to a port of `127.0.0.1`, for a target
+    /// whose port the product fixes.
     #[derive(Default)]
     pub struct FakeResolver {
         pub names: Mutex<HashMap<String, Vec<IpAddr>>>,
+        pub ports: Mutex<HashMap<(String, u16), u16>>,
         pub lookups: Mutex<Vec<String>>,
         pub loopback: bool,
         pub interfaces: Vec<local::Net>,
@@ -173,6 +176,9 @@ pub mod fake {
 
         fn resolve(&self, host: String, port: u16) -> Resolved {
             self.lookups.lock().unwrap().push(host.clone());
+            if let Some(&local) = self.ports.lock().unwrap().get(&(host.clone(), port)) {
+                return Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], local))]) });
+            }
             let found = self.names.lock().unwrap().get(&host).cloned().unwrap_or_default();
             Box::pin(async move { Ok(found.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()) })
         }

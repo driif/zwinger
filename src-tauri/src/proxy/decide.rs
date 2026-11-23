@@ -44,7 +44,8 @@ impl fmt::Display for Reason {
 pub enum Decision {
     Allow(Reason),
     Block(Reason),
-    /// The proxy answers the request itself and connects nowhere.
+    /// The proxy answers the request itself, or sends it to Google when
+    /// the login has no scope.
     TokenInfo,
     /// The host port grant: the request goes to `127.0.0.1:<port>` of the Mac.
     HostPort(NonZeroU16),

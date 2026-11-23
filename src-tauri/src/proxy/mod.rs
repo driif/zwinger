@@ -56,7 +56,7 @@ use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::agent::AgentKind;
-use crate::host_agents::login::{self, TOKENINFO_HOST, TOKENINFO_PATH};
+use crate::host_agents::login::{self, TOKENINFO_HOST};
 use crate::network::{Credential, NetworkPolicy};
 use crate::secrets::{CredentialRef, SecretValue};
 use ca::Ca;
@@ -105,6 +105,13 @@ const HOST_PORT_METHOD: &str = "the host port takes GET, HEAD, POST, PUT, DELETE
 /// The log note of a request to the host port that does not name its authority.
 const HOST_PORT_AUTHORITY: &str =
     "the request must name http://host.microsandbox.internal:<port>; it can omit the port only for port 80";
+/// The log note of a tokeninfo check that the proxy answers itself.
+const TOKENINFO_LOCAL: &str = "answered by zwinger";
+/// The log note of a tokeninfo check that goes to Google with the real token.
+const TOKENINFO_GOOGLE: &str = "sent to Google";
+/// The 502 reason of a tokeninfo check that did not reach Google. It is
+/// fixed, so no part of the request, and no token, gets into it.
+const TOKENINFO_UNREACHABLE: &str = "the tokeninfo endpoint did not answer";
 /// The methods of the host port. A CONNECT or an unknown method could make
 /// the local service a raw tunnel.
 const HOST_PORT_METHODS: [Method; 7] =
@@ -588,7 +595,7 @@ async fn connect(
             return shared.block(entry, &Reason::HostPort.to_string());
         }
         Decision::HostPort(_) => true,
-        // The proxy answers the tokeninfo check itself.
+        // Each inner request is decided again; one that goes to Google dials checked addresses.
         Decision::TokenInfo => false,
         Decision::Allow(_) => {
             let upstreams = &shared.upstreams;
@@ -782,7 +789,7 @@ async fn forward(
     let Snapshot { policy, values } = shared.live.snapshot();
     match shared.decide(&policy, &origin, Some((parts.method.as_str(), parts.uri.path()))) {
         Decision::Block(reason) => return shared.block(entry, &reason.to_string()),
-        Decision::TokenInfo => return tokeninfo(&shared, &parts, entry, started).await,
+        Decision::TokenInfo => return tokeninfo(&shared, &origin, parts, body, entry, started).await,
         // A host port tunnel serves plain HTTP only, so no TLS request gets here.
         Decision::HostPort(_) if origin.https => return shared.block(entry, &Reason::HostPort.to_string()),
         Decision::HostPort(port) => return host_port(&shared, parts, body, entry, started, port).await,
@@ -833,7 +840,7 @@ async fn forward(
     };
     let client = if websocket { &shared.h1 } else { &shared.auto };
     let finish = Finish { entry, started, up, sink: shared.sink.clone() };
-    send(client, Request::from_parts(parts, body), finish, guest_upgrade).await
+    send(client, Request::from_parts(parts, body), finish, guest_upgrade, None).await
 }
 
 /// The host port grant: plain HTTP to `127.0.0.1:<port>` of the Mac. It
@@ -874,7 +881,7 @@ async fn host_port(
     let up = Arc::new(AtomicU64::new(0));
     let body = Counted { inner: body, count: up.clone() }.boxed_unsync();
     let finish = Finish { entry, started, up, sink: shared.sink.clone() };
-    send(&shared.local, Request::from_parts(parts, body), finish, None).await
+    send(&shared.local, Request::from_parts(parts, body), finish, None, None).await
 }
 
 /// The request names `http://host.microsandbox.internal:<port>` and no
@@ -949,12 +956,13 @@ impl Finish {
 
 /// Sends the request upstream and streams the response back. The entry is
 /// logged when the response body ends. A dial to an always-blocked address
-/// is a block.
+/// is a block. `fixed_why`, if given, replaces the error text of a 502.
 async fn send<C: Connect + Clone + Send + Sync + 'static>(
     client: &Client<C, ProxyBody>,
     request: Request<ProxyBody>,
     mut finish: Finish,
     guest_upgrade: Option<GuestUpgrade>,
+    fixed_why: Option<&str>,
 ) -> Response<ProxyBody> {
     let host = finish.entry.host.clone();
     let mut response = match tokio::time::timeout(RESPONSE_LIMIT, client.request(request)).await {
@@ -965,7 +973,10 @@ async fn send<C: Connect + Clone + Send + Sync + 'static>(
                 finish.entry.reason = Reason::AlwaysBlocked.to_string();
                 blocked(&host, &finish.entry.reason)
             } else {
-                let why = dial_error(&e).map_or_else(|| e.to_string(), |d| d.to_string());
+                let why = match fixed_why {
+                    Some(why) => why.to_owned(),
+                    None => dial_error(&e).map_or_else(|| e.to_string(), |d| d.to_string()),
+                };
                 failed(StatusCode::BAD_GATEWAY, &why, format!("zwinger could not reach {host}: {why}\n"))
             };
             finish.entry.status = Some(response.status().as_u16());
@@ -1022,10 +1033,13 @@ fn dial_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Di
 
 /// Answers Gemini CLI's check of its cached token from the host login,
 /// only for a request that carries the login's placeholder. Without a
-/// scope on the Mac, it asks Google with the real token.
+/// scope on the Mac, it sends the original request to Google with the real
+/// token in the placeholder places only, and over HTTPS on port 443 only.
 async fn tokeninfo(
     shared: &Shared,
-    parts: &http::request::Parts,
+    origin: &Origin,
+    mut parts: http::request::Parts,
+    body: Incoming,
     mut entry: Entry,
     started: Instant,
 ) -> Response<ProxyBody> {
@@ -1033,13 +1047,15 @@ async fn tokeninfo(
     let Some(login) = shared.logins.iter().find(|l| l.kind == AgentKind::Gemini) else {
         return shared.block(entry, &Reason::AlwaysBlocked.to_string());
     };
-    if !inject::carries(parts, &login.placeholder()) {
+    let placeholder = login.placeholder();
+    if !inject::carries(&parts, &placeholder) {
         return shared.block(entry, &Reason::AlwaysBlocked.to_string());
     }
     let token = login.current().await;
-    entry.allowed = true;
-    entry.credentials = vec![login.name.clone()];
     if let Some(info) = login::tokeninfo(&token, log::now_ms() as i64) {
+        entry.allowed = true;
+        entry.credentials = vec![login.name.clone()];
+        entry.note = Some(TOKENINFO_LOCAL.into());
         entry.status = Some(StatusCode::OK.as_u16());
         entry.ms = started.elapsed().as_millis() as u64;
         shared.log(entry);
@@ -1047,16 +1063,32 @@ async fn tokeninfo(
         response.headers_mut().insert(CONTENT_TYPE, "application/json; charset=utf-8".parse().expect("a header value"));
         return response;
     }
-    let mut request = Request::new(empty());
-    *request.method_mut() = Method::POST;
-    *request.uri_mut() = format!("https://{TOKENINFO_HOST}{TOKENINFO_PATH}").parse().expect("a URI");
-    let Ok(mut bearer) = format!("Bearer {}", token.full_access().expose()).parse::<http::HeaderValue>() else {
+    if !origin.https || origin.port != 443 {
+        return shared.block(entry, &Reason::AlwaysBlocked.to_string());
+    }
+    let value = token.full_access();
+    inject::replace_header(&mut parts.headers, AUTHORIZATION.as_str(), &placeholder, value.expose());
+    inject::replace_access_token(&mut parts.uri, &placeholder, value.expose());
+    // A place that could not take the token keeps the placeholder: send nothing.
+    if inject::carries(&parts, &placeholder) {
         return shared.block(entry, "invalid token");
+    }
+    entry.allowed = true;
+    entry.credentials = vec![login.name.clone()];
+    entry.note = Some(TOKENINFO_GOOGLE.into());
+    strip_hop(&mut parts.headers, false);
+    parts.headers.remove(HOST);
+    let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    let Ok(uri) = format!("https://{TOKENINFO_HOST}:443{path}").parse() else {
+        return shared.block(entry, "invalid target");
     };
-    bearer.set_sensitive(true);
-    request.headers_mut().insert(AUTHORIZATION, bearer);
-    let finish = Finish { entry, started, up: Arc::default(), sink: shared.sink.clone() };
-    send(&shared.auto, request, finish, None).await
+    parts.uri = uri;
+    parts.version = Version::HTTP_11;
+    parts.extensions = http::Extensions::new();
+    let up = Arc::new(AtomicU64::new(0));
+    let body = Counted { inner: body, count: up.clone() }.boxed_unsync();
+    let finish = Finish { entry, started, up, sink: shared.sink.clone() };
+    send(&shared.auto, Request::from_parts(parts, body), finish, None, Some(TOKENINFO_UNREACHABLE)).await
 }
 
 /// A request body that counts its bytes.
@@ -1344,6 +1376,7 @@ mod tests {
         ca: Arc<Ca>,
         live: Arc<Live>,
         log: Arc<Mutex<Vec<Entry>>>,
+        resolver: Arc<FakeResolver>,
     }
 
     impl Fixture {
@@ -1382,7 +1415,7 @@ mod tests {
         upstream_root: Option<rustls::pki_types::CertificateDer<'static>>,
     ) -> Fixture {
         let ca = temp_ca();
-        let resolver = FakeResolver { loopback: true, ..FakeResolver::default() };
+        let resolver = Arc::new(FakeResolver { loopback: true, ..FakeResolver::default() });
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         for host in ["api.test", "a1.test", "a2.test", "c.test"] {
             resolver.names.lock().unwrap().insert(host.into(), vec![ip("127.0.0.1")]);
@@ -1397,10 +1430,10 @@ mod tests {
             logins,
             refresh,
             sink: Arc::new(move |entry| sink_log.lock().unwrap().push(entry)),
-            resolver: Arc::new(resolver),
+            resolver: resolver.clone(),
             upstream_root,
         };
-        Fixture { proxy: Proxy::start(config).await.unwrap(), ca, live, log }
+        Fixture { proxy: Proxy::start(config).await.unwrap(), ca, live, log, resolver }
     }
 
     fn rule(host: &str, action: Action) -> Rule {
@@ -1408,9 +1441,10 @@ mod tests {
     }
 
     /// Sends one HTTP/1.1 request over `io` and returns the status and body.
-    async fn send_over<T>(io: T, request: Request<Empty<Bytes>>) -> (StatusCode, HeaderMap, String)
+    async fn send_over<T, B>(io: T, request: Request<B>) -> (StatusCode, HeaderMap, String)
     where
         T: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+        B: Body<Data = Bytes, Error = Infallible> + Send + 'static,
     {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(connection);
@@ -1765,8 +1799,13 @@ mod tests {
         assert!(matches!(read, Ok(Ok(0) | Err(_))), "the tunnel stayed open after the stop: {read:?}");
     }
 
-    fn gemini_login() -> Arc<Login> {
-        let doc = serde_json::json!({ "access_token": "ya29.real", "expiry_date": log::now_ms() as i64 + 3_600_000, "scope": "openid email" });
+    /// A Gemini login. `None` gives a login with no scope.
+    fn gemini_login(scope: Option<&str>) -> Arc<Login> {
+        let mut doc =
+            serde_json::json!({ "access_token": "ya29.real/x", "expiry_date": log::now_ms() as i64 + 3_600_000 });
+        if let Some(scope) = scope {
+            doc["scope"] = scope.into();
+        }
         let token = host_login::parse(AgentKind::Gemini, &doc.to_string()).unwrap();
         let name = host_login::secret_name(AgentKind::Gemini).to_owned();
         Arc::new(Login::new(name, vec!["cloudcode-pa.googleapis.com".into()], token, Arc::new(NoLogin)))
@@ -1775,7 +1814,7 @@ mod tests {
     #[tokio::test]
     async fn the_gemini_tokeninfo_check_is_answered_and_its_host_stays_blocked() {
         let policy = NetworkPolicy { default: DefaultAction::Allow, ..Default::default() };
-        let f = fixture(policy, vec![gemini_login()], vec![TOKENINFO_HOST]).await;
+        let f = fixture(policy, vec![gemini_login(Some("openid email"))], vec![TOKENINFO_HOST]).await;
         let placeholder = "Bearer $MSB_GEMINI_HOST_LOGIN$";
 
         let io = tunnel(&f, "oauth2.googleapis.com:443").await.unwrap();
@@ -1787,6 +1826,7 @@ mod tests {
         assert!(!body.contains("ya29"));
         let entry = f.entries().pop().unwrap();
         assert_eq!((entry.reason.as_str(), entry.allowed), ("tokeninfo", true));
+        assert_eq!(entry.note.as_deref(), Some(TOKENINFO_LOCAL));
 
         // The refresh endpoint and a request with no placeholder stay blocked.
         let io = tunnel(&f, "oauth2.googleapis.com:443").await.unwrap();
@@ -1797,6 +1837,189 @@ mod tests {
             Request::get("/tokeninfo?access_token=mine").header(HOST, TOKENINFO_HOST).body(Empty::new()).unwrap();
         assert_eq!(send_over(io, request).await.0, StatusCode::FORBIDDEN);
         assert!(f.entries().iter().all(|e| !format!("{e:?}").contains("ya29")));
+
+        // An empty scope is a known scope: the answer stays local, also over plain http.
+        let policy = NetworkPolicy { default: DefaultAction::Allow, ..Default::default() };
+        let f = fixture(policy, vec![gemini_login(Some(""))], vec![TOKENINFO_HOST]).await;
+        let uri = format!("http://{TOKENINFO_HOST}/tokeninfo?access_token=$MSB_GEMINI_HOST_LOGIN$");
+        let (status, _, body) = plain(&f, &uri, Some(f.auth())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["scope"], "");
+        assert!(f.resolver.lookups.lock().unwrap().is_empty());
+    }
+
+    /// What a recording recipient got: method, path and query, chosen
+    /// header fields, and body.
+    #[derive(Debug, Clone)]
+    struct Recorded {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    const RECORDED_FIELDS: [&str; 8] =
+        ["authorization", "content-type", "x-client", "host", "proxy-authorization", "x-hop", "keep-alive", "te"];
+
+    /// A TLS recipient for `host` on loopback over HTTP/1.1, with a leaf of
+    /// `ca`. It records each request and answers `400` with a fixed body, an
+    /// end-to-end field and a hop field. It echoes nothing.
+    async fn recording_recipient(ca: &Ca, host: &str) -> (u16, Arc<Mutex<Vec<Recorded>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = (*ca.server_config(host).await.unwrap()).clone();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let seen: Arc<Mutex<Vec<Recorded>>> = Arc::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    continue;
+                };
+                let sink = sink.clone();
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let sink = sink.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let headers = RECORDED_FIELDS
+                            .iter()
+                            .flat_map(|name| {
+                                parts
+                                    .headers
+                                    .get_all(*name)
+                                    .iter()
+                                    .map(|v| (name.to_string(), v.to_str().unwrap().to_owned()))
+                            })
+                            .collect();
+                        let body = body.collect().await.unwrap().to_bytes();
+                        sink.lock().unwrap().push(Recorded {
+                            method: parts.method.to_string(),
+                            target: parts.uri.to_string(),
+                            headers,
+                            body: String::from_utf8_lossy(&body).into_owned(),
+                        });
+                        let response = Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header("x-google", "kept")
+                            .header("keep-alive", "timeout=5")
+                            .body(Full::new(Bytes::from("{\"error\":\"invalid_token\"}")))
+                            .unwrap();
+                        Ok::<_, Infallible>(response)
+                    }
+                });
+                tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tls), service));
+            }
+        });
+        (port, seen)
+    }
+
+    /// A Gemini login with no scope, a proxy that trusts `recipients`, and
+    /// Google on 443 sent to `port` of loopback.
+    async fn unscoped_fixture(recipients: &Ca, port: u16) -> Fixture {
+        let policy = NetworkPolicy { default: DefaultAction::Allow, ..Default::default() };
+        let logins = vec![gemini_login(None)];
+        let f = start(policy, HashMap::new(), logins, vec![TOKENINFO_HOST], Some(recipients.der().clone())).await;
+        f.resolver.ports.lock().unwrap().insert((TOKENINFO_HOST.into(), 443), port);
+        f
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_tokeninfo_check_goes_to_google_as_the_guest_sent_it() {
+        let recipients = temp_ca();
+        let (port, seen) = recording_recipient(&recipients, TOKENINFO_HOST).await;
+        let f = unscoped_fixture(&recipients, port).await;
+        let header = |r: &Recorded, name: &str| r.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+
+        // GET with the placeholder in the query, raw and encoded: only that value changes.
+        for query in [
+            "access_token=$MSB_GEMINI_HOST_LOGIN$&x=a%20b+c&flag",
+            "x=a%20b+c&access_token=%24MSB_GEMINI_HOST_LOGIN%24&flag",
+        ] {
+            let io = tunnel(&f, "oauth2.googleapis.com:443").await.unwrap();
+            let request = Request::get(format!("/tokeninfo?{query}"))
+                .header(HOST, TOKENINFO_HOST)
+                .header("x-client", "gemini-cli")
+                .body(Empty::new())
+                .unwrap();
+            let (status, headers, body) = send_over(io, request).await;
+            assert_eq!((status, body.as_str()), (StatusCode::BAD_REQUEST, "{\"error\":\"invalid_token\"}"));
+            assert_eq!(headers["x-google"], "kept");
+            assert!(headers.get("keep-alive").is_none() && headers.get(BLOCKED_HEADER).is_none());
+            let got = seen.lock().unwrap().last().cloned().unwrap();
+            let expected = query
+                .replace("%24MSB_GEMINI_HOST_LOGIN%24", "ya29.real%2Fx")
+                .replace("$MSB_GEMINI_HOST_LOGIN$", "ya29.real%2Fx");
+            assert_eq!((got.method.as_str(), got.target.clone()), ("GET", format!("/tokeninfo?{expected}")));
+            assert_eq!(header(&got, "x-client").as_deref(), Some("gemini-cli"));
+            assert_eq!(header(&got, "host").as_deref(), Some(TOKENINFO_HOST));
+            assert_eq!(header(&got, "authorization"), None);
+        }
+
+        // POST with the placeholder in Authorization: its other bytes, the
+        // other fields and the body stay; the body gets no token; hop fields go.
+        let io = tunnel(&f, "oauth2.googleapis.com:443").await.unwrap();
+        let sent = "access_token=$MSB_GEMINI_HOST_LOGIN$&k=v";
+        let request = Request::post("/tokeninfo?a=1")
+            .header(HOST, TOKENINFO_HOST)
+            .header(AUTHORIZATION, "Bearer $MSB_GEMINI_HOST_LOGIN$ extra")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(CONNECTION, "x-hop")
+            .header("x-hop", "1")
+            .header(PROXY_AUTHORIZATION, "Basic inner")
+            .body(Full::new(Bytes::from(sent)))
+            .unwrap();
+        let (status, _, body) = send_over(io, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let got = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((got.method.as_str(), got.target.as_str(), got.body.as_str()), ("POST", "/tokeninfo?a=1", sent));
+        assert_eq!(header(&got, "authorization").as_deref(), Some("Bearer ya29.real/x extra"));
+        assert_eq!(header(&got, "content-type").as_deref(), Some("application/x-www-form-urlencoded"));
+        for hop in ["x-hop", "proxy-authorization"] {
+            assert_eq!(header(&got, hop), None, "{hop}");
+        }
+
+        let entries = f.entries();
+        assert_eq!(entries.len(), 3);
+        let last = entries.last().unwrap();
+        assert_eq!((last.reason.as_str(), last.allowed, last.status), ("tokeninfo", true, Some(400)));
+        assert_eq!((last.method.as_deref(), last.path.as_deref()), (Some("POST"), Some("/tokeninfo?a")));
+        assert_eq!(last.note.as_deref(), Some(TOKENINFO_GOOGLE));
+        assert_eq!(last.credentials, [host_login::secret_name(AgentKind::Gemini)]);
+        assert_eq!((last.up, last.down), (sent.len() as u64, body.len() as u64));
+        assert_eq!(entries[0].path.as_deref(), Some("/tokeninfo?access_token&x&flag"));
+        assert!(!format!("{entries:?}").contains("ya29"));
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_tokeninfo_check_needs_https_on_443_and_hides_the_token_in_errors() {
+        let recipients = temp_ca();
+        let (port, seen) = recording_recipient(&recipients, TOKENINFO_HOST).await;
+        let f = unscoped_fixture(&recipients, port).await;
+        f.resolver.ports.lock().unwrap().insert((TOKENINFO_HOST.into(), 8443), port);
+        let query = "/tokeninfo?access_token=$MSB_GEMINI_HOST_LOGIN$";
+
+        let io = tunnel(&f, "oauth2.googleapis.com:8443").await.unwrap();
+        let request = Request::get(query).header(HOST, "oauth2.googleapis.com:8443").body(Empty::new()).unwrap();
+        let (status, headers, _) = send_over(io, request).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "always-blocked"));
+        let (status, headers, _) = plain(&f, &format!("http://{TOKENINFO_HOST}{query}"), Some(f.auth())).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "always-blocked"));
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Google does not answer: the 502 text is fixed.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        f.resolver.ports.lock().unwrap().insert((TOKENINFO_HOST.into(), 443), closed);
+        let io = tunnel(&f, "oauth2.googleapis.com:443").await.unwrap();
+        let request = Request::get(query).header(HOST, TOKENINFO_HOST).body(Empty::new()).unwrap();
+        let (status, headers, body) = send_over(io, request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(headers[ERROR_HEADER], TOKENINFO_UNREACHABLE);
+        assert_eq!(body, format!("zwinger could not reach {TOKENINFO_HOST}: {TOKENINFO_UNREACHABLE}\n"));
+        let entries = f.entries();
+        assert_eq!(entries.last().unwrap().status, Some(502));
+        assert!(!format!("{entries:?}").contains("ya29"));
     }
 
     /// A grant for `port`, an Allow rule with a credential for the gateway

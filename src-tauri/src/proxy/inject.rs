@@ -89,7 +89,7 @@ pub fn apply(parts: &mut http::request::Parts, credentials: &[(Credential, Secre
     injected
 }
 
-fn replace_header(headers: &mut HeaderMap, field: &str, placeholder: &str, value: &str) -> bool {
+pub(super) fn replace_header(headers: &mut HeaderMap, field: &str, placeholder: &str, value: &str) -> bool {
     let current: Vec<HeaderValue> = headers.get_all(field).iter().cloned().collect();
     if !current.iter().any(|v| v.to_str().is_ok_and(|v| v.contains(placeholder))) {
         return false;
@@ -125,6 +125,37 @@ fn replace_query(uri: &mut http::Uri, placeholder: &str, value: &str) -> bool {
         return false;
     };
     let new = query.replace(placeholder, &encoded(value)).replace(&encoded(placeholder), &encoded(value));
+    if new == query {
+        return false;
+    }
+    let mut parts = uri.clone().into_parts();
+    let Ok(path) = http::uri::PathAndQuery::try_from(format!("{}?{new}", uri.path())) else {
+        return false;
+    };
+    parts.path_and_query = Some(path);
+    match http::Uri::from_parts(parts) {
+        Ok(changed) => {
+            *uri = changed;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Replaces each `access_token` query item whose value is the placeholder,
+/// raw or encoded, with the encoded value. Every other query byte and the
+/// order stay. A query that does not parse again leaves `uri` as it was.
+pub(super) fn replace_access_token(uri: &mut http::Uri, placeholder: &str, value: &str) -> bool {
+    let Some(query) = uri.query() else {
+        return false;
+    };
+    let accepted = [format!("access_token={placeholder}"), format!("access_token={}", encoded(placeholder))];
+    let replaced = format!("access_token={}", encoded(value));
+    let items: Vec<&str> = query
+        .split('&')
+        .map(|item| if accepted.iter().any(|a| a == item) { replaced.as_str() } else { item })
+        .collect();
+    let new = items.join("&");
     if new == query {
         return false;
     }
@@ -427,6 +458,30 @@ mod tests {
         let injected = apply(&mut head, &[(replace("KEY", places), SecretValue::new("v"))]);
         assert_eq!(head.headers["authorization"], "Bearer mine");
         assert!(injected.names.is_empty());
+    }
+
+    #[test]
+    fn only_the_access_token_items_of_the_placeholder_get_the_encoded_token() {
+        let placeholder = "$MSB_GEMINI_HOST_LOGIN$";
+        let mut head = parts(
+            "https://oauth2.googleapis.com/tokeninfo?a=%24MSB_GEMINI_HOST_LOGIN%24&access_token=%24MSB_GEMINI_HOST_LOGIN%24&x=1+2&access_token=$MSB_GEMINI_HOST_LOGIN$&access_token=mine&k",
+            &[],
+        );
+        assert!(replace_access_token(&mut head.uri, placeholder, "ya29.a/b+c"));
+        assert_eq!(
+            head.uri.query(),
+            Some(
+                "a=%24MSB_GEMINI_HOST_LOGIN%24&access_token=ya29.a%2Fb%2Bc&x=1+2&access_token=ya29.a%2Fb%2Bc&access_token=mine&k"
+            )
+        );
+        assert!(!carries(&head, placeholder));
+
+        // A placeholder in another item or another value is not a token place.
+        for uri in ["https://o.test/tokeninfo?access_token=x$MSB_GEMINI_HOST_LOGIN$", "https://o.test/tokeninfo"] {
+            let mut head = parts(uri, &[]);
+            assert!(!replace_access_token(&mut head.uri, placeholder, "ya29.t"));
+            assert_eq!(head.uri, uri);
+        }
     }
 
     #[tokio::test]

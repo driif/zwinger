@@ -97,6 +97,19 @@ The agent cannot change the profile. The map shows it as `profile (ro)`.
 
 Gemini CLI runs only as an agent from your Mac. zwinger detects Antigravity but does not support it.
 
+### Gemini CLI login check
+
+Gemini CLI checks its cached token at `https://oauth2.googleapis.com/tokeninfo`. The proxy accepts this check only
+when it carries the login placeholder. A Block rule for the host still applies. The check has two answer paths:
+
+- If the login on your Mac names its scopes, zwinger answers the check itself, from the scopes and expiry of that
+  login. No request goes to Google. Activity shows `login check · answered by zwinger`.
+- If the login names no scopes, the proxy sends the original request to Google: the same method, path, query,
+  end-to-end header fields and body. The proxy removes hop-by-hop header fields and sets `Host`, as for all forwarded
+  requests. The real token replaces the placeholder only in the `authorization` header and in the `access_token`
+  query value. Google's status, end-to-end header fields and body come back to the agent. Activity shows
+  `login check · sent to Google`. This path works only over HTTPS on port 443; other checks are blocked.
+
 ## Other logins
 
 An agent can also use an API key as a [credential](/network/#credentials), or its own `/login`. A `/login` in the cage

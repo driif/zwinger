@@ -7,7 +7,8 @@
 //! hosts always, so the agent cannot renew or leak the login. The proxy reads
 //! the login on the Mac again when it is due, so a new host token applies
 //! with no restart. Gemini CLI checks its cached token at the tokeninfo
-//! endpoint of `oauth2.googleapis.com`: the proxy answers that one request.
+//! endpoint of `oauth2.googleapis.com`: the proxy answers that one request,
+//! or, when the login names no scope, sends it to Google with the real token.
 
 use base64::Engine;
 use serde_json::{Map, Value};

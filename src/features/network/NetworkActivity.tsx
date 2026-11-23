@@ -16,7 +16,7 @@ const REASONS: Record<string, string> = {
   offline: "offline",
   "always-blocked": "always blocked",
   default: "the default",
-  tokeninfo: "login check, answered by zwinger",
+  tokeninfo: "login check",
   "host-port": "service on this Mac",
   method: "method refused",
   misdirected: "named another host than its connection",
