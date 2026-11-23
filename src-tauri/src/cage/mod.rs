@@ -3,6 +3,7 @@ pub(crate) mod history;
 pub(crate) mod lifecycle;
 pub(crate) mod manager;
 pub(crate) mod network;
+pub(crate) mod policy;
 pub(crate) mod progress;
 pub(crate) mod tasks;
 #[cfg(test)]
@@ -1320,8 +1321,11 @@ mod tests {
         project.cage.put_host_agent(pi, Some(login::secret(AgentKind::Pi, "api.business.githubcopilot.com")));
         // Allowing GitHub is fine: the proxy blocks api.github.com anyway.
         let github = Target::Service { id: "github".into() };
-        let rule =
-            project.cage.network.put_rule(RuleDraft { id: None, target: github, action: Action::Allow }).unwrap();
+        let rule = project
+            .cage
+            .network
+            .put_rule(RuleDraft { id: None, target: github, action: Action::Allow, methods: None })
+            .unwrap();
         project.check().unwrap();
 
         let token = Credential {
@@ -1359,6 +1363,7 @@ mod tests {
                 id: None,
                 target: Target::Host { host: "other.example.com".into() },
                 action: Action::Allow,
+                methods: None,
             })
             .unwrap();
         cage.network.rule_mut(&rule).unwrap().credentials.push(Credential {
@@ -1373,6 +1378,7 @@ mod tests {
                 id: Some(rule),
                 target: Target::Host { host: "api.anthropic.com".into() },
                 action: Action::Allow,
+                methods: None,
             })
             .unwrap();
         cage.network.rule_mut(&rule).unwrap().credentials[0].inject =

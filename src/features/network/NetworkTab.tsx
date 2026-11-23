@@ -5,6 +5,7 @@ import {
   CardHeader,
   Confirm,
   CopyField,
+  FilterChips,
   FloatingField,
   LiquidSwitch,
   Select,
@@ -46,7 +47,9 @@ import {
   Target,
 } from "../../shared/api";
 import type { Intent, Run } from "../../App";
+import { LivePolicy } from "./LivePolicy";
 import { NetworkActivity } from "./NetworkActivity";
+import { PolicyProfiles } from "./PolicyProfiles";
 import { RuleCredentials } from "./RuleCredentials";
 import { errorMessage } from "../../shared/errorMessage";
 import { removeRuleWithUndo } from "../../shared/undo";
@@ -60,6 +63,9 @@ import {
   serviceOf,
   useCatalog,
 } from "./network";
+
+/** The methods that the rule editor offers. No choice allows all methods. */
+const METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].map((m) => ({ value: m, label: m }));
 
 /** The groups that the proxy blocks after it resolves the host on this Mac. */
 const ALWAYS_BLOCKED = [
@@ -192,9 +198,11 @@ export function NetworkTab({
             </li>
             <li>Blocked services and hosts. Block always beats Allow.</li>
             <li>
-              Allowed services and hosts. Their credentials are added here.
+              Allowed services and hosts, and the hosts allowed until the VM
+              stops. An Allow rule with methods blocks the other methods. The
+              credentials are added here.
             </li>
-            <li>Everything else: the default.</li>
+            <li>Everything else: the default. Ask holds the request until you answer it.</li>
           </ol>
           <p className="muted">
             Changes apply to the next request, with no restart.
@@ -221,6 +229,10 @@ export function NetworkTab({
             <CardBody className="stack">{testForm}</CardBody>
           </Card>
         </>
+      )}
+
+      {running && session.vmKey && (
+        <LivePolicy key={session.vmKey} vmKey={session.vmKey} run={run} />
       )}
 
       <div ref={activity}>
@@ -289,6 +301,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
   const savingMap = useRef(false);
   const [expanded, setExpanded] = useState<string>();
   const [credentialsOf, setCredentialsOf] = useState<string>();
+  const [methodsOf, setMethodsOf] = useState<string>();
   const hostField = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -357,7 +370,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
     if (existing?.action === "allow" || (credentials.length > 0 && !reviewCredentials)) return;
     savingMap.current = true;
     setMapSaving(true);
-    run(() => putRule(id, { id: existing?.id, target, action: "allow" }).then(
+    run(() => putRule(id, { id: existing?.id, target, action: "allow", methods: existing?.methods }).then(
       () => setMapDraft(undefined),
       (error) => setMapProblem(errorMessage(error)),
     ).finally(() => {
@@ -375,6 +388,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
             label="Everything else"
             options={[
               { value: "block", label: "Block everything else" },
+              { value: "ask", label: "Ask for everything else" },
               { value: "allow", label: "Allow everything else" },
             ]}
             value={network.default}
@@ -384,6 +398,11 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
           />
           {network.default === "block" ? (
             <p className="muted">A host that no rule allows is blocked.</p>
+          ) : network.default === "ask" ? (
+            <p className="muted">
+              A request that no rule decides waits up to 30 seconds for your
+              answer in this tab. With no answer, it is blocked.
+            </p>
           ) : (
             <p className="warn row">
               <TriangleAlert size={14} />A host that no rule blocks is allowed.
@@ -531,6 +550,15 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
                     <span className={rule.action === "allow" ? "ok" : "danger"}>
                       {rule.action === "allow" ? "Allowed" : "Blocked"}
                     </span>
+                    {rule.action === "allow" && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setMethodsOf(methodsOf === rule.id ? undefined : rule.id)}
+                      >
+                        {rule.methods ? rule.methods.join(", ") : "All methods"}
+                      </Button>
+                    )}
                     {service && (
                       <Button
                         size="sm"
@@ -587,6 +615,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
                             id: rule.id,
                             target: rule.target,
                             action: other,
+                            methods: rule.methods,
                           }),
                         );
                       }}
@@ -603,6 +632,27 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
                   </div>
                   {expanded === rule.id && (
                     <p className="muted mono">{domains.join(", ")}</p>
+                  )}
+                  {methodsOf === rule.id && rule.action === "allow" && (
+                    <FilterChips
+                      label={`Methods of ${ruleLabel(rule, catalog)}`}
+                      options={METHODS}
+                      value={rule.methods ?? []}
+                      summary={(count) =>
+                        count === 0 ? "All methods" : "Only these methods; the others are blocked"
+                      }
+                      clearLabel="All methods"
+                      onChange={(methods) =>
+                        run(() =>
+                          putRule(id, {
+                            id: rule.id,
+                            target: rule.target,
+                            action: rule.action,
+                            methods: methods.length > 0 ? methods : undefined,
+                          }),
+                        )
+                      }
+                    />
                   )}
                   {credentialsOf === rule.id && takesCredentials && (
                     <RuleCredentials
@@ -700,6 +750,7 @@ function CageRules({ session, cage, catalog, run, intent, onIntentDone, test }: 
         </CardBody>
       </Card>
 
+      <PolicyProfiles cageId={id} network={network} run={run} />
     </>
   );
 }

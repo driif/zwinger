@@ -2,16 +2,17 @@
 //! check of a Gemini host login, unless a Block rule names its host; the
 //! host port grant (ADR 0009), unless a Block rule names its host; the
 //! always-blocked floor (private and metadata addresses, local names, the
-//! refresh hosts of the host logins); Block rules; Allow rules; the
-//! default. The addresses that a name resolves to are checked in
-//! [`super::dial`]: for a CONNECT before its answer, and before each connect.
+//! refresh hosts of the host logins); Block rules; Allow rules, saved and
+//! until stop, with their method lists; the default, which can be Ask.
+//! The addresses that a name resolves to are checked in [`super::dial`]:
+//! for a CONNECT before its answer, and before each connect.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
 
 use crate::host_agents::login::{TOKENINFO_HOST, TOKENINFO_PATH};
-use crate::network::{Action, DefaultAction, NetworkPolicy};
+use crate::network::{Action, DefaultAction, NetworkPolicy, Rule};
 use crate::proxy::GUEST_HOST;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +24,16 @@ pub enum Reason {
     Default,
     TokenInfo,
     HostPort,
+    /// An Allow rule matched, but its method list does not have the method.
+    Method,
+    /// The user answered an ask: Allow once, or Block.
+    Ask,
+    /// No answer came before the deadline, or no ask could be opened.
+    AskTimeout,
 }
 
 /// The log shows the reason as `offline`, `always-blocked`, `rule:<name>`,
-/// `default`, `tokeninfo` or `host-port`.
+/// `default`, `tokeninfo`, `host-port`, `method`, `ask` or `ask-timeout`.
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -36,6 +43,9 @@ impl fmt::Display for Reason {
             Self::Default => f.write_str("default"),
             Self::TokenInfo => f.write_str("tokeninfo"),
             Self::HostPort => f.write_str("host-port"),
+            Self::Method => f.write_str("method"),
+            Self::Ask => f.write_str("ask"),
+            Self::AskTimeout => f.write_str("ask-timeout"),
         }
     }
 }
@@ -49,10 +59,14 @@ pub enum Decision {
     TokenInfo,
     /// The host port grant: the request goes to `127.0.0.1:<port>` of the Mac.
     HostPort(NonZeroU16),
+    /// The default asks the user. Only the proxy can hold a request for an answer.
+    Ask,
 }
 
 pub struct Context<'a> {
     pub policy: &'a NetworkPolicy,
+    /// The Allow rules until stop of the VM. They have no credentials.
+    pub temporary: &'a [Rule],
     /// The refresh hosts of the project's host logins.
     pub refresh: &'a [&'static str],
     /// The project has a Gemini host login, whose tokeninfo check the proxy
@@ -91,12 +105,21 @@ pub fn decide(ctx: &Context, host: &str, port: u16, request: Option<(&str, &str)
     if let Some(rule) = block {
         return Decision::Block(Reason::Rule(rule.label()));
     }
-    if let Some(rule) = rules.iter().find(|r| r.action == Action::Allow && r.matches(host)) {
-        return Decision::Allow(Reason::Rule(rule.label()));
+    let mut allowed = rules.iter().chain(ctx.temporary).filter(|r| r.action == Action::Allow && r.matches(host));
+    if let Some(first) = allowed.next() {
+        // Each matched method list limits the request: the lists intersect.
+        let method = request.map(|(method, _)| method);
+        if let Some(method) = method
+            && !std::iter::once(first).chain(allowed).all(|r| r.permits(method))
+        {
+            return Decision::Block(Reason::Method);
+        }
+        return Decision::Allow(Reason::Rule(first.label()));
     }
     match ctx.policy.default {
         DefaultAction::Allow => Decision::Allow(Reason::Default),
         DefaultAction::Block => Decision::Block(Reason::Default),
+        DefaultAction::Ask => Decision::Ask,
     }
 }
 
@@ -173,7 +196,7 @@ mod tests {
     }
 
     fn ctx(policy: &NetworkPolicy) -> Context<'_> {
-        Context { policy, refresh: &[], tokeninfo: false, listener: LISTENER }
+        Context { policy, temporary: &[], refresh: &[], tokeninfo: false, listener: LISTENER }
     }
 
     #[test]
@@ -195,14 +218,21 @@ mod tests {
     #[test]
     fn refresh_hosts_are_always_blocked_also_when_allowed() {
         let p = policy(DefaultAction::Allow, &[("console.anthropic.com", Action::Allow)]);
-        let ctx = Context { policy: &p, refresh: &["console.anthropic.com"], tokeninfo: false, listener: LISTENER };
+        let ctx = Context {
+            policy: &p,
+            temporary: &[],
+            refresh: &["console.anthropic.com"],
+            tokeninfo: false,
+            listener: LISTENER,
+        };
         assert_eq!(decide(&ctx, "console.anthropic.com", 443, None), Decision::Block(Reason::AlwaysBlocked));
     }
 
     #[test]
     fn the_gemini_tokeninfo_check_is_the_only_exception_of_its_refresh_host() {
         let p = policy(DefaultAction::Block, &[]);
-        let gemini = Context { policy: &p, refresh: &[TOKENINFO_HOST], tokeninfo: true, listener: LISTENER };
+        let gemini =
+            Context { policy: &p, temporary: &[], refresh: &[TOKENINFO_HOST], tokeninfo: true, listener: LISTENER };
         assert_eq!(decide(&gemini, TOKENINFO_HOST, 443, None), Decision::TokenInfo);
         assert_eq!(decide(&gemini, TOKENINFO_HOST, 443, Some(("POST", "/tokeninfo"))), Decision::TokenInfo);
         assert_eq!(decide(&gemini, TOKENINFO_HOST, 443, Some(("GET", "/tokeninfo"))), Decision::TokenInfo);
@@ -214,7 +244,8 @@ mod tests {
             );
         }
         // Without a Gemini login, the refresh deny of another login holds the host.
-        let other = Context { policy: &p, refresh: &[TOKENINFO_HOST], tokeninfo: false, listener: LISTENER };
+        let other =
+            Context { policy: &p, temporary: &[], refresh: &[TOKENINFO_HOST], tokeninfo: false, listener: LISTENER };
         assert_eq!(
             decide(&other, TOKENINFO_HOST, 443, Some(("POST", "/tokeninfo"))),
             Decision::Block(Reason::AlwaysBlocked)
@@ -229,7 +260,8 @@ mod tests {
     fn a_block_rule_beats_the_tokeninfo_check() {
         for blocked in [TOKENINFO_HOST, "*.googleapis.com"] {
             let p = policy(DefaultAction::Allow, &[(blocked, Action::Block)]);
-            let gemini = Context { policy: &p, refresh: &[TOKENINFO_HOST], tokeninfo: true, listener: LISTENER };
+            let gemini =
+                Context { policy: &p, temporary: &[], refresh: &[TOKENINFO_HOST], tokeninfo: true, listener: LISTENER };
             for request in [None, Some(("GET", TOKENINFO_PATH))] {
                 assert_eq!(
                     decide(&gemini, TOKENINFO_HOST, 443, request),
@@ -240,7 +272,7 @@ mod tests {
         }
         // With no Gemini login, an Allow rule allows the host, and the proxy does not answer.
         let p = policy(DefaultAction::Block, &[(TOKENINFO_HOST, Action::Allow)]);
-        let none = Context { policy: &p, refresh: &[], tokeninfo: false, listener: LISTENER };
+        let none = Context { policy: &p, temporary: &[], refresh: &[], tokeninfo: false, listener: LISTENER };
         assert_eq!(
             decide(&none, TOKENINFO_HOST, 443, Some(("GET", TOKENINFO_PATH))),
             Decision::Allow(Reason::Rule(TOKENINFO_HOST.into()))
@@ -315,5 +347,23 @@ mod tests {
         for ip in ["1.1.1.1", "140.82.121.4", "2606:4700::1111", "::ffff:8.8.8.8", "100.128.0.1", "64:ff9b::808:808"] {
             assert!(!is_always_blocked(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn ask_comes_last_and_the_floor_block_rules_and_method_lists_beat_it() {
+        let mut p = policy(DefaultAction::Ask, &[("bad.io", Action::Block), ("api.io", Action::Allow)]);
+        p.rules[1].methods = Some(vec!["GET".into()]);
+        let until_stop = [Rule::new(Target::Host { host: "*.bad.io".into() }, Action::Allow)];
+        let ctx =
+            Context { policy: &p, temporary: &until_stop, refresh: &["refresh.io"], tokeninfo: false, listener: 1 };
+        assert_eq!(decide(&ctx, "other.io", 443, Some(("GET", "/"))), Decision::Ask);
+        assert_eq!(decide(&ctx, "refresh.io", 443, None), Decision::Block(Reason::AlwaysBlocked));
+        assert_eq!(decide(&ctx, "bad.io", 443, None), Decision::Block(Reason::Rule("bad.io".into())));
+        assert_eq!(decide(&ctx, "x.bad.io", 443, None), Decision::Allow(Reason::Rule("*.bad.io".into())));
+        assert_eq!(decide(&ctx, "api.io", 443, Some(("POST", "/"))), Decision::Block(Reason::Method));
+        assert_eq!(decide(&ctx, "api.io", 443, None), Decision::Allow(Reason::Rule("api.io".into())));
+        p.offline = true;
+        let ctx = Context { policy: &p, temporary: &until_stop, refresh: &[], tokeninfo: false, listener: 1 };
+        assert_eq!(decide(&ctx, "x.bad.io", 443, None), Decision::Block(Reason::Offline));
     }
 }

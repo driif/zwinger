@@ -286,7 +286,7 @@ impl<R: SandboxRuntime> Manager<R> {
         progress.begin(Phase::Proxy);
         // The proxy and the runtime log of this VM send with one source.
         let source = lock(&self.state).net.source(id);
-        let (proxy, proxy_took) = timed(self.start_proxy(source.clone(), &cage, live, tokens)).await;
+        let (proxy, proxy_took) = timed(self.start_proxy(id, source.clone(), &cage, live, tokens)).await;
         timings.add(Phase::Proxy, proxy_took);
         let proxy = match proxy {
             Ok(proxy) => Arc::new(proxy),
@@ -554,9 +554,10 @@ impl<R: SandboxRuntime> Manager<R> {
         self.try_migrate_vm_state().await;
     }
 
-    /// Starts the proxy of a VM. Its log entries go to the network log of `source`.
+    /// Starts the proxy of VM `key`. Its log entries go to the network log of `source`.
     pub(crate) async fn start_proxy(
         &self,
+        key: &str,
         source: Source,
         cage: &Cage,
         live: Arc<Live>,
@@ -572,6 +573,7 @@ impl<R: SandboxRuntime> Manager<R> {
             })
             .collect();
         let (state, net, notice) = (self.state.clone(), self.net_sink.clone(), self.notice_sink.clone());
+        let (asked, key) = (self.ask_sink.clone(), key.to_owned());
         let config = proxy::Config {
             ca,
             live,
@@ -579,8 +581,16 @@ impl<R: SandboxRuntime> Manager<R> {
             refresh: login::denied_hosts(&cage.logins),
             sink: Arc::new(move |entry| activity::record(&state, &net, &notice, &source, entry)),
             resolver: Arc::new(proxy::dial::System),
+            asks: self.asks.clone(),
+            ask_sink: Arc::new(move || {
+                if let Some(sink) = asked.get() {
+                    sink(&key);
+                }
+            }),
             #[cfg(test)]
             upstream_root: None,
+            #[cfg(test)]
+            ask_deadline: proxy::ask::DEADLINE,
         };
         Proxy::start(config).await.map_err(|e| Error::Proxy(e.to_string()))
     }

@@ -62,7 +62,8 @@ export interface Mount {
   readonly: boolean;
 }
 
-export type DefaultAction = "block" | "allow";
+/** `ask` holds a request that no rule decides until the user answers it in the Network tab. */
+export type DefaultAction = "block" | "allow" | "ask";
 
 export type Action = "allow" | "block";
 
@@ -98,6 +99,8 @@ export interface Rule {
   id: string;
   target: Target;
   action: Action;
+  /** The only HTTP methods that an Allow rule allows. Absent: all methods. */
+  methods?: string[];
   /** Only an Allow rule has credentials. */
   credentials?: Credential[];
 }

@@ -96,7 +96,7 @@ pub(crate) fn attach(manager: &Manager<FakeRuntime>, session: &str) -> (u64, mps
 }
 
 pub(crate) fn host_rule(host: &str, action: Action) -> RuleDraft {
-    RuleDraft { id: None, target: Target::Host { host: host.into() }, action }
+    RuleDraft { id: None, target: Target::Host { host: host.into() }, action, methods: None }
 }
 
 /// An Allow rule for `host`. Returns its id.

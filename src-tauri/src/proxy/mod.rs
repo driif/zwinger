@@ -9,6 +9,7 @@
 //! goes to `127.0.0.1:<port>` through [`LocalConnector`] alone. Its CONNECT
 //! carries plain HTTP only.
 
+pub mod ask;
 pub mod ca;
 pub mod decide;
 pub mod dial;
@@ -56,8 +57,9 @@ use tokio::time::Instant;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::agent::AgentKind;
+use crate::error::Error;
 use crate::host_agents::login::{self, TOKENINFO_HOST};
-use crate::network::{Credential, NetworkPolicy};
+use crate::network::{Action, Credential, NetworkPolicy, Rule, Target};
 use crate::secrets::{CredentialRef, SecretValue};
 use ca::Ca;
 use decide::{Context, Decision, Reason, decide};
@@ -112,6 +114,8 @@ const TOKENINFO_GOOGLE: &str = "sent to Google";
 /// The 502 reason of a tokeninfo check that did not reach Google. It is
 /// fixed, so no part of the request, and no token, gets into it.
 const TOKENINFO_UNREACHABLE: &str = "the tokeninfo endpoint did not answer";
+/// The most Allow rules until stop of one VM.
+pub const TEMPORARY_LIMIT: usize = 128;
 /// The methods of the host port. A CONNECT or an unknown method could make
 /// the local service a raw tunnel.
 const HOST_PORT_METHODS: [Method; 7] =
@@ -128,29 +132,77 @@ pub struct Snapshot {
     pub policy: Arc<NetworkPolicy>,
     /// The credential values by source and name.
     pub values: Arc<HashMap<CredentialRef, SecretValue>>,
+    /// The Allow rules until stop of this VM. They have no credentials.
+    pub temporary: Arc<Vec<Rule>>,
 }
 
-/// The parts of a cage's proxy that edits change while it runs: the
-/// next request uses them. An edit replaces the policy and the values in one
-/// step, so no request sees a new rule with an old value.
+/// The parts of a VM's proxy that edits change while it runs: the next
+/// request uses them. An edit replaces the policy and the values in one
+/// step, so no request sees a new rule with an old value. Each start makes
+/// a new one, so the rules until stop and the asks end with the VM.
 pub struct Live {
     snapshot: Mutex<Snapshot>,
+    /// Changes at each edit, so a held request decides again.
+    version: watch::Sender<u64>,
+    pub asks: Arc<ask::Registry>,
 }
 
 impl Live {
     pub fn new(policy: NetworkPolicy, values: HashMap<CredentialRef, SecretValue>) -> Arc<Self> {
-        Arc::new(Self { snapshot: Mutex::new(Snapshot { policy: Arc::new(policy), values: Arc::new(values) }) })
+        let snapshot = Snapshot { policy: Arc::new(policy), values: Arc::new(values), temporary: Arc::default() };
+        Arc::new(Self { snapshot: Mutex::new(snapshot), version: watch::channel(0).0, asks: Arc::default() })
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Changes the policy and the values together.
+    /// Changes the policy and the values together. The rules until stop stay.
     pub fn edit(&self, edit: impl FnOnce(&mut NetworkPolicy, &mut HashMap<CredentialRef, SecretValue>)) {
-        let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
-        let Snapshot { policy, values } = &mut *snapshot;
-        edit(Arc::make_mut(policy), Arc::make_mut(values));
+        {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+            let Snapshot { policy, values, .. } = &mut *snapshot;
+            edit(Arc::make_mut(policy), Arc::make_mut(values));
+        }
+        self.version.send_modify(|v| *v += 1);
+    }
+
+    /// Changes at each edit.
+    fn changes(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
+
+    pub fn temporary(&self) -> Vec<Rule> {
+        self.snapshot().temporary.to_vec()
+    }
+
+    /// Adds an Allow rule until stop for the normalized `target`, or returns
+    /// the one that it has. It is never saved.
+    pub fn allow_until_stop(&self, target: Target) -> crate::error::Result<Rule> {
+        let rule = {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(rule) = snapshot.temporary.iter().find(|r| r.target == target) {
+                return Ok(rule.clone());
+            }
+            if snapshot.temporary.len() >= TEMPORARY_LIMIT {
+                return Err(Error::InvalidRule(format!("a VM has at most {TEMPORARY_LIMIT} rules until stop")));
+            }
+            let rule = Rule::new(target, Action::Allow);
+            Arc::make_mut(&mut snapshot.temporary).push(rule.clone());
+            rule
+        };
+        self.version.send_modify(|v| *v += 1);
+        Ok(rule)
+    }
+
+    pub fn remove_temporary(&self, rule_id: &str) -> crate::error::Result<()> {
+        {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+            let i = snapshot.temporary.iter().position(|r| r.id == rule_id).ok_or(Error::RuleNotFound)?;
+            Arc::make_mut(&mut snapshot.temporary).remove(i);
+        }
+        self.version.send_modify(|v| *v += 1);
+        Ok(())
     }
 
     pub fn set_value(&self, key: &CredentialRef, value: Option<SecretValue>) {
@@ -171,10 +223,17 @@ pub struct Config {
     pub refresh: Vec<&'static str>,
     pub sink: Sink,
     pub resolver: Arc<dyn Resolve>,
+    /// The pending asks of the app, [`ask::APP_PENDING`] at most.
+    pub asks: Arc<Semaphore>,
+    /// Gets a signal when the pending asks of this VM change.
+    pub ask_sink: Arc<dyn Fn() + Send + Sync>,
     /// The only root for the upstream TLS in place of the platform roots,
     /// so a test can run a local TLS recipient.
     #[cfg(test)]
     pub upstream_root: Option<rustls::pki_types::CertificateDer<'static>>,
+    /// In place of [`ask::DEADLINE`], so a test does not wait 30 s.
+    #[cfg(test)]
+    pub ask_deadline: Duration,
 }
 
 /// A running proxy. A drop stops it and its connections.
@@ -216,6 +275,9 @@ struct Shared {
     /// The port of this proxy, which the grant never opens.
     port: u16,
     shutdown: watch::Receiver<bool>,
+    asks: Arc<Semaphore>,
+    ask_sink: Arc<dyn Fn() + Send + Sync>,
+    ask_deadline: Duration,
 }
 
 impl Proxy {
@@ -255,6 +317,12 @@ impl Proxy {
             port,
             upstreams,
             shutdown: shutdown_rx,
+            asks: config.asks,
+            ask_sink: config.ask_sink,
+            #[cfg(test)]
+            ask_deadline: config.ask_deadline,
+            #[cfg(not(test))]
+            ask_deadline: ask::DEADLINE,
         });
         #[cfg(test)]
         let shared_upstreams = shared.upstreams.clone();
@@ -382,10 +450,22 @@ impl Shared {
         scheme.eq_ignore_ascii_case("basic") && bool::from(decoded.ct_eq(&self.expected))
     }
 
-    fn decide(&self, policy: &NetworkPolicy, origin: &Origin, request: Option<(&str, &str)>) -> Decision {
+    fn decide(&self, snapshot: &Snapshot, origin: &Origin, request: Option<(&str, &str)>) -> Decision {
         let tokeninfo = self.logins.iter().any(|l| l.kind == AgentKind::Gemini);
-        let context = Context { policy, refresh: &self.refresh, tokeninfo, listener: self.port };
+        let context = Context {
+            policy: &snapshot.policy,
+            temporary: &snapshot.temporary,
+            refresh: &self.refresh,
+            tokeninfo,
+            listener: self.port,
+        };
         decide(&context, &origin.host, origin.port, request)
+    }
+
+    /// Decides the request on the current snapshot, and returns both.
+    fn decide_now(&self, origin: &Origin, request: (&str, &str)) -> (Decision, Snapshot) {
+        let snapshot = self.live.snapshot();
+        (self.decide(&snapshot, origin, Some(request)), snapshot)
     }
 
     fn log(&self, entry: Entry) {
@@ -561,7 +641,7 @@ async fn outer(shared: Arc<Shared>, activity: Activity, permit: Permit, req: Req
     match (req.uri().scheme_str(), req.uri().host()) {
         (Some("http"), Some(host)) => {
             let origin = Origin { https: false, host: normal_host(host), port: req.uri().port_u16().unwrap_or(80) };
-            forward(shared, req, origin, permit).await
+            forward(shared, req, origin, permit, None).await
         }
         _ => failed(
             StatusCode::BAD_REQUEST,
@@ -584,8 +664,8 @@ async fn connect(
         return failed(StatusCode::BAD_REQUEST, "bad request", "zwinger: CONNECT needs host:port\n".into());
     };
     let origin = Origin { https: true, host: normal_host(authority.host()), port: authority.port_u16().unwrap_or(443) };
-    let policy = shared.live.snapshot().policy;
-    let host_port = match shared.decide(&policy, &origin, None) {
+    let snapshot = shared.live.snapshot();
+    let host_port = match shared.decide(&snapshot, &origin, None) {
         Decision::Block(reason) => {
             return shared.block(origin.entry("CONNECT", None), &reason.to_string());
         }
@@ -597,7 +677,8 @@ async fn connect(
         Decision::HostPort(_) => true,
         // Each inner request is decided again; one that goes to Google dials checked addresses.
         Decision::TokenInfo => false,
-        Decision::Allow(_) => {
+        // An Ask holds the first inner request that no rule decides, where the method is known.
+        Decision::Allow(_) | Decision::Ask => {
             let upstreams = &shared.upstreams;
             match dial::checked(upstreams.resolver.as_ref(), &origin.host, origin.port).await {
                 Ok(addrs) => upstreams.pin(&origin.host, origin.port, addrs),
@@ -651,7 +732,7 @@ async fn local_tunnel(shared: Arc<Shared>, mut io: TokioIo<hyper::upgrade::Upgra
     let plain = Origin { https: false, ..origin };
     let service = service_fn(move |req| {
         let (shared, plain, permit) = (shared.clone(), plain.clone(), permit.clone());
-        async move { Ok::<_, Infallible>(forward(shared, req, plain, permit).await) }
+        async move { Ok::<_, Infallible>(forward(shared, req, plain, permit, None).await) }
     });
     let io = Prefixed { first: Some(first[0]), io };
     let _ = hyper::server::conn::http1::Builder::new()
@@ -701,9 +782,10 @@ async fn mitm(shared: Arc<Shared>, io: TokioIo<hyper::upgrade::Upgraded>, origin
     let Ok(Ok(tls)) = tokio::time::timeout(TLS_LIMIT, TlsAcceptor::from(config).accept(io)).await else {
         return;
     };
+    let tunnel = Arc::new(Tunnel::default());
     let service = service_fn(move |req| {
-        let (shared, origin, permit) = (shared.clone(), origin.clone(), permit.clone());
-        async move { Ok::<_, Infallible>(forward(shared, req, origin, permit).await) }
+        let (shared, origin, permit, tunnel) = (shared.clone(), origin.clone(), permit.clone(), tunnel.clone());
+        async move { Ok::<_, Infallible>(forward(shared, req, origin, permit, Some(tunnel)).await) }
     });
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     builder.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_LIMIT).max_buf_size(HEADER_BYTES);
@@ -752,11 +834,77 @@ fn named(parts: &http::request::Parts) -> Vec<String> {
     names
 }
 
+/// The answer to the ask of one MITM tunnel. Its later requests that the
+/// Ask default decides take it, so HTTP/2 asks once per tunnel, not once
+/// per stream. Each request still checks the rules first.
+#[derive(Default)]
+struct Tunnel {
+    answer: tokio::sync::Mutex<Option<Decision>>,
+}
+
+/// Holds a request that the Ask default decides until it is settled. The
+/// answer, a policy change, the deadline, the end of the request and the
+/// proxy stop each settle the ask once. The policy is decided again after
+/// the answer, so a late answer cannot override a newer rule, Offline or
+/// the floor. Returns the decision, never `Ask`, with the snapshot it used.
+async fn held(
+    shared: &Shared,
+    origin: &Origin,
+    request: (&str, &str),
+    tunnel: Option<&Tunnel>,
+) -> (Decision, Snapshot) {
+    let mut tunnel = match tunnel {
+        Some(tunnel) => Some(tunnel.answer.lock().await),
+        None => None,
+    };
+    // Subscribe before the read, so an edit between the two wakes the wait.
+    let mut changes = shared.live.changes();
+    let (decision, snapshot) = shared.decide_now(origin, request);
+    if decision != Decision::Ask {
+        return (decision, snapshot);
+    }
+    if let Some(Some(answered)) = tunnel.as_deref() {
+        return (answered.clone(), snapshot);
+    }
+    let expires_at = log::now_ms() + shared.ask_deadline.as_millis() as u64;
+    let opened =
+        shared.live.asks.open(&origin.host, origin.port, request.0, &shared.asks, expires_at, shared.ask_sink.clone());
+    let Some((ticket, mut answer)) = opened else {
+        return (Decision::Block(Reason::AskTimeout), snapshot);
+    };
+    let mut shutdown = shared.shutdown.clone();
+    let deadline = tokio::time::sleep(shared.ask_deadline);
+    tokio::pin!(deadline);
+    let answered = loop {
+        tokio::select! {
+            answer = &mut answer => break match answer {
+                Ok(ask::Answer::Allow) => Decision::Allow(Reason::Ask),
+                Ok(ask::Answer::Block) | Err(_) => Decision::Block(Reason::Ask),
+            },
+            () = &mut deadline => break Decision::Block(Reason::AskTimeout),
+            _ = shutdown.wait_for(|stop| *stop) => return (Decision::Block(Reason::AskTimeout), snapshot),
+            Ok(()) = changes.changed() => {
+                let (decision, snapshot) = shared.decide_now(origin, request);
+                if decision != Decision::Ask {
+                    return (decision, snapshot);
+                }
+            }
+        }
+    };
+    drop(ticket);
+    if let Some(slot) = tunnel.as_deref_mut() {
+        *slot = Some(answered.clone());
+    }
+    let (decision, snapshot) = shared.decide_now(origin, request);
+    (if decision == Decision::Ask { answered } else { decision }, snapshot)
+}
+
 async fn forward(
     shared: Arc<Shared>,
     mut req: Request<Incoming>,
     origin: Origin,
     permit: Permit,
+    tunnel: Option<Arc<Tunnel>>,
 ) -> Response<ProxyBody> {
     let started = Instant::now();
     let websocket = is_websocket(&req);
@@ -786,9 +934,16 @@ async fn forward(
             format!("zwinger refuses {}: it echoes the request\n", parts.method),
         );
     }
-    let Snapshot { policy, values } = shared.live.snapshot();
-    match shared.decide(&policy, &origin, Some((parts.method.as_str(), parts.uri.path()))) {
+    let request = (parts.method.as_str(), parts.uri.path());
+    let (mut decision, mut snapshot) = shared.decide_now(&origin, request);
+    if decision == Decision::Ask {
+        (decision, snapshot) = held(&shared, &origin, request, tunnel.as_deref()).await;
+    }
+    let Snapshot { policy, values, .. } = snapshot;
+    match decision {
         Decision::Block(reason) => return shared.block(entry, &reason.to_string()),
+        // `held` never returns Ask; fail closed.
+        Decision::Ask => return shared.block(entry, &Reason::AskTimeout.to_string()),
         Decision::TokenInfo => return tokeninfo(&shared, &origin, parts, body, entry, started).await,
         // A host port tunnel serves plain HTTP only, so no TLS request gets here.
         Decision::HostPort(_) if origin.https => return shared.block(entry, &Reason::HostPort.to_string()),
@@ -803,7 +958,7 @@ async fn forward(
     let credentials: Vec<(Credential, SecretValue)> = policy
         .rules
         .iter()
-        .filter(|r| r.sends_credentials_to(&origin.host))
+        .filter(|r| r.sends_credentials_to(&origin.host) && r.permits(parts.method.as_str()))
         .flat_map(|r| &r.credentials)
         .filter_map(|c| values.get(&c.key()).map(|v| (c.clone(), v.clone())))
         .collect();
@@ -1431,7 +1586,10 @@ mod tests {
             refresh,
             sink: Arc::new(move |entry| sink_log.lock().unwrap().push(entry)),
             resolver: resolver.clone(),
+            asks: Arc::new(Semaphore::new(ask::APP_PENDING)),
+            ask_sink: Arc::new(|| {}),
             upstream_root,
+            ask_deadline: Duration::from_secs(2),
         };
         Fixture { proxy: Proxy::start(config).await.unwrap(), ca, live, log, resolver }
     }
@@ -2341,5 +2499,115 @@ mod tests {
         assert_eq!(connect_only(&f, &format!("{GUEST_HOST}:abc")).await.err(), Some(StatusCode::FORBIDDEN));
         let entry = f.entries().pop().unwrap();
         assert_eq!((entry.reason.as_str(), entry.note.as_deref()), ("host-port", Some(HOST_PORT_AUTHORITY)));
+    }
+
+    fn ask_policy() -> NetworkPolicy {
+        NetworkPolicy { default: DefaultAction::Ask, ..Default::default() }
+    }
+
+    /// Waits for the one pending ask and returns its id.
+    async fn pending(f: &Fixture) -> String {
+        assert!(eventually(|| f.live.asks.list().len() == 1).await, "no ask");
+        f.live.asks.list()[0].id.clone()
+    }
+
+    #[tokio::test]
+    async fn an_ask_holds_the_request_until_the_answer() {
+        let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
+        let port = upstream().await;
+        let uri = format!("http://api.test:{port}/");
+        for (answer, status, reason) in
+            [(ask::Answer::Allow, StatusCode::OK, "ask"), (ask::Answer::Block, StatusCode::FORBIDDEN, "ask")]
+        {
+            let answered = async {
+                let id = pending(&f).await;
+                let ask = f.live.asks.get(&id).unwrap();
+                assert_eq!((ask.host.as_str(), ask.method.as_str()), ("api.test", "GET"));
+                f.live.asks.answer(&id, answer).unwrap();
+            };
+            let ((got, _, _), ()) = tokio::join!(plain(&f, &uri, Some(f.auth())), answered);
+            assert_eq!(got, status);
+            assert_eq!(f.entries().last().unwrap().reason, reason);
+            assert!(f.live.asks.list().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_ask_is_blocked_at_the_deadline() {
+        let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
+        let (status, headers, _) = plain(&f, "http://api.test:1/", Some(f.auth())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(headers[BLOCKED_HEADER], "ask-timeout");
+        assert!(f.live.asks.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_policy_edit_or_a_rule_until_stop_decides_a_held_request() {
+        let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
+        let port = upstream().await;
+        let uri = format!("http://api.test:{port}/");
+        let edit = async {
+            pending(&f).await;
+            f.live.edit(|p, _| p.rules.push(rule("api.test", Action::Allow)));
+        };
+        let ((status, _, _), ()) = tokio::join!(plain(&f, &uri, Some(f.auth())), edit);
+        assert_eq!((status, f.entries().last().unwrap().reason.as_str()), (StatusCode::OK, "rule:api.test"));
+
+        f.live.edit(|p, _| p.rules.clear());
+        let until_stop = async {
+            pending(&f).await;
+            f.live.allow_until_stop(Target::Host { host: "api.test".into() }).unwrap()
+        };
+        let ((status, _, _), rule) = tokio::join!(plain(&f, &uri, Some(f.auth())), until_stop);
+        assert_eq!(status, StatusCode::OK);
+        // The rule stays for the next request, with no ask.
+        assert_eq!(plain(&f, &uri, Some(f.auth())).await.0, StatusCode::OK);
+        f.live.remove_temporary(&rule.id).unwrap();
+        assert!(f.live.temporary().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_ask_queue_blocks_at_once() {
+        let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
+        let app = Arc::new(Semaphore::new(1));
+        let tickets: Vec<_> = (0..ask::VM_PENDING)
+            .map(|_| f.live.asks.open("x.test", 443, "GET", &Arc::new(Semaphore::new(1)), 0, Arc::new(|| {})).unwrap())
+            .collect();
+        assert!(f.live.asks.open("x.test", 443, "GET", &app, 0, Arc::new(|| {})).is_none());
+        let started = Instant::now();
+        let (status, headers, _) = plain(&f, "http://api.test:1/", Some(f.auth())).await;
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "ask-timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(tickets);
+    }
+
+    #[tokio::test]
+    async fn an_ask_in_a_tunnel_is_held_on_the_inner_request() {
+        let recipients = temp_ca();
+        let (port, seen) = tls_recipient(&recipients, "a1.test").await;
+        let f = start(ask_policy(), HashMap::new(), Vec::new(), Vec::new(), Some(recipients.der().clone())).await;
+        let answered = async {
+            let id = pending(&f).await;
+            f.live.asks.answer(&id, ask::Answer::Allow).unwrap();
+        };
+        let (status, ()) = tokio::join!(via_tunnel(&f, "a1.test", port), answered);
+        assert_eq!(status, Ok(StatusCode::OK));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_method_list_limits_an_allow_rule_and_its_credential() {
+        let mut limited = rule("api.test", Action::Allow);
+        limited.methods = Some(vec!["GET".into()]);
+        let policy = NetworkPolicy { default: DefaultAction::Allow, rules: vec![limited], ..Default::default() };
+        let f = fixture(policy, Vec::new(), Vec::new()).await;
+        let port = upstream().await;
+        let uri = format!("http://api.test:{port}/");
+        assert_eq!(plain(&f, &uri, Some(f.auth())).await.0, StatusCode::OK);
+        let tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        let post = Request::post(&uri).header(PROXY_AUTHORIZATION, f.auth()).body(Empty::new()).unwrap();
+        let (status, headers, _) = send_over(TokioIo::new(tcp), post).await;
+        // The default Allow does not open a method that the matched rule leaves out.
+        assert_eq!((status, headers[BLOCKED_HEADER].to_str().unwrap()), (StatusCode::FORBIDDEN, "method"));
     }
 }

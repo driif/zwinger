@@ -212,6 +212,11 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
         let _ = handle
             .emit("terminal-folder", serde_json::json!({ "processId": process_id, "seq": seq, "folder": folder }));
     }));
+    // The pending asks or the rules until stop of a VM changed.
+    let handle = app.clone();
+    manager.set_ask_sink(Box::new(move |vm_key| {
+        let _ = handle.emit("net-asks", vm_key);
+    }));
     let handle = app.clone();
     manager.set_guest_sink(Box::new(move |vm_key| {
         let _ = handle.emit("guest-login", vm_key);
@@ -413,6 +418,16 @@ pub fn run() {
             commands::network::wildcard_for,
             commands::network::list_net_events,
             commands::network::export_net_events,
+            commands::network::list_asks,
+            commands::network::answer_ask,
+            commands::network::temporary_rules,
+            commands::network::add_temporary_rule,
+            commands::network::remove_temporary_rule,
+            commands::network::network_profiles,
+            commands::network::save_network_profile,
+            commands::network::apply_network_profile,
+            commands::network::delete_network_profile,
+            commands::network::policy_json,
             commands::cages::start_cage,
             commands::cages::stop_cage,
             commands::cages::restart_cage,

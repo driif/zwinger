@@ -36,6 +36,9 @@ const CURRENT_HOME: &str = "~/.zwinger/microsandbox";
 /// Gets each new network log entry with its VM key.
 pub type NetSink = Box<dyn Fn(&str, &Entry) + Send + Sync>;
 
+/// Gets the key of a VM whose pending asks changed.
+pub type AskSink = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Gets a signal when the app has a new notice to take.
 pub type NoticeSink = Box<dyn Fn() + Send + Sync>;
 
@@ -87,6 +90,11 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) undo: Mutex<Undo>,
     pub(crate) state: Arc<Mutex<State<R::Vm>>>,
     pub(crate) net_sink: Arc<OnceLock<NetSink>>,
+    pub(crate) ask_sink: Arc<OnceLock<AskSink>>,
+    /// The pending asks of all VMs ([`crate::proxy::ask::APP_PENDING`]).
+    pub(crate) asks: Arc<tokio::sync::Semaphore>,
+    /// Serializes the edits of the network profiles file.
+    pub(crate) profiles: Mutex<()>,
     pub(crate) notice_sink: Arc<OnceLock<NoticeSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
     pub(crate) folder_sink: Arc<OnceLock<FolderSink>>,
@@ -512,6 +520,9 @@ impl<R: SandboxRuntime> Manager<R> {
             undo: Mutex::default(),
             state: Arc::new(Mutex::new(state)),
             net_sink: Arc::new(OnceLock::new()),
+            ask_sink: Arc::new(OnceLock::new()),
+            asks: Arc::new(tokio::sync::Semaphore::new(crate::proxy::ask::APP_PENDING)),
+            profiles: Mutex::new(()),
             notice_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
             folder_sink: Arc::new(OnceLock::new()),
@@ -543,6 +554,11 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Only the first sink counts.
     pub fn set_net_sink(&self, sink: NetSink) {
         let _ = self.net_sink.set(sink);
+    }
+
+    /// Only the first sink counts.
+    pub fn set_ask_sink(&self, sink: AskSink) {
+        let _ = self.ask_sink.set(sink);
     }
 
     /// Only the first sink counts.
@@ -1215,7 +1231,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 for host in &secret.hosts {
                     if !c.network.rules.iter().any(|r| r.action == Action::Allow && r.matches(host)) {
                         let target = Target::Host { host: host.to_string() };
-                        c.network.put_rule(RuleDraft { id: None, target, action: Action::Allow })?;
+                        c.network.put_rule(RuleDraft { id: None, target, action: Action::Allow, methods: None })?;
                     }
                 }
             }

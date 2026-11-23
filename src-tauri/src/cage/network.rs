@@ -14,8 +14,10 @@ use crate::proxy::log::Entry;
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::secrets::{self, CredentialRef, Owner, SecretValue};
 
-/// How long the network test may run in the guest.
-pub(crate) const NET_TEST_LIMIT: Duration = Duration::from_secs(25);
+/// How long the network test may run in the guest. Its request waits up to
+/// 40 s, longer than an ask ([`crate::proxy::ask::DEADLINE`]), so the user
+/// can answer the ask that the test opens.
+pub(crate) const NET_TEST_LIMIT: Duration = Duration::from_secs(50);
 
 /// The bytes of the network test output that are read.
 pub(crate) const NET_TEST_OUT: usize = 8 << 10;
@@ -262,13 +264,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     let exact_block = network.rules.iter().any(|rule| {
                         rule.action == Action::Block && matches!(&rule.target, Target::Host { host } if host == HOST)
                     });
-                    if (network.default == DefaultAction::Block || exact_block) && !allow {
+                    if (network.default != DefaultAction::Allow || exact_block) && !allow {
                         return Err(Error::InvalidRule("allow api.anthropic.com first".into()));
                     }
                     let id = network.put_rule(RuleDraft {
                         id: None,
                         target: Target::Host { host: HOST.into() },
                         action: Action::Allow,
+                        methods: None,
                     })?;
                     network.rules.iter().position(|r| r.id == id).expect("new rule")
                 }
@@ -542,7 +545,7 @@ socket.on("connect", async () => {
   socket.end();
   say("proxy", true, "reached " + proxy.host);
   try {
-    const res = await fetch("https://" + host + "/", { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(15000) });
+    const res = await fetch("https://" + host + "/", { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(40000) });
     const blocked = res.headers.get("x-zwinger-blocked");
     const error = res.headers.get("x-zwinger-error");
     say("target", !blocked && !error, blocked ? "blocked: " + blocked : error ? "failed: " + error : "HTTP " + res.status);
@@ -564,7 +567,12 @@ pub(crate) fn net_test(out: &str) -> NetTest {
     let stage = |name: &str| lines.iter().find(|l| l.stage == name).map(|l| l.result.clone());
     let proxy = stage("proxy").unwrap_or(NetStage { ok: false, detail: "the test did not answer in time".into() });
     let target = if proxy.ok {
-        Some(stage("target").unwrap_or(NetStage { ok: false, detail: "the host did not answer in time".into() }))
+        let mut target =
+            stage("target").unwrap_or(NetStage { ok: false, detail: "the host did not answer in time".into() });
+        if target.detail == "blocked: ask-timeout" {
+            target.detail = "blocked: no answer to the ask in time".into();
+        }
+        Some(target)
     } else {
         None
     };
@@ -594,6 +602,12 @@ mod tests {
 {"stage":"target","ok":false,"detail":"failed: cannot connect to a.io in time"}"#;
         let target = net_test(out).target.unwrap();
         assert_eq!((target.ok, target.detail.as_str()), (false, "failed: cannot connect to a.io in time"));
+        // The request outlives a pending ask, so the test shows the ask result.
+        assert!(NET_TEST.contains("AbortSignal.timeout(40000)"));
+        assert!(Duration::from_secs(40) > crate::proxy::ask::DEADLINE && NET_TEST_LIMIT > Duration::from_secs(40));
+        let out = r#"{"stage":"proxy","ok":true,"detail":"reached p"}
+{"stage":"target","ok":false,"detail":"blocked: ask-timeout"}"#;
+        assert_eq!(net_test(out).target.unwrap().detail, "blocked: no answer to the ask in time");
     }
 
     #[tokio::test]
@@ -796,13 +810,22 @@ mod tests {
         ));
         assert_eq!(vault.values.lock().unwrap().len(), 1);
         // A rule with a credential cannot become a wildcard; it can become a Block rule.
-        let moved =
-            RuleDraft { id: Some(rule.clone()), target: Target::Host { host: "*.a.io".into() }, action: Action::Allow };
+        let moved = RuleDraft {
+            id: Some(rule.clone()),
+            target: Target::Host { host: "*.a.io".into() },
+            action: Action::Allow,
+            methods: None,
+        };
         assert!(matches!(manager.put_rule(&id, moved), Err(Error::InvalidSecret(..))));
         manager
             .put_rule(
                 &id,
-                RuleDraft { id: Some(rule), target: Target::Host { host: "a.io".into() }, action: Action::Block },
+                RuleDraft {
+                    id: Some(rule),
+                    target: Target::Host { host: "a.io".into() },
+                    action: Action::Block,
+                    methods: None,
+                },
             )
             .unwrap();
         assert_eq!(manager.list().cages[0].cage.network.rules[0].credentials.len(), 1);
@@ -1243,7 +1266,12 @@ mod tests {
         let service = manager
             .put_rule(
                 &id,
-                RuleDraft { id: None, target: Target::Service { id: "openai".into() }, action: Action::Allow },
+                RuleDraft {
+                    id: None,
+                    target: Target::Service { id: "openai".into() },
+                    action: Action::Allow,
+                    methods: None,
+                },
             )
             .unwrap();
         assert!(matches!(

@@ -337,15 +337,16 @@ export function mapLayout(
     ny += total ? ROW + H + metrics.space * 2 : ROW;
   };
   // The default is the edge style of "everything else".
-  const closed = network.offline || network.default === "block";
+  const closed = network.offline || network.default !== "allow";
+  const verdict = network.default === "ask" ? "asked" : closed ? "blocked" : "allowed";
   host(
     "default",
     {
       icon: Globe,
-      label: network.offline ? "Offline: all blocked" : `Everything else: ${closed ? "blocked" : "allowed"}`,
+      label: network.offline ? "Offline: all blocked" : `Everything else: ${verdict}`,
       title: network.offline
         ? "Offline: the proxy blocks every request and keeps the rules"
-        : `A host that no rule names is ${closed ? "blocked" : "allowed"}`,
+        : `A host that no rule names is ${verdict}`,
       tone: network.offline ? "blocked" : closed ? "muted" : "warn",
       badges: [],
       active: active("default"),

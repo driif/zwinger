@@ -10,9 +10,10 @@ the outside into the cage are always blocked.
 
 The network policy belongs to the cage of a project: the projects of one cage share it. Open it with ⌘4.
 
-- **Default**: Block or Allow all hosts that no rule names.
+- **Default**: Block, Ask or Allow all hosts that no rule names. See [Ask](#ask).
 - **Rules**: each rule names a service of the catalog (for example GitHub or npm, with its domains) or a host, and says
   Allow or Block. A host is `a.io`, or `*.a.io` for the domain and its subdomains.
+- **Methods**: an Allow rule can allow only some HTTP methods. See [Method limits](#method-limits).
 - **Offline**: blocks all requests now and keeps the rules.
 
 The proxy checks each request in this sequence:
@@ -21,10 +22,70 @@ The proxy checks each request in this sequence:
 2. The service on this Mac, unless a Block rule names `host.microsandbox.internal`.
 3. Addresses that are always blocked: this Mac, the local network, loopback, link-local ranges and cloud metadata, except the port in step 2.
 4. Block rules.
-5. Allow rules.
+5. Allow rules, and the rules [until the VM stops](#allow-until-the-vm-stops). A method that a matched rule does not
+   allow is blocked.
 6. The default.
 
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
+
+### Ask
+
+With the default **Ask for everything else**, the proxy holds a request that no rule decides. The request shows in
+**Requests that wait for you** on the network page of the session, with its method, host and port. Select one answer:
+
+- **Allow once**: allows this request. The later requests of the same HTTPS connection get the same answer.
+- **Allow until stop**: adds an Allow rule for the host [until the VM stops](#allow-until-the-vm-stops).
+- **Always allow**: saves an Allow rule for the host in the cage.
+- **Block**: blocks this request, and the later requests of the same HTTPS connection.
+
+The limits:
+
+- A request waits at most 30 seconds. With no answer, it is blocked with the reason `ask-timeout`.
+- A VM holds at most 32 waiting requests, and the app at most 128. A request over these limits is blocked at once with
+  the reason `ask-timeout`.
+- A rule change, Offline or a VM stop decides a waiting request at once.
+- Ask applies only to requests through the proxy. The proxy decides an HTTPS connection on each request in it, so the
+  method is known. A direct connection that ignores the proxy is still blocked.
+- An earlier app version cannot read a cage whose default is Ask. Set the default to Block or Allow before you go back
+  to such a version.
+- The **Test** button opens an ask too. It waits up to 40 seconds, so you can answer the ask. With no answer, the result
+  is "blocked: no answer to the ask in time".
+
+### Allow until the VM stops
+
+The card **Allowed until the VM stops** lists the Allow rules of the session's VM that are not saved. Add a host or a
+`*.` domain, or select **Allow until stop** on an ask. The X button removes a rule. These rules apply only to that VM.
+They end when the VM stops, and another VM of the same cage never gets them. Block rules, Offline and the
+always-blocked groups still have priority. These rules cannot have credentials or method limits.
+
+### Method limits
+
+The method button of an Allow rule shows **All methods** or its methods, for example `GET, HEAD`. Select it to choose
+the methods: GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS. **All methods** clears the list. A request with another
+method is blocked with the reason `method`, also under the default Allow or Ask. If more than one Allow rule matches a
+host, the request must have a method that each of them allows. A credential of the rule goes only with an allowed
+method. The method list stays when you switch a rule between Allow and Block, but a Block rule blocks all methods.
+
+### Profiles
+
+A profile is a named copy of the default and the rules of a cage, with their methods. It has no credentials. Use the
+**Profiles** card on the network page:
+
+- **Save current rules** saves the profile. A profile with the same name is replaced.
+- **Apply…** copies the profile into the current cage, after you confirm. The default and the rules of the profile
+  replace the ones of the cage. A rule of the cage that has a credential stays. If the profile has a rule for the same
+  target, the rule gets the action and the methods of the profile and keeps its credentials. Offline and the service on
+  this Mac do not change.
+- The X button deletes the profile. Cages that got the profile keep their rules.
+
+A change of a profile or of a cage never changes another cage. The app keeps at most 100 profiles in
+`network-profiles.json` in the zwinger data folder.
+
+### Policy as JSON
+
+**Effective policy as JSON** in the **Profiles** card shows the policy of the cage as read-only JSON: the order of the
+checks, Offline, the always-blocked groups, the service on this Mac, the rules, the rules until stop of each running VM,
+the default and the Ask limits. It has the credential names and templates of the rules, never a credential value.
 
 ### Allow from the map
 
@@ -101,7 +162,8 @@ The limits:
 The network page groups the requests by host. The newest host is first. For each host it shows:
 
 - the time, allowed or blocked, and the number of requests.
-- the latest request: method, path, status, reason and note. If a tool does not use the proxy, the reason is "direct
+- the latest request: method, path, status, reason and note. The reason `ask` is your answer to an ask, and
+  `ask-timeout` is an ask with no answer. If a tool does not use the proxy, the reason is "direct
   connection blocked — this tool ignores the proxy".
 - the credentials that the proxy added.
 - **Allow** or **Block** for the host, its wildcard or its service. For the service on this Mac, the host shows as

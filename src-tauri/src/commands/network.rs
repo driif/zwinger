@@ -4,10 +4,12 @@ use tauri_plugin_dialog::DialogExt as _;
 use crate::cage;
 use crate::cage::manager::Manager;
 use crate::cage::network::{LibraryCredential, NetTest};
+use crate::cage::policy::{AskAnswer, Profile};
 use crate::cage::undo::Removal;
 use crate::cage::vm_state;
 use crate::error::{Error, Result};
-use crate::network::{self, DefaultAction, Inject, RuleDraft, Service, Source};
+use crate::network::{self, DefaultAction, Inject, Rule, RuleDraft, Service, Source};
+use crate::proxy::ask::Ask;
 use crate::proxy::log::Entry;
 use crate::runtime::Microsandbox;
 use crate::secrets::SecretValue;
@@ -147,6 +149,59 @@ pub async fn stored_credentials(manager: Managed<'_>, cage_id: String) -> Result
 #[tauri::command]
 pub async fn test_network(manager: Managed<'_>, cage_id: String, host: String) -> Result<NetTest> {
     manager.test_network(&cage_id, &host).await
+}
+
+/// The pending asks of VM `vm_key`. None if it does not run.
+#[tauri::command]
+pub fn list_asks(manager: Managed<'_>, vm_key: String) -> Vec<Ask> {
+    manager.list_asks(&vm_key)
+}
+
+#[tauri::command]
+pub fn answer_ask(manager: Managed<'_>, vm_key: String, ask_id: String, answer: AskAnswer) -> Result<()> {
+    manager.answer_ask(&vm_key, &ask_id, answer)
+}
+
+/// The Allow rules until stop of VM `vm_key`. None if it does not run.
+#[tauri::command]
+pub fn temporary_rules(manager: Managed<'_>, vm_key: String) -> Vec<Rule> {
+    manager.temporary_rules(&vm_key)
+}
+
+#[tauri::command]
+pub fn add_temporary_rule(manager: Managed<'_>, vm_key: String, host: String) -> Result<Rule> {
+    manager.add_temporary_rule(&vm_key, &host)
+}
+
+#[tauri::command]
+pub fn remove_temporary_rule(manager: Managed<'_>, vm_key: String, rule_id: String) -> Result<()> {
+    manager.remove_temporary_rule(&vm_key, &rule_id)
+}
+
+#[tauri::command]
+pub async fn network_profiles(manager: Managed<'_>) -> Result<Vec<Profile>> {
+    manager.network_profiles()
+}
+
+#[tauri::command]
+pub async fn save_network_profile(manager: Managed<'_>, cage_id: String, name: String) -> Result<()> {
+    manager.save_network_profile(&cage_id, &name)
+}
+
+#[tauri::command]
+pub async fn apply_network_profile(manager: Managed<'_>, cage_id: String, name: String) -> Result<()> {
+    manager.apply_network_profile(&cage_id, &name)
+}
+
+#[tauri::command]
+pub async fn delete_network_profile(manager: Managed<'_>, name: String) -> Result<()> {
+    manager.delete_network_profile(&name)
+}
+
+/// The effective policy of the cage, read-only. It has no credential values.
+#[tauri::command]
+pub fn policy_json(manager: Managed<'_>, cage_id: String) -> Result<serde_json::Value> {
+    manager.policy_json(&cage_id)
 }
 
 #[cfg(test)]

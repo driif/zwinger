@@ -26,6 +26,10 @@ const TEMPLATE_LIMIT: usize = 512;
 pub(crate) const RULE_LIMIT: usize = 500;
 /// The most credentials of one rule.
 const CREDENTIAL_LIMIT: usize = 16;
+/// The most methods of one rule.
+const METHOD_LIMIT: usize = 16;
+/// The longest method token.
+const METHOD_LENGTH: usize = 32;
 /// Header fields that a credential may not set: the proxy or HTTP owns them.
 const OWNED_HEADERS: &[&str] = &[
     "host",
@@ -41,12 +45,15 @@ const OWNED_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
+/// `Ask` holds a request that no rule decides until the user answers it.
+/// An app from before `Ask` cannot read a config that has it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DefaultAction {
     #[default]
     Block,
     Allow,
+    Ask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,17 +118,24 @@ pub struct Rule {
     pub id: String,
     pub target: Target,
     pub action: Action,
+    /// The only methods that an Allow rule allows. `None`: all methods. A
+    /// Block rule blocks all methods and keeps the list inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<Credential>,
 }
 
-/// A new or changed rule from the UI. The credentials stay.
+/// A new or changed rule from the UI. The credentials stay; the methods
+/// are the ones of the draft.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleDraft {
     pub id: Option<String>,
     pub target: Target,
     pub action: Action,
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,7 +223,12 @@ fn allow_rules(domains: &[String]) -> Vec<Rule> {
 
 impl Rule {
     pub fn new(target: Target, action: Action) -> Self {
-        Self { id: uuid::Uuid::new_v4().to_string(), target, action, credentials: Vec::new() }
+        Self { id: uuid::Uuid::new_v4().to_string(), target, action, methods: None, credentials: Vec::new() }
+    }
+
+    /// An Allow rule with no method list allows each method.
+    pub fn permits(&self, method: &str) -> bool {
+        self.methods.as_ref().is_none_or(|m| m.iter().any(|x| x == method))
     }
 
     /// The service name or the host, as the log reason shows it.
@@ -261,6 +280,7 @@ impl NetworkPolicy {
     /// credentials of a changed rule stay. Returns the rule id.
     pub fn put_rule(&mut self, draft: RuleDraft) -> Result<String> {
         let target = normalize_target(draft.target)?;
+        let methods = draft.methods.map(normalize_methods).transpose()?;
         let existing = match &draft.id {
             Some(id) => Some(self.rules.iter().position(|r| r.id == *id).ok_or(Error::RuleNotFound)?),
             None => self.rules.iter().position(|r| r.target == target),
@@ -270,7 +290,7 @@ impl NetworkPolicy {
                 return Err(Error::InvalidRule("another rule has this target".into()));
             }
             // The kept credentials must fit the new target.
-            let changed = Rule { target, action: draft.action, ..self.rules[i].clone() };
+            let changed = Rule { target, action: draft.action, methods, ..self.rules[i].clone() };
             for credential in &changed.credentials {
                 check_holder(&changed, &credential.name)?;
             }
@@ -281,7 +301,7 @@ impl NetworkPolicy {
         if self.rules.len() >= RULE_LIMIT {
             return Err(Error::InvalidRule(format!("a project has at most {RULE_LIMIT} rules")));
         }
-        let rule = Rule::new(target, draft.action);
+        let rule = Rule { methods, ..Rule::new(target, draft.action) };
         let id = rule.id.clone();
         self.rules.push(rule);
         Ok(id)
@@ -320,6 +340,11 @@ impl NetworkPolicy {
                 return Err(Error::InvalidRule(format!("{} is in the list twice", rule.label())));
             }
             normalize_target(rule.target.clone())?;
+            if let Some(methods) = &rule.methods
+                && normalize_methods(methods.clone())? != *methods
+            {
+                return Err(Error::InvalidRule(format!("the methods of {} are not in normal form", rule.label())));
+            }
             if rule.credentials.len() > CREDENTIAL_LIMIT {
                 return Err(Error::InvalidRule(format!("a rule has at most {CREDENTIAL_LIMIT} credentials")));
             }
@@ -432,7 +457,7 @@ fn is_owned(pattern: &str) -> bool {
     }
 }
 
-fn normalize_target(target: Target) -> Result<Target> {
+pub(crate) fn normalize_target(target: Target) -> Result<Target> {
     match target {
         Target::Service { id } => match service(&id) {
             Some(_) => Ok(Target::Service { id }),
@@ -440,6 +465,28 @@ fn normalize_target(target: Target) -> Result<Target> {
         },
         Target::Host { host } => Ok(Target::Host { host: cage::domain(&host)? }),
     }
+}
+
+/// Uppercase HTTP method tokens, each once, in the given order. The list
+/// may not be empty: a rule that allows no method is a Block rule.
+pub fn normalize_methods(methods: Vec<String>) -> Result<Vec<String>> {
+    if methods.is_empty() {
+        return Err(Error::InvalidRule("name at least one method, or allow all methods".into()));
+    }
+    if methods.len() > METHOD_LIMIT {
+        return Err(Error::InvalidRule(format!("a rule has at most {METHOD_LIMIT} methods")));
+    }
+    let mut normal: Vec<String> = Vec::new();
+    for method in methods {
+        let method = method.trim().to_ascii_uppercase();
+        if method.len() > METHOD_LENGTH || !secrets::is_token(&method) {
+            return Err(Error::InvalidRule(format!("{method:?} is not an HTTP method")));
+        }
+        if !normal.contains(&method) {
+            normal.push(method);
+        }
+    }
+    Ok(normal)
 }
 
 impl Credential {
@@ -711,7 +758,7 @@ pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
     let refresh = login::denied_hosts(&cage.logins);
     let tokeninfo = cage.logins.iter().any(|l| l.origin == Origin::HostLogin { agent: AgentKind::Gemini });
     // The agents use HTTPS, so port 443; no proxy port is known here.
-    let ctx = decide::Context { policy: &cage.network, refresh: &refresh, tokeninfo, listener: 0 };
+    let ctx = decide::Context { policy: &cage.network, temporary: &[], refresh: &refresh, tokeninfo, listener: 0 };
     needs
         .into_iter()
         .filter_map(|(agent, host)| {
@@ -860,7 +907,7 @@ mod tests {
     #[test]
     fn put_rule_changes_a_rule_of_the_same_target() {
         let mut policy = NetworkPolicy::default();
-        let draft = |target, action| RuleDraft { id: None, target, action };
+        let draft = |target, action| RuleDraft { id: None, target, action, methods: None };
         let id = policy.put_rule(draft(host(" Example.COM "), Action::Allow)).unwrap();
         assert_eq!(policy.put_rule(draft(host("example.com"), Action::Block)).unwrap(), id);
         assert_eq!(targets(&policy), [(host("example.com"), Action::Block)]);
@@ -868,7 +915,7 @@ mod tests {
             assert!(policy.put_rule(draft(bad, Action::Allow)).is_err());
         }
         let other = policy.put_rule(draft(host("b.io"), Action::Allow)).unwrap();
-        let moved = RuleDraft { id: Some(other), target: host("example.com"), action: Action::Allow };
+        let moved = RuleDraft { id: Some(other), target: host("example.com"), action: Action::Allow, methods: None };
         assert!(matches!(policy.put_rule(moved), Err(Error::InvalidRule(_))));
         policy.check().unwrap();
     }

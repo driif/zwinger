@@ -6,6 +6,7 @@ import {
   type DefaultAction,
   type Inject,
   type Removal,
+  type Rule,
   type Target,
 } from "../../shared/api.ts";
 
@@ -38,10 +39,13 @@ export const setHostPort = (cageId: string, port: number | null) =>
 /** The name of this Mac in the guest. The host port grant opens one port of it. */
 export const GUEST_HOST = "host.microsandbox.internal";
 
-/** No `rule.id`: adds the rule, or changes the rule with the same target. The credentials stay. Resolves to the rule id. */
+/**
+ * No `rule.id`: adds the rule, or changes the rule with the same target. The credentials stay. `methods` replaces
+ * the method list; absent allows all methods. Resolves to the rule id.
+ */
 export const putRule = (
   cageId: string,
-  rule: { id?: string; target: Target; action: Action },
+  rule: { id?: string; target: Target; action: Action; methods?: string[] },
 ) => call<string>("put_rule", { cageId, rule });
 
 /** The receipt can undo the removal with `undoRemoval` until it expires. */
@@ -101,7 +105,10 @@ export interface NetEvent {
   down: number;
   ms: number;
   allowed: boolean;
-  /** `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo`, `host-port`, `misdirected`, `method` or `direct`. */
+  /**
+   * `offline`, `always-blocked`, `rule:<name>`, `default`, `tokeninfo`, `host-port`, `misdirected`, `method`, `ask`,
+   * `ask-timeout` or `direct`.
+   */
   reason: string;
   /** The names of the injected credentials. */
   credentials: string[];
@@ -122,3 +129,57 @@ export const onNetEvent = (
   listen<{ vmKey: string; event: NetEvent }>("net-event", ({ payload }) =>
     handler(payload.vmKey, payload.event),
   );
+
+/** A request that the Ask default holds until the user answers. */
+export interface Ask {
+  id: string;
+  host: string;
+  port: number;
+  method: string;
+  /** In ms since the epoch. Then the proxy blocks the request. */
+  expiresAt: number;
+}
+
+/** `once` allows this request and its connection, `untilStop` adds a rule until the VM stops, `always` saves a rule. */
+export type AskAnswer = "once" | "untilStop" | "always" | "block";
+
+export const listAsks = (vmKey: string) => call<Ask[]>("list_asks", { vmKey });
+
+export const answerAsk = (vmKey: string, askId: string, answer: AskAnswer) =>
+  call<void>("answer_ask", { vmKey, askId, answer });
+
+/** The Allow rules of the VM until it stops. They are never saved. */
+export const temporaryRules = (vmKey: string) => call<Rule[]>("temporary_rules", { vmKey });
+
+export const addTemporaryRule = (vmKey: string, host: string) =>
+  call<Rule>("add_temporary_rule", { vmKey, host });
+
+export const removeTemporaryRule = (vmKey: string, ruleId: string) =>
+  call<void>("remove_temporary_rule", { vmKey, ruleId });
+
+/** Resolves to the function that stops the listener. The asks or the rules until stop of `vmKey` changed. */
+export const onNetAsks = (handler: (vmKey: string) => void) =>
+  listen<string>("net-asks", ({ payload }) => handler(payload));
+
+/** A named copy of a default and rules, with no credentials. */
+export interface Profile {
+  name: string;
+  default: DefaultAction;
+  rules: { target: Target; action: Action; methods?: string[] }[];
+}
+
+export const networkProfiles = () => call<Profile[]>("network_profiles");
+
+/** Replaces the profile with the same name. */
+export const saveNetworkProfile = (cageId: string, name: string) =>
+  call<void>("save_network_profile", { cageId, name });
+
+/** Replaces the default and the rules of the cage. Rules with a credential stay. */
+export const applyNetworkProfile = (cageId: string, name: string) =>
+  call<void>("apply_network_profile", { cageId, name });
+
+export const deleteNetworkProfile = (name: string) =>
+  call<void>("delete_network_profile", { name });
+
+/** The effective policy of the cage, read-only. It has no credential values. */
+export const policyJson = (cageId: string) => call<unknown>("policy_json", { cageId });

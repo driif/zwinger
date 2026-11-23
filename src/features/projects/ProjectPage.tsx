@@ -107,7 +107,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   const exactBlock = cage.network.rules.some(
     (rule) => rule.action === "block" && rule.target.kind === "host" && rule.target.host === "api.anthropic.com",
   );
-  const needsAllow = claude && !exactAllow && (cage.network.default === "block" || exactBlock);
+  const needsAllow = claude && !exactAllow && (cage.network.default !== "allow" || exactBlock);
   const blockedOverride = claude && allowRule && !decide(cage.network, "api.anthropic.com", catalog).allowed;
   if (!agent) return null;
   const name = AGENT_NAMES[kind];
@@ -564,7 +564,7 @@ export function ProjectPage({
                           <dd>
                             {cage.network.offline
                               ? "Offline"
-                              : `${cage.network.default === "allow" ? "Allow" : "Block"} everything else, ${cage.network.rules.length} rules`}
+                              : `${{ allow: "Allow", block: "Block", ask: "Ask for" }[cage.network.default]} everything else, ${cage.network.rules.length} rules`}
                           </dd>
                         </div>
                       )}

@@ -79,6 +79,12 @@ pub enum Error {
     SecretNotFound(String),
     #[error("rule not found")]
     RuleNotFound,
+    #[error("the ask is no longer pending: it timed out, or its request or cage ended")]
+    AskNotFound,
+    #[error("invalid network profile: {0}")]
+    InvalidProfile(String),
+    #[error("network profile not found")]
+    ProfileNotFound,
     #[error("invalid rule: {0}")]
     InvalidRule(String),
     #[error("a host port must be 1-65535, not {0}")]
