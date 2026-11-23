@@ -20,10 +20,11 @@ use crate::error::{Error, Result};
 use crate::run_git;
 use crate::runtime::SandboxRuntime;
 use crate::session::Task;
+use crate::session::TaskAgent;
 use crate::task_agents::{self, Access, Exec, Failure, Limits, Reply, SnapshotError};
-use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, TURNS, append_durable, read_record, stage_key};
-use crate::task_participants::participants;
-use crate::task_recovery::{self, Checkpoint, Decisions, Fence, Recovered};
+use crate::task_artifacts::{NO_GIT_DIFF, RoundWriter, append_durable, read_record, stage_key};
+use crate::task_participants::{INDEPENDENT, independent, participants};
+use crate::task_recovery::{self, Checkpoint, Decisions, Fence, INDEPENDENT_GROUP, Recovered};
 
 const PLAN: &str = include_str!("task_runs/prompts/plan.md");
 const EXCHANGE: &str = include_str!("task_runs/prompts/exchange.md");
@@ -32,6 +33,7 @@ const IMPLEMENT: &str = include_str!("task_runs/prompts/implement.md");
 const CROSSREVIEW: &str = include_str!("task_runs/prompts/crossreview.md");
 const REVISE: &str = include_str!("task_runs/prompts/revise.md");
 const FINAL: &str = include_str!("task_runs/prompts/final.md");
+const INDEPENDENT_REVIEW: &str = include_str!("task_runs/prompts/independent.md");
 /// The live records of the active stage that a late room still gets.
 const RECENT: usize = 2000;
 const LIVE_QUEUE: usize = 1024;
@@ -115,17 +117,13 @@ pub struct Status {
     pub base: Option<String>,
 }
 
+/// What a run uses of its recorded options.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Exchange turns before a tiebreak.
     pub turns: u32,
+    /// The limits of each agent call and each gate command, not of a stage.
     pub limits: Limits,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self { turns: TURNS, limits: Limits { idle: Duration::from_secs(600), hard: Duration::from_secs(1800) } }
-    }
 }
 
 /// A record of the active stage, from one agent.
@@ -558,6 +556,8 @@ struct Round {
     implementer: Option<usize>,
     verdict: Option<String>,
     finals: Vec<(usize, Value)>,
+    /// The reply of the independent reviewer.
+    independent: Option<Value>,
     backlog: Vec<String>,
     violations: Vec<String>,
     /// `Some(false)` once a check found that it cannot see changes.
@@ -809,11 +809,14 @@ impl<R: SandboxRuntime> Io<R> {
     }
 
     async fn call(&self, i: usize, stage: &str, access: Access, prompt: &str) -> Reply {
-        let name = self.name(i).to_owned();
-        let live = |record: Value| self.live.send(&name, stage, record);
+        self.call_agent(&self.task.agents[i], self.name(i), stage, access, prompt).await
+    }
+
+    /// One call of `agent`, whose live records and files use `name`.
+    async fn call_agent(&self, agent: &TaskAgent, name: &str, stage: &str, access: Access, prompt: &str) -> Reply {
+        let live = |record: Value| self.live.send(name, stage, record);
         let mut cancel = self.cancel.clone();
-        let mut reply =
-            self.exec.call_json(&self.task.agents[i], access, prompt, self.config.limits, &mut cancel, &live).await;
+        let mut reply = self.exec.call_json(agent, access, prompt, self.config.limits, &mut cancel, &live).await;
         // A process that ends because of a cancel, such as with a stopped VM, is no degraded agent.
         if reply.failure.is_some() && *self.cancel.borrow() {
             reply.failure = Some(Failure::Cancelled);
@@ -1039,7 +1042,10 @@ impl<R: SandboxRuntime> Actor<R> {
 
     /// Writes the raw reply and its JSON, or records the failure. Returns the JSON.
     fn record(&mut self, i: usize, stage: &str, base: &str, reply: Reply) -> Option<Value> {
-        let name = self.name(i);
+        self.record_as(&self.name(i), stage, base, reply)
+    }
+
+    fn record_as(&mut self, name: &str, stage: &str, base: &str, reply: Reply) -> Option<Value> {
         if !reply.raw.is_empty() {
             self.book.writer.write(&format!("{base}.raw"), reply.raw.as_bytes());
         }
@@ -1249,6 +1255,8 @@ impl<R: SandboxRuntime> Actor<R> {
         self.flow.revision = json("revision.json");
         let finals = checkpoint.outcomes.get("final").filter(|_| done("final")).into_iter().flatten();
         self.run.finals = finals.filter_map(|n| Some((index(n)?, json(&format!("final-{n}.json"))?))).collect();
+        let reviewed = checkpoint.outcomes.get(INDEPENDENT_GROUP).is_some_and(|r| r.iter().any(|n| n == INDEPENDENT));
+        self.run.independent = json("independent-review.json").filter(|_| reviewed && done(INDEPENDENT_GROUP));
 
         // The budget of the source is the start of this budget. An accepted
         // contribution with no message line stays reserved: a retry with the
@@ -1337,7 +1345,8 @@ impl<R: SandboxRuntime> Actor<R> {
             let files = match group.as_str() {
                 "crossreview" => vec!["crossreview.json".to_owned()],
                 "final" => reported.iter().map(|n| format!("final-{n}.json")).collect(),
-                gates => vec![format!("{gates}.json")],
+                // `gates`, `revision-gates` and `independent-review`.
+                group => vec![format!("{group}.json")],
             };
             for file in files {
                 self.flow.artifacts.remove(&file);
@@ -1361,7 +1370,10 @@ impl<R: SandboxRuntime> Actor<R> {
             }
             None => String::new(),
         };
-        self.run.finals.clear();
+        if dropped.iter().any(|g| g == "final") {
+            self.run.finals.clear();
+        }
+        self.run.independent = None;
         let stage = self.flow.done.iter().rev().find(|g| *g != "decision").cloned();
         self.book.set(|s| s.stage = stage);
         let labels: Vec<String> = dropped.iter().map(|g| crate::task_artifacts::stage_label(g)).collect();
@@ -1449,7 +1461,8 @@ impl<R: SandboxRuntime> Actor<R> {
                 self.gates("revision-gates").await?;
             }
         }
-        self.finals().await
+        self.finals().await?;
+        self.independent_review().await
     }
 
     /// 1. Blind plans, in parallel.
@@ -1877,6 +1890,65 @@ impl<R: SandboxRuntime> Actor<R> {
         self.checkpoint(Some("final"), &files)
     }
 
+    /// Stage 9, the independent review, if the task has a reviewer: a fresh
+    /// read-only call outside the pair. It sees the change, the gates and
+    /// the review history, but not the final reviews of the pair.
+    async fn independent_review(&mut self) -> std::result::Result<(), Stop> {
+        let Some(agent) = self.io.task.options.independent.clone() else {
+            return Ok(());
+        };
+        if self.done(INDEPENDENT_GROUP) {
+            return Ok(());
+        }
+        self.stage(INDEPENDENT_GROUP, INDEPENDENT_GROUP)?;
+        let history = history(self.flow.review.as_ref(), self.flow.revision.as_ref());
+        let change = self.io.change(self.run.base.as_deref()).await;
+        let prompt = fit(
+            INDEPENDENT_REVIEW,
+            &[
+                ("CONTEXT", &self.context()),
+                ("MESSAGES", &self.messages()),
+                ("PLAN", &self.flow.plan),
+                ("HISTORY", &history),
+                ("GATES", &self.flow.gates),
+                ("CHANGE", &change),
+            ],
+        );
+        self.book.writer.write("independent-review.prompt.md", prompt.as_bytes());
+        let reply = self
+            .read_only(INDEPENDENT_GROUP, async |io: &Io<R>| {
+                io.call_agent(&agent, INDEPENDENT, INDEPENDENT_GROUP, Access::Read, &prompt).await
+            })
+            .await?;
+        let review = self.record_as(INDEPENDENT, "independent review", "independent-review", reply);
+        if self.book.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let files = match &review {
+            Some(review) => {
+                let verdict = match approval(review) {
+                    Ok(true) => "approved".to_owned(),
+                    Ok(false) => "denied".to_owned(),
+                    Err(why) => format!("not valid: {why}"),
+                };
+                self.book.writer.event("independent_review", &verdict);
+                vec!["independent-review.json".to_owned()]
+            }
+            None => {
+                self.book.writer.event("agent_degraded", &format!("{INDEPENDENT} review returned no JSON"));
+                Vec::new()
+            }
+        };
+        self.flow
+            .outcomes
+            .insert(INDEPENDENT_GROUP.to_owned(), review.iter().map(|_| INDEPENDENT.to_owned()).collect());
+        self.run.independent = review;
+        if let Some(fence) = self.flow.read_fence.take() {
+            self.flow.fences.insert(INDEPENDENT_GROUP.to_owned(), fence);
+        }
+        self.checkpoint(Some(INDEPENDENT_GROUP), &files)
+    }
+
     /// Saves the change of the run after `stage`, so the room can show it
     /// with no VM. A failed read says so and keeps the last saved diff.
     async fn save_diff(&mut self, stage: &str, artifact: &str) {
@@ -1958,25 +2030,44 @@ impl<R: SandboxRuntime> Actor<R> {
         });
     }
 
-    /// As duo's manifest: `ship` only if both final reviewers set it.
+    /// As duo's manifest: `ship` only if both final reviewers set it. With
+    /// an independent reviewer, its valid approval is necessary too.
     fn manifest(&self, stopped: Option<&str>) -> Value {
         let names = &self.io.names;
         let reported: Vec<&String> = self.run.finals.iter().map(|(i, _)| &names[*i]).collect();
         let mirror_error = self.book.writer.mirror_error();
+        let reviewer = self.io.task.options.independent.as_ref();
+        let verdict = reviewer.map(|_| match self.run.independent.as_ref().map(approval) {
+            None => Err("the independent reviewer gave no review".to_owned()),
+            Some(Ok(true)) => Ok(()),
+            Some(Ok(false)) => Err("the independent reviewer did not approve".to_owned()),
+            Some(Err(why)) => Err(format!("the independent review is not valid ({why})")),
+        });
         let ship = stopped.is_none()
             && mirror_error.is_none()
             && reported.len() == 2
-            && self.run.finals.iter().all(|(_, f)| f["ship"] == true);
+            && self.run.finals.iter().all(|(_, f)| f["ship"] == true)
+            && verdict.as_ref().is_none_or(|v| v.is_ok());
         let blocking: Vec<Value> =
             self.run.finals.iter().flat_map(|(_, f)| f["blocking"].as_array().cloned().unwrap_or_default()).collect();
         let ship_basis = if let Some(e) = mirror_error {
             format!("withheld — the harness copy failed: {e}")
-        } else if reported.len() == 2 {
-            "both reviewers".to_owned()
-        } else {
+        } else if reported.len() != 2 {
             let who: Vec<&str> = reported.iter().map(|s| s.as_str()).collect();
             format!("withheld — only {} reviewed", if who.is_empty() { "nobody".to_owned() } else { who.join(", ") })
+        } else {
+            match &verdict {
+                None => "both reviewers".to_owned(),
+                Some(Ok(())) => "both reviewers and the independent reviewer".to_owned(),
+                Some(Err(why)) => format!("withheld — {why}"),
+            }
         };
+        let independent_verdict = reviewer.map(|_| match self.run.independent.as_ref().map(approval) {
+            None => "missing",
+            Some(Ok(true)) => "approved",
+            Some(Ok(false)) => "denied",
+            Some(Err(_)) => "invalid",
+        });
         let task_met: serde_json::Map<String, Value> =
             self.run.finals.iter().map(|(i, f)| (names[*i].clone(), f["task_met"].clone())).collect();
         json!({
@@ -1989,6 +2080,8 @@ impl<R: SandboxRuntime> Actor<R> {
             "degraded": (0..2).filter(|i| !self.run.planned.contains(i)).map(|i| names[i].clone()).collect::<Vec<_>>(),
             "crossreview_verdict": self.run.verdict,
             "final_reviewers": reported,
+            "independent": reviewer.map(independent),
+            "independent_verdict": independent_verdict,
             "ship": ship,
             "ship_basis": ship_basis,
             "blocking": blocking,
@@ -2122,6 +2215,25 @@ fn gates_text(results: &Value) -> String {
     }
 }
 
+/// The verdict of an independent review: `Ok(true)` approves and
+/// `Ok(false)` denies. A review without the fields, or one that approves
+/// with blocking findings, is not valid: it is no approval.
+fn approval(review: &Value) -> std::result::Result<bool, &'static str> {
+    let Some(ship) = review["ship"].as_bool() else {
+        return Err("ship is not true or false");
+    };
+    let Some(blocking) = review["blocking"].as_array() else {
+        return Err("blocking is not a list");
+    };
+    if !review["task_met"].is_string() {
+        return Err("task_met is not text");
+    }
+    if ship && !blocking.is_empty() {
+        return Err("it approves with blocking findings");
+    }
+    Ok(ship)
+}
+
 /// Both agreed, on the same agent of the run. Anything else is no agreement.
 pub(crate) fn converged(names: &[String; 2], replies: &[Option<Value>; 2]) -> Option<usize> {
     let picks: Vec<usize> = replies
@@ -2209,7 +2321,7 @@ pub(crate) mod tests {
     use crate::agent::AgentKind;
     use crate::runtime::fake::{FakePipe, FakeRuntime, FakeVm};
     use crate::runtime::{PipeEvent, PipeInput};
-    use crate::session::TaskAgent;
+    use crate::session::RunOptions;
     use crate::task_agents::{claude_result_line, codex_result_lines, pi_result_line};
     use crate::task_artifacts::{Mirror, read_diff, read_room};
     use crate::task_recovery::{RunRecord, TaskRuns};
@@ -2237,6 +2349,7 @@ pub(crate) mod tests {
         Crossreview,
         Revise,
         Final,
+        Independent,
     }
 
     fn stage_of(prompt: &str) -> Stage {
@@ -2249,6 +2362,7 @@ pub(crate) mod tests {
             ("# Review", Stage::Crossreview),
             ("# Revise", Stage::Revise),
             ("# Final", Stage::Final),
+            ("# Independent review", Stage::Independent),
         ]
         .into_iter()
         .find(|(head, _)| first.starts_with(head))
@@ -2411,7 +2525,7 @@ pub(crate) mod tests {
             Stage::Implement => done(),
             Stage::Crossreview => review("accept"),
             Stage::Revise => revised(),
-            Stage::Final => ship(true),
+            Stage::Final | Stage::Independent => ship(true),
         }
     }
 
@@ -2456,11 +2570,24 @@ pub(crate) mod tests {
             TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
             TaskAgent { kind: AgentKind::Codex, model: None },
         ];
-        start_agents(agents, idle, sh, script, shared_vm)
+        start_agents(agents, RunOptions::default(), idle, sh, script, shared_vm)
+    }
+
+    /// The default pair with the run options `options`.
+    pub(crate) fn start_options(
+        options: RunOptions,
+        script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
+    ) -> Started {
+        let agents = [
+            TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
+            TaskAgent { kind: AgentKind::Codex, model: None },
+        ];
+        start_agents(agents, options, Duration::from_secs(5), no_git, script, false)
     }
 
     fn start_agents(
         agents: [TaskAgent; 2],
+        options: RunOptions,
         idle: Duration,
         sh: impl Fn(&str) -> Fake + Send + Sync + 'static,
         script: impl Fn(&str, Stage, &str) -> Fake + Send + Sync + 'static,
@@ -2481,11 +2608,16 @@ pub(crate) mod tests {
             agents,
             gates: vec!["pnpm build".into()],
             workdir: "/workspace".into(),
+            options,
         };
         let registry = Registry::default();
-        let config = Config { turns: 2, limits: Limits { idle, hard: Duration::from_secs(10) } };
+        // The tests use limits below one second, which the task cannot set.
+        let config = Config { turns: task.options.turns, limits: Limits { idle, hard: Duration::from_secs(10) } };
+        let mut record = RunRecord::new(&task);
+        record.config.idle_ms = idle.as_millis() as u64;
+        record.config.hard_ms = 10_000;
         let writer = RoundWriter::create(dir.clone(), Some(mirror)).unwrap();
-        writer.write_durable(task_recovery::RUN, &serde_json::to_vec(&RunRecord::new(&task, config)).unwrap()).unwrap();
+        writer.write_durable(task_recovery::RUN, &serde_json::to_vec(&record).unwrap()).unwrap();
         let handle = registry.start(Spec {
             session_id: "s".into(),
             task,
@@ -2624,6 +2756,7 @@ pub(crate) mod tests {
         };
         start_agents(
             agents,
+            RunOptions::default(),
             Duration::from_secs(5),
             no_git,
             move |_, stage, prompt| script(&me(prompt), stage, prompt),
@@ -4708,5 +4841,283 @@ pub(crate) mod tests {
                 None => assert!(load(&src).is_ok(), "{messages}"),
             }
         }
+    }
+
+    // --- run options -------------------------------------------------------
+
+    fn turns(n: u32) -> RunOptions {
+        RunOptions { turns: n, ..RunOptions::default() }
+    }
+
+    /// A claude reviewer with another model than the claude participant.
+    fn reviewed() -> RunOptions {
+        RunOptions {
+            independent: Some(TaskAgent { kind: AgentKind::Claude, model: Some("sonnet".into()) }),
+            ..RunOptions::default()
+        }
+    }
+
+    fn exchange_ids(run: &Started) -> Vec<(String, &'static str)> {
+        states(&run.dir).into_iter().filter(|(id, _)| id.starts_with("exchange-")).collect()
+    }
+
+    fn tiebreak_to(implementer: &str) -> Fake {
+        Fake::Reply(fenced(
+            json!({ "implementer": implementer, "why": "It knows the files.", "plan": "The tiebreak plan.", "open_questions": [] }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn zero_turns_go_from_the_plans_to_the_tiebreak() {
+        let run = start_options(turns(0), |agent, stage, prompt| match stage {
+            Stage::Tiebreak => tiebreak_to("codex"),
+            _ => happy(agent, stage, prompt),
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["ship"], true);
+        assert!(calls_of(&run, Stage::Exchange).is_empty());
+        assert_eq!(calls_of(&run, Stage::Tiebreak).len(), 1);
+        assert_eq!(calls_of(&run, Stage::Implement)[0].agent, "codex");
+        assert!(exchange_ids(&run).is_empty());
+        assert!(states(&run.dir).contains(&("tiebreak".to_owned(), "done")));
+        let record: Value = serde_json::from_slice(&std::fs::read(run.dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(record["config"]["turns"], 0);
+    }
+
+    #[tokio::test]
+    async fn one_turn_and_three_turns_run_the_configured_count() {
+        for count in [1, 3] {
+            let run = start_options(turns(count), |agent, stage, prompt| match stage {
+                Stage::Exchange => turn(agent, false),
+                Stage::Tiebreak => tiebreak_to("claude"),
+                _ => happy(agent, stage, prompt),
+            });
+            settled(&run).await;
+            assert_eq!(calls_of(&run, Stage::Exchange).len(), 2 * count as usize);
+            assert_eq!(calls_of(&run, Stage::Tiebreak).len(), 1);
+            let expected: Vec<(String, &str)> = (1..=count).map(|n| (format!("exchange-{n}"), "done")).collect();
+            assert_eq!(exchange_ids(&run), expected);
+            assert_eq!(read_room(&run.dir).turns.len(), count as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_early_agreement_or_a_walkover_skips_the_other_configured_turns() {
+        let run = start_options(turns(3), happy);
+        settled(&run).await;
+        assert_eq!(calls_of(&run, Stage::Exchange).len(), 2);
+        assert_eq!(
+            exchange_ids(&run),
+            [
+                ("exchange-1".to_owned(), "done"),
+                ("exchange-2".to_owned(), "skipped"),
+                ("exchange-3".to_owned(), "skipped")
+            ]
+        );
+        assert!(states(&run.dir).contains(&("tiebreak".to_owned(), "skipped")));
+
+        let options = RunOptions { turns: 3, ..reviewed() };
+        let run = start_options(
+            options,
+            |agent, stage, prompt| {
+                if agent == "codex" { Fake::Exit(1) } else { happy(agent, stage, prompt) }
+            },
+        );
+        let manifest = settled(&run).await;
+        assert!(calls_of(&run, Stage::Exchange).is_empty());
+        assert!(exchange_ids(&run).iter().all(|(_, state)| *state == "skipped"));
+        assert_eq!(exchange_ids(&run).len(), 3);
+        // The independent approval does not replace a missing final review.
+        assert_eq!(read_room(&run.dir).independent.unwrap().verdict.as_deref(), Some("approved"));
+        assert_eq!(
+            (manifest["ship"].clone(), manifest["ship_basis"].clone()),
+            (json!(false), json!("withheld — only claude reviewed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_independent_reviewer_approves_in_its_own_role() {
+        let run = start_options(reviewed(), |agent, stage, prompt| match stage {
+            Stage::Final => {
+                Fake::Reply(fenced(json!({ "ship": true, "blocking": [], "residual": [], "task_met": "PAIR-VOTE" })))
+            }
+            Stage::Independent => Fake::Reply(fenced(
+                json!({ "ship": true, "blocking": [], "residual": ["A note."], "task_met": "Done." }),
+            )),
+            _ => happy(agent, stage, prompt),
+        });
+        let manifest = settled(&run).await;
+        assert_eq!(manifest["ship"], true);
+        assert_eq!(manifest["ship_basis"], "both reviewers and the independent reviewer");
+        assert_eq!(manifest["independent_verdict"], "approved");
+        assert_eq!(manifest["independent"], json!({ "id": "independent", "kind": "claude", "model": "sonnet" }));
+        assert_eq!(manifest["participants"].as_array().unwrap().len(), 2);
+
+        // One fresh read-only call with its own model. It gets the change and
+        // the gates, but not the votes of the pair.
+        let calls = calls_of(&run, Stage::Independent);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].agent, "claude");
+        assert!(calls[0].argv.contains(&"sonnet".to_owned()));
+        assert!(calls[0].argv.contains(&"--disallowedTools".to_owned()));
+        assert!(calls[0].prompt.contains("pnpm build") && calls[0].prompt.contains("## The change"));
+        assert!(!calls[0].prompt.contains("PAIR-VOTE"));
+        assert!(!calls[0].prompt.contains("### codex — opening plan"));
+
+        // The same kind as a participant writes its own file.
+        let file =
+            |name: &str| -> Value { serde_json::from_slice(&std::fs::read(run.dir.join(name)).unwrap()).unwrap() };
+        assert_eq!(file("final-claude.json")["task_met"], "PAIR-VOTE");
+        assert_eq!(file("independent-review.json")["task_met"], "Done.");
+        assert!(run.mirror.join("independent-review.json").is_file());
+        let checkpoint = file("checkpoint.json");
+        assert_eq!(checkpoint["groups"].as_array().unwrap().last().unwrap(), "independent-review");
+        assert_eq!(checkpoint["outcomes"]["independent-review"], json!(["independent"]));
+
+        let room = read_room(&run.dir);
+        assert_eq!(room.agents, ["claude", "codex"]);
+        assert_eq!(room.finals.iter().map(|f| f.agent.as_str()).collect::<Vec<_>>(), ["claude", "codex"]);
+        let independent = room.independent.unwrap();
+        assert_eq!(independent.reviewer.id, "independent");
+        assert_eq!(independent.reviewer.model.as_deref(), Some("sonnet"));
+        assert_eq!((independent.state, independent.verdict.as_deref()), ("done", Some("approved")));
+        assert_eq!(independent.review.unwrap().residual, ["A note."]);
+        assert!(states(&run.dir).ends_with(&[("final".to_owned(), "done"), ("independent-review".to_owned(), "done")]));
+        assert!(room.messages.iter().any(|m| m.from == "independent" && m.stage == "independent-review"));
+        assert_eq!(room.outcome.unwrap().ship_basis, "both reviewers and the independent reviewer");
+    }
+
+    #[tokio::test]
+    async fn a_denied_malformed_or_contradictory_review_withholds_ship() {
+        let blocking = json!([{ "what": "Bug.", "why": "Wrong.", "where": "a.rs" }]);
+        let cases = [
+            (
+                json!({ "ship": false, "blocking": blocking, "residual": [], "task_met": "No." }),
+                "denied",
+                "withheld — the independent reviewer did not approve",
+            ),
+            (
+                json!({ "ship": true, "blocking": blocking, "residual": [], "task_met": "Yes." }),
+                "invalid",
+                "withheld — the independent review is not valid (it approves with blocking findings)",
+            ),
+            (
+                json!({ "ship": true }),
+                "invalid",
+                "withheld — the independent review is not valid (blocking is not a list)",
+            ),
+            (
+                json!({ "ship": "yes", "blocking": [], "task_met": "Yes." }),
+                "invalid",
+                "withheld — the independent review is not valid (ship is not true or false)",
+            ),
+            (
+                json!({ "ship": true, "blocking": [] }),
+                "invalid",
+                "withheld — the independent review is not valid (task_met is not text)",
+            ),
+            (
+                json!({ "verdict": "accept" }),
+                "invalid",
+                "withheld — the independent review is not valid (ship is not true or false)",
+            ),
+        ];
+        for (reply, verdict, basis) in cases {
+            let text = fenced(reply.clone());
+            let run = start_options(reviewed(), move |agent, stage, prompt| match stage {
+                Stage::Independent => Fake::Reply(text.clone()),
+                _ => happy(agent, stage, prompt),
+            });
+            let manifest = settled(&run).await;
+            assert_eq!(run.handle.status().state, RunState::Done, "{reply}");
+            assert_eq!(manifest["ship"], false, "{reply}");
+            assert_eq!(manifest["independent_verdict"], verdict, "{reply}");
+            assert_eq!(manifest["ship_basis"], basis, "{reply}");
+            // No automatic repair loop: the pair does not run again.
+            assert_eq!(calls_of(&run, Stage::Revise).len(), 0);
+            assert_eq!(calls_of(&run, Stage::Independent).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_reviewer_withholds_ship() {
+        let agents = [
+            TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
+            TaskAgent { kind: AgentKind::Codex, model: None },
+        ];
+        let run = start_agents(
+            agents,
+            reviewed(),
+            Duration::from_millis(300),
+            no_git,
+            |agent, stage, prompt| {
+                if stage == Stage::Independent { Fake::Hang } else { happy(agent, stage, prompt) }
+            },
+            false,
+        );
+        let manifest = settled(&run).await;
+        assert_eq!(run.handle.status().state, RunState::Done);
+        assert_eq!(manifest["ship"], false);
+        assert_eq!(manifest["independent_verdict"], "missing");
+        assert_eq!(manifest["ship_basis"], "withheld — the independent reviewer gave no review");
+        assert!(!run.dir.join("independent-review.json").exists());
+        let room = read_room(&run.dir);
+        assert!(room.degraded.iter().any(|d| d.stage == "independent-review"));
+        assert_eq!(room.independent.unwrap().verdict.as_deref(), Some("missing"));
+    }
+
+    #[tokio::test]
+    async fn without_a_reviewer_the_pair_rule_is_unchanged() {
+        let run = start(happy);
+        let manifest = settled(&run).await;
+        assert_eq!((manifest["ship"].clone(), manifest["ship_basis"].clone()), (json!(true), json!("both reviewers")));
+        assert_eq!(
+            (manifest["independent"].clone(), manifest["independent_verdict"].clone()),
+            (Value::Null, Value::Null)
+        );
+        assert!(calls_of(&run, Stage::Independent).is_empty());
+        let room = read_room(&run.dir);
+        assert!(room.independent.is_none());
+        assert!(!room.stages.iter().any(|s| s.id == "independent-review"));
+        let record: Value = serde_json::from_slice(&std::fs::read(run.dir.join("run.json")).unwrap()).unwrap();
+        assert!(record.get("independent").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_independent_review_repeats_alone() {
+        let agents = [
+            TaskAgent { kind: AgentKind::Claude, model: Some("opus".into()) },
+            TaskAgent { kind: AgentKind::Codex, model: None },
+        ];
+        let sh = |script: &str| git_at(COMMIT, script);
+        let src = start_agents(
+            agents,
+            reviewed(),
+            Duration::from_secs(5),
+            sh,
+            |agent, stage, prompt| if stage == Stage::Independent { Fake::Hang } else { happy(agent, stage, prompt) },
+            false,
+        );
+        eventually(|| !calls_of(&src, Stage::Independent).is_empty()).await;
+        src.handle.control(Control::Cancel { reason: None }).unwrap();
+        let stopped = settled(&src).await;
+        assert_eq!((src.handle.status().state, stopped["ship"].clone()), (RunState::Cancelled, json!(false)));
+        let recovered = load(&src).unwrap();
+        assert_eq!((recovered.from.as_str(), recovered.repeats), ("independent-review", true));
+
+        let next = resume_full(&src, sh, happy);
+        let manifest = settled(&next).await;
+        assert_eq!(manifest["ship"], true);
+        assert_eq!(manifest["ship_basis"], "both reviewers and the independent reviewer");
+        assert_eq!(gate_runs(&next), 0);
+        assert!(calls_of(&next, Stage::Final).is_empty());
+        assert_eq!(calls_of(&next, Stage::Independent).len(), 1);
+        let record: Value = serde_json::from_slice(&std::fs::read(next.dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(record["independent"], json!({ "kind": "claude", "model": "sonnet" }));
+        // A completed review is not repeated: the run only settles.
+        let task_dir = next.dir.parent().unwrap().to_owned();
+        let names = ["01".to_owned(), "02".to_owned()];
+        let done = TaskRuns::read(&task_dir, &names).load("02");
+        assert_eq!(done.unwrap_err(), "the run completed all stages");
     }
 }

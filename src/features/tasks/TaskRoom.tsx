@@ -254,6 +254,8 @@ export function TaskRoom(props: Props) {
   const first = steps.find((s) => s.started)?.started;
   const total = first ? elapsed((room?.endedAt ? Date.parse(room.endedAt) : now) - Date.parse(first)) : undefined;
   const title = props.kind === "task" ? props.task.title : props.path;
+  // The independent reviewer has live output too, but it is no participant.
+  const speakers = room ? [...room.agents, ...(room.independent ? [room.independent.reviewer.id] : [])] : [];
 
   return (
     <section className="room">
@@ -407,10 +409,10 @@ export function TaskRoom(props: Props) {
           <div className="room-timeline stack">
             <Timeline room={room} />
             {active &&
-              room.agents
+              speakers
                 .filter((agent) => live[agent]?.stage === active.id)
                 .map((agent) => <LiveEntry key={agent} agent={agent} room={room} chat={live[agent].chat} since={since} />)}
-            {active && !room.agents.some((agent) => live[agent]?.stage === active.id) && (
+            {active && !speakers.some((agent) => live[agent]?.stage === active.id) && (
               <p className="muted">
                 {active.label}: working… {since}
               </p>

@@ -1,6 +1,10 @@
 //! The two participants of a task run. The provider kind selects the CLI,
 //! its mapper and its mounts; the participant id selects the slot in
 //! prompts, files, messages, picks and the manifest.
+//!
+//! The independent reviewer is no participant: it has the fixed id
+//! [`INDEPENDENT`], which is no provider kind and no slot id, so it never
+//! shares a file or a pick with a participant, also with their kind and model.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +19,14 @@ pub struct Participant {
     pub kind: AgentKind,
     /// `None` is the default model of the CLI.
     pub model: Option<String>,
+}
+
+/// The id of the independent reviewer of a run.
+pub const INDEPENDENT: &str = "independent";
+
+/// The independent reviewer of a run, with its fixed id.
+pub fn independent(agent: &TaskAgent) -> Participant {
+    Participant { id: INDEPENDENT.to_owned(), kind: agent.kind, model: agent.model.clone() }
 }
 
 /// The participants of the slots, in order. Two kinds keep the kind names
@@ -54,5 +66,20 @@ mod tests {
         let pair = participants(&[agent(AgentKind::Codex, Some("a")), agent(AgentKind::Codex, None)]);
         assert_eq!(pair[0].model.as_deref(), Some("a"));
         assert_eq!(pair[1].kind, AgentKind::Codex);
+    }
+
+    #[test]
+    fn the_independent_reviewer_never_has_a_participant_id() {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi, AgentKind::Gemini] {
+            let reviewer = independent(&agent(kind, Some("m")));
+            assert_eq!(
+                (reviewer.id.as_str(), reviewer.kind, reviewer.model.as_deref()),
+                (INDEPENDENT, kind, Some("m"))
+            );
+            for pair in [[kind, kind], [kind, AgentKind::Claude], [AgentKind::Codex, kind]] {
+                let ids = participants(&pair.map(|k| agent(k, Some("m")))).map(|p| p.id);
+                assert!(!ids.contains(&reviewer.id), "{ids:?}");
+            }
+        }
     }
 }

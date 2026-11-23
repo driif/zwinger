@@ -30,6 +30,10 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
   );
   const [gates, setGates] = useState(task?.gates.join("\n") ?? "");
   const [workdir, setWorkdir] = useState(task?.workdir ?? session.harness ?? "/workspace");
+  const [turns, setTurns] = useState(String(task?.turns ?? 2));
+  const [idleSecs, setIdleSecs] = useState(String(task?.idleSecs ?? 600));
+  const [hardSecs, setHardSecs] = useState(String(task?.hardSecs ?? 1800));
+  const [independent, setIndependent] = useState<TaskAgent | null>(task?.independent ?? null);
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const vm = session.vmCage === cage.id ? cage.vms.find((v) => v.key === session.vmKey) : undefined;
@@ -56,6 +60,10 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
         agents,
         gates: gates.split("\n"),
         workdir,
+        turns: Number(turns),
+        idleSecs: Number(idleSecs),
+        hardSecs: Number(hardSecs),
+        independent,
       });
       await onDone(id);
     } catch (e) {
@@ -105,6 +113,76 @@ export function TaskDialog({ session, cage, taskId, onDone }: Props) {
             value={gates}
             onChange={(e) => setGates(e.target.value)}
           />
+          <div className="row">
+            <FloatingField
+              label="Exchange turns"
+              hint="0 to 10. With 0, agent 1 decides the implementer at once."
+              type="number"
+              inputMode="numeric"
+              min={0}
+              max={10}
+              step={1}
+              value={turns}
+              required
+              onChange={(e) => setTurns(e.target.value)}
+            />
+            <FloatingField
+              label="Idle limit (seconds)"
+              hint="1 to 86400, not more than the hard limit. Output starts it again."
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={Math.min(86400, Number(hardSecs) || 86400)}
+              step={1}
+              value={idleSecs}
+              required
+              onChange={(e) => setIdleSecs(e.target.value)}
+            />
+            <FloatingField
+              label="Hard limit (seconds)"
+              hint="1 to 86400."
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={86400}
+              step={1}
+              value={hardSecs}
+              required
+              onChange={(e) => setHardSecs(e.target.value)}
+            />
+          </div>
+          <p className="muted">
+            The limits apply to each agent call and each gate command, also to the one retry of a reply with no JSON.
+            A stage has no limit of its own.
+          </p>
+          <div className="row">
+            <SegmentedControl
+              label="Independent reviewer"
+              options={[
+                { value: "off", label: "Off" },
+                ...kinds(cage).map((kind) => ({ value: kind, label: AGENT_NAMES[kind] })),
+              ]}
+              value={independent?.kind ?? "off"}
+              onChange={(kind) =>
+                setIndependent(kind === "off" ? null : { kind: kind as AgentKind, model: independent?.model ?? null })
+              }
+            />
+            {independent && (
+              <FloatingField
+                className="grow"
+                label="Model (empty: the default model)"
+                value={independent.model ?? ""}
+                showValidity={false}
+                onChange={(e) => setIndependent({ ...independent, model: e.target.value || null })}
+              />
+            )}
+          </div>
+          {independent && (
+            <p className="muted">
+              After the two final reviews, a fresh agent reviews the full change, the gates and the review history. It
+              does not see the votes of the pair. The run ships only if it approves too.
+            </p>
+          )}
           <FloatingField
             label="Working dir"
             hint="/workspace or a folder below it or below a mount"

@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use crate::agent::AgentKind;
 use crate::agent::cli::{iso, now_ms};
 use crate::error::{Error, Result};
-use crate::session::TaskAgent;
-use crate::task_participants::participants;
+use crate::session::{TURN_LIMIT, TaskAgent};
+use crate::task_participants::{INDEPENDENT, participants};
 use crate::task_runs::EXTERNAL;
 
 /// A larger file of a round is not read.
@@ -41,15 +41,25 @@ const DETAIL_LIMIT: usize = 4 << 10;
 const EVENTS_RESERVE: u64 = 64 << 10;
 /// The events that the room needs to show the stages and the end of a run.
 const ESSENTIAL: [&str; 4] = ["stage", "done", "cancelled", "run_failed"];
-/// The exchange turns that a round shows before it has more.
+/// The exchange turns that a round with no recorded turns shows before it has more.
 pub const TURNS: u32 = 2;
 pub(crate) const TURNS_DIR: &str = "turns";
 /// A full scan checks its cancel flag after this many directory entries.
 const CANCEL_EVERY: u64 = 4096;
 
 /// The order of the stages. `exchange` repeats once per turn.
-const STAGES: [&str; 9] =
-    ["plan", "exchange", "tiebreak", "implement", "gates", "crossreview", "revise", "revision-gates", "final"];
+const STAGES: [&str; 10] = [
+    "plan",
+    "exchange",
+    "tiebreak",
+    "implement",
+    "gates",
+    "crossreview",
+    "revise",
+    "revision-gates",
+    "final",
+    "independent-review",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +84,8 @@ pub struct Room {
     pub tiebreak: Option<Tiebreak>,
     pub crossreview: Option<Review>,
     pub finals: Vec<Final>,
+    /// The independent reviewer, if the run has one. It is no participant.
+    pub independent: Option<IndependentReview>,
     pub outcome: Option<Outcome>,
     pub degraded: Vec<Notice>,
     pub violations: Vec<Notice>,
@@ -221,6 +233,18 @@ pub struct Final {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct IndependentReview {
+    /// Its id is always `independent`.
+    pub reviewer: RoomParticipant,
+    /// The state of its stage.
+    pub state: &'static str,
+    pub review: Option<Final>,
+    /// `approved`, `denied`, `invalid` or `missing`, from the manifest.
+    pub verdict: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Blocking {
     pub what: String,
     pub why: String,
@@ -306,21 +330,25 @@ fn read_at(dir: &OwnedFd, name: &str) -> Option<Vec<u8>> {
 /// What a reader does with a file name of a round, by its relative name:
 /// `Some(true)` reads it, `Some(false)` only keeps its name (a plan prompt
 /// names its agent), `None` skips it.
+/// The fixed files of a round folder. A reader takes them before the
+/// files of each agent.
+const ROOT: [&str; 13] = [
+    "run.json",
+    "checkpoint.json",
+    "events.jsonl",
+    "messages.jsonl",
+    "manifest.json",
+    "tiebreak.json",
+    "implementation.json",
+    "gates.json",
+    "crossreview.json",
+    "revision.json",
+    "revision-gates.json",
+    "independent-review.json",
+    "open-questions.txt",
+];
+
 pub(crate) fn known(key: &str) -> Option<bool> {
-    const ROOT: [&str; 12] = [
-        "run.json",
-        "checkpoint.json",
-        "events.jsonl",
-        "messages.jsonl",
-        "manifest.json",
-        "tiebreak.json",
-        "implementation.json",
-        "gates.json",
-        "crossreview.json",
-        "revision.json",
-        "revision-gates.json",
-        "open-questions.txt",
-    ];
     let agent = |rest: &str| !rest.is_empty() && !rest.starts_with('.') && !rest.contains('/');
     if ROOT.contains(&key) || key.strip_prefix("final-").and_then(|r| r.strip_suffix(".json")).is_some_and(agent) {
         return Some(true);
@@ -389,6 +417,9 @@ impl RoundReader {
             let Ok(entries) = Dir::read_from(&dir) else {
                 continue;
             };
+            // The fixed files first, so the files of many agents or turns
+            // cannot push them out. Each list stays within the file limit.
+            let (mut fixed, mut other) = (Vec::new(), Vec::new());
             for entry in entries.flatten() {
                 // Also before the first entry, so a cancelled scan reads nothing.
                 if entries_seen.is_multiple_of(CANCEL_EVERY) && cancel.load(Ordering::Relaxed) {
@@ -402,14 +433,21 @@ impl RoundReader {
                 let Some(read) = known(&key) else {
                     continue;
                 };
+                if ROOT.contains(&key.as_str()) {
+                    fixed.push((key, name.to_owned(), read));
+                } else if other.len() < READ_FILES {
+                    other.push((key, name.to_owned(), read));
+                }
+            }
+            for (key, name, read) in fixed.into_iter().chain(other) {
                 if seen.len() == READ_FILES {
                     break;
                 }
-                let Some(stamp) = stamp_at(&dir, name) else {
+                let Some(stamp) = stamp_at(&dir, &name) else {
                     continue;
                 };
                 let old = self.files.remove(&key);
-                let entry = self.next(old, stamp, read, bytes_kept, (&dir, name), &mut changed);
+                let entry = self.next(old, stamp, read, bytes_kept, (&dir, &name), &mut changed);
                 bytes_kept += entry.bytes.as_ref().map_or(0, |b| b.len() as u64);
                 seen.insert(key, entry);
             }
@@ -587,6 +625,7 @@ pub(crate) fn stage_label(id: &str) -> String {
             "crossreview" => "Cross review".to_owned(),
             "revision-gates" => "Revision gates".to_owned(),
             "final" => "Final review".to_owned(),
+            "independent-review" => "Independent review".to_owned(),
             "settle" => "Result".to_owned(),
             other => {
                 let mut label = other.to_owned();
@@ -638,6 +677,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             || !(name == "gates.json"
                 || name == "revision-gates.json"
                 || name == "crossreview.json"
+                || name == "independent-review.json"
                 || name.starts_with("final-"))
             || checkpoint.as_ref().is_some_and(|c| c["artifacts"][name].is_string())
     };
@@ -668,8 +708,23 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     };
     let mtime = |name: &str| visible(name).then(|| files.get(name).map(|(secs, _)| iso(secs * 1000))).flatten();
     let manifest = json("manifest.json");
+    let run = json("run.json");
+    // The independent reviewer as the run recorded it. It is no participant.
+    let independent_reviewer = manifest
+        .as_ref()
+        .and_then(|m| serde_json::from_value::<RoomParticipant>(m["independent"].clone()).ok())
+        .filter(|p| p.id == INDEPENDENT)
+        .or_else(|| {
+            let agent = serde_json::from_value::<TaskAgent>(run.as_ref()?["independent"].clone()).ok()?;
+            Some(RoomParticipant {
+                id: INDEPENDENT.to_owned(),
+                kind: Some(agent.kind),
+                model: agent.model,
+                model_recorded: true,
+            })
+        });
 
-    let roster = roster(manifest.as_ref(), json("run.json").as_ref()).unwrap_or_else(|| {
+    let roster = roster(manifest.as_ref(), run.as_ref()).unwrap_or_else(|| {
         let mut names: Vec<String> = Vec::new();
         let mut add = |name: &str| {
             if !name.is_empty() && !names.iter().any(|a| a == name) {
@@ -716,7 +771,8 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         .collect();
     // A continuation names the run that it continues, and its first stage
     // if the source started that stage before it stopped.
-    let repeated = json("run.json")
+    let repeated = run
+        .as_ref()
         .filter(|r| r["continues"]["repeats"] == true)
         .and_then(|r| r["continues"]["from"].as_str().map(str::to_owned));
     let started_in = |inherited: bool| -> BTreeMap<String, String> {
@@ -759,9 +815,16 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     // round folder must not expand into a range.
     let mut turns_seen: BTreeSet<u32> = started.iter().map(|(s, _)| turn_of(s)).filter(|n| *n > 0).collect();
     turns_seen.extend(file_turns(files));
+    // A run shows the turns that it recorded; an older or external round
+    // shows the default turns.
+    let configured = run
+        .as_ref()
+        .and_then(|r| r["config"]["turns"].as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n <= TURN_LIMIT);
     let mut ids = vec!["plan".to_owned()];
     ids.extend(
-        (1..=TURNS)
+        (1..=configured.unwrap_or(TURNS))
             .chain(turns_seen.iter().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -770,9 +833,17 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
     // Older rounds have no second gate stage. Show it when a round starts it.
     let revision_gates = started.iter().any(|(id, _)| id == "revision-gates")
         || (visible("revision-gates.json") && files.contains_key("revision-gates.json"));
-    ids.extend(STAGES[2..].iter().copied().filter(|id| *id != "revision-gates" || revision_gates).map(str::to_owned));
+    let independent_stage = independent_reviewer.is_some() || started.iter().any(|(id, _)| id == "independent-review");
+    ids.extend(
+        STAGES[2..]
+            .iter()
+            .copied()
+            .filter(|id| *id != "revision-gates" || revision_gates)
+            .filter(|id| *id != "independent-review" || independent_stage)
+            .map(str::to_owned),
+    );
     let last = started.iter().map(|(s, _)| s).max_by_key(|s| stage_key(s)).cloned();
-    let stages = ids
+    let stages: Vec<Stage> = ids
         .iter()
         .map(|id| {
             let at = started.iter().find(|(s, _)| s == id).map(|(_, at)| at.clone());
@@ -1107,6 +1178,44 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         message(name.clone(), agent, "user".to_owned(), "final", "final", mtime(&name), &review.task_met, body);
         finals.push(review);
     }
+    let independent = independent_stage.then(|| {
+        let review = json("independent-review.json").map(|f| Final {
+            agent: INDEPENDENT.to_owned(),
+            ship: f["ship"].as_bool().unwrap_or(false),
+            blocking: blocking_of(&f["blocking"]),
+            residual: strings(&f["residual"]),
+            task_met: text(&f["task_met"]),
+        });
+        if let Some(review) = &review {
+            let mut body = format!("**Ship:** {}\n\n{}", review.ship, review.task_met);
+            for b in &review.blocking {
+                body.push_str(&format!("\n- blocking: {} ({})", b.what, b.at));
+            }
+            let name = "independent-review.json";
+            let stage = "independent-review";
+            message(
+                name.to_owned(),
+                INDEPENDENT,
+                "user".to_owned(),
+                "independent",
+                stage,
+                mtime(name),
+                &review.task_met,
+                body,
+            );
+        }
+        IndependentReview {
+            reviewer: independent_reviewer.clone().unwrap_or(RoomParticipant {
+                id: INDEPENDENT.to_owned(),
+                kind: None,
+                model: None,
+                model_recorded: false,
+            }),
+            state: stages.iter().find(|s| s.id == "independent-review").map_or("pending", |s| s.state),
+            review,
+            verdict: manifest.as_ref().and_then(|m| m["independent_verdict"].as_str()).map(str::to_owned),
+        }
+    });
     let outcome = manifest.as_ref().map(|m| Outcome {
         ship: m["ship"].as_bool().unwrap_or(false),
         ship_basis: text(&m["ship_basis"]),
@@ -1210,6 +1319,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
         tiebreak,
         crossreview,
         finals,
+        independent,
         outcome,
         degraded,
         violations,
@@ -1909,6 +2019,150 @@ mod tests {
         assert_eq!(reader.keys(), names.map(String::from));
         assert!(!reader.scan(&AtomicBool::new(false)));
         assert_eq!(reader.counts(), (3, reads), "no new content reads");
+    }
+
+    fn exchange_ids(room: &Room) -> Vec<&str> {
+        room.stages.iter().map(|s| s.id.as_str()).filter(|s| s.starts_with("exchange-")).collect()
+    }
+
+    #[test]
+    fn a_recorded_run_shows_its_configured_turns_and_an_older_round_the_default() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("turns")).unwrap();
+        assert_eq!(exchange_ids(&read_room(&dir)), ["exchange-1", "exchange-2"]);
+        let agents = json!([{ "kind": "claude", "model": null }, { "kind": "codex", "model": null }]);
+        let record =
+            |turns: u32| json!({ "agents": agents, "config": { "turns": turns, "idleMs": 1000, "hardMs": 1000 } });
+        for (turns, expected) in [
+            (0, vec![]),
+            (1, vec!["exchange-1"]),
+            (5, vec!["exchange-1", "exchange-2", "exchange-3", "exchange-4", "exchange-5"]),
+            // A damaged count is not expanded: the default turns show.
+            (4_000_000, vec!["exchange-1", "exchange-2"]),
+        ] {
+            std::fs::write(dir.join("run.json"), record(turns).to_string()).unwrap();
+            assert_eq!(exchange_ids(&read_room(&dir)), expected, "{turns}");
+        }
+        // An observed turn shows too.
+        std::fs::write(dir.join("run.json"), record(1).to_string()).unwrap();
+        std::fs::write(dir.join("turns/t2-claude.json"), r#"{"message":"m"}"#).unwrap();
+        assert_eq!(exchange_ids(&read_room(&dir)), ["exchange-1", "exchange-2"]);
+        let room = read_room(&dir);
+        assert!(room.independent.is_none());
+        assert!(!room.stages.iter().any(|s| s.id == "independent-review"));
+    }
+
+    #[test]
+    fn the_independent_reviewer_shows_from_the_record_or_its_stage() {
+        let dir = temp_dir();
+        let agents = json!([{ "kind": "claude", "model": "opus" }, { "kind": "claude", "model": null }]);
+        let run = json!({ "agents": agents, "independent": { "kind": "claude", "model": "opus" } });
+        std::fs::write(dir.join("run.json"), run.to_string()).unwrap();
+        let room = read_room(&dir);
+        // The same kind and model as a participant, in its own role.
+        assert_eq!(room.agents, ["claude-1", "claude-2"]);
+        let independent = room.independent.unwrap();
+        assert_eq!(independent.reviewer.id, "independent");
+        assert_eq!(
+            (independent.reviewer.kind, independent.reviewer.model.as_deref()),
+            (Some(AgentKind::Claude), Some("opus"))
+        );
+        assert_eq!((independent.state, independent.review, independent.verdict), ("pending", None, None));
+        assert_eq!(room.stages.last().map(|s| (s.id.as_str(), s.state)), Some(("independent-review", "pending")));
+
+        // A round with no record shows the stage once it starts it.
+        let dir = temp_dir();
+        let events = [
+            json!({ "at": "t", "kind": "stage", "detail": "final review" }),
+            json!({ "at": "t", "kind": "stage", "detail": "independent-review" }),
+        ];
+        let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
+        std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+        std::fs::write(
+            dir.join("independent-review.json"),
+            json!({ "ship": false, "blocking": [{ "what": "Bug.", "why": "W.", "where": "a.rs" }], "task_met": "No." })
+                .to_string(),
+        )
+        .unwrap();
+        let room = read_room(&dir);
+        let independent = room.independent.unwrap();
+        assert_eq!((independent.reviewer.kind, independent.state), (None, "active"));
+        assert_eq!(independent.review.unwrap().blocking[0].what, "Bug.");
+        assert_eq!(room.active_actor, None);
+    }
+
+    /// A complete round with ten exchange turns and an independent review.
+    fn ten_turn_round() -> PathBuf {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("turns")).unwrap();
+        let write = |name: &str, value: Value| std::fs::write(dir.join(name), value.to_string()).unwrap();
+        let agents = json!([{ "kind": "claude", "model": null }, { "kind": "codex", "model": null }]);
+        let config = json!({ "turns": 10, "idleMs": 1000, "hardMs": 1000 });
+        write(
+            "run.json",
+            json!({ "agents": agents, "config": config, "independent": { "kind": "pi", "model": null } }),
+        );
+        write("checkpoint.json", json!({ "groups": [] }));
+        let mut events = String::new();
+        for detail in ["plan"].into_iter().map(str::to_owned).chain((1..=10).map(|n| format!("exchange turn {n}"))) {
+            events.push_str(&format!("{}\n", json!({ "at": "t", "kind": "stage", "detail": detail })));
+        }
+        events.push_str(&format!("{}\n", json!({ "at": "t", "kind": "done", "detail": "ship=false" })));
+        std::fs::write(dir.join("events.jsonl"), events).unwrap();
+        write(
+            "manifest.json",
+            json!({ "ship": false, "ship_basis": "withheld — the independent reviewer did not approve", "independent_verdict": "denied" }),
+        );
+        for name in ["implementation.json", "crossreview.json", "revision.json", "tiebreak.json"] {
+            write(name, json!({ "message": "m" }));
+        }
+        for name in ["gates.json", "revision-gates.json"] {
+            write(name, json!([]));
+        }
+        write("independent-review.json", json!({ "ship": false, "blocking": [], "task_met": "No." }));
+        std::fs::write(dir.join("open-questions.txt"), "Q?").unwrap();
+        let message = json!({ "at": "t", "stage": "plan", "kind": "user", "body": "Hi." });
+        std::fs::write(dir.join("messages.jsonl"), format!("{message}\n")).unwrap();
+        for agent in ["claude", "codex"] {
+            write(&format!("final-{agent}.json"), json!({ "ship": true, "blocking": [], "task_met": "Yes." }));
+            write(&format!("turns/plan-{agent}.json"), json!({ "plan": "P.", "claim": agent }));
+            std::fs::write(dir.join(format!("turns/plan-{agent}.prompt.md")), "p").unwrap();
+            std::fs::write(dir.join(format!("turns/plan-{agent}.raw")), "r").unwrap();
+            for n in 1..=10 {
+                write(&format!("turns/t{n}-{agent}.json"), json!({ "message": "m", "implementer": "claude" }));
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn a_ten_turn_room_stays_within_the_reader_limits() {
+        let dir = ten_turn_round();
+        let mut reader = RoundReader::new(dir.clone());
+        reader.refresh();
+        assert!(reader.files.len() < READ_FILES, "{}", reader.files.len());
+        let room = reader.room();
+        assert_eq!(room.turns.len(), 10);
+        assert!(room.turns.iter().all(|t| t.replies.len() == 2));
+        assert_eq!(exchange_ids(&room).len(), 10);
+        assert_eq!(room.finals.len(), 2);
+        let independent = room.independent.unwrap();
+        assert_eq!((independent.reviewer.kind, independent.verdict.as_deref()), (Some(AgentKind::Pi), Some("denied")));
+        assert_eq!(room.outcome.unwrap().ship_basis, "withheld — the independent reviewer did not approve");
+
+        // Many agent files cannot push out the fixed files of the round.
+        for i in 0..200 {
+            std::fs::write(dir.join(format!("final-x{i}.json")), "{}").unwrap();
+        }
+        let mut reader = RoundReader::new(dir);
+        reader.refresh();
+        assert_eq!(reader.files.len(), READ_FILES);
+        for name in ROOT {
+            assert!(reader.files.get(name).is_some_and(|e| e.bytes.is_some()), "{name}");
+        }
+        let room = reader.room();
+        assert_eq!(exchange_ids(&room).len(), 10);
+        assert!(room.independent.is_some() && room.outcome.is_some());
     }
 
     #[test]

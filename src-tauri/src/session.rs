@@ -12,6 +12,10 @@ const REQUEST_LIMIT: usize = 64 << 10;
 const MODEL_LIMIT: usize = 128;
 const GATE_COUNT: usize = 16;
 const COMMAND_LIMIT: usize = 4096;
+/// The most exchange turns of a task run.
+pub const TURN_LIMIT: u32 = 10;
+/// The longest idle or hard limit of one process call, in seconds.
+const SECS_LIMIT: u64 = 86_400;
 /// The saved map positions per session; more entries are dropped.
 const LAYOUT_LIMIT: usize = 1000;
 /// The deepest split of a pane layout.
@@ -175,6 +179,46 @@ pub struct Task {
     pub gates: Vec<String>,
     /// The guest folder where the agents and the gates run.
     pub workdir: String,
+    /// A task saved before these options has the defaults.
+    #[serde(flatten)]
+    pub options: RunOptions,
+}
+
+/// The settings of the runs of a task. A run records them when it starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunOptions {
+    /// The exchange turns before a tiebreak, `0..=TURN_LIMIT`.
+    #[serde(default = "default_turns")]
+    pub turns: u32,
+    /// Each agent call and each gate command stops after this many seconds
+    /// with no output.
+    #[serde(default = "default_idle")]
+    pub idle_secs: u64,
+    /// Each agent call and each gate command stops after this many seconds.
+    #[serde(default = "default_hard")]
+    pub hard_secs: u64,
+    /// The independent reviewer after the final reviews. `None`: off.
+    #[serde(default)]
+    pub independent: Option<TaskAgent>,
+}
+
+fn default_turns() -> u32 {
+    2
+}
+
+fn default_idle() -> u64 {
+    600
+}
+
+fn default_hard() -> u64 {
+    1800
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self { turns: default_turns(), idle_secs: default_idle(), hard_secs: default_hard(), independent: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +239,8 @@ pub struct TaskDraft {
     pub agents: [TaskAgent; 2],
     pub gates: Vec<String>,
     pub workdir: String,
+    #[serde(flatten)]
+    pub options: RunOptions,
 }
 
 impl Session {
@@ -328,13 +374,24 @@ impl Session {
             return Err(invalid(format!("the request must have 1 to {REQUEST_LIMIT} bytes")));
         }
         let mut agents = draft.agents.clone();
-        for agent in &mut agents {
+        let mut options = draft.options.clone();
+        for agent in agents.iter_mut().chain(options.independent.as_mut()) {
             agent.model = agent.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
             if let Some(model) = &agent.model
                 && (model.len() > MODEL_LIMIT || !model.bytes().all(|b| b.is_ascii_graphic()))
             {
                 return Err(invalid(format!("the model {model} is not valid")));
             }
+        }
+        if options.turns > TURN_LIMIT {
+            return Err(invalid(format!("the exchange turns must be 0 to {TURN_LIMIT}")));
+        }
+        let secs = 1..=SECS_LIMIT;
+        if !secs.contains(&options.idle_secs) || !secs.contains(&options.hard_secs) {
+            return Err(invalid(format!("the idle and hard limits must be 1 to {SECS_LIMIT} seconds")));
+        }
+        if options.idle_secs > options.hard_secs {
+            return Err(invalid("the idle limit must not be longer than the hard limit".to_owned()));
         }
         let gates: Vec<String> =
             draft.gates.iter().map(|g| g.trim()).filter(|g| !g.is_empty()).map(str::to_owned).collect();
@@ -358,6 +415,7 @@ impl Session {
             agents,
             gates,
             workdir,
+            options,
         };
         let id = task.id.clone();
         match draft.id {
@@ -422,6 +480,33 @@ mod tests {
         assert_eq!(folder_slug(Path::new("/x/My App_v2"), []), "my-app-v2");
         assert_eq!(folder_slug(Path::new("/x/api"), ["api", "api-2"]), "api-3");
         assert_eq!(folder_slug(Path::new("/x/ü"), []), "session");
+    }
+
+    #[test]
+    fn a_task_from_before_the_run_options_loads_with_the_defaults() {
+        let saved = serde_json::json!({
+            "id": "t", "slug": "fix", "title": "Fix", "request": "Fix it.",
+            "agents": [{ "kind": "pi", "model": null }, { "kind": "claude", "model": null }],
+            "gates": [], "workdir": "/workspace"
+        });
+        let task: Task = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(task.options, RunOptions::default());
+        assert_eq!((task.options.turns, task.options.idle_secs, task.options.hard_secs), (2, 600, 1800));
+        let draft: TaskDraft = serde_json::from_value(saved).unwrap();
+        assert_eq!(draft.options, RunOptions::default());
+
+        // The options are flat in the saved task and come back the same.
+        let options = RunOptions {
+            turns: 0,
+            idle_secs: 5,
+            hard_secs: 10,
+            independent: Some(TaskAgent { kind: AgentKind::Codex, model: Some("m".into()) }),
+        };
+        let task = Task { options, ..task };
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!((json["turns"].clone(), json["idleSecs"].clone()), (serde_json::json!(0), serde_json::json!(5)));
+        assert_eq!(json["independent"], serde_json::json!({ "kind": "codex", "model": "m" }));
+        assert_eq!(serde_json::from_value::<Task>(json).unwrap(), task);
     }
 
     #[test]

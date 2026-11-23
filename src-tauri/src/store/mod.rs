@@ -657,6 +657,7 @@ mod tests {
                 ],
                 gates: vec!["pnpm build".into()],
                 workdir: "/workspace".into(),
+                options: Default::default(),
             }],
             layout: [("mount:/mnt/data".to_owned(), Pos { x: 12.5, y: -40.0 })].into(),
             viewport: None,

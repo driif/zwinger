@@ -1245,3 +1245,160 @@ PATH=$ORIGINAL_PATH exec git "$@"
         assert_eq!(r.error.as_deref(), Some("401"));
     }
 }
+
+/// The limits of one process call: `idle` restarts on each stdout or
+/// stderr chunk, `hard` does not. Each call, retry and gate command has its
+/// own budget from its start; a stage has no limit of its own.
+#[cfg(test)]
+mod limit_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::runtime::fake::{FakePipe, FakeRuntime, FakeVm};
+
+    #[derive(Clone)]
+    enum Act {
+        Silent,
+        /// Prints a line on stdout, then on stderr, at each interval.
+        Ticks(Duration),
+        /// Replies `text` as a claude result after the delay, then exits.
+        Reply(Duration, String),
+    }
+
+    /// The pipes that the call opens play `acts`, in order. Counts the kills.
+    fn exec(acts: Vec<Act>) -> (Exec<FakeRuntime>, Arc<AtomicUsize>) {
+        let runtime = FakeRuntime::default();
+        let kills = Arc::new(AtomicUsize::new(0));
+        let (pipes, counted) = (runtime.pipes.clone(), kills.clone());
+        tokio::spawn(async move {
+            let mut next = 0;
+            loop {
+                let opened: Vec<FakePipe> = std::mem::take(&mut *pipes.lock().unwrap());
+                for pipe in opened {
+                    tokio::spawn(play(pipe, acts[next.min(acts.len() - 1)].clone(), counted.clone()));
+                    next += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+        let exec = Exec {
+            runtime,
+            vm: Arc::new(FakeVm { key: "s".into() }),
+            cwd: "/workspace".into(),
+            scope: "/workspace".into(),
+            artifacts: None,
+            pi_host: false,
+            gemini: None,
+            proxy: None,
+        };
+        (exec, kills)
+    }
+
+    async fn play(mut pipe: FakePipe, act: Act, kills: Arc<AtomicUsize>) {
+        loop {
+            match pipe.stdin.recv().await {
+                Some(PipeInput::Data(_)) => {}
+                Some(PipeInput::Close) => break,
+                Some(PipeInput::Kill) | None => return,
+            }
+        }
+        let out = pipe.out.clone();
+        let work = async move {
+            match act {
+                Act::Silent => std::future::pending::<()>().await,
+                Act::Ticks(every) => loop {
+                    tokio::time::sleep(every).await;
+                    let _ = out.send(PipeEvent::Stdout(b"tick\n".to_vec())).await;
+                    tokio::time::sleep(every).await;
+                    let _ = out.send(PipeEvent::Stderr(b"tick\n".to_vec())).await;
+                },
+                Act::Reply(after, text) => {
+                    tokio::time::sleep(after).await;
+                    let _ = out.send(PipeEvent::Stdout(claude_result_line(&text))).await;
+                    let _ = out.send(PipeEvent::Exit(0)).await;
+                    std::future::pending::<()>().await
+                }
+            }
+        };
+        tokio::select! {
+            () = work => {}
+            input = pipe.stdin.recv() => if matches!(input, Some(PipeInput::Kill)) {
+                kills.fetch_add(1, Ordering::SeqCst);
+                let _ = pipe.out.send(PipeEvent::Exit(137)).await;
+            },
+        }
+    }
+
+    fn claude() -> TaskAgent {
+        TaskAgent { kind: AgentKind::Claude, model: None }
+    }
+
+    fn limits(idle: u64, hard: u64) -> Limits {
+        Limits { idle: Duration::from_millis(idle), hard: Duration::from_millis(hard) }
+    }
+
+    async fn agent_call(exec: &Exec<FakeRuntime>, limits: Limits, cancel: &mut watch::Receiver<bool>) -> Failure {
+        exec.agent(&claude(), Access::Read, "Do it.", limits, cancel, &|_| {}).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn silence_ends_an_agent_call_and_a_gate_at_the_idle_limit() {
+        let (exec, kills) = exec(vec![Act::Silent]);
+        let (_tx, mut cancel) = watch::channel(false);
+        let start = Instant::now();
+        assert!(matches!(agent_call(&exec, limits(100, 5000), &mut cancel).await, Failure::Idle(_)));
+        let gate = exec.sh("pnpm build", limits(100, 5000), &mut cancel).await.unwrap();
+        assert_eq!(gate.code, None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // Each timed-out process was killed before the call returned.
+        assert_eq!(kills.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn output_postpones_the_idle_limit_but_not_the_hard_limit() {
+        let (exec, kills) = exec(vec![Act::Ticks(Duration::from_millis(30))]);
+        let (_tx, mut cancel) = watch::channel(false);
+        let start = Instant::now();
+        assert!(matches!(agent_call(&exec, limits(150, 500), &mut cancel).await, Failure::Hard(_)));
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        let start = Instant::now();
+        let gate = exec.sh("pnpm build", limits(150, 500), &mut cancel).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        assert_eq!(gate.code, None);
+        assert!(gate.output.contains("tick"));
+        assert_eq!(kills.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_retry_gets_a_fresh_budget() {
+        let slow = Duration::from_millis(250);
+        let (exec, kills) = exec(vec![
+            Act::Reply(slow, "No JSON here.".into()),
+            Act::Reply(slow, "```json\n{\"ok\": true}\n```".into()),
+        ]);
+        let (_tx, mut cancel) = watch::channel(false);
+        let start = Instant::now();
+        let reply = exec.call_json(&claude(), Access::Read, "Do it.", limits(400, 400), &mut cancel, &|_| {}).await;
+        // The two calls together take longer than one hard limit.
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        assert!(reply.retried && reply.failure.is_none());
+        assert_eq!(reply.json, Some(serde_json::json!({ "ok": true })));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_kills_the_call_at_once() {
+        let (exec, kills) = exec(vec![Act::Silent]);
+        let (tx, mut cancel) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+        let start = Instant::now();
+        assert!(matches!(agent_call(&exec, limits(5000, 5000), &mut cancel).await, Failure::Cancelled));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+    }
+}

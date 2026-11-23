@@ -197,6 +197,19 @@ export interface Room {
     residual: string[];
     taskMet: string;
   }[];
+  /** The independent reviewer, if the run has one. Its id is always `independent`. */
+  independent: {
+    reviewer: RoomParticipant;
+    state: StageState;
+    review: {
+      agent: string;
+      ship: boolean;
+      blocking: Blocking[];
+      residual: string[];
+      taskMet: string;
+    } | null;
+    verdict: "approved" | "denied" | "invalid" | "missing" | null;
+  } | null;
   outcome: {
     ship: boolean;
     shipBasis: string;

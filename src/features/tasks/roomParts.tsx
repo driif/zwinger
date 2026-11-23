@@ -124,13 +124,17 @@ export function iconOf(name: string, room: Room): LucideIcon {
   if (name === "user") return User;
   if (name === "run") return Activity;
   if (name === "a2a") return Cable;
-  const kind = room.participants.find((p) => p.id === name)?.kind;
+  const kind = [...room.participants, ...(room.independent ? [room.independent.reviewer] : [])].find(
+    (p) => p.id === name,
+  )?.kind;
   return kind ? AGENT_ICONS[kind] : Bot;
 }
 
 export function AgentName({ name, room }: { name: string; room: Room }) {
   const Icon = iconOf(name, room);
-  const participant = room.participants.find((p) => p.id === name && p.kind);
+  const participant = [...room.participants, ...(room.independent ? [room.independent.reviewer] : [])].find(
+    (p) => p.id === name && p.kind,
+  );
   return (
     <span className="row room-agent">
       <Icon size={14} />
@@ -342,6 +346,7 @@ export function Verdicts({ room }: { room: Room }) {
           )}
         </Card>
       ))}
+      {room.independent && <IndependentReview room={room} />}
       {outcome && (
         <Card variant="elevated" padding="sm" className="stack">
           <p className="row">
@@ -363,6 +368,49 @@ export function Verdicts({ room }: { room: Room }) {
         </Card>
       )}
     </section>
+  );
+}
+
+const VERDICTS = {
+  approved: "approves",
+  denied: "does not approve",
+  invalid: "gave no valid review",
+  missing: "gave no review",
+} as const;
+
+/** The independent reviewer: a fixed role outside the pair. Ship needs its approval. */
+function IndependentReview({ room }: { room: Room }) {
+  const { reviewer, state, review, verdict } = room.independent!;
+  const approved = verdict === "approved";
+  return (
+    <Card variant="outlined" padding="sm" className="stack">
+      <p className="row">
+        {verdict ? (
+          approved ? (
+            <CircleCheck size={14} className="ok" />
+          ) : (
+            <CircleX size={14} className="danger" />
+          )
+        ) : null}
+        <span className="grow">
+          Independent review by <AgentName name={reviewer.id} room={room} />
+        </span>
+        <strong>{verdict ? VERDICTS[verdict] : state}</strong>
+      </p>
+      {review && (
+        <>
+          <p>{review.taskMet}</p>
+          <Blockings items={review.blocking} />
+          {review.residual.length > 0 && (
+            <ul className="list muted">
+              {review.residual.map((r, i) => (
+                <li key={i}>{r}</li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </Card>
   );
 }
 

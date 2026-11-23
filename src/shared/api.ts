@@ -210,6 +210,14 @@ export interface Task {
   agents: [TaskAgent, TaskAgent];
   gates: string[];
   workdir: string;
+  /** Exchange turns before a tiebreak, 0 to 10. */
+  turns: number;
+  /** Each agent call and each gate command stops after this many seconds with no output. */
+  idleSecs: number;
+  /** Each agent call and each gate command stops after this many seconds. Not a limit of a stage. */
+  hardSecs: number;
+  /** The independent reviewer after the final reviews. `null`: off. It is no participant. */
+  independent: TaskAgent | null;
 }
 
 /** A host agent of a cage: its runtime, and its read-only profile and host login if set. */

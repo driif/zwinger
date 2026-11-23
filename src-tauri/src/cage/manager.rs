@@ -95,8 +95,6 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) shares: a2a::Shares,
     /// Serializes run starts, so two starts cannot take the same run name.
     pub(crate) run_start: Mutex<()>,
-    /// The stage limits of new task runs.
-    pub(crate) run_config: task_runs::Config,
     pub(crate) host: Arc<HostAgents>,
     pub(crate) guest_sink: Arc<OnceLock<GuestSink>>,
     pub(crate) progress_sink: Arc<OnceLock<ProgressSink>>,
@@ -520,7 +518,6 @@ impl<R: SandboxRuntime> Manager<R> {
             runs: Arc::default(),
             shares: a2a::Shares::default(),
             run_start: Mutex::new(()),
-            run_config: task_runs::Config::default(),
             host,
             guest_sink: Arc::new(OnceLock::new()),
             progress_sink: Arc::new(OnceLock::new()),

@@ -25,10 +25,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::run_git::Origin;
-use crate::session::{Task, TaskAgent};
+use crate::session::{RunOptions, Task, TaskAgent};
 use crate::task_agents::Limits;
 use crate::task_artifacts::{RoundWriter, read_record, stage_label, stage_of};
-use crate::task_participants::participants;
+use crate::task_participants::{INDEPENDENT, participants};
 use crate::task_runs::{Config, MESSAGE_LIMIT, MESSAGES_BYTES, MESSAGES_COUNT, converged};
 
 pub const VERSION: u32 = 2;
@@ -41,11 +41,15 @@ pub const SETTLE: &str = "settle";
 const MESSAGES: &str = "messages.jsonl";
 const WRITE_FAILED: &str = "the run could not write its record, so its state is not known; start a new run instead";
 const EVENTS: &str = "events.jsonl";
+/// The group of the independent reviewer, after the final reviews.
+pub const INDEPENDENT_GROUP: &str = "independent-review";
 /// The groups in which agents report, each with its own result file.
-const AGENT_GROUPS: [&str; 6] = ["plan", "tiebreak", "implement", "crossreview", "revise", "final"];
+const AGENT_GROUPS: [&str; 7] = ["plan", "tiebreak", "implement", "crossreview", "revise", "final", INDEPENDENT_GROUP];
+/// The groups that check the files after the last write stage.
+const CHECK_GROUPS: [&str; 5] = ["gates", "revision-gates", "crossreview", "final", INDEPENDENT_GROUP];
 /// The artifacts of a round that a checkpoint can name, besides the ones
 /// of each agent.
-const FIXED: [&str; 9] = [
+const FIXED: [&str; 10] = [
     "tiebreak.json",
     "plan.md",
     "implementation.json",
@@ -55,6 +59,7 @@ const FIXED: [&str; 9] = [
     "crossreview.json",
     "revision.json",
     "revision-gates.json",
+    "independent-review.json",
 ];
 
 /// What a run started with.
@@ -71,6 +76,9 @@ pub struct RunRecord {
     /// The working dir as the task names it, before the VM binding.
     pub workdir: String,
     pub config: RecordedConfig,
+    /// The independent reviewer. A record from before has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent: Option<TaskAgent>,
     #[serde(default)]
     pub continues: Option<Link>,
     /// Where the working dir was at the start. A record from before has none.
@@ -97,8 +105,10 @@ pub struct Link {
 }
 
 impl RunRecord {
-    /// `task.workdir` is the working dir as the task names it.
-    pub fn new(task: &Task, config: Config) -> Self {
+    /// The run options of the task as they are now. `task.workdir` is the
+    /// working dir as the task names it.
+    pub fn new(task: &Task) -> Self {
+        let options = &task.options;
         Self {
             version: VERSION,
             title: task.title.clone(),
@@ -107,10 +117,11 @@ impl RunRecord {
             gates: task.gates.clone(),
             workdir: task.workdir.clone(),
             config: RecordedConfig {
-                turns: config.turns,
-                idle_ms: config.limits.idle.as_millis() as u64,
-                hard_ms: config.limits.hard.as_millis() as u64,
+                turns: options.turns,
+                idle_ms: options.idle_secs.saturating_mul(1000),
+                hard_ms: options.hard_secs.saturating_mul(1000),
             },
+            independent: options.independent.clone(),
             continues: None,
             origin: None,
         }
@@ -137,6 +148,12 @@ impl RunRecord {
             agents: self.agents.clone(),
             gates: self.gates.clone(),
             workdir,
+            options: RunOptions {
+                turns: self.config.turns,
+                idle_secs: self.config.idle_ms / 1000,
+                hard_secs: self.config.hard_ms / 1000,
+                independent: self.independent.clone(),
+            },
         }
     }
 
@@ -224,7 +241,7 @@ fn check_groups(checkpoint: &Checkpoint) -> impl Iterator<Item = &String> {
         checkpoint.decisions.verdict.as_deref() == Some("revise") && !groups.iter().any(|g| g == "revise");
     let start = groups.iter().rposition(|g| g == "implement" || g == "revise").map_or(0, |i| i + 1);
     let start = if pending_revise { groups.len() } else { start };
-    groups[start..].iter().filter(|g| matches!(g.as_str(), "gates" | "revision-gates" | "crossreview" | "final"))
+    groups[start..].iter().filter(|g| CHECK_GROUPS.contains(&g.as_str()))
 }
 
 pub fn first_check(checkpoint: &Checkpoint) -> Option<&str> {
@@ -474,7 +491,9 @@ fn recover(
     let names = record.names();
     let mut artifacts = BTreeMap::new();
     for (name, hex) in &checkpoint.artifacts {
-        if !allowed(name, &names, record.config.turns) {
+        if !allowed(name, &names, record.config.turns)
+            || (name == "independent-review.json" && record.independent.is_none())
+        {
             return Err(format!("{CHECKPOINT} names an unknown file {name}"));
         }
         let bytes = read_record(dir, name)?.ok_or_else(|| format!("{name} is missing"))?;
@@ -700,7 +719,8 @@ impl Context<'_> {
             "revise" if self.record.gates.is_empty() => "final".to_owned(),
             "revise" => "revision-gates".to_owned(),
             "revision-gates" => "final".to_owned(),
-            "final" => return None,
+            "final" if self.record.independent.is_some() => INDEPENDENT_GROUP.to_owned(),
+            "final" | INDEPENDENT_GROUP => return None,
             other => {
                 let n: u32 = other.strip_prefix("exchange-")?.parse().ok()?;
                 let replies = self.names.clone().map(|a| self.json(&format!("turns/t{n}-{a}.json")));
@@ -731,18 +751,17 @@ impl Context<'_> {
             }
         }
         let known = |name: &String| self.names.contains(name);
+        let known_in = |group: &str, name: &String| match group {
+            INDEPENDENT_GROUP => name == INDEPENDENT,
+            _ => known(name),
+        };
         let mut planned = decisions.planned.clone();
         planned.dedup();
         if planned.len() != decisions.planned.len() || !decisions.planned.iter().all(known) {
             return damaged("planned agents".to_owned());
         }
         let has = |group: &str| groups.iter().any(|g| g == group);
-        if self
-            .checkpoint
-            .fences
-            .keys()
-            .any(|g| !has(g) || !matches!(g.as_str(), "gates" | "revision-gates" | "crossreview" | "final"))
-        {
+        if self.checkpoint.fences.keys().any(|g| !has(g) || !CHECK_GROUPS.contains(&g.as_str())) {
             return damaged("check fences".to_owned());
         }
         let cleanup: BTreeSet<&String> = self.checkpoint.cleanup.iter().collect();
@@ -750,8 +769,10 @@ impl Context<'_> {
             || cleanup.len() != self.checkpoint.cleanup.len()
             || cleanup.iter().any(|name| {
                 self.checkpoint.artifacts.contains_key(name.as_str())
-                    || !(matches!(name.as_str(), "gates.json" | "revision-gates.json" | "crossreview.json")
-                        || self.names.iter().any(|agent| *name == &format!("final-{agent}.json")))
+                    || !(matches!(
+                        name.as_str(),
+                        "gates.json" | "revision-gates.json" | "crossreview.json" | "independent-review.json"
+                    ) || self.names.iter().any(|agent| *name == &format!("final-{agent}.json")))
             })
         {
             return damaged("cleanup files".to_owned());
@@ -798,7 +819,7 @@ impl Context<'_> {
                 return damaged(format!("{group} has no outcome"));
             };
             let unique: BTreeSet<&String> = reported.iter().collect();
-            if unique.len() != reported.len() || !reported.iter().all(known) {
+            if unique.len() != reported.len() || !reported.iter().all(|r| known_in(group, r)) {
                 return damaged(format!("the outcome of {group}"));
             }
             let implementer = decisions.implementer.as_deref();
@@ -809,6 +830,7 @@ impl Context<'_> {
                 "tiebreak" => *reported == [self.names[0].clone()],
                 "implement" | "revise" => only(implementer),
                 "crossreview" => only(reviewer),
+                INDEPENDENT_GROUP => only(Some(INDEPENDENT)),
                 _ => true,
             };
             if !fits {
@@ -821,6 +843,7 @@ impl Context<'_> {
                 "crossreview" => "crossreview.json".to_owned(),
                 "revise" => "revision.json".to_owned(),
                 "final" => format!("final-{agent}.json"),
+                INDEPENDENT_GROUP => "independent-review.json".to_owned(),
                 exchange => format!("turns/t{}-{agent}.json", exchange.trim_start_matches("exchange-")),
             }));
         }
@@ -905,4 +928,59 @@ pub fn create(writer: &RoundWriter, recovered: &Recovered, run: &str) -> std::io
     let mut checkpoint = recovered.checkpoint.clone();
     checkpoint.events = events.len();
     writer.write_durable(CHECKPOINT, &serde_json::to_vec_pretty(&checkpoint)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentKind;
+
+    /// A version 2 record from before the independent reviewer.
+    const OLD: &str = r#"{
+        "version": 2, "title": "Fix", "request": "Fix it.",
+        "agents": [{ "kind": "claude", "model": "opus" }, { "kind": "codex", "model": null }],
+        "gates": ["pnpm build"], "workdir": "/workspace",
+        "config": { "turns": 2, "idleMs": 600000, "hardMs": 1800000 },
+        "continues": null
+    }"#;
+
+    #[test]
+    fn an_old_version_2_record_loads_without_a_reviewer() {
+        let record: RunRecord = parse(OLD.as_bytes(), RUN).unwrap();
+        assert_eq!(record.independent, None);
+        let task = record.task("t", "fix", "/workspace".into());
+        assert_eq!(task.options, RunOptions::default());
+        // It writes back as it was: no new key.
+        let written = serde_json::to_value(&record).unwrap();
+        assert!(written.get("independent").is_none());
+        // An unknown key is still damage.
+        let unknown = OLD.replace("\"continues\": null", "\"continues\": null, \"extra\": 1");
+        assert!(parse::<RunRecord>(unknown.as_bytes(), RUN).unwrap_err().contains("damaged"));
+    }
+
+    #[test]
+    fn the_record_gives_back_the_options_that_the_run_started_with() {
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "t", "slug": "fix", "title": "Fix", "request": "Fix it.",
+            "agents": [{ "kind": "claude", "model": null }, { "kind": "claude", "model": null }],
+            "gates": [], "workdir": "/workspace"
+        }))
+        .unwrap();
+        task.options = RunOptions {
+            turns: 7,
+            idle_secs: 30,
+            hard_secs: 90,
+            independent: Some(TaskAgent { kind: AgentKind::Claude, model: Some("sonnet".into()) }),
+        };
+        let record = RunRecord::new(&task);
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let back: RunRecord = parse(&bytes, RUN).unwrap();
+        assert_eq!(back, record);
+        assert_eq!(back.task("t", "fix", "/workspace".into()), task);
+        let config = back.config();
+        assert_eq!(
+            (config.turns, config.limits.idle, config.limits.hard),
+            (7, Duration::from_secs(30), Duration::from_secs(90))
+        );
+    }
 }

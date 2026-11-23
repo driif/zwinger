@@ -196,6 +196,7 @@ pub(crate) fn task_draft(id: Option<String>, title: &str, kinds: [AgentKind; 2])
         agents: kinds.map(|kind| session::TaskAgent { kind, model: None }),
         gates: vec!["pnpm build".into(), "  ".into()],
         workdir: "/workspace".into(),
+        options: Default::default(),
     }
 }
 

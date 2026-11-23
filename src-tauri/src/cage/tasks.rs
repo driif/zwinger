@@ -62,7 +62,7 @@ impl<R: SandboxRuntime> Manager<R> {
     pub fn start_task_run(&self, id: &str, task_id: &str) -> Result<String> {
         let _start = lock(&self.run_start);
         let task = lock(&self.state).session(id)?.task(task_id)?.clone();
-        let record = RunRecord::new(&task, self.run_config);
+        let record = RunRecord::new(&task);
         self.launch_run(id, task, record, None)
     }
 
@@ -107,9 +107,11 @@ impl<R: SandboxRuntime> Manager<R> {
             };
             let scope = git_scope(&task, &folder, &cage.mounts)?;
             let origin = Origin::of(&task.workdir, &scope, &folder, &member.folder, &cage.mounts);
+            // The independent reviewer must be ready too, before any process starts.
             let unmounted = task
                 .agents
                 .iter()
+                .chain(&task.options.independent)
                 .find(|a| a.kind != AgentKind::Pi && !runtimes.contains(&a.kind.name()))
                 .map(|a| self.unmounted(a.kind, host));
             (
@@ -358,7 +360,7 @@ pub(crate) fn git_scope(task: &Task, folder: &str, mounts: &[Mount]) -> Result<S
 mod tests {
     use crate::cage::Mount;
     use crate::cage::testing::*;
-    use crate::session::{Task, TaskAgent};
+    use crate::session::{RunOptions, Task, TaskAgent};
     use crate::task_artifacts::{self, RoundWriter};
     use crate::task_recovery::{self, Resume, RunRecord};
     use crate::task_runs::tests::{Fake, no_git, serve};
@@ -373,6 +375,7 @@ mod tests {
             agents: [AgentKind::Pi, AgentKind::Claude].map(|kind| TaskAgent { kind, model: None }),
             gates: Vec::new(),
             workdir: workdir.into(),
+            options: Default::default(),
         }
     }
 
@@ -501,7 +504,7 @@ mod tests {
         let task = lock(&manager.state).session(&id).unwrap().task(&task_id).unwrap().clone();
         let round = manager.task_dir(&id, "fix").join("01");
         let writer = RoundWriter::create(round.clone(), None).unwrap();
-        let record = serde_json::to_vec(&RunRecord::new(&task, manager.run_config)).unwrap();
+        let record = serde_json::to_vec(&RunRecord::new(&task)).unwrap();
         writer.write_durable(task_recovery::RUN, &record).unwrap();
         let checkpoint = serde_json::to_vec(&task_recovery::Checkpoint::empty()).unwrap();
         writer.write_durable(task_recovery::CHECKPOINT, &checkpoint).unwrap();
@@ -622,6 +625,93 @@ mod tests {
         assert_eq!(room.agents, ["claude-1", "claude-2"]);
         assert_eq!(room.participants[0].model.as_deref(), Some("opus"));
         cancel(&manager, &id, &task_id, "02").await;
+    }
+
+    #[tokio::test]
+    async fn run_options_are_checked_and_saved() {
+        let (manager, _runtime, id) = manager();
+        let kinds = [AgentKind::Pi, AgentKind::Claude];
+        let task_id = manager.put_task(&id, task_draft(None, "Fix", kinds)).unwrap();
+        let saved = || lock(&manager.state).session(&id).unwrap().task(&task_id).unwrap().options.clone();
+        assert_eq!(saved(), RunOptions::default());
+        let reviewer = |model: &str| Some(TaskAgent { kind: AgentKind::Codex, model: Some(model.into()) });
+        for bad in [
+            RunOptions { turns: 11, ..RunOptions::default() },
+            RunOptions { idle_secs: 0, ..RunOptions::default() },
+            RunOptions { idle_secs: 600, hard_secs: 86_401, ..RunOptions::default() },
+            RunOptions { idle_secs: 100, hard_secs: 99, ..RunOptions::default() },
+            RunOptions { independent: reviewer("two words"), ..RunOptions::default() },
+        ] {
+            let mut draft = task_draft(Some(task_id.clone()), "Fix", kinds);
+            draft.options = bad.clone();
+            assert!(matches!(manager.put_task(&id, draft), Err(Error::InvalidTask(..))), "{bad:?}");
+            assert_eq!(saved(), RunOptions::default());
+        }
+        for (turns, idle_secs, hard_secs) in [(0, 1, 1), (10, 86_400, 86_400)] {
+            let mut draft = task_draft(Some(task_id.clone()), "Fix", kinds);
+            draft.options = RunOptions { turns, idle_secs, hard_secs, independent: reviewer(" gpt-5 ") };
+            manager.put_task(&id, draft).unwrap();
+            assert_eq!(saved(), RunOptions { turns, idle_secs, hard_secs, independent: reviewer("gpt-5") });
+        }
+        // A blank reviewer model is the default model of its CLI.
+        let mut draft = task_draft(Some(task_id.clone()), "Fix", kinds);
+        draft.options.independent = reviewer("  ");
+        manager.put_task(&id, draft).unwrap();
+        assert_eq!(saved().independent, Some(TaskAgent { kind: AgentKind::Codex, model: None }));
+    }
+
+    #[tokio::test]
+    async fn a_run_needs_the_runtime_of_its_independent_reviewer() {
+        let (manager, _runtime, id) = manager();
+        runtimes::fake_install(&manager.data, "claude");
+        let mut draft = task_draft(None, "Fix", [AgentKind::Pi, AgentKind::Claude]);
+        draft.options.independent = Some(TaskAgent { kind: AgentKind::Codex, model: None });
+        let task_id = manager.put_task(&id, draft).unwrap();
+        manager.start(&id).await.unwrap();
+        assert!(matches!(manager.start_task_run(&id, &task_id), Err(Error::RuntimeMissing(name)) if name == "codex"));
+        assert!(!manager.task_dir(&id, "fix").exists());
+    }
+
+    #[tokio::test]
+    async fn a_continuation_keeps_the_run_options_after_a_task_edit() {
+        let (manager, runtime, id) = manager();
+        serve(&runtime, Arc::new(no_git), Arc::new(|_: &str, _, _: &str| Fake::Hang));
+        runtimes::fake_install(&manager.data, "claude");
+        let kinds = [AgentKind::Pi, AgentKind::Claude];
+        let mut draft = task_draft(None, "Fix", kinds);
+        let options = RunOptions {
+            turns: 3,
+            idle_secs: 120,
+            hard_secs: 240,
+            independent: Some(TaskAgent { kind: AgentKind::Claude, model: Some("sonnet".into()) }),
+        };
+        draft.options = options.clone();
+        let task_id = manager.put_task(&id, draft).unwrap();
+        manager.start(&id).await.unwrap();
+        assert_eq!(manager.start_task_run(&id, &task_id).unwrap(), "01");
+        cancel(&manager, &id, &task_id, "01").await;
+        let first = record(&manager.round_dir(&id, &task_id, "01").unwrap());
+        assert_eq!(first["config"], serde_json::json!({ "turns": 3, "idleMs": 120_000, "hardMs": 240_000 }));
+        assert_eq!(first["independent"], serde_json::json!({ "kind": "claude", "model": "sonnet" }));
+
+        // The edit applies to a new run only.
+        manager.put_task(&id, task_draft(Some(task_id.clone()), "Fix", kinds)).unwrap();
+        assert_eq!(manager.resume_task_run(&id, &task_id, "01").unwrap(), "02");
+        let round = manager.round_dir(&id, &task_id, "02").unwrap();
+        assert_eq!(record(&round)["config"], first["config"]);
+        assert_eq!(record(&round)["independent"], first["independent"]);
+        let room = task_artifacts::read_room(&round);
+        let exchange: Vec<String> =
+            room.stages.iter().map(|s| s.id.clone()).filter(|s| s.starts_with("exchange-")).collect();
+        assert_eq!(exchange, ["exchange-1", "exchange-2", "exchange-3"]);
+        assert_eq!(room.independent.unwrap().reviewer.model.as_deref(), Some("sonnet"));
+        cancel(&manager, &id, &task_id, "02").await;
+
+        assert_eq!(manager.start_task_run(&id, &task_id).unwrap(), "03");
+        let third = record(&manager.round_dir(&id, &task_id, "03").unwrap());
+        assert_eq!(third["config"], serde_json::json!({ "turns": 2, "idleMs": 600_000, "hardMs": 1_800_000 }));
+        assert!(third.get("independent").is_none());
+        cancel(&manager, &id, &task_id, "03").await;
     }
 
     fn guest_folder(manager: &Manager<FakeRuntime>, id: &str) -> String {

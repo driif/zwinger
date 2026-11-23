@@ -19,24 +19,64 @@ A task has these fields:
 - **Gates**: shell lines that check the result, for example `pnpm build`.
 - **Working dir**: `/workspace`, or a folder below it or below a mount. In a VM with more projects, `/workspace` is the
   project's folder `/workspace/<slug>`.
+- **Exchange turns**: 0 to 10, default 2. The most turns where the agents compare their plans. With 0, the run goes
+  from the plans to the tiebreak.
+- **Idle limit** and **Hard limit**: 1 to 86400 seconds, default 600 and 1800. The idle limit must not be longer than
+  the hard limit. See [Limits](#limits).
+- **Independent reviewer**: Off (default), or an agent kind with an optional model. See
+  [Independent reviewer](#independent-reviewer).
 
-A change to a task needs no restart.
+A change to a task needs no restart. A task from an earlier version has the default values. A run uses the values
+that the task had when the run started: a later change applies only to a new run, not to a run that is live, ended or
+continued.
 
 ## Run
 
 A run is one execution of a task. It has these stages:
 
 1. The two agents write plans in parallel. They do not see the plan of the other agent.
-2. Up to 2 turns where the agents compare their plans.
+2. Up to the configured exchange turns where the agents compare their plans. If they agree or you select the
+   implementer, the other turns are skipped.
 3. A tiebreak by the first agent, if the agents do not agree.
 4. The implementation.
 5. The run executes the gates.
 6. The other agent reviews the implementation and the gate results.
 7. If the review says `revise`, the implementer gets one revision. The run then executes the gates again.
 8. The two agents review the change in parallel, each with the latest gate results. The result is `ship` only if both reviewers say so.
+9. If the task has an independent reviewer, it reviews the change. Then `ship` also needs its approval.
 
 If an agent fails, the run continues in a degraded mode, and the room shows it. A degraded result is never shown as an
 agreement.
+
+### Limits
+
+The idle limit and the hard limit apply to **each process call**, not to a stage or to the run:
+
+- Each agent call, each gate command and the one retry of a reply with no JSON has its own limits. They start when
+  the process has its prompt.
+- Output on stdout or stderr starts the idle limit again. Output does not change the hard limit.
+- When a limit ends a call, zwinger stops the process and its child processes, and waits for them, before the next
+  step starts. A failed agent is degraded. A gate that a limit ends has no exit code.
+- A stage with two agents, more gates or a retry can take longer than the hard limit. No limit applies to a full
+  stage. The Git checks and the diffs have their own fixed limits.
+
+### Independent reviewer
+
+The independent reviewer is an agent outside the pair, with its own kind and model. It can be of the same kind and
+model as an agent of the pair; it still has its own role, files and name `independent`. It does not plan, exchange,
+break a tie, implement or cross-review, and you cannot select it as the implementer.
+
+After the two final reviews, it makes one new read-only call. It gets the task, the agreed plan, the full change, the
+cross review and the revision, and the latest gate results. It does not get the final reviews of the pair. It has the
+same read-only check as the other read-only stages, and the same limits as the other calls.
+
+With an independent reviewer, the result is `ship` only if both final reviewers say so and the independent reviewer
+returns `ship: true` with an empty `blocking` list and a `task_met` text. A `ship: false`, a reply without these
+fields, `ship: true` with blocking findings, a timeout, a cancel or no reply gives no ship. The room shows why. The run
+does not revise the change again after the independent review. Without an independent reviewer, the result is as
+before.
+
+The runtime of the independent reviewer must be available in the cage when the run starts, as for the two agents.
 
 A task needs a cage. A session with no cage cannot start a task: attach a cage, or set a default cage for its workspace.
 
@@ -66,6 +106,10 @@ contains the model. The room shows each agent with the icon of its kind, its kin
 if the task gives no model. The default model is the one that the CLI selects; zwinger does not know which model that
 is. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
 
+The room shows the independent reviewer, if the run has one, in its own card with its kind, model, stage and result.
+The exchange stages are the turns that the run started with. A run from an earlier version and a duo round folder
+from outside the app show 2 exchange stages, plus each turn that the round has.
+
 The room of an earlier run shows the agents and models that the run started with, not the current task. An older run
 that recorded its agents and models still shows them. An older run that recorded no models keeps its names and shows
 only the kind, with no model details. A duo round folder from outside
@@ -80,7 +124,7 @@ folders again. While an agent of an external round writes its live output, the r
 Every 30 seconds the room does a light check: it checks the
 two folders and the round files that it shows, and reads the whole folder again only if a folder changed. This finds a
 change that macOS did not report. The check also reads new live output. If the app cannot watch the round folder,
-`turns` or the folder that contains the round, the room does this check every 2 seconds and tries to watch again. The room reads at most 64 round files and 32 MiB. A file larger than 8 MiB is not read. A full
+`turns` or the folder that contains the round, the room does this check every 2 seconds and tries to watch again. The room reads at most 64 round files and 32 MiB, the fixed files of the round (such as `run.json` and the manifest) first. A file larger than 8 MiB is not read. A full
 read of a folder takes longer when the folder has many other files.
 
 If the round folder or `turns` is replaced by a different folder, the room reads nothing from the new folder until it
@@ -102,7 +146,7 @@ A cage stop cancels its runs.
 
 ## Commit or open a PR
 
-`ship` is the verdict of the two agent reviewers. It does not change your repository. After a run that ended with
+`ship` is the verdict of the two agent reviewers, and of the independent reviewer if the run has one. It does not change your repository. After a run that ended with
 `ship`, the room shows **Commit or PR**. Nothing happens in Git until you review the change and approve it there. A2A
 clients and agent messages cannot approve it. The room of a duo round folder from outside the app has no such action.
 
