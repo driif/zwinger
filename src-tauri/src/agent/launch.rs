@@ -237,9 +237,11 @@ fn status(kind: AgentKind) -> Status {
     }
 }
 
-/// The agent's wrapper adds hooks that report its state in a terminal.
+/// The agent surely reports a turn through its status hooks.
 pub fn reports_status(kind: AgentKind) -> bool {
-    status_flag(kind).is_some()
+    // Codex and Gemini hooks can be missing (an image's own hooks.json, an
+    // older Gemini), so only Claude and pi count as a sure turn signal.
+    matches!(kind, AgentKind::Claude | AgentKind::Pi)
 }
 
 /// [`AGENT_OSC`] after its ESC.
