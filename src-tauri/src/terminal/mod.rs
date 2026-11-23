@@ -56,7 +56,7 @@ pub struct TerminalView {
     pub kind: TerminalKind,
     pub exit_code: Option<i32>,
     pub terminal_id: Option<String>,
-    /// Set only while an agent terminal is live.
+    /// Set only while a VM agent or a VM shell with an agent in it is live.
     pub agent: Option<AgentState>,
     /// The last known folder of a live process. `None`: exited, or unknown.
     pub folder: Option<TerminalFolder>,

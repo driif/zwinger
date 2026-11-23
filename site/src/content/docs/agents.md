@@ -54,19 +54,33 @@ Tasks need a cage. A project with no cage cannot run a task.
 
 ## Agent status
 
-The terminal, session and workspace rows show an agent status glyph while an agent terminal runs:
+The terminal, session and workspace rows show an agent status glyph while an agent runs in a VM terminal. This
+includes an agent that you start in a VM shell:
 
 - **Active:** the agent is working.
 - **Blocked:** the agent waits for your answer or permission.
 - **Done:** the agent finished its turn and waits for a new prompt.
 
 Point to a glyph to read its status. A session with several agents shows the most urgent state: **blocked > active > done**.
-A workspace uses the same rule across its sessions. The glyph disappears when the agent process exits.
+A workspace uses the same rule across its sessions. The glyph disappears when the agent exits. In a VM shell, the
+shell stays open and its row shows no glyph again.
 
-For interactive terminals, zwinger adds status hooks to Claude Code and pi. The hooks write status signals to the
-terminal; they do not change a read-only agent profile. Claude Code reports all three states. Pi reports active and
-done; it does not report blocked. Codex and Gemini CLI do not report status yet, so their rows show no glyph. An agent
-with no cage shows no glyph, because zwinger does not install its hooks on your Mac.
+When an agent goes to **blocked** while zwinger is in the background, the dock icon bounces once and its badge shows
+the number of blocked agents. The badge goes when you bring the zwinger window to the front.
+
+For interactive terminals, zwinger adds status hooks to each agent. The hooks write status signals to the terminal;
+they do not change your agent settings or a read-only agent profile:
+
+- **Claude Code** reports all three states.
+- **Codex** reports all three states. Its hooks are in `/etc/codex/hooks.json` in the VM, as system hooks, so Codex
+  does not ask you to trust them. If the VM image has its own `/etc/codex/hooks.json`, zwinger keeps it, and Codex
+  reports no status. With **Agents run without permission prompts** on, Codex never asks, so it is never blocked.
+- **Gemini CLI** reports all three states. Its hooks are in a system defaults file, so your own Gemini settings win
+  and your own hooks run too. Gemini CLI runs hooks only in a trusted folder.
+- **Pi** reports active and done; it does not report blocked.
+
+A headless call, such as `claude -p`, `codex exec` or `gemini -p`, reports no status. An agent with no cage shows no
+glyph, because zwinger does not install its hooks on your Mac.
 
 ## Permission prompts
 

@@ -1,6 +1,7 @@
 mod a2a;
 mod agent;
 mod appearance;
+mod blocked_badge;
 mod bootstrap;
 mod cage;
 mod commands;
@@ -203,6 +204,7 @@ fn connect(app: &AppHandle, manager: &Manager<Microsandbox>) {
     let handle = app.clone();
     manager.set_agent_sink(Box::new(move |process_id, state| {
         let _ = handle.emit("agent-state", serde_json::json!({ "processId": process_id, "state": state }));
+        blocked_badge::agent_state(&handle, process_id, state);
     }));
     let handle = app.clone();
     manager.set_folder_sink(Box::new(move |process_id, seq, folder| {
@@ -237,6 +239,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
         .on_window_event(|window, event| {
+            if let WindowEvent::Focused(true) = event {
+                blocked_badge::focused(window.app_handle());
+            }
             if let WindowEvent::Destroyed = event {
                 if let Some(watches) = window.try_state::<folder_watch::FolderWatches>() {
                     watches.drop_owner(window.label());
@@ -277,6 +282,7 @@ pub fn run() {
             };
             app.manage(lock);
             app.manage(commands::window::WindowReveal::default());
+            app.manage(blocked_badge::BlockedBadge::default());
             report_panics(app.handle().clone());
             if let Err(e) = raise_open_files() {
                 eprintln!("the open file limit could not be raised: {e}");

@@ -22,7 +22,7 @@ use crate::network::{self, Action, RuleDraft, Source, Target};
 use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
-use crate::runtime::{SandboxRuntime, TerminalKind};
+use crate::runtime::SandboxRuntime;
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
@@ -612,10 +612,7 @@ impl<R: SandboxRuntime> Manager<R> {
                                 kind: t.kind,
                                 exit_code: t.exit_code,
                                 terminal_id: t.terminal_id.clone(),
-                                agent: output
-                                    .osc
-                                    .agent
-                                    .filter(|_| live && matches!(t.kind, TerminalKind::Agent { .. })),
+                                agent: output.osc.agent.filter(|_| live && !t.kind.on_host()),
                                 folder: output.folder.clone().filter(|_| live),
                                 folder_seq: output.folder_seq,
                             }

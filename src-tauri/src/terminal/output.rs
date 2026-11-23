@@ -217,18 +217,16 @@ impl Osc {
         self.body.clear();
     }
 
-    /// Keeps a known state; the sequence goes in all cases.
+    /// Keeps a known state; `none` clears it, as the agent has exited. The
+    /// sequence goes in all cases.
     fn finish_agent(&mut self) {
         let value = &self.held[AGENT_OSC.len()..];
-        let value = value.strip_suffix(b"\x1b").unwrap_or(value);
-        let state = match value {
-            b"active" => Some(AgentState::Active),
-            b"blocked" => Some(AgentState::Blocked),
-            b"done" => Some(AgentState::Done),
-            _ => None,
-        };
-        if state.is_some() {
-            self.agent = state;
+        match value.strip_suffix(b"\x1b").unwrap_or(value) {
+            b"active" => self.agent = Some(AgentState::Active),
+            b"blocked" => self.agent = Some(AgentState::Blocked),
+            b"done" => self.agent = Some(AgentState::Done),
+            b"none" => self.agent = None,
+            _ => {}
         }
         self.held.clear();
         self.reset();
@@ -432,7 +430,7 @@ pub(crate) fn keep_folder(output: &Mutex<Output>, folder: &Option<TerminalFolder
 /// process exits. While the view is full, it does not read, so the process
 /// blocks on its writes. The exit code is recorded before the `Exit` event
 /// is delivered, so a listing done in reaction to it shows the exit. A change
-/// of the agent state goes to `agents`; at the exit, the state goes. A VM
+/// of the agent state of a VM process goes to `agents`; at the exit, the state goes. A VM
 /// process that reports a new folder by OSC 7 sends its change to `folders`.
 /// The pump never asks macOS: a Mac folder comes from the batch call only.
 pub(crate) async fn pump<V>(
@@ -444,7 +442,7 @@ pub(crate) async fn pump<V>(
     agents: Arc<OnceLock<AgentSink>>,
     folders: Arc<OnceLock<FolderSink>>,
 ) {
-    let agent_terminal = matches!(kind, TerminalKind::Agent { .. });
+    // A VM shell can run an agent through its wrapper too.
     let vm = !kind.on_host();
     let mut frames = Frames::new(events);
     let room = lock(&output).room.clone();
@@ -485,7 +483,7 @@ pub(crate) async fn pump<V>(
             }
             (before, output.osc.agent.filter(|_| exit.is_none()), moved)
         };
-        if agent_terminal
+        if vm
             && before != after
             && let Some(sink) = agents.get()
         {
@@ -569,6 +567,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_vm_shell_shows_the_state_of_its_agent_until_the_agent_exits() {
+        let (manager, _, id) = manager();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        manager.set_agent_sink(Box::new(move |_, state| lock(&into).push(state)));
+        manager.start(&id).await.unwrap();
+        let session = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let agent = || manager.list().sessions[0].processes[0].agent;
+        manager.write(&session, b"\x1b]1337;zwinger-agent=active\x07".to_vec()).unwrap();
+        until(|| agent() == Some(AgentState::Active)).await;
+        // The wrapper clears the state when the agent exits; the shell lives on.
+        manager.write(&session, b"\x1b]1337;zwinger-agent=none\x07".to_vec()).unwrap();
+        until(|| lock(&seen).len() == 2).await;
+        assert_eq!(*lock(&seen), [Some(AgentState::Active), None]);
+        assert_eq!((agent(), manager.list().sessions[0].processes[0].exit_code), (None, None));
+    }
+
     fn cwd(chunks: &[&[u8]]) -> Option<String> {
         let mut osc = Osc::default();
         for chunk in chunks {
@@ -596,6 +612,7 @@ mod tests {
             scan(&[b"\x1b]1337;zwinger-agent=active\x07x\x1b]1337;zwinger-agent=done\x1b\\y"]),
             (b"xy".to_vec(), Some(AgentState::Done))
         );
+        assert_eq!(scan(&[b"\x1b]1337;zwinger-agent=blocked\x07\x1b]1337;zwinger-agent=none\x07"]), (Vec::new(), None));
         // An unknown value changes nothing, and goes too.
         assert_eq!(
             scan(&[b"\x1b]1337;zwinger-agent=done\x07\x1b]1337;zwinger-agent=sleepy\x07z"]),

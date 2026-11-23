@@ -179,25 +179,61 @@ fn added(kind: AgentKind, unprompted: bool) -> Option<Added> {
 const STATUS: &str = "zwinger-agent-status";
 const CLAUDE_STATUS: &str = "claude-status.json";
 const PI_STATUS: &str = "pi-status.js";
+/// Gemini CLI's system defaults: the lowest settings scope, so the user's
+/// own settings win and their hooks are added to these.
+const GEMINI_STATUS: &str = "gemini-status.json";
+/// Codex's system hooks in the guest root fs. Codex runs system hooks
+/// without the trust step of user hooks.
+const CODEX_HOOKS: &str = "/etc/codex/hooks.json";
 /// The wrapper adds the status hooks only to an agent in a terminal: a
 /// headless call from a tool cannot change its parent's state.
 const TTY: &str = "[ -t 0 ] && [ -t 1 ]";
+/// The terminal of an interactive agent, from its wrapper. Codex runs its
+/// hooks in a new session with no `/dev/tty`, so the hooks write here. A
+/// wrapper with no terminal unsets it, so a nested headless agent stays quiet.
+const TTY_ENV: &str = "ZWINGER_TTY";
+/// The value of [`TTY_ENV`]. A test replaces it.
+const TTY_NAME: &str = "\"$(tty)\"";
+/// The state value that clears the state: the agent has exited.
+const NO_STATE: &str = "none";
 
-/// The flag that adds the status hooks, and the arguments that start no
-/// interactive session.
-fn status_flag(kind: AgentKind) -> Option<(String, &'static str, &'static str)> {
+/// How the wrapper adds the status hooks to an interactive session.
+struct Status {
+    /// Goes before the user arguments.
+    flag: Option<String>,
+    /// Exported with [`TTY_ENV`].
+    env: Option<String>,
+    /// `case` patterns of the first argument: a subcommand that starts no
+    /// interactive session.
+    subcommands: Option<&'static str>,
+    /// `case` patterns of each argument that starts no interactive session.
+    other: Option<&'static str>,
+}
+
+fn status(kind: AgentKind) -> Status {
     match kind {
-        AgentKind::Claude => Some((
-            format!("--settings {BIN_DIR}/{CLAUDE_STATUS}"),
-            "agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade",
-            "-p|--print",
-        )),
-        AgentKind::Pi => Some((
-            format!("-e {BIN_DIR}/{PI_STATUS}"),
-            "install|remove|uninstall|update|list|config|auth|mcp",
-            "-p|--print",
-        )),
-        AgentKind::Codex | AgentKind::Gemini => None,
+        AgentKind::Claude => Status {
+            flag: Some(format!("--settings {BIN_DIR}/{CLAUDE_STATUS}")),
+            env: None,
+            subcommands: Some(
+                "agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade",
+            ),
+            other: Some("-p|--print"),
+        },
+        AgentKind::Pi => Status {
+            flag: Some(format!("-e {BIN_DIR}/{PI_STATUS}")),
+            env: None,
+            subcommands: Some("install|remove|uninstall|update|list|config|auth|mcp"),
+            other: Some("-p|--print"),
+        },
+        // The hooks are in [`CODEX_HOOKS`].
+        AgentKind::Codex => Status { flag: None, env: None, subcommands: Some("exec|e"), other: None },
+        AgentKind::Gemini => Status {
+            flag: None,
+            env: Some(format!("GEMINI_CLI_SYSTEM_DEFAULTS_PATH={BIN_DIR}/{GEMINI_STATUS}")),
+            subcommands: None,
+            other: Some("-p|--prompt|--prompt=*"),
+        },
     }
 }
 
@@ -214,32 +250,71 @@ const TOOL: &str = "tool";
 fn status_script() -> String {
     format!(
         "#!/bin/sh\n# zwinger writes this file at each cage start.\n\
+         [ -n \"${{{TTY_ENV}-}}\" ] || exit 0\n\
          state=$1\n\
          if [ \"$state\" = {TOOL} ]; then\n  \
            case \"$(cat)\" in *'\"tool_name\":\"AskUserQuestion\"'*|*'\"tool_name\": \"AskUserQuestion\"'*) state=blocked ;; \
            *) state=active ;; esac\n\
          fi\n\
-         printf '\\033{}%s\\007' \"$state\" > /dev/tty 2>/dev/null || true\n",
-        agent_osc()
+         {}\n",
+        report("\"$state\"")
     )
+}
+
+/// The `sh` line that writes [`AGENT_OSC`] with `state` to [`TTY_ENV`].
+fn report(state: &str) -> String {
+    format!("{{ printf '\\033{}%s\\007' {state} > \"${TTY_ENV}\"; }} 2>/dev/null || true", agent_osc())
+}
+
+/// One hook command that reports `state`.
+fn hook(state: &str) -> serde_json::Value {
+    serde_json::json!([{ "type": "command", "command": format!("{BIN_DIR}/{STATUS} {state}") }])
 }
 
 /// Claude Code settings with the status hooks only. `--settings` adds them
 /// to the hooks of the user's settings.
 fn claude_status() -> String {
-    let set =
-        |state: &str| serde_json::json!([{ "type": "command", "command": format!("{BIN_DIR}/{STATUS} {state}") }]);
     let hooks = serde_json::json!({
-        "UserPromptSubmit": [{ "hooks": set("active") }],
+        "UserPromptSubmit": [{ "hooks": hook("active") }],
         // One hook for all tools: two matching hooks would run in parallel.
-        "PreToolUse": [{ "hooks": set(TOOL) }],
+        "PreToolUse": [{ "hooks": hook(TOOL) }],
         // After the user approves a permission, the tool runs.
-        "PostToolUse": [{ "hooks": set("active") }],
+        "PostToolUse": [{ "hooks": hook("active") }],
         // Not `idle_prompt`: it comes after `Stop`, when the turn is done.
-        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": set("blocked") }],
-        "Stop": [{ "hooks": set("done") }],
+        "Notification": [{ "matcher": "permission_prompt|elicitation_dialog", "hooks": hook("blocked") }],
+        "Stop": [{ "hooks": hook("done") }],
     });
     serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).expect("JSON")
+}
+
+/// Codex's hooks.json with the status hooks only. Codex 0.163 has these
+/// events. With the approvals bypass, it never asks for a permission.
+fn codex_hooks() -> String {
+    let hooks = serde_json::json!({
+        "UserPromptSubmit": [{ "hooks": hook("active") }],
+        "PermissionRequest": [{ "hooks": hook("blocked") }],
+        // After the user approves a permission, the tool runs.
+        "PostToolUse": [{ "hooks": hook("active") }],
+        "Stop": [{ "hooks": hook("done") }],
+        // An interrupted turn has no `Stop`.
+        "Interrupt": [{ "hooks": hook("done") }],
+    });
+    serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).expect("JSON")
+}
+
+/// Gemini CLI system defaults with the status hooks only. The hooks of all
+/// settings scopes add up. The hook rows in its UI are off; the user's own
+/// settings can turn them on.
+fn gemini_status() -> String {
+    let hooks = serde_json::json!({
+        "BeforeAgent": [{ "hooks": hook("active") }],
+        "Notification": [{ "matcher": "ToolPermission", "hooks": hook("blocked") }],
+        // After the user approves a permission, the tool runs.
+        "AfterTool": [{ "hooks": hook("active") }],
+        "AfterAgent": [{ "hooks": hook("done") }],
+    });
+    let settings = serde_json::json!({ "hooksConfig": { "notifications": false }, "hooks": hooks });
+    serde_json::to_string_pretty(&settings).expect("JSON")
 }
 
 /// A pi extension. pi asks for no permissions, so it is never blocked.
@@ -295,15 +370,32 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
         }
         script.push_str(&format!("for arg do\n  case \"$arg\" in {}) add= ;; esac\ndone\n", added.user));
     }
-    if let Some((flag, subcommands, other)) = status_flag(kind) {
-        script.push_str(&format!("status=\n{TTY} && status=1\ncase \"$first\" in {subcommands}) status= ;; esac\n"));
+    let status = status(kind);
+    script.push_str(&format!("status=\n{TTY} && status=1\n"));
+    if let Some(subcommands) = status.subcommands {
+        script.push_str(&format!("case \"$first\" in {subcommands}) status= ;; esac\n"));
+    }
+    if let Some(other) = status.other {
         script.push_str(&format!("for arg do\n  case \"$arg\" in {other}) status= ;; esac\ndone\n"));
+    }
+    let env = status.env.map(|env| format!(" {env}")).unwrap_or_default();
+    script
+        .push_str(&format!("if [ -n \"$status\" ]; then export {TTY_ENV}={TTY_NAME}{env}; else unset {TTY_ENV}; fi\n"));
+    if let Some(flag) = status.flag {
         script.push_str(&format!("[ -n \"$status\" ] && set -- {flag} \"$@\"\n"));
     }
     if let Some(added) = permission {
         script.push_str(&format!("[ -n \"$add\" ] && set -- {} \"$@\"\n", added.flag.join(" ")));
     }
-    script.push_str(&format!("exec {} \"$@\"\n", program.join(" ")));
+    // The wrapper waits for the agent, then clears its state: a shell
+    // terminal lives on after the agent. A trapped signal is the default
+    // again in the agent, so Ctrl-C reaches only the agent.
+    let program = program.join(" ");
+    script.push_str(&format!(
+        "if [ -n \"$status\" ]; then\n  trap : INT QUIT\n  {program} \"$@\"\n  code=$?\n  {}\n  exit $code\nfi\n",
+        report(NO_STATE)
+    ));
+    script.push_str(&format!("exec {program} \"$@\"\n"));
     Some(script)
 }
 
@@ -494,12 +586,14 @@ pub fn profile() -> String {
 }
 
 /// The root exec that writes the shell files in the guest's root fs: the
-/// zsh files, the fish file, then [`PROFILE`], which uses the zsh files.
-/// Each file goes to a temp file first, then replaces the old file.
+/// zsh files, the fish file, then [`PROFILE`], which uses the zsh files,
+/// and [`CODEX_HOOKS`]. Each file goes to a temp file first, then replaces
+/// the old file.
 pub fn profile_argv() -> Vec<String> {
     let mut files = zsh_files();
     files.push((FISH_CONF.to_owned(), FISH_EMITTER.to_owned()));
     files.push((PROFILE.to_owned(), profile()));
+    files.push((CODEX_HOOKS.to_owned(), codex_hooks()));
     let mut script = "set -e\n\
          put() (\n\
            umask 022\n\
@@ -514,7 +608,13 @@ pub fn profile_argv() -> Vec<String> {
          )\n"
     .to_owned();
     for (i, (path, _)) in files.iter().enumerate() {
-        script.push_str(&format!("put {path} \"${{{}}}\"\n", i + 1));
+        // An image's own Codex hooks stay; then Codex reports no state.
+        let keep = if path == CODEX_HOOKS {
+            format!("[ -e {path} ] && ! grep -qF {STATUS} {path} || ")
+        } else {
+            String::new()
+        };
+        script.push_str(&format!("{keep}put {path} \"${{{}}}\"\n", i + 1));
     }
     let mut argv: Vec<String> = ["/bin/sh", "-c", &script, "sh"].map(str::to_owned).into();
     argv.extend(files.into_iter().map(|(_, content)| content));
@@ -679,11 +779,16 @@ pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) ->
         std::fs::write(&path, script)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
     }
-    if kinds.contains(&AgentKind::Claude) {
+    if kinds.iter().any(|&kind| kind != AgentKind::Pi) {
         let path = dir.join(STATUS);
         std::fs::write(&path, status_script())?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if kinds.contains(&AgentKind::Claude) {
         std::fs::write(dir.join(CLAUDE_STATUS), claude_status())?;
+    }
+    if kinds.contains(&AgentKind::Gemini) && found.gemini.is_some() {
+        std::fs::write(dir.join(GEMINI_STATUS), gemini_status())?;
     }
     if kinds.contains(&AgentKind::Pi) {
         std::fs::write(dir.join(PI_STATUS), pi_status())?;
@@ -767,12 +872,24 @@ mod tests {
 
     /// Runs the wrapper with `sh`, with a program that prints its env and arguments.
     fn run_with_tty_check(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool) -> String {
+        run_printing(kind, unprompted, args, tty, "\"$HOME$CODEX_HOME$PI_CODING_AGENT_DIR\"").0
+    }
+
+    /// Runs the wrapper with a program that prints `vars` and its arguments.
+    /// With `tty`, the wrapper takes the interactive branch with a temp file
+    /// as its terminal. Gives the output and what the wrapper wrote to the
+    /// terminal.
+    fn run_printing(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool, vars: &str) -> (String, String) {
         let script = wrapper(kind, HOST, unprompted).unwrap();
+        let terminal = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
         // The test process has pipes; substitute the TTY check to exercise the interactive branch.
-        let script = if tty { script.replace(TTY, "true") } else { script };
+        let script = if tty {
+            script.replace(TTY, "true").replace(TTY_NAME, &quote(&terminal.display().to_string()))
+        } else {
+            script
+        };
         let program = program(kind, HOST).unwrap().iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
-        let script =
-            script.replace(&format!("exec {program}"), "exec printf '%s\\n' \"$HOME$CODEX_HOME$PI_CODING_AGENT_DIR\"");
+        let script = script.replace(&format!("{program} "), &format!("printf '%s\\n' {vars} "));
         let out = std::process::Command::new("/bin/sh")
             .env_clear()
             .arg("-c")
@@ -782,7 +899,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap()
+        let written = std::fs::read_to_string(&terminal).unwrap_or_default();
+        let _ = std::fs::remove_file(terminal);
+        (String::from_utf8(out.stdout).unwrap(), written)
     }
 
     fn run(kind: AgentKind, unprompted: bool, args: &[&str]) -> String {
@@ -812,6 +931,29 @@ mod tests {
     }
 
     #[test]
+    fn an_interactive_agent_gets_its_terminal_and_clears_its_state_at_the_exit() {
+        let cleared = format!("\x1b{}{NO_STATE}\x07", agent_osc());
+        let vars = "\"${ZWINGER_TTY:+tty}|${GEMINI_CLI_SYSTEM_DEFAULTS_PATH-}\"";
+        let run = |kind, args: &[&str], tty| run_printing(kind, true, args, tty, vars);
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Pi] {
+            let (out, written) = run(kind, &[], true);
+            assert!(out.starts_with("tty|\n"), "{kind:?}: {out}");
+            assert_eq!(written, cleared, "{kind:?}");
+        }
+        assert_eq!(
+            run(AgentKind::Gemini, &[], true),
+            ("tty|/opt/zwinger/bin/gemini-status.json\n--yolo\n".to_owned(), cleared)
+        );
+        // A headless agent gets no terminal, so its hooks stay quiet.
+        assert_eq!(
+            run(AgentKind::Codex, &["exec", "hi"], true),
+            ("|\n--dangerously-bypass-approvals-and-sandbox\nexec\nhi\n".to_owned(), String::new())
+        );
+        assert_eq!(run(AgentKind::Gemini, &["-p", "hi"], true), ("|\n--yolo\n-p\nhi\n".to_owned(), String::new()));
+        assert_eq!(run(AgentKind::Claude, &[], false).1, "");
+    }
+
+    #[test]
     fn claude_wrapper_sets_its_state_and_skips_permissions() {
         assert_eq!(
             wrapper(AgentKind::Claude, Found::default(), true).unwrap(),
@@ -824,8 +966,16 @@ mod tests {
              status=\n[ -t 0 ] && [ -t 1 ] && status=1\n\
              case \"$first\" in agents|attach|auth|auto-mode|config|doctor|gateway|import|install|logs|mcp|plugin|plugins|purge|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) status= ;; esac\n\
              for arg do\n  case \"$arg\" in -p|--print) status= ;; esac\ndone\n\
+             if [ -n \"$status\" ]; then export ZWINGER_TTY=\"$(tty)\"; else unset ZWINGER_TTY; fi\n\
              [ -n \"$status\" ] && set -- --settings /opt/zwinger/bin/claude-status.json \"$@\"\n\
              [ -n \"$add\" ] && set -- --dangerously-skip-permissions \"$@\"\n\
+             if [ -n \"$status\" ]; then\n  \
+               trap : INT QUIT\n  \
+               /opt/zwinger/claude/claude \"$@\"\n  \
+               code=$?\n  \
+               { printf '\\033]1337;zwinger-agent=%s\\007' none > \"$ZWINGER_TTY\"; } 2>/dev/null || true\n  \
+               exit $code\n\
+             fi\n\
              exec /opt/zwinger/claude/claude \"$@\"\n"
         );
         assert_eq!(
@@ -982,7 +1132,7 @@ mod tests {
         let argv = profile_argv();
         assert_eq!(argv[..2], ["/bin/sh", "-c"]);
         let mut files: Vec<_> = zsh_files().into_iter().map(|(_, content)| content).collect();
-        files.extend([FISH_EMITTER.to_owned(), profile()]);
+        files.extend([FISH_EMITTER.to_owned(), profile(), codex_hooks()]);
         assert_eq!(argv[3], "sh");
         assert_eq!(argv[4..], files);
         assert!(PATH.starts_with(&format!("{BIN_DIR}:")));
@@ -1815,9 +1965,10 @@ mod tests {
     #[test]
     fn status_script_picks_the_state_from_the_tool_name() {
         let tty = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
-        let script = status_script().replace("/dev/tty", &tty.display().to_string());
+        let script = status_script();
         let run = |arg: &str, input: &str| {
             let mut child = std::process::Command::new("/bin/sh")
+                .env(TTY_ENV, &tty)
                 .arg("-c")
                 .arg(&script)
                 .arg("sh")
@@ -1837,7 +1988,17 @@ mod tests {
         assert_eq!(run(TOOL, r#"{"tool_name":"Bash","tool_input":{"command":"AskUserQuestion"}}"#), osc("active"));
         assert_eq!(run(TOOL, r#"{"tool_name":"Read"}"#), osc("active"));
         assert_eq!(run("done", ""), osc("done"));
-        std::fs::remove_file(tty).unwrap();
+        std::fs::remove_file(&tty).unwrap();
+        // With no terminal from the wrapper, the hook writes nothing.
+        let quiet = std::process::Command::new("/bin/sh")
+            .env_remove(TTY_ENV)
+            .arg("-c")
+            .arg(&script)
+            .arg("sh")
+            .arg("done")
+            .status();
+        assert!(quiet.unwrap().success());
+        assert!(!tty.exists());
     }
 
     #[test]
@@ -1863,6 +2024,51 @@ mod tests {
         let empty = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&empty).unwrap();
         write(&empty, &[], Found::default(), false).unwrap();
-        assert_eq!(std::fs::read_dir(empty).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        write(&empty, &[AgentKind::Codex, AgentKind::Gemini], HOST, true).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&empty).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["codex", "gemini", "gemini-status.json", "zwinger-agent-status"]);
+    }
+
+    #[test]
+    fn codex_and_gemini_hooks_give_one_state_per_event() {
+        let state = |name: &str| serde_json::json!(format!("{BIN_DIR}/{STATUS} {name}"));
+        let codex: serde_json::Value = serde_json::from_str(&codex_hooks()).unwrap();
+        let codex = &codex["hooks"];
+        for (event, name) in [
+            ("UserPromptSubmit", "active"),
+            ("PermissionRequest", "blocked"),
+            ("PostToolUse", "active"),
+            ("Stop", "done"),
+            ("Interrupt", "done"),
+        ] {
+            assert_eq!(codex[event][0]["hooks"][0]["command"], state(name), "{event}");
+        }
+        let gemini: serde_json::Value = serde_json::from_str(&gemini_status()).unwrap();
+        assert_eq!(gemini["hooksConfig"]["notifications"], false);
+        let hooks = &gemini["hooks"];
+        for (event, name) in
+            [("BeforeAgent", "active"), ("Notification", "blocked"), ("AfterTool", "active"), ("AfterAgent", "done")]
+        {
+            assert_eq!(hooks[event][0]["hooks"][0]["command"], state(name), "{event}");
+        }
+        assert_eq!(hooks["Notification"][0]["matcher"], "ToolPermission");
+    }
+
+    #[test]
+    fn the_codex_hooks_of_the_image_stay() {
+        let root = Temp::new("codex-hooks");
+        let etc = root.path("etc");
+        let mut argv = profile_argv();
+        argv[2] = argv[2].replace("/etc/", &format!("{etc}/"));
+        let run = || {
+            let out = std::process::Command::new(&argv[0]).env_clear().args(&argv[1..]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            std::fs::read_to_string(format!("{etc}/codex/hooks.json")).unwrap()
+        };
+        assert_eq!(run(), codex_hooks());
+        std::fs::write(format!("{etc}/codex/hooks.json"), "{}").unwrap();
+        assert_eq!(run(), "{}");
     }
 }
