@@ -19,7 +19,7 @@ const target = (cage: CageView | null, vmCage: CageView | null = cage): SessionC
 
 const cage = (state: "running" | "stopped", hostAgents: CageView["hostAgents"] = []) => target(cageView(state, hostAgents));
 
-const detection = (...kinds: AgentKind[]) => ({ agents: kinds.map((kind) => ({ kind })), antigravity: false }) as Detection;
+const detection = (...kinds: AgentKind[]) => ({ agents: kinds.map((kind) => ({ kind })), antigravity: null }) as Detection;
 
 const editors: Editors = {
   editors: [
@@ -62,7 +62,7 @@ test("a stopped cage lists the agents that a start can mount, host agents first"
   const agents = launchActions(cage("stopped", host), undefined, undefined)
     .filter((a) => a.type === "session" && a.kind.type === "agent" && !a.kind.resume)
     .map((a) => a.id);
-  assert.deepEqual(agents, ["agent-gemini", "agent-claude", "agent-codex", "agent-pi"]);
+  assert.deepEqual(agents, ["agent-gemini", "agent-claude", "agent-codex", "agent-pi", "agent-agy"]);
 });
 
 test("no editors, or all editors off, give no editor actions", () => {
@@ -84,8 +84,14 @@ test("with no cage, each agent runs on this Mac, and an agent that is not instal
       ["pi: continue last session", undefined],
       ["New Gemini CLI", "Gemini CLI is not installed on this Mac"],
       ["Gemini CLI: continue last session", "Gemini CLI is not installed on this Mac"],
+      ["New Antigravity CLI", "Antigravity CLI is not installed on this Mac"],
+      ["Antigravity CLI: continue last session", "Antigravity CLI is not installed on this Mac"],
     ],
   );
+  // Antigravity CLI is no host agent of a cage, so the detection has it apart.
+  const agy = { ...detection(), antigravity: { kind: "agy" } } as Detection;
+  const found = launchActions(target(null), agy, undefined).find((a) => a.id === "agent-agy");
+  assert.equal(found?.disabled, undefined);
   assert.deepEqual(sessions[4], {
     id: "resume-codex",
     label: "Codex: continue last session",

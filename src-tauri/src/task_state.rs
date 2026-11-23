@@ -48,8 +48,8 @@ fn link_config(state: &Path, home: &[&str], kind: AgentKind) -> io::Result<()> {
     let parts = profile::state_home(kind);
     let terminal = host_agents::open_parts(state, parts)?;
     let dir = host_agents::open_parts(state, &[home, parts].concat())?;
-    let (_, login) = guest_login::place(kind);
-    for name in profile::entries(kind).iter().chain([&login]) {
+    let login = guest_login::place(kind).map(|(_, name)| name);
+    for name in profile::entries(kind).iter().chain(&login) {
         if host_agents::type_at(&terminal, *name)?.is_some() {
             let target = format!("{STATE_DIR}/{}/{name}", parts.join("/"));
             rustix::fs::symlinkat(target.as_str(), &dir, *name)?;

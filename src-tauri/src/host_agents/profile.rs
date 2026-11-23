@@ -30,6 +30,7 @@ pub fn config_dir(kind: AgentKind) -> &'static str {
         AgentKind::Codex => ".codex",
         AgentKind::Pi => ".pi/agent",
         AgentKind::Gemini => ".gemini",
+        AgentKind::Antigravity => ".gemini/antigravity-cli",
     }
 }
 
@@ -40,6 +41,8 @@ pub fn entries(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => &["config.toml", "AGENTS.md", "prompts", "skills"],
         AgentKind::Pi => &["settings.json", "extensions", "themes", "models-store.json", "npm"],
         AgentKind::Gemini => &["settings.json", "GEMINI.md", "commands", "policies"],
+        // Not a host agent: it has no profile.
+        AgentKind::Antigravity => &[],
     }
 }
 
@@ -93,6 +96,7 @@ pub fn state_home(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => &["codex"],
         AgentKind::Pi => &["agent"],
         AgentKind::Gemini => &["gemini", ".gemini"],
+        AgentKind::Antigravity => &["agy", ".gemini", "antigravity-cli"],
     }
 }
 

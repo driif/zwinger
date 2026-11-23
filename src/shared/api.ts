@@ -305,7 +305,7 @@ export interface VmView {
   members: string[];
   pendingRestart: boolean;
   /** The agent runtimes that the running VM has mounted. A host Gemini CLI that loads counts as one. */
-  runtimes: ("claude" | "codex" | "gemini")[];
+  runtimes: ("claude" | "codex" | "gemini" | "agy")[];
   /** The earliest expiry of the host logins that the proxy has now, in ms since the epoch. The proxy reads a newer login when it is due. */
   loginExpiresAt: number | null;
   /** What the start did differently for the host agents, such as a fallback. */

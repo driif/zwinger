@@ -1,7 +1,9 @@
-//! The agents of a project: pi, Claude Code, Codex and Gemini CLI. Each one
-//! runs in the VM: as its own TUI in an agent session, or headless in a task
-//! run, where its JSONL output becomes pi-shaped records.
+//! The agents of a project: pi, Claude Code, Codex, Gemini CLI and
+//! Antigravity CLI. Each one runs in the VM: as its own TUI in an agent
+//! session, or headless in a task run, where its JSONL output becomes
+//! pi-shaped records. Antigravity CLI runs in agent sessions only.
 
+pub mod agy;
 pub mod claude;
 pub mod cli;
 pub mod codex;
@@ -26,9 +28,13 @@ pub enum AgentKind {
     Claude,
     Codex,
     Gemini,
+    #[serde(rename = "agy")]
+    Antigravity,
 }
 
 impl AgentKind {
+    pub const ALL: [Self; 5] = [Self::Claude, Self::Codex, Self::Pi, Self::Gemini, Self::Antigravity];
+
     /// Also the name of its runtime and of its command in the VM.
     pub fn name(self) -> &'static str {
         match self {
@@ -36,6 +42,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
         }
     }
 
@@ -46,6 +53,7 @@ impl AgentKind {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::Gemini => "Gemini CLI",
+            Self::Antigravity => "Antigravity CLI",
         }
     }
 }

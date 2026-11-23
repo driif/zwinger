@@ -16,7 +16,8 @@ use crate::runtimes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Source {
-    /// The host install, mounted read-only (pi, Gemini CLI).
+    /// The host install, mounted read-only (pi, Gemini CLI). Antigravity
+    /// CLI runs from the host install only with no cage.
     Host,
     /// The cached Linux build of the host version (Claude Code, Codex).
     Cached,
@@ -60,13 +61,14 @@ pub struct HostAgent {
 #[serde(rename_all = "camelCase")]
 pub struct Detection {
     pub agents: Vec<HostAgent>,
-    /// Antigravity is installed. It is not supported yet.
-    pub antigravity: bool,
+    /// Antigravity CLI (`agy`). It runs on the Mac only in a session with no
+    /// cage: a cage cannot reuse its Google sign-in (ADR 0002).
+    pub antigravity: Option<HostAgent>,
 }
 
 impl Detection {
     pub fn agent(&self, kind: AgentKind) -> Option<&HostAgent> {
-        self.agents.iter().find(|a| a.kind == kind)
+        self.agents.iter().chain(&self.antigravity).find(|a| a.kind == kind)
     }
 }
 
@@ -163,6 +165,13 @@ fn claude(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
     runnable(fs, bins)
 }
 
+/// The official installer's `~/.local/bin/agy`, then `PATH`. `--version` must run.
+fn agy(fs: &dyn HostFs) -> Option<(PathBuf, String)> {
+    let mut bins = vec![fs.home().join(".local/bin/agy")];
+    bins.extend(fs.path_dirs().into_iter().map(|d| d.join("agy")));
+    runnable(fs, bins)
+}
+
 /// Gemini CLI's entry points when `package.json` names none that exists:
 /// the bundle of newer releases, then the build of older ones.
 const GEMINI_ENTRIES: [&str; 2] = ["bundle/gemini.js", "dist/index.js"];
@@ -218,12 +227,13 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
             AgentKind::Pi => npm(fs, "@earendil-works/pi-coding-agent", pi::HOST_ENTRY)
                 .map(|(path, version)| (path, version, None, None)),
             AgentKind::Gemini => gemini(fs).map(|(path, version, entry)| (path, version, Some(entry), None)),
+            AgentKind::Antigravity => None,
         };
         let Some((path, version, entry, bin)) = found else {
             continue;
         };
         let node = match kind {
-            AgentKind::Claude => None,
+            AgentKind::Claude | AgentKind::Antigravity => None,
             // Only Codex's npm link is a node script; a native `codex` is not.
             AgentKind::Codex => bin
                 .as_ref()
@@ -251,9 +261,19 @@ pub fn detect(fs: &dyn HostFs, logins: &dyn LoginSource, now: i64, data: &Path) 
             version,
         });
     }
-    let antigravity = [PathBuf::from("/Applications/Antigravity.app"), fs.home().join("Applications/Antigravity.app")]
-        .iter()
-        .any(|app| fs.is_dir(app));
+    let antigravity = agy(fs).map(|(bin, version)| HostAgent {
+        kind: AgentKind::Antigravity,
+        version,
+        path: bin.display().to_string(),
+        source: Source::Host,
+        pinned: true,
+        profile: false,
+        login: LoginState::None,
+        package: None,
+        entry: None,
+        bin: Some(bin),
+        node: None,
+    });
     Detection { agents, antigravity }
 }
 
@@ -300,7 +320,10 @@ mod tests {
         let brew = "/opt/homebrew/opt/gemini-cli/libexec/lib/node_modules/@google/gemini-cli";
         fs.file(&format!("{brew}/package.json"), r#"{"version":"0.64.0","bin":{"gemini":"bundle/gemini.js"}}"#);
         fs.file(&format!("{brew}/bundle/gemini.js"), "");
+        // The official installer's `agy`; the app alone is not the CLI.
         fs.dirs.insert("/Applications/Antigravity.app".into());
+        fs.file("/Users/me/.local/bin/agy", "");
+        fs.versions.insert("/Users/me/.local/bin/agy".into(), "1.5.15\n".into());
 
         let logins = FakeLogins::default();
         let data = data();
@@ -329,7 +352,10 @@ mod tests {
         let nodes: Vec<_> = found.agents.iter().map(|a| a.node.as_deref()).collect();
         assert_eq!(nodes, [None, None, Some(Path::new("/Users/me/.nvm/versions/node/v22.19.0/bin/node")), None]);
         assert_eq!(found.agent(AgentKind::Codex).unwrap().login, LoginState::None);
-        assert!(found.antigravity);
+        // Antigravity CLI is no host agent of a cage, but a session with no cage runs it.
+        let agy = found.agent(AgentKind::Antigravity).unwrap();
+        assert_eq!((agy.version.as_str(), agy.bin.as_deref()), ("1.5.15", Some(Path::new("/Users/me/.local/bin/agy"))));
+        assert!(found.agents.iter().all(|a| a.kind != AgentKind::Antigravity));
 
         // A cached Linux build of the host version is the source.
         runtimes::fake_install_version(&data, "codex", "0.163.0");

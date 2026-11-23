@@ -15,7 +15,7 @@ A task has these fields:
 - Two agents (pi, Claude Code, Codex), each with an optional model. **Agent 1** decides a tiebreak. The two agents can
   be of the same kind, for example Claude Code with `opus` and Claude Code with `sonnet`. The two models are
   independent: they can also be equal, or empty for the default model of the CLI. Gemini CLI is also available if the
-  cage uses Gemini CLI from the Mac.
+  cage uses Gemini CLI from the Mac. Antigravity CLI does not run tasks.
 - **Gates**: shell lines that check the result, for example `pnpm build`.
 - **Working dir**: `/workspace`, or a folder below it or below a mount. In a VM with more projects, `/workspace` is the
   project's folder `/workspace/<slug>`.

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::AgentKind;
 use crate::cage::{self, Bound};
 use crate::error::{Error, Result};
-use crate::host_agents::{self, login};
+use crate::host_agents::login;
 use crate::proxy::decide::{self, Decision};
 use crate::runtime::TerminalKind;
 use crate::secrets::{self, CredentialRef, Origin, Places};
@@ -715,7 +715,7 @@ pub struct AgentNeed {
 
 /// The hosts that the agents of the session and its cage need: pi the provider of its Mac
 /// login, and npm for the extensions of its Mac profile; Claude Code the
-/// Anthropic API; Codex the OpenAI API; Gemini CLI Google Gemini. An agent
+/// Anthropic API; Codex the OpenAI API; Gemini CLI and Antigravity CLI Google Gemini. An agent
 /// with a Mac login needs the hosts of the login. The agents are the ones
 /// of the host agents, the terminals and the tasks. `allowed` is the
 /// decision of the proxy on the name, before the address check.
@@ -733,7 +733,7 @@ pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
         .chain(session.tasks.iter().flat_map(|t| t.agents.iter().map(|a| a.kind)))
         .collect();
     let mut needs: Vec<(AgentKind, String)> = Vec::new();
-    for kind in host_agents::KINDS.into_iter().filter(|k| used.contains(k)) {
+    for kind in AgentKind::ALL.into_iter().filter(|k| used.contains(k)) {
         let logins: Vec<String> = cage
             .logins
             .iter()
@@ -743,7 +743,7 @@ pub fn agent_needs(bound: Bound<'_>) -> Vec<AgentNeed> {
         let fallback = match kind {
             AgentKind::Claude => Some("anthropic"),
             AgentKind::Codex => Some("openai"),
-            AgentKind::Gemini => Some("gemini"),
+            AgentKind::Gemini | AgentKind::Antigravity => Some("gemini"),
             AgentKind::Pi => None,
         };
         if !logins.is_empty() {
@@ -883,10 +883,11 @@ mod tests {
             HostAgentUse { kind: AgentKind::Codex, profile: false, login: false },
         ];
         cage.logins = vec![login::secret(AgentKind::Pi, "api.anthropic.com")];
-        session.terminals = vec![crate::session::TerminalRecord {
-            id: "t".into(),
-            kind: TerminalKind::Agent { agent: AgentKind::Gemini, resume: false },
-        }];
+        let agent = |id: &str, agent| crate::session::TerminalRecord {
+            id: id.into(),
+            kind: TerminalKind::Agent { agent, resume: false },
+        };
+        session.terminals = vec![agent("t", AgentKind::Gemini), agent("a", AgentKind::Antigravity)];
         cage.network.rules = vec![
             Rule::new(Target::Service { id: "anthropic".into() }, Action::Allow),
             Rule::new(host("registry.npmjs.org"), Action::Allow),
@@ -900,6 +901,8 @@ mod tests {
                 need(AgentKind::Pi, "anthropic", "api.anthropic.com", true),
                 need(AgentKind::Pi, "npm", "registry.npmjs.org", true),
                 need(AgentKind::Gemini, "gemini", "generativelanguage.googleapis.com", false),
+                // Antigravity CLI uses the Gemini API with a `GEMINI_API_KEY` credential.
+                need(AgentKind::Antigravity, "gemini", "generativelanguage.googleapis.com", false),
             ]
         );
     }

@@ -5,7 +5,7 @@ import { launchCage } from "../cages/sessionCage.ts";
 import type { Detection } from "../settings/api.ts";
 import type { Editor, Editors, Opened } from "./api.ts";
 
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini", "agy"];
 
 /**
  * The agents of the cage, host agents first. A running cage has pi and its mounted runtimes. A stopped cage
@@ -14,7 +14,9 @@ const AGENT_ORDER: AgentKind[] = ["claude", "codex", "pi", "gemini"];
 export function agentsOf(cage: CageView | VmCage): AgentKind[] {
   const host = cage.hostAgents.map((a) => a.kind);
   const available: AgentKind[] =
-    "status" in cage && cage.status.state === "running" ? ["pi", ...cage.runtimes] : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini")];
+    "status" in cage && cage.status.state === "running"
+      ? ["pi", ...cage.runtimes]
+      : ["claude", "codex", "pi", ...host.filter((k) => k === "gemini"), "agy"];
   return [...host, ...AGENT_ORDER.filter((k) => !host.includes(k))].filter((k) => available.includes(k));
 }
 
@@ -110,7 +112,9 @@ const hostAgentActions = (detection: Detection | undefined) =>
     agentActions(
       agent,
       "hostAgent",
-      detection && !detection.agents.some((a) => a.kind === agent) ? `${AGENT_NAMES[agent]} is not installed on this Mac` : undefined,
+      detection && ![...detection.agents, detection.antigravity].some((a) => a?.kind === agent)
+        ? `${AGENT_NAMES[agent]} is not installed on this Mac`
+        : undefined,
     ),
   );
 

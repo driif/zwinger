@@ -9,6 +9,7 @@ import {
   Download,
   Gem,
   LucideIcon,
+  Orbit,
   Sparkles,
   TriangleAlert,
   User,
@@ -23,7 +24,7 @@ import { Block, ChatState, Message, textOf, ToolRun } from "./agentChat";
 import { Markdown } from "../../shared/Markdown";
 import "./tasks.css";
 
-export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces, gemini: Gem };
+export const AGENT_ICONS: Record<AgentKind, LucideIcon> = { pi: Bot, claude: Sparkles, codex: Braces, gemini: Gem, agy: Orbit };
 
 /** Install, or the progress of the install that runs. Only the download can be cancelled. */
 export function InstallControl({ runtime, runtimes }: { runtime: RuntimeView; runtimes: Runtimes }) {

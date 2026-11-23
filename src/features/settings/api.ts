@@ -64,7 +64,7 @@ export const setMountReadonly = (
 ) => call<void>("set_mount_readonly", { cageId, guest, readonly });
 
 /** The agents that zwinger downloads on first use. pi is bundled. */
-export type RuntimeName = "claude" | "codex";
+export type RuntimeName = "claude" | "codex" | "agy";
 
 export interface RuntimeView {
   name: RuntimeName;
@@ -121,8 +121,8 @@ export interface HostAgent {
 
 export interface Detection {
   agents: HostAgent[];
-  /** Antigravity is installed. It is not supported yet. */
-  antigravity: boolean;
+  /** Antigravity CLI on this Mac. It runs here only in a project with no cage: a cage runs its own copy. */
+  antigravity: HostAgent | null;
 }
 
 /** The last detection, else a new one. */

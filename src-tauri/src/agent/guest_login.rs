@@ -18,12 +18,14 @@ use crate::host_agents::{self, KINDS, login};
 const FILE_LIMIT: u64 = 1 << 20;
 
 /// The folders below the state dir and the name of the agent's login file.
-pub fn place(kind: AgentKind) -> (&'static [&'static str], &'static str) {
+/// `None` for Antigravity CLI: its sign-in file is not documented.
+pub fn place(kind: AgentKind) -> Option<(&'static [&'static str], &'static str)> {
     match kind {
-        AgentKind::Claude => (&["claude", ".claude"], ".credentials.json"),
-        AgentKind::Codex => (&["codex"], "auth.json"),
-        AgentKind::Pi => (&["agent"], "auth.json"),
-        AgentKind::Gemini => (&["gemini", ".gemini"], "oauth_creds.json"),
+        AgentKind::Claude => Some((&["claude", ".claude"], ".credentials.json")),
+        AgentKind::Codex => Some((&["codex"], "auth.json")),
+        AgentKind::Pi => Some((&["agent"], "auth.json")),
+        AgentKind::Gemini => Some((&["gemini", ".gemini"], "oauth_creds.json")),
+        AgentKind::Antigravity => None,
     }
 }
 
@@ -38,7 +40,9 @@ pub fn remove(state: &Path, kind: AgentKind) -> std::io::Result<()> {
     if !read(state, kind).is_some_and(|doc| is_login(kind, &doc)) {
         return Ok(());
     }
-    let (dirs, name) = place(kind);
+    let Some((dirs, name)) = place(kind) else {
+        return Ok(());
+    };
     match open_dirs(state, dirs) {
         Ok(dir) => match rustix::fs::unlinkat(&dir, name, rustix::fs::AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
@@ -63,13 +67,14 @@ fn is_login(kind: AgentKind, doc: &Value) -> bool {
             is_token(&doc["access_token"])
                 || (is_token(&doc["refresh_token"]) && doc["refresh_token"] != login::INERT_REFRESH)
         }
+        AgentKind::Antigravity => false,
     }
 }
 
 /// The guest can write the state dir, so no link is followed, and a file
 /// that is not regular (such as a FIFO) is not read.
 fn read(state: &Path, kind: AgentKind) -> Option<Value> {
-    let (dirs, name) = place(kind);
+    let (dirs, name) = place(kind)?;
     let dir = open_dirs(state, dirs).ok()?;
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let fd = rustix::fs::openat(&dir, name, flags, Mode::empty()).ok()?;
@@ -105,7 +110,7 @@ mod tests {
     }
 
     fn put(state: &Path, kind: AgentKind, doc: &Value) {
-        let (dirs, name) = place(kind);
+        let (dirs, name) = place(kind).unwrap();
         let dir = dirs.iter().fold(state.to_owned(), |dir, part| dir.join(part));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), doc.to_string()).unwrap();

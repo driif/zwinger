@@ -1,10 +1,10 @@
 ---
 title: Agents
-description: Run Claude Code, Codex, pi or Gemini CLI in a cage, or on your Mac with no cage.
+description: Run Claude Code, Codex, pi, Gemini CLI or Antigravity CLI in a cage, or on your Mac with no cage.
 ---
 
-An **agent** is an AI coding CLI that runs in a [cage](/cages/): pi, Claude Code, Codex or Gemini CLI. zwinger has no
-chat interface of its own. The agent runs as its own terminal interface, with all its functions.
+An **agent** is an AI coding CLI that runs in a [cage](/cages/): pi, Claude Code, Codex, Gemini CLI or Antigravity
+CLI. zwinger has no chat interface of its own. The agent runs as its own terminal interface, with all its functions.
 
 ## Agent sessions
 
@@ -16,16 +16,17 @@ The [effective cage](/cages/#attach-or-inherit) of the project sets where an age
 
 A Mac shell (⌘T) runs on the Mac with no sandbox. zwinger never types an agent command into a Mac shell.
 
-In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi` and `gemini` are on the `PATH`.
+In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi`, `gemini` and `agy` are on the `PATH`.
 
 **Continue last session** starts the agent with its continue option (`claude -c`, `codex resume --last`, `pi -c`,
-`gemini --resume latest`). It continues a session of the agent terminals only, never a call of a
+`gemini --resume latest`, `agy -c`). It continues a session of the agent terminals only, never a call of a
 [task run](/tasks/#agent-state).
 
 ## Agents with no cage
 
 A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,
-**New Gemini CLI** and their **continue last session** actions. An agent that zwinger did not find on your Mac is
+**New Gemini CLI**, **New Antigravity CLI** and their **continue last session** actions. zwinger finds Antigravity CLI at
+`~/.local/bin/agy`, where its installer puts it, or as `agy` in a folder of `PATH`. An agent that zwinger did not find on your Mac is
 disabled, with the reason "*agent* is not installed on this Mac". The agent starts in the project folder, through your
 login shell, so it gets the `PATH` of your profile. zwinger uses only an agent binary in an absolute folder of
 `PATH`, so a binary in the project folder never runs. pi, Gemini CLI and the npm install of Codex run with the `node`
@@ -81,16 +82,18 @@ they do not change your agent settings or a read-only agent profile:
 - **Gemini CLI** reports all three states. Its hooks are in a system defaults file, so your own Gemini settings win
   and your own hooks run too. Gemini CLI runs hooks only in a trusted folder.
 - **Pi** reports active and done; it does not report blocked.
+- **Antigravity CLI** reports no status. Its row shows no glyph.
 
-A headless call, such as `claude -p`, `codex exec` or `gemini -p`, reports no status. An agent with no cage shows no
+A headless call, such as `claude -p`, `codex exec`, `gemini -p` or `agy -p`, reports no status. An agent with no cage shows no
 glyph, because zwinger does not install its hooks on your Mac.
 
 ## Permission prompts
 
 The project setting **Agents run without permission prompts** is on by default. It adds the bypass option of each
 agent (for example `--dangerously-skip-permissions` for Claude Code). This is safe only because the cage is the
-sandbox: the agent has only its mounts, its allowed hosts and placeholders for its credentials. A change of the
-setting applies immediately, also in a running cage.
+sandbox: the agent has only its mounts, its allowed hosts and placeholders for its credentials. Antigravity CLI gets
+`--dangerously-skip-permissions`, unless you give your own `--mode`. A change of the setting applies immediately, also
+in a running cage.
 
 ## Agents from your Mac
 
@@ -112,7 +115,8 @@ example the settings, `CLAUDE.md`, skills, commands, agents and plugins of `~/.c
 projects are never copied. The profile also skips Git metadata (`.git`) in plugins and other folders.
 The agent cannot change the profile. The map shows it as `profile (ro)`.
 
-Gemini CLI runs only as an agent from your Mac. zwinger detects Antigravity but does not support it.
+Gemini CLI runs only as an agent from your Mac. Antigravity CLI is not an agent from your Mac for a cage. See
+[Antigravity CLI](#antigravity-cli).
 
 ### Gemini CLI login check
 
@@ -134,8 +138,36 @@ needs Allow rules for the login hosts of the provider, and it keeps the real tok
 it. zwinger warns when it finds such a login: **Remove it** deletes the login file, and **Use my Mac login instead**
 opens the settings for agents from your Mac.
 
+## Antigravity CLI
+
+Antigravity CLI (`agy`) runs in a cage from its own Linux build. Install it one time in **Settings > Runtimes**. In the
+cage it uses the Gemini API with your API key:
+
+1. Add an Allow rule for the **Google Gemini** service to the cage.
+2. Add a [credential](/network/#credentials) with the name `GEMINI_API_KEY` to that rule, with your Gemini API key as
+   the value.
+3. Open **New Antigravity CLI**.
+
+The agent sees only a placeholder in `GEMINI_API_KEY`. The proxy sets the real key in the `x-goog-api-key` header,
+only for `generativelanguage.googleapis.com`. Antigravity CLI uses the key only when its settings select the Gemini API.
+So at each cage start, zwinger writes `~/.gemini/antigravity-cli/settings.json` with `"modelProvider": "gemini"` in the
+agent state of the cage, if that file does not exist. zwinger does not change a settings file that exists.
+
+Limits:
+
+- **No Google sign-in in a cage.** Antigravity CLI keeps its sign-in token where the agent can read it: in the keyring
+  of your Mac, or in a file in the cage. Google does not document how to split this login. So zwinger cannot keep the
+  token out of the cage, and a cage does not use your Antigravity sign-in or subscription. If you sign in in the cage,
+  the real token stays in the cage, where the agent can read and send it. zwinger does not find or remove this login.
+- **No agent from your Mac for a cage.** The Antigravity CLI of your Mac runs only in a project with no cage.
+  **Settings > Agents on this Mac** shows it with this limit.
+- **No tasks.** A task cannot use Antigravity CLI.
+- **No status.** See [Agent status](#agent-status).
+- **No self-update in the cage.** The runtime is read-only. A new zwinger version can pin a newer version.
+
 ## Runtimes
 
-zwinger includes pi. Install Claude Code and Codex one time in **Settings > Runtimes**, for all projects. zwinger
-downloads a pinned version and checks its SHA-512 hash. A runtime that you install while a cage runs needs a cage
-restart.
+zwinger includes pi. Install Claude Code, Codex and Antigravity CLI one time in **Settings > Runtimes**, for all
+projects. zwinger downloads a pinned version and checks its hash: the SHA-512 of the npm package for Claude Code and
+Codex, the SHA-256 of the official GitHub release asset for Antigravity CLI. A runtime that you install while a cage
+runs needs a cage restart.

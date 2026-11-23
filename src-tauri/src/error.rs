@@ -218,6 +218,8 @@ pub enum Error {
     HostAgentMissing(String),
     #[error("{0} runs only from this Mac; add it to the project with Add agent, then restart the cage")]
     NotHostAgent(String),
+    #[error("a cage cannot use {0} from this Mac; the cage runs its own copy")]
+    NoHostUse(String),
     #[error("{0} from this Mac does not run in the cage: {1}")]
     HostAgentFailed(String, String),
     #[error("the {0} login on this Mac: {1}")]

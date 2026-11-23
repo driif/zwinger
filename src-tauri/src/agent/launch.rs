@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use super::{AgentKind, STATE_DIR, claude, codex, gemini, pi};
+use super::{AgentKind, STATE_DIR, agy, claude, codex, gemini, pi};
 use crate::host_agents::detect::HostAgent;
 use crate::terminal::output::AGENT_OSC;
 
@@ -73,6 +73,7 @@ pub fn env(kind: AgentKind) -> &'static [(&'static str, &'static str)] {
         AgentKind::Codex => &[("CODEX_HOME", codex::HOME)],
         AgentKind::Pi => &[("PI_CODING_AGENT_DIR", pi::AGENT_DIR)],
         AgentKind::Gemini => &[("HOME", gemini::HOME)],
+        AgentKind::Antigravity => &[("HOME", agy::HOME)],
     }
 }
 
@@ -83,6 +84,7 @@ pub fn program(kind: AgentKind, found: Found) -> Option<Vec<String>> {
         AgentKind::Codex => vec![format!("{}/bin/codex", codex::DIR)],
         AgentKind::Pi => vec!["node".to_owned(), pi::cli(found.pi_host)],
         AgentKind::Gemini => vec!["node".to_owned(), found.gemini?.to_owned()],
+        AgentKind::Antigravity => vec![format!("{}/agy", agy::DIR)],
     })
 }
 
@@ -112,7 +114,7 @@ pub fn command(kind: AgentKind, found: Found, home: Option<&str>) -> Option<Vec<
 /// The arguments that continue the agent's last session in the harness.
 pub fn continue_args(kind: AgentKind) -> &'static [&'static str] {
     match kind {
-        AgentKind::Claude | AgentKind::Pi => &["-c"],
+        AgentKind::Claude | AgentKind::Pi | AgentKind::Antigravity => &["-c"],
         AgentKind::Codex => &["resume", "--last"],
         AgentKind::Gemini => &["--resume", "latest"],
     }
@@ -127,7 +129,7 @@ pub fn continue_args(kind: AgentKind) -> &'static [&'static str] {
 pub fn host_argv(found: &HostAgent, resume: bool) -> Option<Vec<String>> {
     let node = found.node.as_ref().map(|node| node.to_string_lossy().into_owned());
     let mut argv = match found.kind {
-        AgentKind::Claude | AgentKind::Codex => {
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Antigravity => {
             let bin = found.bin.as_ref().filter(|bin| bin.is_absolute())?.to_string_lossy().into_owned();
             // Codex's npm link with no node next to it starts `env node`
             // through the login shell's `PATH`, as before.
@@ -160,6 +162,8 @@ struct Added {
 }
 
 const CODEX_SUBCOMMANDS: Option<&str> = Some("login|logout|mcp");
+/// The Antigravity CLI subcommands that start no session.
+const AGY_SUBCOMMANDS: Option<&str> = Some("models|agents|plugin|acp");
 
 /// `unprompted` is the project setting "Agents run without permission
 /// prompts". It is acceptable because the cage is the sandbox: the VM has
@@ -185,6 +189,11 @@ fn added(kind: AgentKind, unprompted: bool) -> Option<Added> {
         (AgentKind::Gemini, true) => {
             Some(Added { flag: &["--yolo"], user: "-y|--yolo|--approval-mode|--approval-mode=*", subcommands: None })
         }
+        (AgentKind::Antigravity, true) => Some(Added {
+            flag: &["--dangerously-skip-permissions"],
+            user: "--dangerously-skip-permissions|--mode|--mode=*",
+            subcommands: AGY_SUBCOMMANDS,
+        }),
         _ => None,
     }
 }
@@ -248,6 +257,13 @@ fn status(kind: AgentKind) -> Status {
             env: Some(format!("GEMINI_CLI_SYSTEM_DEFAULTS_PATH={BIN_DIR}/{GEMINI_STATUS}")),
             subcommands: None,
             other: Some("-p|--prompt|--prompt=*"),
+        },
+        // No status hooks: Antigravity CLI reports no state.
+        AgentKind::Antigravity => Status {
+            flag: None,
+            env: None,
+            subcommands: AGY_SUBCOMMANDS,
+            other: Some("-p|--print|--prompt|--prompt=*"),
         },
     }
 }
@@ -898,6 +914,8 @@ mod tests {
         }
         // A detection with no runnable form opens nothing.
         assert_eq!(host_argv(&found(AgentKind::Codex, None, None, None), false), None);
+        let agy = found(AgentKind::Antigravity, None, None, Some("/Users/me/.local/bin/agy"));
+        assert_eq!(host_argv(&agy, true).unwrap(), ["/Users/me/.local/bin/agy", "-c"]);
         assert_eq!(host_argv(&found(AgentKind::Gemini, Some("/opt/gemini"), None, None), false), None);
         // A relative binary would run from the session folder or by PATH.
         for bin in ["codex", "./codex", "node_modules/.bin/codex", ""] {
@@ -1053,6 +1071,29 @@ mod tests {
             "/opt/zwinger/state/codex\n--sandbox=read-only\n"
         );
         assert_eq!(run(AgentKind::Codex, false, &["logout"]), "/opt/zwinger/state/codex\nlogout\n");
+    }
+
+    #[test]
+    fn agy_wrapper_runs_the_runtime_with_its_state_and_skips_permissions() {
+        let script = wrapper(AgentKind::Antigravity, HOST, true).unwrap();
+        assert!(script.contains(" HOME=/opt/zwinger/state/agy\n"), "{script}");
+        assert!(script.ends_with("exec /opt/zwinger/agy/agy \"$@\"\n"), "{script}");
+        assert_eq!(
+            run(AgentKind::Antigravity, true, &["-c"]),
+            "/opt/zwinger/state/agy\n--dangerously-skip-permissions\n-c\n"
+        );
+        // The user's own mode stays, and a subcommand gets no flag.
+        assert_eq!(run(AgentKind::Antigravity, true, &["--mode", "plan"]), "/opt/zwinger/state/agy\n--mode\nplan\n");
+        assert_eq!(run(AgentKind::Antigravity, true, &["models"]), "/opt/zwinger/state/agy\nmodels\n");
+        assert_eq!(run(AgentKind::Antigravity, false, &[]), "/opt/zwinger/state/agy\n");
+        assert_eq!(continue_args(AgentKind::Antigravity), ["-c"]);
+        assert_eq!(
+            command(AgentKind::Antigravity, Found::default(), None).unwrap().last().unwrap(),
+            "/opt/zwinger/agy/agy"
+        );
+        // Its hooks stay quiet: it has none, so nothing reports a state but the exit.
+        let (_, written) = run_printing(AgentKind::Antigravity, true, &[], true, "\"$HOME\"");
+        assert_eq!(written, format!("\x1b{}{NO_STATE}\x07", agent_osc()));
     }
 
     #[test]

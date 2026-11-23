@@ -11,6 +11,7 @@ const CONFIG_DIRS: Record<HostAgent["kind"], string> = {
   codex: "~/.codex",
   pi: "~/.pi/agent",
   gemini: "~/.gemini",
+  agy: "~/.gemini/antigravity-cli",
 };
 
 export const time = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -128,7 +129,18 @@ export function HostAgentsSettings({ detection, sessions, runtimes, run, onRefre
       })}
       {detection?.antigravity && (
         <Card variant="outlined" padding="md">
-          <CardHeader title="Antigravity" titleAs="h2" description="Not supported yet." />
+          <CardHeader
+            title={`${AGENT_NAMES.agy} ${detection.antigravity.version}`}
+            titleAs="h2"
+            description={detection.antigravity.path}
+          />
+          <CardBody className="stack">
+            <span>Runs from this Mac only in a project with no cage.</span>
+            <span className="muted">
+              A cage runs its own downloaded copy (see Runtimes) and cannot use your Google sign-in: the agent could read
+              that token. In a cage, it uses a GEMINI_API_KEY credential, and the agent sees only a placeholder.
+            </span>
+          </CardBody>
         </Card>
       )}
     </div>

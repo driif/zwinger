@@ -118,6 +118,8 @@ pub fn secret_name(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "CODEX_HOST_LOGIN",
         AgentKind::Pi => "PI_HOST_LOGIN",
         AgentKind::Gemini => "GEMINI_HOST_LOGIN",
+        // Not a host agent: a cage check refuses its use from the Mac.
+        AgentKind::Antigravity => "AGY_HOST_LOGIN",
     }
 }
 
@@ -138,7 +140,7 @@ impl HostLogins {
             AgentKind::Codex => Some(self.home.join(".codex/auth.json")),
             AgentKind::Pi => Some(self.home.join(".pi/agent/auth.json")),
             AgentKind::Gemini => Some(self.home.join(".gemini/oauth_creds.json")),
-            AgentKind::Claude => None,
+            AgentKind::Claude | AgentKind::Antigravity => None,
         }
     }
 }
@@ -226,6 +228,7 @@ pub fn parse(kind: AgentKind, text: &str) -> Result<HostToken> {
     let mut prefix = String::new();
     let (access, expires, host, pi) = match kind {
         AgentKind::Claude => return Err(bad(kind, "use claude setup-token")),
+        AgentKind::Antigravity => return Err(bad(kind, "zwinger does not reuse its Google sign-in")),
         AgentKind::Codex => {
             let token = access(&doc["tokens"]["access_token"]);
             let expires = token.as_ref().and_then(|t| jwt_expiry(t.expose()));
@@ -301,7 +304,7 @@ pub fn api_host(kind: AgentKind) -> Option<&'static str> {
         AgentKind::Claude => Some(ANTHROPIC.host),
         AgentKind::Codex => Some(CHATGPT.host),
         AgentKind::Gemini => Some(GOOGLE.host),
-        AgentKind::Pi => None,
+        AgentKind::Pi | AgentKind::Antigravity => None,
     }
 }
 
@@ -341,7 +344,7 @@ fn keep(from: &Value, names: &[&str]) -> Map<String, Value> {
 /// placeholder from `CLAUDE_CODE_OAUTH_TOKEN`.
 pub fn guest_files(token: &HostToken, placeholder: &str, now: i64) -> Vec<GuestFile> {
     match token.kind {
-        AgentKind::Claude => Vec::new(),
+        AgentKind::Claude | AgentKind::Antigravity => Vec::new(),
         AgentKind::Gemini => {
             let mut creds = keep(&token.doc, &["scope", "token_type"]);
             creds.insert("access_token".to_owned(), placeholder.into());

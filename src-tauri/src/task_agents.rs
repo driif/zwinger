@@ -197,6 +197,9 @@ pub fn argv(
     home: Option<&str>,
 ) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
+    if agent.kind == AgentKind::Antigravity {
+        return Err(Failure::Start(format!("{} does not run tasks", agent.kind.label())));
+    }
     let Some(mut argv) = launch::command(agent.kind, found, home) else {
         return Err(Failure::Start("Gemini CLI is not mounted in the cage".to_owned()));
     };
@@ -241,6 +244,7 @@ pub fn argv(
                 argv.extend(["-m".to_owned(), model.to_owned()]);
             }
         }
+        AgentKind::Antigravity => {}
         AgentKind::Pi => {
             argv.extend(["--no-session", "--mode", "json"].map(str::to_owned));
             if access == Access::Read {
@@ -502,7 +506,8 @@ impl<R: SandboxRuntime> Exec<R> {
             AgentKind::Claude => Mapper::Claude(claude::Mapper::default()),
             AgentKind::Codex => Mapper::Codex(codex::Mapper::default()),
             AgentKind::Gemini => Mapper::Gemini(gemini::Mapper::default()),
-            AgentKind::Pi => Mapper::Pi,
+            // `argv` refuses it before a process starts.
+            AgentKind::Pi | AgentKind::Antigravity => Mapper::Pi,
         };
         let mut framer = Framer::default();
         let mut result = Result_::default();

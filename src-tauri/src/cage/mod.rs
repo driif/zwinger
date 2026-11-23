@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentKind};
 use crate::error::{Error, Result};
-use crate::host_agents::login;
+use crate::host_agents::{self, login};
 use crate::network::{NetworkPolicy, Source};
 use crate::secrets::{self, CredentialRef, Origin, Secret};
 use crate::session::{Session, VmChoice};
@@ -207,6 +207,9 @@ impl Cage {
         self.claude_token_binding()?;
         secrets::check_unique(&self.logins)?;
         for (i, used) in self.host_agents.iter().enumerate() {
+            if !host_agents::KINDS.contains(&used.kind) {
+                return Err(Error::NoHostUse(used.kind.label().to_owned()));
+            }
             if self.host_agents[..i].iter().any(|a| a.kind == used.kind) {
                 return Err(Error::DuplicateHostAgent(used.kind.name().to_owned()));
             }
@@ -1310,6 +1313,9 @@ mod tests {
         assert!(project.cage.logins.is_empty() && project.cage.host_agents.is_empty());
         project.cage.host_agents = vec![claude(false, false), claude(true, false)];
         assert!(matches!(project.check(), Err(Error::DuplicateHostAgent(_))));
+        // A cage runs its own Antigravity CLI, never the Mac's.
+        project.cage.host_agents = vec![HostAgentUse { kind: AgentKind::Antigravity, profile: false, login: false }];
+        assert!(matches!(project.check(), Err(Error::NoHostUse(_))));
     }
 
     #[test]

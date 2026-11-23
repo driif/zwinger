@@ -1,7 +1,9 @@
-//! The agent runtimes that zwinger downloads on first use: Claude Code and
-//! Codex. They are npm packages, fetched on the host from the registry,
-//! checked against a pinned SHA-512 (and the registry's `dist.integrity`,
-//! which must name the same hash) and unpacked into
+//! The agent runtimes that zwinger downloads on first use: Claude Code,
+//! Codex and Antigravity CLI. Claude Code and Codex are npm packages, fetched
+//! on the host from the registry and checked against a pinned SHA-512 (and
+//! the registry's `dist.integrity`, which must name the same hash).
+//! Antigravity CLI is an asset of its GitHub release, checked against a
+//! pinned SHA-256. Each one is unpacked into
 //! `<app_data>/runtimes/<name>/<version>/`. A cage start mounts one
 //! installed version of each runtime read-only at `/opt/zwinger/<name>`.
 //!
@@ -20,7 +22,7 @@ use base64::Engine;
 use flate2::read::GzDecoder;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
@@ -29,7 +31,10 @@ use crate::error::{Error, Result};
 const REGISTRY: &str = "https://registry.npmjs.org";
 const CLAUDE_VERSION: &str = "2.1.306";
 const CODEX_VERSION: &str = "0.163.0";
-pub const NAMES: [&str; 2] = ["claude", "codex"];
+const AGY_VERSION: &str = "1.5.15";
+/// The release assets of Antigravity CLI.
+const AGY_RELEASES: &str = "https://github.com/google-antigravity/antigravity-cli/releases/download";
+pub const NAMES: [&str; 3] = ["claude", "codex", "agy"];
 /// The SRI hash of each pinned version per npm arch.
 const PINS: [(&str, &str, &str, &str); 4] = [
     (
@@ -57,6 +62,12 @@ const PINS: [(&str, &str, &str, &str); 4] = [
         "sha512-uwRaOsrYogLQhcxAM/GoeWrw0QIWEMRo7c9gM8sKAviVkZQHlu9kRLJ5PkufbV+ABGjyZgIwiFdJ0LCJ0N6e8w==",
     ),
 ];
+/// The SHA-256 (hex) of each Antigravity CLI asset per arch: the static musl
+/// build, so it runs on any glibc or musl image.
+const AGY_PINS: [(&str, &str); 2] = [
+    ("arm64", "455d20cc37507058bd9287d47d51aa7e6110351eb717fbf17e19619a7dc9d32e"),
+    ("x64", "a12514fb33e8835186082a00b60725f6fb15941ba061f0403347b86c4dbd8f46"),
+];
 /// The unpinned versions that the user confirmed, as `<name>@<version>`.
 const CONFIRMED: &str = "confirmed.json";
 /// Progress is reported after each this many bytes.
@@ -76,16 +87,37 @@ struct Wanted {
     required: bool,
 }
 
+/// Where the archive of a runtime comes from.
+enum Origin {
+    Npm {
+        npm: String,
+        npm_version: String,
+        /// The pinned SRI hash of the tarball of this version and arch.
+        /// `None` for a version that zwinger does not pin.
+        sha512: Option<&'static str>,
+    },
+    /// A release asset with a pinned SHA-256 (hex). Only the pinned version.
+    Release { url: String, sha256: &'static str },
+}
+
 struct Package {
     name: &'static str,
     /// The version that the UI shows.
     version: String,
-    npm: String,
-    npm_version: String,
-    /// The pinned SRI hash of the tarball of this version and arch. `None`
-    /// for a version that zwinger does not pin.
-    sha512: Option<&'static str>,
+    /// The name of the runtime dir.
+    folder: String,
+    origin: Origin,
     files: Vec<Wanted>,
+}
+
+impl Package {
+    /// zwinger pins the hash of this archive.
+    fn is_pinned(&self) -> bool {
+        match self.origin {
+            Origin::Npm { sha512, .. } => sha512.is_some(),
+            Origin::Release { .. } => true,
+        }
+    }
 }
 
 /// The npm arch and the Rust target of the guest. The VM has the arch of the host.
@@ -101,6 +133,7 @@ fn pinned_version(name: &str) -> Result<&'static str> {
     match name {
         "claude" => Ok(CLAUDE_VERSION),
         "codex" => Ok(CODEX_VERSION),
+        "agy" => Ok(AGY_VERSION),
         _ => Err(Error::UnknownRuntime(name.to_owned())),
     }
 }
@@ -129,17 +162,40 @@ fn package(name: &str, version: &str) -> Result<Package> {
         "claude" => Ok(Package {
             name: "claude",
             version: version.to_owned(),
-            npm: format!("@anthropic-ai/claude-code-linux-{arch}"),
-            npm_version: version.to_owned(),
-            sha512,
+            folder: version.to_owned(),
+            origin: Origin::Npm {
+                npm: format!("@anthropic-ai/claude-code-linux-{arch}"),
+                npm_version: version.to_owned(),
+                sha512,
+            },
             files: vec![Wanted { from: "package/claude".to_owned(), to: "claude", required: true }],
         }),
+        "agy" => {
+            let sha256 = AGY_PINS.iter().find(|(a, _)| *a == arch).map(|p| p.1);
+            let Some(sha256) = sha256.filter(|_| version == AGY_VERSION) else {
+                return Err(Error::BadPackage(name.to_owned(), format!("no pinned hash for {version}")));
+            };
+            Ok(Package {
+                name: "agy",
+                version: version.to_owned(),
+                folder: version.to_owned(),
+                origin: Origin::Release {
+                    url: format!("{AGY_RELEASES}/{version}/agy_cli_linux_{arch}_musl.tar.gz"),
+                    sha256,
+                },
+                // The official installer also installs `antigravity` as `agy`.
+                files: vec![Wanted { from: "antigravity".to_owned(), to: "agy", required: true }],
+            })
+        }
         _ => Ok(Package {
             name: "codex",
             version: version.to_owned(),
-            npm: "@openai/codex".to_owned(),
-            npm_version: format!("{version}-linux-{arch}"),
-            sha512,
+            folder: format!("{version}-linux-{arch}"),
+            origin: Origin::Npm {
+                npm: "@openai/codex".to_owned(),
+                npm_version: format!("{version}-linux-{arch}"),
+                sha512,
+            },
             files: vec![
                 Wanted { from: format!("package/vendor/{target}/bin/codex"), to: "bin/codex", required: true },
                 // Codex finds files with it; it falls back without.
@@ -150,7 +206,7 @@ fn package(name: &str, version: &str) -> Result<Package> {
 }
 
 fn runtime_dir(data: &Path, package: &Package) -> PathBuf {
-    data.join("runtimes").join(package.name).join(&package.npm_version)
+    data.join("runtimes").join(package.name).join(&package.folder)
 }
 
 fn is_installed(dir: &Path, package: &Package) -> bool {
@@ -282,7 +338,7 @@ impl Runtimes {
         if is_installed(&dest, &package) {
             return Ok(());
         }
-        if package.sha512.is_none() {
+        if !package.is_pinned() {
             if confirm {
                 self.confirm(&package)?;
             } else if !self.confirmed().contains(&format!("{}@{}", package.name, package.version)) {
@@ -327,7 +383,7 @@ async fn fetch(
     cancel: &Notify,
 ) -> Result<()> {
     let tgz = tmp.join("package.tgz");
-    let (digest, sha512) = tokio::select! {
+    let (digest, expected) = tokio::select! {
         // A cancel wins over a download that ends at the same time.
         biased;
         () = cancel.notified() => return Err(Error::InstallCancelled(package.name.to_owned())),
@@ -341,7 +397,7 @@ async fn fetch(
         package.files.iter().map(|f| Wanted { from: f.from.clone(), to: f.to, required: f.required }).collect();
     let unpacked = root.clone();
     tokio::task::spawn_blocking(move || {
-        check_integrity(name, &sha512, &digest)?;
+        expected.check(name, &digest)?;
         extract(name, &tgz, &files, &unpacked)
     })
     .await
@@ -355,38 +411,96 @@ async fn fetch(
     Ok(())
 }
 
-/// Downloads the tarball to `tgz` and returns its SHA-512 digest and the
-/// integrity that the download must match. The registry must name the
-/// pinned hash before the download starts. An unpinned version must match
-/// the registry's integrity.
-async fn download(
-    package: &Package,
-    tgz: &Path,
-    progress: &(impl Fn(Progress) + Send + Sync),
-) -> Result<(Vec<u8>, String)> {
+/// The hash that a download must match.
+enum Expected {
+    /// An SRI value: `sha512-<base64>`, maybe with more hashes.
+    Sri(String),
+    /// A SHA-256 in hex.
+    Sha256(&'static str),
+}
+
+impl Expected {
+    fn hasher(&self) -> Hasher {
+        match self {
+            Self::Sri(_) => Hasher::Sha512(Sha512::new()),
+            Self::Sha256(_) => Hasher::Sha256(Sha256::new()),
+        }
+    }
+
+    fn check(&self, name: &str, digest: &[u8]) -> Result<()> {
+        match self {
+            Self::Sri(integrity) => check_integrity(name, integrity, digest),
+            Self::Sha256(hex) => {
+                let actual: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                if actual == *hex { Ok(()) } else { Err(Error::IntegrityMismatch(name.to_owned())) }
+            }
+        }
+    }
+}
+
+enum Hasher {
+    Sha512(Sha512),
+    Sha256(Sha256),
+}
+
+impl Hasher {
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha512(h) => h.update(bytes),
+            Self::Sha256(h) => h.update(bytes),
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Sha512(h) => h.finalize().to_vec(),
+            Self::Sha256(h) => h.finalize().to_vec(),
+        }
+    }
+}
+
+/// The archive URL and the hash that it must match. The registry must name
+/// the pinned hash before the download starts. An unpinned npm version must
+/// match the registry's integrity.
+async fn source(client: &reqwest::Client, package: &Package) -> Result<(String, Expected)> {
     let bad = |why: &str| Error::BadPackage(package.name.to_owned(), why.to_owned());
-    let client =
-        reqwest::Client::builder().https_only(true).connect_timeout(CONNECT_LIMIT).read_timeout(READ_LIMIT).build()?;
-    let url = format!("{REGISTRY}/{}/{}", package.npm, package.npm_version);
+    let (npm, npm_version, sha512) = match &package.origin {
+        Origin::Release { url, sha256 } => return Ok((url.clone(), Expected::Sha256(sha256))),
+        Origin::Npm { npm, npm_version, sha512 } => (npm, npm_version, sha512),
+    };
+    let url = format!("{REGISTRY}/{npm}/{npm_version}");
     let meta: Value = client.get(&url).send().await?.error_for_status()?.json().await?;
     let tarball = meta["dist"]["tarball"].as_str().ok_or_else(|| bad("no dist.tarball"))?;
     if !tarball.starts_with(&format!("{REGISTRY}/")) {
         return Err(bad("the tarball is not on the registry"));
     }
     let integrity = meta["dist"]["integrity"].as_str().ok_or_else(|| bad("no dist.integrity"))?;
-    let expected = match package.sha512 {
+    let expected = match sha512 {
         Some(pinned) => {
             check_pinned(pinned, package.name, integrity)?;
-            pinned.to_owned()
+            (*pinned).to_owned()
         }
         None => integrity.to_owned(),
     };
+    Ok((tarball.to_owned(), Expected::Sri(expected)))
+}
 
-    // About 290 MB: it streams to disk and is hashed on the way.
-    let mut response = client.get(tarball).send().await?.error_for_status()?;
+/// Downloads the archive to `tgz` and returns its digest and the hash that
+/// the download must match.
+async fn download(
+    package: &Package,
+    tgz: &Path,
+    progress: &(impl Fn(Progress) + Send + Sync),
+) -> Result<(Vec<u8>, Expected)> {
+    let client =
+        reqwest::Client::builder().https_only(true).connect_timeout(CONNECT_LIMIT).read_timeout(READ_LIMIT).build()?;
+    let (url, expected) = source(&client, package).await?;
+
+    // About 100 to 290 MB: it streams to disk and is hashed on the way.
+    let mut response = client.get(url).send().await?.error_for_status()?;
     let total = response.content_length();
     let mut file = tokio::fs::File::create(tgz).await?;
-    let mut hasher = Sha512::new();
+    let mut hasher = expected.hasher();
     let (mut received, mut reported) = (0, 0);
     progress(Progress::Download { received, total });
     while let Some(chunk) = response.chunk().await? {
@@ -401,7 +515,7 @@ async fn download(
     file.flush().await?;
     drop(file);
     progress(Progress::Download { received, total });
-    Ok((hasher.finalize().to_vec(), expected))
+    Ok((hasher.finalize(), expected))
 }
 
 /// The registry's `dist.integrity` must name the pinned hash, so a changed
@@ -509,6 +623,14 @@ mod tests {
         path
     }
 
+    /// The npm name, version and pin of a package.
+    fn npm(package: &Package) -> (&str, &str, Option<&'static str>) {
+        match &package.origin {
+            Origin::Npm { npm, npm_version, sha512 } => (npm, npm_version, *sha512),
+            Origin::Release { .. } => panic!("not an npm package"),
+        }
+    }
+
     fn files() -> Vec<Wanted> {
         vec![
             Wanted { from: "package/bin/tool".into(), to: "bin/tool", required: true },
@@ -567,7 +689,7 @@ mod tests {
 
     #[test]
     fn the_pinned_hash_must_match_the_registry_and_the_download() {
-        let pinned = package("claude", CLAUDE_VERSION).unwrap().sha512.unwrap();
+        let pinned = npm(&package("claude", CLAUDE_VERSION).unwrap()).2.unwrap();
         let hash = base64::engine::general_purpose::STANDARD.decode(pinned.strip_prefix("sha512-").unwrap()).unwrap();
         assert_eq!(hash.len(), 64);
         check_pinned(pinned, "claude", &format!("sha1-abc {pinned}")).unwrap();
@@ -576,7 +698,7 @@ mod tests {
         check_integrity("claude", pinned, &hash).unwrap();
         let download = Sha512::digest(b"changed tarball").to_vec();
         assert!(matches!(check_integrity("claude", pinned, &download), Err(Error::IntegrityMismatch(_))));
-        assert_ne!(package("codex", CODEX_VERSION).unwrap().sha512, Some(pinned));
+        assert_ne!(npm(&package("codex", CODEX_VERSION).unwrap()).2, Some(pinned));
     }
 
     #[tokio::test]
@@ -616,19 +738,50 @@ mod tests {
     fn packages_are_pinned_per_arch() {
         let (arch, target) = arch().unwrap();
         let claude = package("claude", "2.1.306").unwrap();
-        assert_eq!(claude.npm, format!("@anthropic-ai/claude-code-linux-{arch}"));
-        assert_eq!(claude.npm_version, "2.1.306");
+        assert_eq!(npm(&claude).0, format!("@anthropic-ai/claude-code-linux-{arch}"));
+        assert_eq!(npm(&claude).1, "2.1.306");
         let codex = package("codex", "0.163.0").unwrap();
-        assert_eq!((codex.npm.as_str(), codex.npm_version.clone()), ("@openai/codex", format!("0.163.0-linux-{arch}")));
+        assert_eq!((npm(&codex).0, npm(&codex).1.to_owned()), ("@openai/codex", format!("0.163.0-linux-{arch}")));
         assert_eq!(codex.files[0].from, format!("package/vendor/{target}/bin/codex"));
         assert!(matches!(package("pi", "1.0.0"), Err(Error::UnknownRuntime(_))));
         // Another version has no pin, and a version must be safe in a URL and a folder name.
         let newer = package("codex", "0.170.1").unwrap();
-        assert_eq!((newer.sha512, newer.npm_version), (None, format!("0.170.1-linux-{arch}")));
+        assert_eq!((npm(&newer).2, newer.folder.clone()), (None, format!("0.170.1-linux-{arch}")));
         assert!(is_pinned("claude", "2.1.306") && !is_pinned("claude", "2.1.310"));
         for bad in ["", "../1", "1.0/x", "latest", "1.0 0"] {
             assert!(matches!(package("claude", bad), Err(Error::BadPackage(..))), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn antigravity_is_the_pinned_musl_release_asset() {
+        let (arch, _) = arch().unwrap();
+        let agy = package("agy", AGY_VERSION).unwrap();
+        let Origin::Release { url, sha256 } = &agy.origin else { panic!("not a release") };
+        assert_eq!(
+            url,
+            &format!(
+                "https://github.com/google-antigravity/antigravity-cli/releases/download/{AGY_VERSION}/agy_cli_linux_{arch}_musl.tar.gz"
+            )
+        );
+        assert_eq!(sha256.len(), 64);
+        assert!(agy.is_pinned());
+        assert_eq!((agy.files[0].from.as_str(), agy.files[0].to), ("antigravity", "agy"));
+        // Only the pinned version: a release asset has no second check.
+        assert!(matches!(package("agy", "1.5.16"), Err(Error::BadPackage(..))));
+    }
+
+    #[test]
+    fn a_sha256_must_match_its_hex() {
+        let digest = Sha256::digest(b"archive").to_vec();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let hex: &'static str = Box::leak(hex.into_boxed_str());
+        Expected::Sha256(hex).check("agy", &digest).unwrap();
+        let other = Sha256::digest(b"changed").to_vec();
+        assert!(matches!(Expected::Sha256(hex).check("agy", &other), Err(Error::IntegrityMismatch(_))));
+        let mut hasher = Expected::Sha256(hex).hasher();
+        hasher.update(b"archive");
+        assert_eq!(hasher.finalize(), digest);
     }
 
     #[tokio::test]
@@ -662,7 +815,7 @@ mod tests {
         let list = Runtimes::new(data.clone()).list().unwrap();
         assert_eq!(
             list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(),
-            [("claude", false), ("codex", true)]
+            [("claude", false), ("codex", true), ("agy", false)]
         );
 
         // The host version wins when it is cached; else the pinned version is the fallback.

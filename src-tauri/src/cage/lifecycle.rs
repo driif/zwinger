@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::AbortHandle;
 
-use crate::agent::{AgentKind, gemini, guest_login, launch, pi};
+use crate::agent::{AgentKind, agy, gemini, guest_login, launch, pi};
 use crate::cage::activity::{self, Source};
 use crate::cage::history::StartRecord;
 use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock};
@@ -1230,6 +1230,7 @@ pub(crate) fn prepare(
     for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini] {
         host_agents::open_parts(&state, &[kind.name()])?;
     }
+    agy::seed(&state)?;
     let mut run = HostRun::default();
 
     let detection = host.last();
@@ -1296,6 +1297,8 @@ pub(crate) fn prepare(
             (AgentKind::Pi | AgentKind::Gemini, ..) => {
                 run.failed.push((kind, "detection found no package or entry point; refresh the detection".to_owned()));
             }
+            // Not in `KINDS`: a cage check refuses it.
+            (AgentKind::Antigravity, ..) => {}
         }
     }
 
@@ -1397,7 +1400,7 @@ impl Probe {
 
 /// The agents that run in the VM: pi always, the others if their runtime is mounted.
 pub(crate) fn mounted(runtimes: &[&str]) -> Vec<AgentKind> {
-    host_agents::KINDS.into_iter().filter(|k| *k == AgentKind::Pi || runtimes.contains(&k.name())).collect()
+    AgentKind::ALL.into_iter().filter(|k| *k == AgentKind::Pi || runtimes.contains(&k.name())).collect()
 }
 
 /// The end of a probe's output, else its exit code.
