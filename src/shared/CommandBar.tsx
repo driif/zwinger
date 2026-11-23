@@ -4,7 +4,9 @@ import {
   setOffline,
 } from "../features/network/api";
 import { setMountReadonly } from "../features/settings/api";
-import { SessionCage, SessionView } from "./api";
+import { CageView, SessionCage, SessionView } from "./api";
+import { copyName, duplicateCage } from "../features/cages/api";
+import { restartPending } from "../features/cages/sessionCage";
 import type { Intent, Pane, Run, View } from "../App";
 import { paneName } from "../features/projects/ProjectRail";
 import { editorLabel } from "../features/terminal/folders";
@@ -34,6 +36,9 @@ interface Props {
   onToggle: (target: SessionCage) => void;
   /** Restarts the cage of the session. */
   onRestart: (sessionId: string) => void;
+  cages: CageView[];
+  /** Opens the Cages page, or the Edit view of the cage. */
+  onCages: (cageId?: string) => void;
   onIntent: (kind: Intent["kind"]) => void;
   onOpenRound: () => void;
   editors?: Editors;
@@ -57,6 +62,8 @@ export function CommandBar({
   onView,
   onToggle,
   onRestart,
+  cages,
+  onCages,
   onIntent,
   onOpenRound,
   editors,
@@ -86,7 +93,7 @@ export function CommandBar({
         label: state === "running" ? `Stop ${session.name} cage` : `Start ${session.name} cage`,
         onSelect: () => onToggle(selected),
       });
-    if (cage && (vmCage?.pendingRestart || (state === "running" && cage.id !== vmCage?.id)))
+    if (restartPending(selected))
       commands.push({ id: "restart", label: `Restart ${session.name} cage`, onSelect: () => onRestart(session.id) });
     commands.push(action("newAgent", "New agent"));
     const herePane = panes.find((p) => p.key === here);
@@ -164,6 +171,16 @@ export function CommandBar({
       commands.push({ id: `unmount-${mount.guest}`, label: `Remove mount ${mount.guest}`, onSelect: () => removeMountWithUndo(run, id, mount.guest) });
     }
   }
+  commands.push({ id: "cages", label: "Cages", onSelect: () => onCages() });
+  for (const cage of cages)
+    commands.push(
+      { id: `cage-edit-${cage.id}`, label: `Edit cage ${cage.name}`, onSelect: () => onCages(cage.id) },
+      {
+        id: `cage-duplicate-${cage.id}`,
+        label: `Duplicate cage ${cage.name}`,
+        onSelect: () => run(() => duplicateCage(cage.id, copyName(cage.name))),
+      },
+    );
   commands.push(
     action("newProject", "New project"),
     { id: "open-round", label: "Open round folder…", onSelect: onOpenRound },

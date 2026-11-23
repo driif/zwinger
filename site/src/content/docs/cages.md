@@ -15,11 +15,21 @@ Hypervisor.framework). The VM is the unit of isolation.
 
 - **Create cage** adds a cage with no mounts, rules or agents.
 - **Rename** changes the name of the cage. The projects keep their names.
-- **Edit** shows the mounts and the agent settings of the cage.
+- **Duplicate** adds a copy named "<name> copy" with the mounts, network rules, agents and settings of the cage. The copy
+  has no credential values of its own: set them again in the Network tab of a project that uses the copy. Credentials
+  from the [credential library](/network/#shared-credentials) keep their shared value.
+- **Edit** shows the mounts, the agent settings and a read-only summary of the network policy of the cage. Edit the
+  network policy in the **Network** tab of a project that uses the cage.
 - **Delete** removes the cage, its own credential values and the agent state of all its VMs. Values from the
   [credential library](/network/#shared-credentials) stay. A project that kept an own VM
   of the cage after a cage change goes back to the shared VM. You cannot delete a cage that a project uses, that is the
   default cage of a workspace, or whose VM runs. The button then shows the reason as a tooltip.
+
+The ⌘K menu has **Cages**, and **Edit cage X** and **Duplicate cage X** for each cage.
+
+When you delete a project that is the only user of its cage, **Settings > Delete project** also offers **Delete with
+cage X**. This deletes the project, then the cage and its credential values. A cage that is the default cage of a
+workspace, or whose VM runs for a different project, is not offered.
 
 ## Attach or inherit
 
@@ -32,6 +42,9 @@ need a cage.
 A change of the cage applies at the next start. A VM that runs keeps running with its old cage until it stops. The
 project page then shows "The VM runs cage X; restart to use Y". If the project has no cage now, the page still shows
 **Stop cage** for the old VM.
+
+The project row in the sidebar shows a restart button (pending cage change) when its VM runs a different cage or an
+older config of its cage. Click it to restart the VM. A shared VM asks first.
 
 Edits always go to the current cage of the project: mounts, network rules, offline, logins, agents and settings. A VM
 that runs with an old cage does not get these edits: they apply after the restart. The VM status, **Start** and **Stop**, the network test and

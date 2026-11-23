@@ -245,6 +245,8 @@ interface Props {
   cages: CageView[];
   /** The default cage of the session's workspace. */
   defaultCage?: CageView;
+  /** The cage that only this session uses. */
+  soleCage?: CageView;
   /** The network events of the session's VM, oldest first. */
   events: NetEvent[];
   view: View;
@@ -306,6 +308,7 @@ export function ProjectPage({
   vmCage,
   cages,
   defaultCage,
+  soleCage,
   events,
   view,
   onView,
@@ -621,6 +624,7 @@ export function ProjectPage({
                     session={session}
                     cages={cages}
                     defaultCage={defaultCage}
+                    soleCage={soleCage}
                     folders={folders ?? []}
                     editors={editors}
                     runtimes={runtimes}

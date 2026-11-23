@@ -66,7 +66,7 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
 - **Move to** in the menu of a session shows the other workspaces. Select one to move the session to the end of that
   workspace. The workspace then expands.
 - A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,
-  the rail asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,
+  a dialog asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,
   and **Cancel** puts the session back. Until the restart, the project page edits the new cage and shows the state of
   the old VM.
 - With the keyboard, press Space to pick up a row, the Up and Down arrow keys to move it, and Space to drop it. Escape

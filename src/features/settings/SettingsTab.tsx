@@ -3,6 +3,7 @@ import { Trash2 } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { setHarness, setProjectAccent } from "./api";
 import { deleteSession, renameSession, setSessionCage } from "../projects/api";
+import { deleteCage } from "../cages/api";
 import { CageView, SessionView } from "../../shared/api";
 import type { Editors } from "../launcher/api";
 import { useThemeColor } from "../appearance/themes";
@@ -18,6 +19,8 @@ interface Props {
   cages: CageView[];
   /** The default cage of the session's workspace. */
   defaultCage?: CageView;
+  /** The cage that only this session uses: Delete offers to delete it too. */
+  soleCage?: CageView;
   folders: string[];
   /** `undefined` until the first detection. */
   editors?: Editors;
@@ -29,7 +32,7 @@ interface Props {
 
 const HEX = /^#[0-9a-f]{6}$/i;
 
-export function SettingsTab({ session, onProjectEditor, cages, defaultCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
+export function SettingsTab({ session, onProjectEditor, cages, defaultCage, soleCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
   const { cage, vmCage } = sessionCage(session, cages);
   // By key, not by `vmCage`: that is null for a planned VM, and for a shared VM that runs for other projects.
   const startHistory = cages.flatMap((c) => c.vms).find((v) => v.key === session.vmKey)?.startHistory ?? [];
@@ -242,7 +245,11 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
         <CardHeader
           title="Delete project"
           titleAs="h2"
-          description="Stops the VM of the project. The cage and your folders stay."
+          description={
+            soleCage
+              ? `Stops the VM of the project. Your folders stay. No other project uses cage ${soleCage.name}: you can delete it and its credential values too.`
+              : "Stops the VM of the project. The cage and your folders stay."
+          }
         />
         <CardBody className="row">
           {confirmDelete ? (
@@ -254,6 +261,15 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, fold
               <Button variant="danger" iconLeft={<Trash2 size={14} />} onClick={() => run(() => deleteSession(session.id))}>
                 Delete
               </Button>
+              {soleCage && (
+                <Button
+                  variant="danger"
+                  iconLeft={<Trash2 size={14} />}
+                  onClick={() => run(() => deleteSession(session.id).then(() => deleteCage(soleCage.id)))}
+                >
+                  Delete with cage {soleCage.name}
+                </Button>
+              )}
             </>
           ) : (
             <Button variant="danger" iconLeft={<Trash2 size={14} />} disabled={busy} onClick={() => setConfirmDelete(true)}>

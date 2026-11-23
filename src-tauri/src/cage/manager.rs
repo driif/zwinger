@@ -896,6 +896,23 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(id)
     }
 
+    /// Adds a copy of the cage with its mounts, network rules, host agents and
+    /// settings. The vault values are per cage id, so the copy has none.
+    /// Returns its id.
+    pub fn duplicate_cage(&self, id: &str, name: &str) -> Result<String> {
+        let name = cage::display_name(name)?;
+        let mut state = lock(&self.state);
+        let mut copy = state.cage(id)?.clone();
+        copy.id = uuid::Uuid::new_v4().to_string();
+        copy.name = name;
+        let copy_id = copy.id.clone();
+        let mut cages = state.cages.clone();
+        cages.push(copy);
+        self.store.save_cages(&cages)?;
+        state.cages = cages;
+        Ok(copy_id)
+    }
+
     pub fn rename_cage(&self, id: &str, name: &str) -> Result<()> {
         let name = cage::display_name(name)?;
         self.edit_cage(id, |c, _| {
@@ -2150,6 +2167,25 @@ mod tests {
         let terminal = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
         manager.close_terminal(&id, &terminal).unwrap();
         assert!(manager.workspaces().iter().any(|w| w.id == workspace));
+    }
+
+    #[test]
+    fn duplicate_cage_copies_the_config_but_no_values() {
+        let (manager, _, id, vault) = manager_with_vault();
+        credential(&manager, &id, "a.io", "A", Some("1")).unwrap();
+        manager.set_offline(&id, true).unwrap();
+        let copy = manager.duplicate_cage(&id, "Copy").unwrap();
+        let cages = manager.list().cages;
+        let (old, new) =
+            (cages.iter().find(|c| c.cage.id == id).unwrap(), cages.iter().find(|c| c.cage.id == copy).unwrap());
+        assert_eq!(new.cage.name, "Copy");
+        assert_eq!(new.cage.network, old.cage.network);
+        assert_eq!(new.cage.mounts, old.cage.mounts);
+        assert_eq!(new.cage.host_agents, old.cage.host_agents);
+        assert_eq!(vault.get(&Owner::cage(&copy), "A").unwrap(), None);
+        assert_eq!(vault.get(&Owner::cage(&id), "A").unwrap().unwrap().expose(), "1");
+        assert!(matches!(manager.duplicate_cage(&id, " "), Err(Error::InvalidName(_))));
+        assert!(matches!(manager.duplicate_cage("gone", "X"), Err(Error::CageNotFound)));
     }
 
     #[test]

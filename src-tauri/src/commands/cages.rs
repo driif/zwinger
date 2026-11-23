@@ -82,6 +82,12 @@ pub fn create_cage(manager: Managed<'_>, name: String) -> Result<String> {
     manager.create_cage(&name)
 }
 
+/// A copy of the cage with no vault values. Returns its id.
+#[tauri::command]
+pub fn duplicate_cage(manager: Managed<'_>, cage_id: String, name: String) -> Result<String> {
+    manager.duplicate_cage(&cage_id, &name)
+}
+
 #[tauri::command]
 pub fn rename_cage(manager: Managed<'_>, cage_id: String, name: String) -> Result<()> {
     manager.rename_cage(&cage_id, &name)

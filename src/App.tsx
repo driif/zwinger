@@ -85,7 +85,7 @@ import { ProjectRail } from "./features/projects/ProjectRail";
 import { folderDrop, resolveFolderTarget } from "./features/projects/folderDrop";
 import { PendingEditorChoices } from "./features/launcher/editorChoices";
 import { agentsOf, EditorCalls, LaunchAction, macAgent, openEditor as openEditorWith } from "./features/launcher/actions";
-import { launchCage, sessionCage } from "./features/cages/sessionCage";
+import { cageChanged, launchCage, sessionCage } from "./features/cages/sessionCage";
 import { detectEditors, Editors, openInEditor, revealSession } from "./features/launcher/api";
 import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
@@ -314,6 +314,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const showSettings = settingsTab !== undefined;
   /** The list of cages, which the main area shows instead of a session. */
   const [showCages, setShowCages] = useState(false);
+  /** The cage that the Cages page edits. */
+  const [editingCage, setEditingCage] = useState<string>();
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
   const [editorChoices] = useState(() => new PendingEditorChoices());
@@ -578,7 +580,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   );
   const vmCage = selected?.vmCage;
   // With no effective cage there is nothing to restart into: the banner offers Stop.
-  const cageChanged = vmCage?.status.state === "running" && !!selected.cage && selected.cage.id !== vmCage.id;
+  const selectedCageChanged = !!selected && cageChanged(selected);
   const sessionPanes = panes.filter((p) => p.sessionId === session?.id);
   /** The focused pane of a session; a stale one gives way to the first pane. */
   const focusedOf = (target: SessionView) => {
@@ -590,6 +592,13 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const here = terminalShows ? focused : undefined;
   const events = (vmCage && net[vmCage.key]) ?? [];
   const defaultCage = cages.find((c) => c.id === workspaces.find((w) => w.sessions.includes(session?.id ?? ""))?.defaultCage);
+  /** The cage that only the selected session uses: a delete of the session can also delete it. */
+  const soleCage =
+    selected?.cage &&
+    !sessions.some((s) => s.id !== selected.session.id && (s.effectiveCage?.id === selected.cage?.id || s.vmCage === selected.cage?.id)) &&
+    !workspaces.some((w) => w.defaultCage === selected.cage?.id)
+      ? selected.cage
+      : undefined;
 
   // A deleted task has no view.
   useEffect(() => {
@@ -990,12 +999,13 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   }
 
   /**
-   * Restarts the VM of the selected session with all its members. After a cage change, it stops the old cage's VM and
-   * starts the new cage.
+   * Restarts the VM of the session with all its members. After a cage change, it stops the old cage's VM and starts the
+   * new cage.
    */
-  const restart = (sessionId: string) =>
-    run(() =>
-      cageChanged
+  const restart = (sessionId: string) => {
+    const target = joined.find((j) => j.session.id === sessionId);
+    return run(() =>
+      target && cageChanged(target)
         ? vm.stop(sessionId).then(() => vm.start(sessionId))
         : confirmShared(
             (others) => `Its VM also runs ${others}: their terminals reopen; their running tasks are cancelled.`,
@@ -1003,6 +1013,14 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             (confirmed) => restartCage(sessionId, confirmed).finally(pullNotices),
           ),
     );
+  };
+
+  function openCages(cageId?: string) {
+    setRoundFolder(undefined);
+    setSettingsTab(undefined);
+    setShowCages(true);
+    setEditingCage(cageId);
+  }
 
   const actions: Record<ShortcutAction, () => void> = {
     commands: () => setCommandsOpen((open) => !open),
@@ -1057,11 +1075,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         onMoveTerminals={moveTerminals}
         onNew={actions.newProject}
         onSettings={actions.appSettings}
-        onCages={() => {
-          setRoundFolder(undefined);
-          setSettingsTab(undefined);
-          setShowCages(true);
-        }}
+        onCages={() => openCages()}
+        onRestart={restart}
         dropFolder={dropFolder}
         editors={editors}
         detection={detection}
@@ -1093,6 +1108,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           }}
           onToggle={toggle}
           onRestart={restart}
+          cages={cages}
+          onCages={openCages}
           onIntent={startIntent}
           onOpenRound={() => run(openRoundFolder)}
           editors={editors}
@@ -1152,7 +1169,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             </Notice>
           ))}
           {banner}
-          {!showSettings && !showCages && !roundFolder && session && (vmCage?.pendingRestart || cageChanged) && (
+          {!showSettings && !showCages && !roundFolder && session && (vmCage?.pendingRestart || selectedCageChanged) && (
             <Notice
               icon={<RotateCw size={14} className="warn" />}
               actions={
@@ -1169,8 +1186,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             >
               {!selected.cage
                 ? `The VM runs cage ${vmCage?.name}, but the project has no cage now. Stop the VM.`
-                : cageChanged
-                  ? `The VM runs cage ${vmCage.name}; restart to use ${selected.cage.name}.`
+                : selectedCageChanged
+                  ? `The VM runs cage ${vmCage?.name}; restart to use ${selected.cage.name}.`
                   : "The running cage uses an older config. Restart it to apply the changes."}
             </Notice>
           )}
@@ -1197,7 +1214,15 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             appearance={appearance}
           />
         ) : showCages ? (
-          <CagesPage cages={cages} sessions={sessions} workspaces={workspaces} runtimes={runtimes} run={run} />
+          <CagesPage
+            cages={cages}
+            sessions={sessions}
+            workspaces={workspaces}
+            runtimes={runtimes}
+            run={run}
+            editing={editingCage}
+            onEdit={setEditingCage}
+          />
         ) : roundFolder ? (
           <section className="page">
             <div className="view task-view">
@@ -1230,6 +1255,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             vmCage={selected.vmCage}
             cages={cages}
             defaultCage={defaultCage}
+            soleCage={soleCage}
             events={events}
             view={view}
             onView={setView}

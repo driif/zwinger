@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CageView, SessionView, VmView } from "../../shared/api.ts";
-import { sessionCage } from "./sessionCage.ts";
+import { restartPending, sessionCage } from "./sessionCage.ts";
 
 const vm = (key: string, state: VmView["status"]["state"] = "stopped") =>
   ({ key, own: false, status: { state }, members: [] }) as unknown as VmView;
@@ -57,4 +57,14 @@ test("a failed start shows only on the session that started it", () => {
   const cages = [cage("a", "error")];
   assert.equal(sessionCage(session("a", "a"), cages).vmCage?.id, "a");
   assert.equal(sessionCage(session("a", null, "a"), cages).vmCage, null);
+});
+
+test("a restart is pending after a cage change or a config edit of the running VM, not with no cage", () => {
+  const pending = (s: SessionView, cages: CageView[]) => restartPending(sessionCage(s, cages));
+  assert.equal(pending(session("new", "old"), [cage("old", "running"), cage("new")]), true);
+  assert.equal(pending(session("a", "a"), [cage("a", "running")]), false);
+  const edited = cage("a", "running");
+  edited.vms[0].pendingRestart = true;
+  assert.equal(pending(session("a", "a"), [edited]), true);
+  assert.equal(pending(session(null, "old"), [cage("old", "running")]), false);
 });

@@ -1,4 +1,4 @@
-import { Badge, Button, Card, IconButton, Select, TextField } from "@driif/motiv";
+import { Badge, Button, Card, Dialog, IconButton, Select, TextField } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -37,6 +37,7 @@ import {
   Pencil,
   Play,
   Plus,
+  RotateCw,
   Settings,
   Square,
   Trash2,
@@ -75,6 +76,7 @@ import type { Detection } from "../settings/api";
 import { launchMenu } from "../launcher/SplitLaunch";
 import { useTerminalTitles } from "../terminal/titles";
 import { StartProgress } from "./StartProgress";
+import { cageChanged, restartPending } from "../cages/sessionCage";
 import { mostUrgent } from "./agentState";
 import { cageAfterMove, moveSession, stepSession, stepWorkspace } from "./tree";
 import "./rail.css";
@@ -300,6 +302,8 @@ interface Props {
   onOpen: (sessionId: string, view: View) => void;
   onRunsChange: (sessionId: string) => void;
   onToggle: (target: SessionCage) => void;
+  /** Restarts the VM of the session to apply a cage change or a newer cage config. */
+  onRestart: (sessionId: string) => void;
   onNewSession: (sessionId: string, kind: TerminalKind) => void;
   onClosePane: (key: string) => void;
   /** Opens a dormant or exited terminal again. */
@@ -339,6 +343,7 @@ export function ProjectRail({
   onOpen,
   onRunsChange,
   onToggle,
+  onRestart,
   onNewSession,
   onClosePane,
   onReopen,
@@ -761,6 +766,11 @@ export function ProjectRail({
     setMoving({ session: moved.session, next, to });
   }
 
+  function cancelMove() {
+    setMoving(undefined);
+    setDraft(undefined);
+  }
+
   /**
    * Saves the order of `next`, then runs `then`. If the tree changed since the drag began, the backend refuses it and
    * the tree reloads. A refused save also reverts the draft.
@@ -940,20 +950,17 @@ export function ProjectRail({
           </Card>
         )}
         {moving && (
-          <Card variant="outlined" padding="sm" className="stack">
+          <Dialog
+            open
+            title="Change the cage of a running VM?"
+            onClose={cancelMove}
+          >
             <p>
               The VM of <strong>{moving.session.name}</strong> runs in cage {cageName(moving.session.vmCage)}. After the
               move, the project uses {moving.to ? `cage ${cageName(moving.to)}` : "no cage"}.
             </p>
             <div className="row end">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setMoving(undefined);
-                  setDraft(undefined);
-                }}
-              >
+              <Button size="sm" variant="ghost" onClick={cancelMove}>
                 Cancel
               </Button>
               <Button size="sm" variant="outline" onClick={() => save(moving.next)}>
@@ -969,7 +976,7 @@ export function ProjectRail({
                 Restart now
               </Button>
             </div>
-          </Card>
+          </Dialog>
         )}
         <DndContext
           sensors={sensors}
@@ -1141,6 +1148,21 @@ export function ProjectRail({
                                   <AgentStatusGlyph
                                     state={mostUrgent(session.processes.filter((p) => p.exitCode === null).map((p) => p.agent))}
                                   />
+                                  {restartPending(target) && (
+                                    <IconButton
+                                      icon={<RotateCw size={12} className="warn" />}
+                                      label={
+                                        cageChanged(target)
+                                          ? `Pending cage change: restart ${session.name} to use cage ${target.cage?.name}`
+                                          : `Pending cage change: restart ${session.name} to apply the new cage config`
+                                      }
+                                      tabIndex={-1}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        onRestart(session.id);
+                                      }}
+                                    />
+                                  )}
                                   <IconButton
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
                                     label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}

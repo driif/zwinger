@@ -418,6 +418,7 @@ pub fn run() {
             commands::cages::restart_cage,
             commands::cages::restart_cage_to_add,
             commands::cages::create_cage,
+            commands::cages::duplicate_cage,
             commands::cages::rename_cage,
             commands::cages::delete_cage,
             commands::cages::set_session_cage,

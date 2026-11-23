@@ -14,3 +14,11 @@ export function sessionCage(session: SessionView, cages: CageView[]): SessionCag
 
 /** The cage whose agents a new terminal can use: the running VM, else the effective cage. */
 export const launchCage = ({ cage, vmCage }: SessionCage) => (vmCage?.status.state === "running" ? vmCage : cage);
+
+/** The VM of the session runs a different cage than the session uses now. */
+export const cageChanged = ({ cage, vmCage }: SessionCage) =>
+  vmCage?.status.state === "running" && !!cage && cage.id !== vmCage.id;
+
+/** A restart of the session's VM applies a cage change or a newer config of its cage. */
+export const restartPending = (target: SessionCage) =>
+  !!target.cage && (!!target.vmCage?.pendingRestart || cageChanged(target));
