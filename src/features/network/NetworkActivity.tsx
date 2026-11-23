@@ -114,8 +114,15 @@ export function NetworkActivity({ cage, vmKey, running, events, catalog, onStart
       last.reason === "tokeninfo"
     )
       return null;
-    const set = (target: Target, action: Action) =>
-      run(() => putRule(cage.id, { target, action }));
+    // Keep the method list of an existing rule for this target.
+    const set = (target: Target, action: Action) => {
+      const existing = cage.network.rules.find((rule) =>
+        target.kind === "host"
+          ? rule.target.kind === "host" && rule.target.host.toLowerCase() === target.host.toLowerCase()
+          : rule.target.kind === "service" && rule.target.id === target.id,
+      );
+      return run(() => putRule(cage.id, { id: existing?.id, target, action, methods: existing?.methods }));
+    };
     const action: Action = decide(cage.network, host, catalog).allowed
       ? "block"
       : "allow";

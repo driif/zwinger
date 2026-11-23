@@ -39,7 +39,7 @@ function NetworkSummary({ cage }: { cage: CageView }) {
       <CardBody className="stack">
         <p>
           {network.offline ? "Offline: all requests are blocked. " : ""}
-          Hosts with no rule: {network.default === "allow" ? "allowed" : "blocked"}.
+          Hosts with no rule: {network.default === "allow" ? "allowed" : network.default === "ask" ? "ask" : "blocked"}.
           {network.hostPort ? ` Port ${network.hostPort} of this Mac is open to the cage.` : ""}
         </p>
         {network.rules.length === 0 && <p className="muted">No rules.</p>}
