@@ -1,66 +1,37 @@
 ---
 name: chief
-description: Use for each implementation task in this repo (feature, fix or refactor). Do not use when the user asks for a trivial change or for a different workflow.
+description: "Use for each implementation task in this repo (feature, fix or refactor). Do not use when the user asks for a trivial change or for a different workflow."
 ---
 
 # Chief of staff
 
-You control the work. The user is the client. Make the decisions yourself. Go to the user only for the conditions in "Escalation".
-Each task uses the same loop.
-
-**Do not use this skill when `DUO_ROUND` is set.** In a duo round, do only your stage.
+You control the work. The user is the client. Make the decisions yourself.
+Go to the user only for a product decision that the code does not answer, or for a destructive step.
 
 ## Loop
 
-1. **Triage.** Select one route. Write the route and the reason in `task.md` under *Chosen here*.
-   - *Direct*: a typo, a one-line fix or a question. Do the task immediately. Skip steps 2–8.
-   - *Subagent*: one area, a clear spec, no new design, no security change, no data-model change.
-     Example: a CSS bug, a removal, a docs page. In step 3, one Opus subagent implements from `task.md`.
-   - *Duo*: all other tasks. Example: a new design, a migration, security, or changes in more than one area.
-   For more tasks at a time: run tasks in parallel only if their files do not overlap.
-   Make one commit per task, and stage only the paths of that task.
-2. **Brief.** Make a slug for the task. Write `docs/tasks/<slug>/task.md` with these sections:
-   - *Asked for*: the words of the user.
-   - *Chosen here*: your decisions. Other agents can challenge them.
-   - *Done*: the necessary behaviour and the gates.
+1. **Pick.** A bug in a main flow (project, cage start, terminal, agent, task run) goes first.
+   Then tickets by value to the user, not by number. Close tickets that are superseded or of low value, with a one-line reason.
+2. **Brief.** Write a short brief in the subagent prompt: the issue text, the files to start from, the done criteria.
+   Do not write preflight reports, proof receipts or hash records.
+3. **Implement.** One Opus subagent per ticket. At most 3 at a time, only on tickets with no shared files.
+   A trivial fix (typo, one line) you do yourself.
+   The subagent runs only the tests of its area: `cargo test <module>`, the related `pnpm test` file.
+   It does not stage, commit or push.
+4. **Commit.** After each ticket, commit only its paths with a Conventional Commit message (`Closes #N`).
+   Do not push yet.
+5. **Batch review.** After about 5 tickets (or at the end of an epic), start one fresh subagent.
+   Give it the commit range. It reports only critical and major findings: correctness, security, task not done,
+   docs in `site/src/content/docs/` missing for a user-visible change. One fix subagent fixes them.
+6. **Gates and push.** Run the gates once per batch, in sequence:
+   `pnpm build`, `pnpm test`, `pnpm --filter site build`, `cargo fmt --manifest-path src-tauri/Cargo.toml --check`,
+   `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`.
+   Fix failures, then push to the **current branch**. Never create branches. Check CI on the pushed head.
+7. **Backlog.** File out-of-scope ideas as backlog issues, with no duplicates (`gh issue list --label backlog`).
+8. **Report.** A short report: what shipped, the commits, the review result, the backlog issues.
 
-   Install the necessary dependencies now. Codex has no network access.
-3. **Pair.** For the *Subagent* route, start the subagent and go to step 4. For the *Duo* route, use the `duo` skill. Run `.claude/skills/duo/scripts/duo-round.sh <slug> 01` in the background.
-   - On exit 3, answer the open questions from the code and `AGENTS.md`.
-   - Ask the user only about product decisions.
-   - Then run the round again with a new round name.
-4. **Review.** Start a new subagent that did not see the round. Give it `task.md` and `git diff`.
-   Tell it to report only critical and major findings: correctness, security, or task not done.
-   It also checks that a change to user-visible behaviour updates `site/src/content/docs/`.
-5. **Fix once.** If the review has findings, do these steps:
-   1. Add the findings to `task.md` in the section *Review findings*.
-   2. Run one more round on the same route: a duo round `02-fix`, or the subagent again.
-   3. Stop the loop. Do not do more fix rounds.
-6. **Ship.** Run the gates yourself. If all gates pass, do these steps:
-   1. Commit with a Conventional Commit message.
-   2. Push to the **current branch**.
+## Build hygiene
 
-   Never create branches.
-7. **Backlog.** Collect backlog items from these sources:
-   - the `backlog` field in `manifest.json`
-   - review findings that are out of scope
-   - your own ideas
-
-   Do not file duplicates. Find existing backlog issues with `gh issue list --label backlog`.
-   Make one backlog issue for each item, with a body of 2–4 lines:
-   `gh issue create --label backlog --title … --body …`
-8. **Report.** Write a short report with these items:
-   - what you shipped
-   - the commit
-   - the implementer
-   - the review result
-   - the backlog issues that you filed
-
-## Escalation
-
-Go to the user only in these conditions:
-
-- An open question needs a product decision, and the code does not give the answer.
-- The gates fail after the fix round.
-- The duo tool fails two times (exit 2).
-- The next step is destructive, or the next step does more than a push to the current branch.
+- Use the normal `src-tauri/target` with incremental builds. Do not make a target dir per ticket.
+- Parallel tickets in a worktree share one extra target dir: `CARGO_TARGET_DIR=../zwinger-target`.
+- Do not keep test temp dirs or build copies in `docs/tasks/`.
