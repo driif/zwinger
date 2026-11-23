@@ -1,16 +1,17 @@
 import { Button, Card } from "@driif/motiv";
+import { ChevronRight } from "lucide-react";
 import { KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import "./actionMenu.css";
 
-/** A menu action. `confirm` asks first. `reason` shows why a disabled action cannot run. */
-export interface MenuAction {
+/** A menu action. `confirm` asks first. `reason` shows why a disabled action cannot run. `submenu` opens more actions. */
+export type MenuAction = {
   label: string;
   icon: ReactNode;
   disabled?: boolean;
   reason?: string;
-  run: () => void;
-  confirm?: string;
-}
+} & ({ run: () => void; confirm?: string } | { submenu: MenuAction[] });
+
+type RunAction = Extract<MenuAction, { run: () => void }>;
 
 /** True for a target in the menu or on its open opener. The opener is in the element before the menu. */
 function inside(menu: HTMLElement | null, target: Element) {
@@ -25,13 +26,14 @@ function inside(menu: HTMLElement | null, target: Element) {
  */
 export function ActionMenu({ label, actions, onClose }: { label: string; actions: MenuAction[]; onClose: (refocus: boolean) => void }) {
   const card = useRef<HTMLElement>(null);
-  const [step, setStep] = useState<MenuAction>();
+  const [step, setStep] = useState<RunAction>();
+  const [sub, setSub] = useState<MenuAction[]>();
   const close = useRef(onClose);
   close.current = onClose;
 
   useEffect(() => {
     card.current?.querySelector<HTMLElement>("button:not(:disabled)")?.focus();
-  }, [step]);
+  }, [step, sub]);
 
   useEffect(() => {
     const outside = (event: Event) => {
@@ -60,6 +62,7 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
   }
 
   function choose(action: MenuAction) {
+    if ("submenu" in action) return setSub(action.submenu);
     if (action.confirm) return setStep(action);
     onClose(true);
     action.run();
@@ -69,13 +72,15 @@ export function ActionMenu({ label, actions, onClose }: { label: string; actions
     <Card ref={card} padding="sm" className="action-menu" tabIndex={-1} onKeyDown={onKeyDown}>
       {!step ? (
         <div role="menu" aria-label={label} className="stack">
-          {actions.map((action) => (
+          {(sub ?? actions).map((action, i) => (
             <Button
-              key={action.label}
+              key={i}
               role="menuitem"
               size="sm"
               variant="ghost"
               iconLeft={action.icon}
+              iconRight={"submenu" in action && <ChevronRight size={14} />}
+              aria-haspopup={"submenu" in action ? "menu" : undefined}
               disabled={action.disabled}
               onClick={() => choose(action)}
             >

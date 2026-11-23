@@ -8,6 +8,7 @@ import {
   DragEndEvent,
   DragMoveEvent,
   DragOverEvent,
+  DragOverlay,
   DragStartEvent,
   KeyboardCoordinateGetter,
   KeyboardSensor,
@@ -28,6 +29,7 @@ import {
   CirclePlay,
   Ellipsis,
   Fence,
+  FolderInput,
   History,
   Laptop,
   ShieldOff,
@@ -41,6 +43,7 @@ import {
   X,
 } from "lucide-react";
 import { CSSProperties, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   arrangeWorkspaces,
   createWorkspace,
@@ -358,6 +361,8 @@ export function ProjectRail({
   );
   const [focused, setFocused] = useState<string>();
   const [dragging, setDragging] = useState(false);
+  /** The label of the row that the pointer drags. A keyboard drag moves the row itself, so it has no overlay. */
+  const [overlay, setOverlay] = useState<string>();
   /** During a session drag and until its save is done: the workspaces with the session where it is now. */
   const [draft, setDraft] = useState<Workspace[]>();
   /** The other session that a dragged terminal is over. */
@@ -396,6 +401,13 @@ export function ProjectRail({
     setCollapsed((current) => {
       const next = new Set(current);
       if (!next.delete(id)) next.add(id);
+      return next;
+    });
+
+  const expand = (id: string) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      next.delete(id);
       return next;
     });
 
@@ -646,11 +658,7 @@ export function ProjectRail({
     if (data.kind === "workspace") {
       setAnnouncement(`${data.label} is at place ${next.indexOf(workspace) + 1} of ${next.length}.`);
     } else {
-      setCollapsed((current) => {
-        const open = new Set(current);
-        open.delete(`w|${workspace.id}`);
-        return open;
-      });
+      expand(`w|${workspace.id}`);
       const place = workspace.sessions.indexOf(data.entity) + 1;
       setAnnouncement(`${data.label} is in ${workspace.name} at place ${place} of ${workspace.sessions.length}.`);
     }
@@ -691,6 +699,7 @@ export function ProjectRail({
   function onDragStart({ active, activatorEvent }: DragStartEvent) {
     setDragging(true);
     keyboardDrag.current = activatorEvent instanceof globalThis.KeyboardEvent ? String(active.id) : undefined;
+    if (!keyboardDrag.current) setOverlay(dataOf(active).label);
   }
 
   // A session over a session of another workspace moves there at once, so the rows make room for it.
@@ -706,6 +715,7 @@ export function ProjectRail({
 
   function onDragEnd({ active, over }: DragEndEvent) {
     setDragging(false);
+    setOverlay(undefined);
     const keyboard = keyboardDrag.current;
     keyboardDrag.current = undefined;
     const data = dataOf(active);
@@ -721,7 +731,8 @@ export function ProjectRail({
       return;
     }
     let next = draft ?? workspaces;
-    if (keyboard) return drop(next, data);
+    const session = data.kind === "session" ? data.entity : undefined;
+    if (keyboard) return drop(next, session);
     if (!over) return setDraft(undefined);
     const target = dataOf(over);
     if (data.kind === "workspace") {
@@ -729,11 +740,7 @@ export function ProjectRail({
       next = arrayMove(next, ids.indexOf(data.entity), ids.indexOf(target.entity));
     } else if (target.kind === "drop") {
       next = moveSession(next, data.entity, target.entity);
-      setCollapsed((current) => {
-        const open = new Set(current);
-        open.delete(`w|${target.entity}`);
-        return open;
-      });
+      expand(`w|${target.entity}`);
     } else {
       next = next.map((w) => {
         const from = w.sessions.indexOf(data.entity);
@@ -741,12 +748,12 @@ export function ProjectRail({
         return from >= 0 && to >= 0 ? { ...w, sessions: arrayMove(w.sessions, from, to) } : w;
       });
     }
-    drop(next, data);
+    drop(next, session);
   }
 
-  /** Saves `next`, or first asks what to do when the move changes the cage of a session whose VM runs. */
-  function drop(next: Workspace[], data: DragData) {
-    const moved = data.kind === "session" ? byId.get(data.entity) : undefined;
+  /** Saves `next`, or first asks what to do when the move of `session` changes the cage of its running VM. */
+  function drop(next: Workspace[], session?: string) {
+    const moved = session ? byId.get(session) : undefined;
     const vm = moved?.vmCage?.status.state;
     const to = moved && vm && vm !== "error" && vm !== "stopped" ? cageAfterMove(moved.session, next) : undefined;
     if (!moved || to === undefined) return save(next);
@@ -780,14 +787,50 @@ export function ProjectRail({
   };
 
   function workspaceMenu(workspace: Workspace): MenuAction[] {
+    const index = workspaces.indexOf(workspace);
+    // The sessions of a deleted workspace go to the workspace above it, else to the one below.
+    const heir = workspaces[index - 1] ?? workspaces[index + 1];
+    const remove = () => deleteWorkspace(workspace.id);
     return [
       renameAction(`w|${workspace.id}`),
       { label: "Default cage…", icon: <Fence size={14} />, run: () => setPicking(workspace.id) },
       {
         label: "Delete workspace",
         icon: <Trash2 size={14} />,
-        disabled: workspace.sessions.length > 0 || workspaces.length === 1,
-        run: () => run(() => deleteWorkspace(workspace.id)),
+        disabled: !heir,
+        confirm:
+          workspace.sessions.length > 0 && heir
+            ? `Delete ${workspace.name}? Its ${workspace.sessions.length} sessions move to ${heir.name}.` +
+              (heir.defaultCage === workspace.defaultCage ? "" : " A session that inherits its cage gets the cage of its new workspace at its next start.")
+            : undefined,
+        run: () =>
+          workspace.sessions.length > 0
+            ? save(
+                workspaces.map((w) =>
+                  w === heir ? { ...w, sessions: [...w.sessions, ...workspace.sessions] } : w === workspace ? { ...w, sessions: [] } : w,
+                ),
+                remove,
+              )
+            : run(remove),
+      },
+    ];
+  }
+
+  function moveMenu(session: SessionView, from: Workspace): MenuAction[] {
+    const others = workspaces.filter((w) => w.id !== from.id);
+    if (others.length === 0) return [];
+    return [
+      {
+        label: "Move to",
+        icon: <FolderInput size={14} />,
+        submenu: others.map((w) => ({
+          label: w.name,
+          icon: <ChevronRight size={14} />,
+          run: () => {
+            expand(`w|${w.id}`);
+            drop(moveSession(workspaces, session.id, w.id), session.id);
+          },
+        })),
       },
     ];
   }
@@ -945,6 +988,7 @@ export function ProjectRail({
           onDragCancel={() => {
             keyboardDrag.current = undefined;
             setDragging(false);
+            setOverlay(undefined);
             setForbidden(undefined);
             setDraft(undefined);
           }}
@@ -1117,6 +1161,7 @@ export function ProjectRail({
                                   actions={[
                                     ...launchMenu(launch, (action) => onLaunch(session.id, action)),
                                     renameAction(sessionRow),
+                                    ...moveMenu(session, workspace),
                                     ...(effective
                                       ? [
                                           session.vm.kind === "own"
@@ -1218,6 +1263,16 @@ export function ProjectRail({
               ))}
             </SortableContext>
           </ul>
+          {createPortal(
+            <DragOverlay>
+              {overlay && (
+                <Card padding="sm" variant="outlined">
+                  {overlay}
+                </Card>
+              )}
+            </DragOverlay>,
+            document.body,
+          )}
         </DndContext>
         <div className="sr-only" aria-live="assertive">
           {announcement}
@@ -1227,7 +1282,7 @@ export function ProjectRail({
         <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
           New project
         </Button>
-        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={() => run(createWorkspace)}>
+        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={() => run(() => createWorkspace().then((id) => setEditing(`w|${id}`)))}>
           New workspace
         </Button>
         <Button variant="ghost" size="sm" iconLeft={<Fence size={14} />} onClick={onCages}>

@@ -41,7 +41,8 @@ To resize the project list, drag its right edge or press Tab to focus the edge a
 Home sets the minimum width and End sets the maximum. Double-click the edge to restore the default width.
 
 - At the first start, one workspace with the name "Workspace" holds all projects.
-- **New workspace** at the bottom of the rail adds an empty workspace.
+- **New workspace** at the bottom of the rail adds an empty workspace. Its name is a field at once, so you can type
+  the name.
 - To rename a workspace or a session, double-click its row, or use **Rename** in its menu (right-click or the **…**
   button). The name becomes a field in the row. Press Enter or click outside the field to save the name. Press Escape
   to cancel. An empty name gives a workspace the name "Workspace" again.
@@ -50,7 +51,10 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
 - **Copy path** in a session menu, a launch menu or the command menu copies the project folder. A short message
   names the project and the path, and goes away after two seconds. If the copy fails, the error shows instead. A new
   copy removes the message of the earlier copy. Only the result of the last copy shows.
-- You can delete only an empty workspace. The last workspace cannot be deleted.
+- **Delete workspace** in the menu of a workspace deletes it. If it has sessions, zwinger asks first. Its sessions
+  then move to the end of the workspace above it, or of the workspace below it if it is the first. A session that
+  inherits its cage gets the cage of its new workspace at its next start. The last workspace cannot be deleted.
+- The rail remembers which workspaces and sessions are collapsed, also after a restart.
 - **Default cage…** in the menu of a workspace sets the cage of the sessions in it that inherit their cage. A session
   row shows a cage icon when the session has a cage. Its tooltip names the cage, with "(inherited)" if the cage comes
   from the workspace, and says if the session uses the shared VM of the cage or its own VM.
@@ -58,6 +62,9 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   back in the shared VM of its cage. If its VM runs, zwinger asks first. See [Own VM](/cages/#own-vm).
 - Drag a workspace to change the order of the workspaces. Drag a session to change its place or to move it to a
   different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
+  While you drag with the pointer, a copy of the row follows the pointer and the row stays dim at its place.
+- **Move to** in the menu of a session shows the other workspaces. Select one to move the session to the end of that
+  workspace. The workspace then expands.
 - A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,
   the rail asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,
   and **Cancel** puts the session back. Until the restart, the project page edits the new cage and shows the state of
