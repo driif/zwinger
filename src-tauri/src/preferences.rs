@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// The app-wide choices of the user.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ pub struct Prefs {
     pub terminal: TerminalPrefs,
     pub editors: EditorPrefs,
     /// The zoom of the whole app; 1.0 is the actual size. Only
-    /// [`Preferences::set_zoom`] changes it: [`Preferences::set`] keeps it.
+    /// [`Preferences::set_zoom`] changes it: [`Preferences::update`] refuses it.
     pub zoom: f64,
 }
 
@@ -170,15 +170,21 @@ impl Preferences {
         self.current.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Keeps the zoom: the UI writes all prefs, and its copy of the zoom can
-    /// be old.
-    pub fn set(&self, mut prefs: Prefs) -> Result<()> {
+    /// Merges `patch` into the current prefs and saves them. `patch` has the
+    /// camelCase shape of [`Prefs`] with only the changed fields; an object
+    /// merges into its field, any other value replaces it. Each control sends
+    /// only its own fields, so an old copy of the prefs in the UI cannot
+    /// overwrite a different field. A failed save keeps the current prefs.
+    pub fn update(&self, patch: serde_json::Value) -> Result<Prefs> {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let mut merged = serde_json::to_value(&*current)?;
+        merge(&mut merged, patch, "")?;
+        let mut prefs: Prefs = serde_json::from_value(merged).map_err(|e| Error::InvalidPreference(e.to_string()))?;
         prefs.terminal = prefs.terminal.clamped();
         prefs.sidebar_font_size =
             prefs.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
-        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        prefs.zoom = current.zoom;
-        self.write(&mut current, prefs)
+        self.write(&mut current, prefs.clone())?;
+        Ok(prefs)
     }
 
     pub fn set_zoom(&self, level: f64) -> Result<()> {
@@ -200,9 +206,40 @@ impl Preferences {
     }
 }
 
+/// Merges `patch` into `target`, field by field. A field that `target` does
+/// not have, or the zoom, is an error.
+fn merge(target: &mut serde_json::Value, patch: serde_json::Value, path: &str) -> Result<()> {
+    let serde_json::Value::Object(fields) = patch else {
+        return Err(Error::InvalidPreference(format!(
+            "{} must be an object",
+            if path.is_empty() { "the change" } else { path }
+        )));
+    };
+    for (name, value) in fields {
+        let field = if path.is_empty() { name.clone() } else { format!("{path}.{name}") };
+        let slot = match target.get_mut(&name) {
+            Some(slot) if field != "zoom" => slot,
+            _ => return Err(Error::InvalidPreference(format!("{field} cannot change here"))),
+        };
+        if slot.is_object() {
+            merge(slot, value, &field)?;
+        } else {
+            *slot = value;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends all fields but the zoom, as an old full-snapshot save did.
+    fn set_all(preferences: &Preferences, prefs: Prefs) {
+        let mut patch = serde_json::to_value(prefs).unwrap();
+        patch.as_object_mut().unwrap().remove("zoom");
+        preferences.update(patch).unwrap();
+    }
 
     fn path() -> PathBuf {
         crate::test_dir::root().join(format!("zwinger-prefs-{}", uuid::Uuid::new_v4())).join("preferences.json")
@@ -226,7 +263,7 @@ mod tests {
             terminal: TerminalPrefs { ligatures: true, ..TerminalPrefs::default() },
             ..Prefs::default()
         };
-        prefs.set(changed.clone()).unwrap();
+        set_all(&prefs, changed.clone());
         assert_eq!(Preferences::load(path.clone()).get(), changed);
         assert!(!path.with_extension("json.tmp").exists());
     }
@@ -267,7 +304,7 @@ mod tests {
         assert_eq!(off.editors, EditorPrefs { enabled: Some(Vec::new()), default: Some("zed".into()) });
         let path = path();
         let prefs = Preferences::load(path.clone());
-        prefs.set(off.clone()).unwrap();
+        set_all(&prefs, off.clone());
         assert_eq!(Preferences::load(path).get().editors, off.editors);
     }
 
@@ -309,10 +346,13 @@ mod tests {
     fn terminal_numbers_out_of_range_are_clamped_on_set() {
         let path = path();
         let prefs = Preferences::load(path.clone());
-        let terminal =
-            TerminalPrefs { font_size: f64::NAN, line_height: 3.0, scrollback: 1_000_000, ..TerminalPrefs::default() };
-        prefs.set(Prefs { terminal, ..Prefs::default() }).unwrap();
-        let clamped = TerminalPrefs { line_height: 2.0, scrollback: 100_000, ..TerminalPrefs::default() };
+        prefs
+            .update(serde_json::json!({ "terminal": { "fontSize": 2, "lineHeight": 3, "scrollback": 1_000_000 } }))
+            .unwrap();
+        // JSON has no NaN: a non-finite number arrives as null, which is refused.
+        assert!(prefs.update(serde_json::json!({ "terminal": { "fontSize": null } })).is_err());
+        let clamped =
+            TerminalPrefs { font_size: 8.0, line_height: 2.0, scrollback: 100_000, ..TerminalPrefs::default() };
         assert_eq!(prefs.get().terminal, clamped);
         assert_eq!(Preferences::load(path).get().terminal, clamped);
     }
@@ -322,7 +362,7 @@ mod tests {
         let path = path();
         let prefs = Preferences::load(path.clone());
         let changed = Prefs { density: Density::Compact, sidebar_font_size: Some(14), ..Prefs::default() };
-        prefs.set(changed.clone()).unwrap();
+        set_all(&prefs, changed.clone());
         assert_eq!(Preferences::load(path).get(), changed);
     }
 
@@ -331,7 +371,8 @@ mod tests {
         let path = path();
         let prefs = Preferences::load(path.clone());
         prefs.set_zoom(1.25).unwrap();
-        prefs.set(Prefs { zoom: 1.0, rail_width: 300, ..Prefs::default() }).unwrap();
+        set_all(&prefs, Prefs { rail_width: 300, ..Prefs::default() });
+        assert!(matches!(prefs.update(serde_json::json!({ "zoom": 1.0 })), Err(Error::InvalidPreference(_))));
         let loaded = Preferences::load(path.clone()).get();
         assert_eq!((loaded.zoom, loaded.rail_width), (1.25, 300));
         std::fs::write(&path, br#"{"zoom":9}"#).unwrap();
@@ -345,7 +386,7 @@ mod tests {
         std::fs::write(&path, br#"{"sidebarFontSize":0}"#).unwrap();
         let prefs = Preferences::load(path.clone());
         assert_eq!(prefs.get().sidebar_font_size, Some(11));
-        prefs.set(Prefs { sidebar_font_size: Some(100), ..Prefs::default() }).unwrap();
+        set_all(&prefs, Prefs { sidebar_font_size: Some(100), ..Prefs::default() });
         assert_eq!(prefs.get().sidebar_font_size, Some(16));
         assert_eq!(Preferences::load(path).get().sidebar_font_size, Some(16));
     }
@@ -382,5 +423,83 @@ mod tests {
                 "zoom": 1.0,
             })
         );
+    }
+
+    #[test]
+    fn two_controls_with_old_copies_keep_both_changes() {
+        let path = path();
+        let prefs = Preferences::load(path.clone());
+        // Both controls rendered before either save: each sends only its own field.
+        prefs.update(serde_json::json!({ "density": "compact" })).unwrap();
+        let after = prefs.update(serde_json::json!({ "terminal": { "fontSize": 15 } })).unwrap();
+        assert_eq!(after.density, Density::Compact);
+        assert_eq!(after.terminal, TerminalPrefs { font_size: 15.0, ..TerminalPrefs::default() });
+        prefs.update(serde_json::json!({ "terminal": { "cursorBlink": false } })).unwrap();
+        let loaded = Preferences::load(path).get();
+        assert_eq!(loaded.density, Density::Compact);
+        assert_eq!(loaded.terminal, TerminalPrefs { font_size: 15.0, cursor_blink: false, ..TerminalPrefs::default() });
+    }
+
+    #[test]
+    fn simultaneous_patches_from_two_threads_keep_both_fields() {
+        let prefs = std::sync::Arc::new(Preferences::load(path()));
+        let writers: Vec<_> = [("railWidth", 300), ("sidebarFontSize", 14)]
+            .into_iter()
+            .map(|(field, value)| {
+                let prefs = prefs.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        prefs.update(serde_json::json!({ field: value })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let prefs = prefs.get();
+        assert_eq!((prefs.rail_width, prefs.sidebar_font_size), (300, Some(14)));
+    }
+
+    #[test]
+    fn a_patch_sets_and_clears_optional_fields() {
+        let prefs = Preferences::load(path());
+        let set =
+            prefs.update(serde_json::json!({ "editors": { "enabled": ["zed"] }, "sidebarFontSize": 14 })).unwrap();
+        assert_eq!((set.editors.enabled, set.sidebar_font_size), (Some(vec!["zed".to_owned()]), Some(14)));
+        let cleared =
+            prefs.update(serde_json::json!({ "editors": { "enabled": null }, "sidebarFontSize": null })).unwrap();
+        assert_eq!((cleared.editors.enabled, cleared.sidebar_font_size), (None, None));
+    }
+
+    #[test]
+    fn a_bad_patch_changes_nothing() {
+        let prefs = Preferences::load(path());
+        prefs.update(serde_json::json!({ "railWidth": 300 })).unwrap();
+        for patch in [
+            serde_json::json!({ "railWidth": 1, "unknown": true }),
+            serde_json::json!({ "terminal": { "fontSize": "big" } }),
+            serde_json::json!({ "terminal": null }),
+            serde_json::json!({ "theme": null }),
+            serde_json::json!([]),
+        ] {
+            assert!(matches!(prefs.update(patch.clone()), Err(Error::InvalidPreference(_))), "{patch}");
+        }
+        assert_eq!(prefs.get(), Prefs { rail_width: 300, ..Prefs::default() });
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_prefs_and_a_later_change_merges_into_them() {
+        let path = path();
+        let prefs = Preferences::load(path.clone());
+        prefs.update(serde_json::json!({ "density": "compact" })).unwrap();
+        // A folder in place of the temp file makes the write fail.
+        std::fs::create_dir_all(path.with_extension("json.tmp")).unwrap();
+        assert!(matches!(prefs.update(serde_json::json!({ "railWidth": 300 })), Err(Error::Io(_))));
+        assert_eq!(prefs.get(), Prefs { density: Density::Compact, ..Prefs::default() });
+        std::fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+        let after = prefs.update(serde_json::json!({ "autoUpdate": false })).unwrap();
+        assert_eq!(after, Prefs { density: Density::Compact, auto_update: false, ..Prefs::default() });
+        assert_eq!(Preferences::load(path).get(), after);
     }
 }

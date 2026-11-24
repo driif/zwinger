@@ -274,6 +274,8 @@ pub enum Error {
     InvalidAccent(String),
     #[error("invalid theme: {0}")]
     InvalidTheme(String),
+    #[error("invalid preference change: {0}")]
+    InvalidPreference(String),
     #[error("update: {0}")]
     Update(String),
     #[error("download: {0}")]

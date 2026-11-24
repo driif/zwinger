@@ -11,6 +11,7 @@ import {
   legacyStorage,
   LegacyView,
   Prefs,
+  PrefsPatch,
   proxyCaFingerprint,
   removeLegacyRuntime,
   storage,
@@ -84,7 +85,7 @@ function Updates({ version, prefs, onPrefs, run, update, onUpdate }: { version?:
           <LiquidSwitch
             label="Check for updates when zwinger starts"
             checked={prefs.autoUpdate}
-            onChange={(autoUpdate) => run(() => onPrefs({ ...prefs, autoUpdate }))}
+            onChange={(autoUpdate) => run(() => onPrefs({ autoUpdate }))}
           />
         </CardBody>
       </Card>
@@ -283,7 +284,7 @@ interface Props {
   /** Opens the project's Add agent step for this agent. */
   onUse: (sessionId: string, agent: HostAgent) => void;
   prefs: Prefs;
-  onPrefs: (prefs: Prefs) => Promise<void>;
+  onPrefs: (patch: PrefsPatch) => Promise<void>;
   update?: UpdateInfo;
   onUpdate: (update?: UpdateInfo) => void;
   appearance: Appearance;
@@ -356,7 +357,7 @@ export function AppSettings({
     ),
     appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
     terminal: <TerminalSettings appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
-    editors: <EditorsSettings editors={editors} prefs={prefs} onPrefs={onPrefs} run={run} onDetect={onDetectEditors} />,
+    editors: <EditorsSettings editors={editors} onPrefs={onPrefs} run={run} onDetect={onDetectEditors} />,
     updates: <Updates version={version} prefs={prefs} onPrefs={onPrefs} run={run} update={update} onUpdate={onUpdate} />,
     storage: <Storage />,
     about: <About version={version} />,

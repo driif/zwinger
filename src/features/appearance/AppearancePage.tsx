@@ -1,7 +1,7 @@
 import { Button, Card, CardBody, CardHeader, LiquidSwitch, SegmentedControl, Select } from "@driif/motiv";
 import { Check, Copy, Download, Pencil, Trash2, TriangleAlert, Upload } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Prefs } from "../settings/api";
+import { Prefs, PrefsPatch } from "../settings/api";
 import type { Run } from "../../App";
 import { Notice } from "../../shared/Notice";
 import { deleteTheme, exportTheme, importAndReload, saveTheme, Theme } from "./api";
@@ -14,7 +14,7 @@ const SWATCH = ["--motiv-color-surface", "--motiv-color-primary", "--motiv-color
 interface Props {
   appearance: Appearance;
   prefs: Prefs;
-  onPrefs: (prefs: Prefs) => Promise<void>;
+  onPrefs: (patch: PrefsPatch) => Promise<void>;
   run: Run;
 }
 
@@ -31,7 +31,7 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
   /** With follow-system, the theme takes the light or the dark place of its base. */
   const slot = (theme: Theme): "theme" | "lightTheme" | "darkTheme" =>
     !prefs.followSystem ? "theme" : theme.base === "dark" ? "darkTheme" : "lightTheme";
-  const use = (theme: Theme) => run(() => onPrefs({ ...prefs, [slot(theme)]: theme.id }));
+  const use = (theme: Theme) => run(() => onPrefs({ [slot(theme)]: theme.id }));
 
   function duplicate(theme: Theme) {
     setAsking(undefined);
@@ -43,7 +43,7 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
       await saveTheme(theme);
       await reload();
       // A new theme is selected before the draft goes, so the window does not flash the old theme.
-      if (!themes.some((t) => t.id === theme.id)) await onPrefs({ ...prefs, [slot(theme)]: theme.id });
+      if (!themes.some((t) => t.id === theme.id)) await onPrefs({ [slot(theme)]: theme.id });
       setEditing(undefined);
       preview(undefined);
     });
@@ -55,13 +55,8 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
       await reload();
       // A deleted theme falls back to the built-in default of its place.
       if (![prefs.theme, prefs.lightTheme, prefs.darkTheme].includes(theme.id)) return;
-      const reset = (id: string, fallback: string) => (id === theme.id ? fallback : id);
-      await onPrefs({
-        ...prefs,
-        theme: reset(prefs.theme, BUILT_INS[0].id),
-        lightTheme: reset(prefs.lightTheme, BUILT_INS[1].id),
-        darkTheme: reset(prefs.darkTheme, BUILT_INS[0].id),
-      });
+      const fallbacks = { theme: BUILT_INS[0].id, lightTheme: BUILT_INS[1].id, darkTheme: BUILT_INS[0].id };
+      await onPrefs(Object.fromEntries(Object.entries(fallbacks).filter(([slot]) => prefs[slot as keyof typeof fallbacks] === theme.id)));
     });
 
   // A cancel or an error keeps the last notice.
@@ -87,13 +82,13 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
             label="Density"
             options={[{ value: "default", label: "Default" }, { value: "compact", label: "Compact" }]}
             value={prefs.density}
-            onChange={(density) => run(() => onPrefs({ ...prefs, density: density as Prefs["density"] }))}
+            onChange={(density) => run(() => onPrefs({ density: density as Prefs["density"] }))}
           />
           <Select
             label="Sidebar font size"
             options={[{ value: "", label: "Theme default" }, ...[12, 13, 14, 15].map((size) => ({ value: String(size), label: `${size} px` }))]}
             value={prefs.sidebarFontSize === null ? "" : String(prefs.sidebarFontSize)}
-            onChange={(size) => run(() => onPrefs({ ...prefs, sidebarFontSize: size ? Number(size) : null }))}
+            onChange={(size) => run(() => onPrefs({ sidebarFontSize: size ? Number(size) : null }))}
           />
         </CardBody>
       </Card>
@@ -117,7 +112,7 @@ export function AppearancePage({ appearance, prefs, onPrefs, run }: Props) {
           <LiquidSwitch
             label="Follow the system: use a light theme and a dark theme as macOS changes its appearance"
             checked={prefs.followSystem}
-            onChange={(followSystem) => run(() => onPrefs({ ...prefs, followSystem }))}
+            onChange={(followSystem) => run(() => onPrefs({ followSystem }))}
           />
           <ul className="theme-grid">
             {themes.map((theme) => (

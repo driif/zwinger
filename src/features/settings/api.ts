@@ -213,10 +213,17 @@ export interface TerminalPrefs {
 
 export const getPreferences = () => call<Prefs>("get_preferences");
 
-export const setPreferences = (prefs: Prefs) =>
-  call<void>("set_preferences", { prefs });
+/** The changed fields only. The backend merges them into the saved prefs, so a control cannot overwrite a field it did not change. */
+export type PrefsPatch = Partial<Omit<Prefs, "terminal" | "editors">> & {
+  terminal?: Partial<TerminalPrefs>;
+  editors?: Partial<EditorPrefs>;
+};
 
-/** Zooms the whole app one step and saves the level. `setPreferences` does not change the zoom. */
+/** Saves `patch` and resolves to all prefs after it. */
+export const updatePreferences = (patch: PrefsPatch) =>
+  call<Prefs>("update_preferences", { patch });
+
+/** Zooms the whole app one step and saves the level. `updatePreferences` does not change the zoom. */
 export const zoom = (step: "in" | "out" | "reset") => call<void>("zoom", { step });
 
 /** Sizes in bytes. `null`: unknown. */

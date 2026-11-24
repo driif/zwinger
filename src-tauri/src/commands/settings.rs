@@ -28,9 +28,10 @@ pub fn get_preferences(preferences: State<'_, Preferences>) -> Prefs {
     preferences.get()
 }
 
+/// Merges the changed fields in `patch` into the saved prefs and returns them.
 #[tauri::command]
-pub fn set_preferences(preferences: State<'_, Preferences>, prefs: Prefs) -> Result<()> {
-    preferences.set(prefs)
+pub fn update_preferences(preferences: State<'_, Preferences>, patch: serde_json::Value) -> Result<Prefs> {
+    preferences.update(patch)
 }
 
 /// Zooms the whole app one step. The UI calls it for ⌘+; the View menu has

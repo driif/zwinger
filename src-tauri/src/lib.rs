@@ -511,7 +511,7 @@ pub fn run() {
             commands::sessions::confirm_paths,
             commands::settings::startup_status,
             commands::settings::get_preferences,
-            commands::settings::set_preferences,
+            commands::settings::update_preferences,
             commands::settings::zoom,
             commands::settings::import_ghostty_config,
             commands::settings::storage,

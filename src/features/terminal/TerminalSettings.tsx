@@ -4,7 +4,7 @@ import { useState } from "react";
 import type { Run } from "../../App";
 import { saveTheme } from "../appearance/api";
 import { Appearance } from "../appearance/themes";
-import { CursorStyle, Prefs, TerminalPrefs } from "../settings/api";
+import { CursorStyle, Prefs, PrefsPatch, TerminalPrefs } from "../settings/api";
 import { importGhosttyConfig } from "./api";
 import { adjustmentNote, clampNumber, ghosttyTheme, NUMBERS, NumberSetting } from "./settings";
 
@@ -60,7 +60,7 @@ function NumberField({ setting, value, onSave }: {
 
 interface Props {
   prefs: Prefs;
-  onPrefs: (prefs: Prefs) => Promise<void>;
+  onPrefs: (patch: PrefsPatch) => Promise<void>;
   appearance: Appearance;
   run: Run;
 }
@@ -69,10 +69,10 @@ interface Props {
 export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
   const terminal = prefs.terminal;
   const [notes, setNotes] = useState<string[]>([]);
-  const save = (change: Partial<TerminalPrefs>) => run(() => onPrefs({ ...prefs, terminal: { ...terminal, ...change } }));
+  const save = (change: Partial<TerminalPrefs>) => run(() => onPrefs({ terminal: change }));
   const saveNumber = (setting: NumberSetting) => (value: number, note?: string) =>
     run(async () => {
-      if (value !== terminal[setting]) await onPrefs({ ...prefs, terminal: { ...terminal, [setting]: value } });
+      if (value !== terminal[setting]) await onPrefs({ terminal: { [setting]: value } });
       setNotes(note ? [note] : []);
     });
 
@@ -80,14 +80,14 @@ export function TerminalSettings({ prefs, onPrefs, appearance, run }: Props) {
     run(async () => {
       setNotes([]);
       const found = await importGhosttyConfig();
-      const next = { ...terminal, ...found.settings };
+      const next: Partial<TerminalPrefs> = { ...found.settings };
       if (found.palette) {
         const theme = ghosttyTheme(appearance.theme, found.palette, appearance.themes);
         await saveTheme(theme);
         await appearance.reload();
         next.themeId = theme.id;
       }
-      await onPrefs({ ...prefs, terminal: next });
+      await onPrefs({ terminal: next });
       setNotes([
         found.ignored.length > 0 ? `Imported. Not used: ${found.ignored.join(", ")}.` : "Imported.",
         ...found.adjusted.map((a) => adjustmentNote(a.setting, `Ghostty ${a.input}`, a.value)),

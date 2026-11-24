@@ -16,11 +16,12 @@ import {
   installRuntime,
   listRuntimes,
   Prefs,
+  PrefsPatch,
   RuntimeName,
   RuntimeView,
-  setPreferences,
   setProjectEditor,
 } from "./features/settings/api";
+import { prefsWriter } from "./features/settings/prefsWriter";
 import {
   createSession,
   listSessions,
@@ -197,6 +198,7 @@ const PHASE_ORDER: Record<Startup["phase"], number> = { checking: 0, installing:
 export default function App() {
   const [startup, setStartup] = useState<Startup>();
   const [prefs, setPrefs] = useState<Prefs>();
+  const [savePrefs] = useState(() => prefsWriter(setPrefs));
   const [firstSession, setFirstSession] = useState<string>();
   const [error, setError] = useState<string>();
   const [update, setUpdate] = useState<UpdateInfo>();
@@ -231,11 +233,6 @@ export default function App() {
     };
   }, []);
 
-  const savePrefs = async (next: Prefs) => {
-    await setPreferences(next);
-    setPrefs(next);
-  };
-
   if (lost || startLost) return <ReloadScreen title={LOST_TITLE} />;
   if (error) return <p className="empty danger">{error}</p>;
   if (!startup || !prefs) return null;
@@ -245,11 +242,11 @@ export default function App() {
       <Onboarding
         startup={startup}
         banner={banner}
-        onEditor={(id) => savePrefs({ ...prefs, editors: { ...prefs.editors, default: id } })}
+        onEditor={(id) => savePrefs({ editors: { default: id } })}
         onDone={async (sessionId) => {
           // Set first: the workspace reads it once, when it mounts.
           setFirstSession(sessionId);
-          await savePrefs({ ...prefs, onboarded: true });
+          await savePrefs({ onboarded: true });
         }}
       />
     );
@@ -271,7 +268,7 @@ interface WorkspaceProps {
   /** The session that the first-run steps made. */
   firstSession?: string;
   prefs: Prefs;
-  onPrefs: (prefs: Prefs) => Promise<void>;
+  onPrefs: (patch: PrefsPatch) => Promise<void>;
   /** The update banner of the app. */
   banner: ReactNode;
   update?: UpdateInfo;
@@ -332,7 +329,6 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** The editors on this Mac. `undefined` until the first detection. */
   const [editors, setEditors] = useState<Editors>();
   const [editorChoices] = useState(() => new PendingEditorChoices());
-  const lastPrefsWrite = useRef<Prefs | undefined>(undefined);
   const [home, setHome] = useState<string>();
   /** Per session, the host agent that its Add agent step shows. */
   const [adding, setAdding] = useState<Record<string, AgentKind | undefined>>({});
@@ -412,16 +408,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     homeDir().then(setHome, () => {});
   }, []);
 
-  const writePrefs = async (next: Prefs) => {
-    const previous = lastPrefsWrite.current ?? prefs;
-    editorChoices.preferencesChanged(previous.editors, next.editors);
-    lastPrefsWrite.current = next;
-    try {
-      await onPrefs(next);
-    } catch (error) {
-      if (lastPrefsWrite.current === next) lastPrefsWrite.current = previous;
-      throw error;
-    }
+  const writePrefs = (patch: PrefsPatch) => {
+    if (patch.editors) editorChoices.preferencesChanged(prefs.editors, { ...prefs.editors, ...patch.editors });
+    return onPrefs(patch);
   };
 
   const changeProjectEditor = (sessionId: string, editor: string | null) => {
@@ -430,8 +419,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   };
 
   /** The editors that are on and the default come from the prefs, so they are read again. */
-  const savePrefs = async (next: Prefs) => {
-    await writePrefs(next);
+  const savePrefs = async (patch: PrefsPatch) => {
+    await writePrefs(patch);
     await loadEditors();
   };
 
@@ -804,12 +793,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         if (choice?.current()) await setProjectEditor(sessionId, id);
       },
       setAppEditor: async (id) => {
-        const before = lastPrefsWrite.current;
-        const saved = await getPreferences();
-        if (!choice?.current()) return;
-        // A settings edit may have started after the backend took its snapshot.
-        const current = lastPrefsWrite.current && lastPrefsWrite.current !== before ? lastPrefsWrite.current : saved;
-        await savePrefs({ ...current, editors: { ...current.editors, default: id } });
+        if (choice?.current()) await savePrefs({ editors: { default: id } });
       },
     };
     const { opened, notice, stale } = await openEditorWith(editorCalls, target, editors, editorId, terminalId).catch((e) => {
@@ -1161,7 +1145,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       <RailHandle
         width={railWidth}
         onResize={setRailWidth}
-        onDone={(width) => writePrefs({ ...prefs, railWidth: width }).then(
+        onDone={(width) => writePrefs({ railWidth: width }).then(
             () => clearError("rail-width"),
             (e) => showError(e, undefined, "rail-width"),
           )}

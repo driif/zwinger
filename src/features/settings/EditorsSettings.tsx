@@ -1,22 +1,21 @@
 import { Button, Card, CardBody, CardHeader, LiquidSwitch, RadioGroup } from "@driif/motiv";
 import { RefreshCw } from "lucide-react";
-import { Prefs } from "./api";
+import { PrefsPatch } from "./api";
 import { Editors } from "../launcher/api";
 import { EditorIcon } from "../launcher/EditorIcon";
 import type { Run } from "../../App";
 
 interface Props {
   editors?: Editors;
-  prefs: Prefs;
-  onPrefs: (prefs: Prefs) => Promise<void>;
+  onPrefs: (patch: PrefsPatch) => Promise<void>;
   run: Run;
   onDetect: () => void;
 }
 
 /** The editors that the launchers offer, and the default of Open in editor. */
-export function EditorsSettings({ editors, prefs, onPrefs, run, onDetect }: Props) {
+export function EditorsSettings({ editors, onPrefs, run, onDetect }: Props) {
   const on = editors?.editors.filter((e) => e.enabled) ?? [];
-  const save = (next: Partial<Prefs["editors"]>) => run(() => onPrefs({ ...prefs, editors: { ...prefs.editors, ...next } }));
+  const save = (next: PrefsPatch["editors"]) => run(() => onPrefs({ editors: next }));
   const toggle = (id: string, enabled: boolean) =>
     save({ enabled: enabled ? [...on.map((e) => e.id), id] : on.filter((e) => e.id !== id).map((e) => e.id) });
 
