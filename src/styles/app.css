@@ -80,6 +80,7 @@ p {
 
 .stack {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: calc(var(--motiv-space) * 3);
 }
 
@@ -288,9 +289,29 @@ p {
   padding-bottom: var(--zw-page-pad);
 }
 
+.settings {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--zw-page-pad);
+}
+
+.settings-nav {
+  align-self: start;
+}
+
+.settings-panel {
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: var(--zw-page-pad);
+}
+
+/* One column that never grows past the panel, so a nowrap row ellipsizes instead of scrolling the page sideways. */
 .overview,
 .tab-body {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--zw-page-pad);
 }
 

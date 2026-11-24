@@ -1,8 +1,8 @@
-import { Button, Card, CardBody, CardHeader, CopyField, ElasticTabs, LiquidSwitch } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, CopyField, GlideNav, LiquidSwitch } from "@driif/motiv";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink, RefreshCw, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import {
   cleanImages,
   Detection,
@@ -34,15 +34,15 @@ import { LegacyKeychain } from "./LegacyKeychain";
 const REPO = "https://github.com/driif/zwinger";
 
 const TABS = [
-  { value: "agents", label: "Agents on this Mac" },
-  { value: "runtimes", label: "Runtimes" },
-  { value: "credentials", label: "Credentials" },
-  { value: "appearance", label: "Appearance" },
-  { value: "terminal", label: "Terminal" },
-  { value: "editors", label: "Editors" },
-  { value: "updates", label: "Updates" },
-  { value: "storage", label: "Storage" },
-  { value: "about", label: "About" },
+  { id: "agents", label: "Agents on this Mac" },
+  { id: "runtimes", label: "Runtimes" },
+  { id: "credentials", label: "Credentials" },
+  { id: "appearance", label: "Appearance" },
+  { id: "terminal", label: "Terminal" },
+  { id: "editors", label: "Editors" },
+  { id: "updates", label: "Updates" },
+  { id: "storage", label: "Storage" },
+  { id: "about", label: "About" },
 ];
 
 const size = (bytes: number | null) =>
@@ -313,67 +313,69 @@ export function AppSettings({
     getVersion().then(setVersion);
   }, []);
 
+  const panels: Record<string, ReactNode> = {
+    agents: (
+      <HostAgentsSettings
+        detection={detection}
+        sessions={sessions}
+        runtimes={runtimes}
+        run={run}
+        onRefresh={onRefresh}
+        onUse={onUse}
+      />
+    ),
+    runtimes: (
+      <div className="tab-body">
+        <Card variant="outlined" padding="md">
+          <CardHeader
+            title="Agent runtimes"
+            titleAs="h2"
+            description="The Linux builds of the agents, for all projects. A cage uses them when this Mac has no install of the agent."
+          />
+          <CardBody>
+            <ul className="list">
+              {runtimes.list.map((runtime) => (
+                <li key={runtime.name} className="row">
+                  <strong>{AGENT_NAMES[runtime.name]}</strong>
+                  <span className="grow muted">
+                    {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
+                  </span>
+                  {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
+                </li>
+              ))}
+            </ul>
+          </CardBody>
+        </Card>
+      </div>
+    ),
+    credentials: (
+      <div className="tab-body">
+        <LibraryCredentials />
+        <LegacyKeychain />
+      </div>
+    ),
+    appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
+    terminal: <TerminalSettings appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
+    editors: <EditorsSettings editors={editors} prefs={prefs} onPrefs={onPrefs} run={run} onDetect={onDetectEditors} />,
+    updates: <Updates version={version} prefs={prefs} onPrefs={onPrefs} run={run} update={update} onUpdate={onUpdate} />,
+    storage: <Storage />,
+    about: <About version={version} />,
+  };
+
   return (
     <section className="page">
       <header className="page-header">
         <h1 className="page-title">Settings</h1>
       </header>
-      <ElasticTabs
-        className="tabs"
-        fill
-        label="Settings"
-        tabs={TABS}
-        value={tab}
-        onChange={onTab}
-        panels={{
-          agents: (
-            <HostAgentsSettings
-              detection={detection}
-              sessions={sessions}
-              runtimes={runtimes}
-              run={run}
-              onRefresh={onRefresh}
-              onUse={onUse}
-            />
-          ),
-          runtimes: (
-            <div className="tab-body">
-              <Card variant="outlined" padding="md">
-                <CardHeader
-                  title="Agent runtimes"
-                  titleAs="h2"
-                  description="The Linux builds of the agents, for all projects. A cage uses them when this Mac has no install of the agent."
-                />
-                <CardBody>
-                  <ul className="list">
-                    {runtimes.list.map((runtime) => (
-                      <li key={runtime.name} className="row">
-                        <strong>{AGENT_NAMES[runtime.name]}</strong>
-                        <span className="grow muted">
-                          {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
-                        </span>
-                        {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
-                      </li>
-                    ))}
-                  </ul>
-                </CardBody>
-              </Card>
-            </div>
-          ),
-          credentials: (
-            <div className="tab-body">
-              <LibraryCredentials />
-              <LegacyKeychain />
-            </div>
-          ),
-          appearance: <AppearancePage appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
-          terminal: <TerminalSettings appearance={appearance} prefs={prefs} onPrefs={onPrefs} run={run} />,
-          editors: <EditorsSettings editors={editors} prefs={prefs} onPrefs={onPrefs} run={run} onDetect={onDetectEditors} />,
-          updates: <Updates version={version} prefs={prefs} onPrefs={onPrefs} run={run} update={update} onUpdate={onUpdate} />,
-          storage: <Storage />,
-          about: <About version={version} />,
-        }}
-      />
+      <div className="settings">
+        <GlideNav className="settings-nav" label="Settings" items={TABS} value={tab} onChange={onTab} />
+        {/* All panels stay mounted, so a draft in one panel stays when the user opens a different one. */}
+        {TABS.map(({ id }) => (
+          <div key={id} className="settings-panel" hidden={id !== tab}>
+            {panels[id]}
+          </div>
+        ))}
+      </div>
     </section>
   );
 }

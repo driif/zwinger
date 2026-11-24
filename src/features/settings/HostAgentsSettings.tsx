@@ -47,7 +47,7 @@ export function HostAgentsSettings({ detection, sessions, runtimes, run, onRefre
   return (
     <div className="tab-body">
       <div className="row">
-        <p className="muted grow">
+        <p className="muted">
           Projects can use these agents instead of their own copies, with your profile (read-only) and your subscription
           login. The agent never sees the login: the cage's proxy adds it to requests to the provider only.
         </p>
