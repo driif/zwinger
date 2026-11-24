@@ -38,7 +38,7 @@ jobs:
           cp -R src-tauri/icons/zwinger.icon "$work/Icon.icon"
           mkdir "$work/out"
           set +e
-          actool "$work/Icon.icon" --compile "$work/out" --output-format human-readable-text --notices --warnings \
+          MACOSX_DEPLOYMENT_TARGET=14.0 actool "$work/Icon.icon" --compile "$work/out" --output-format human-readable-text --notices --warnings \
             --output-partial-info-plist "$work/out/assetcatalog_generated_info.plist" --app-icon Icon \
             --include-all-app-icons --accent-color AccentColor --enable-on-demand-resources NO \
             --development-region en --target-device mac --minimum-deployment-target 26.0 --platform macosx
