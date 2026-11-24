@@ -403,12 +403,12 @@ export function ProjectPage({
   const copyPath = actions.find((a) => a.type === "copyPath")!;
 
   return (
-    <section className="page" hidden={covered}>
+    <section className="page" hidden={covered} style={{ "--zw-project-accent": session.accent ?? undefined } as CSSProperties}>
       {!covered && (
         <>
-          <header className="page-header" style={{ "--zw-project-accent": session.accent ?? undefined } as CSSProperties}>
+          <header className="page-header">
             <div className="page-header-top row">
-              <h1 className="page-title project-title">{session.name}</h1>
+              <h1 className="page-title project-mark">{session.name}</h1>
               <span className={`dot ${status.state}`} />
               <SplitButton
                 size="sm"

@@ -136,7 +136,7 @@ function BoundaryNode({ data }: NodeProps<Node<BoundaryData, "boundary">>) {
     <div className={`map-boundary ${data.state}`}>
       <div className="map-boundary-header">
         <CageMark size={18} />
-        <span className="map-title">{data.name}</span>
+        <span className="map-title project-mark">{data.name}</span>
         <span className="map-state">microVM · {data.state}</span>
       </div>
       <Handle type="target" position={Position.Left} className="map-mount-target" />

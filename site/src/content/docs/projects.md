@@ -20,7 +20,7 @@ cage with the name of the project.
 ## Accent color
 
 Each project has a color mark: a stripe at the left edge of its row in the sidebar, and a bar before its name at the
-top of the project page. By default the mark uses the primary color of the theme, and it changes when you change the
+top of the project page, on its map and in each terminal tab. The names keep the text color. By default the mark uses the primary color of the theme, and it changes when you change the
 theme.
 
 To give a project its own color, open the project's **Settings** tab. In **Accent color**, click the swatch and select a

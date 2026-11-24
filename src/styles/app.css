@@ -262,8 +262,8 @@ p {
   margin-inline-start: var(--zw-gap);
 }
 
-/* The project mark before the title. */
-.project-title::before {
+/* The project accent before a project or terminal name. It is a bar, so the name keeps the text color. */
+.project-mark::before {
   content: "";
   display: inline-block;
   width: 4px;

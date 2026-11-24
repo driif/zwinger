@@ -84,7 +84,7 @@ export function TerminalTabs({ session, panes, selected, newItems, onShow, onReo
                     title={hasCage ? `${name}: this session has a cage, so an agent with no cage does not open in it.` : liveName}
                     onClick={() => onShow(pane.key)}
                   >
-                    <span className="terminal-tab-name">{liveName}</span>
+                    <span className="terminal-tab-name project-mark">{liveName}</span>
                     {state && <span className={process?.exitCode ? "dot error" : "dot"} role="img" aria-label={state} title={state} />}
                     {hasCage && <span className="danger"> · the session has a cage</span>}
                   </Button>
