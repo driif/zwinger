@@ -1,4 +1,4 @@
-import { Button, Card, Dialog, IconButton, Select, TextField } from "@driif/motiv";
+import { Badge, Button, Card, Dialog, IconButton, Select, TextField } from "@driif/motiv";
 import {
   Active,
   Announcements,
@@ -19,7 +19,7 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Box, ChevronRight, Ellipsis, Fence, FolderInput, Pencil, Play, Plus, RotateCw, Settings, Square, Trash2 } from "lucide-react";
+import { Box, ChevronRight, Ellipsis, Fence, FolderInput, Hourglass, Pencil, Play, Plus, RotateCw, Settings, Square, Trash2 } from "lucide-react";
 import { CSSProperties, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -179,6 +179,8 @@ interface Props {
   selectedId?: string;
   /** Per session, the blocked events that the Network tab has not shown yet. */
   blocked: Record<string, number>;
+  /** Per session, the requests of its VM that wait for an answer. */
+  waiting: Record<string, number>;
   run: Run;
   vm: VmControl;
   /** Opens the terminal view of the session. */
@@ -211,6 +213,7 @@ export function ProjectRail({
   workspaces,
   selectedId,
   blocked,
+  waiting,
   run,
   vm,
   onOpen,
@@ -794,6 +797,12 @@ export function ProjectRail({
                                         <Fence size={12} aria-label={`Cage ${cageName(effective.id)}`} />
                                       </span>
                                     )
+                                  )}
+                                  {waiting[session.id] > 0 && (
+                                    <Badge tone="warning" size="sm" title="Network requests that wait for your answer">
+                                      <Hourglass size={10} aria-hidden="true" />
+                                      {waiting[session.id]}
+                                    </Badge>
                                   )}
                                   {blocked[session.id] > 0 && (
                                     <span className="rail-blocked" title="Blocked network events since you last saw them">

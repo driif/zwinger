@@ -31,7 +31,15 @@ A Block rule always has priority over an Allow rule. A rule change applies to th
 ### Ask
 
 With the default **Ask for everything else**, the proxy holds a request that no rule decides. The request shows in
-**Requests that wait for you** on the network page of the session, with its method, host and port. Select one answer:
+**Requests that wait for you** on the network page of the session, with its method, host, port and the seconds until
+the proxy blocks it. You also see a waiting request outside the network page:
+
+- The session row in the sidebar shows an hourglass badge with the number of waiting requests of its VM.
+- A notice at the top of the main area lists the waiting requests of each VM, with the same countdown and answers.
+  **Open Network** opens the network page of the session. The notice does not show while the network page of that VM
+  is open.
+
+Select one answer:
 
 - **Allow once**: allows this request. The later requests of the same HTTPS connection get the same answer.
 - **Allow until stop**: adds an Allow rule for the host [until the VM stops](#allow-until-the-vm-stops).

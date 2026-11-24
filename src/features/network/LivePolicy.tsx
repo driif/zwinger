@@ -1,27 +1,19 @@
 import { Button, Card, CardBody, CardHeader, FloatingField } from "@driif/motiv";
-import { Hourglass, X } from "lucide-react";
+import { X } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 import type { Run } from "../../App";
 import type { Rule } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
 import {
   addTemporaryRule,
-  answerAsk,
   Ask,
-  AskAnswer,
   listAsks,
   onNetAsks,
   removeTemporaryRule,
   temporaryRules,
 } from "./api";
 import { domainError } from "./network";
-
-const ANSWERS: { answer: AskAnswer; label: string }[] = [
-  { answer: "once", label: "Allow once" },
-  { answer: "untilStop", label: "Allow until stop" },
-  { answer: "always", label: "Always allow" },
-  { answer: "block", label: "Block" },
-];
+import { AskRow } from "./PendingAsks";
 
 interface Props {
   vmKey: string;
@@ -71,23 +63,7 @@ export function LivePolicy({ vmKey, run }: Props) {
           <CardBody>
             <ul className="list">
               {asks.map((ask) => (
-                <li key={ask.id} className="row">
-                  <Hourglass size={14} className="warn" />
-                  <span className="grow mono">
-                    {ask.method} {ask.host}
-                    {ask.port === 443 || ask.port === 80 ? "" : `:${ask.port}`}
-                  </span>
-                  {ANSWERS.map(({ answer, label }) => (
-                    <Button
-                      key={answer}
-                      size="sm"
-                      variant={answer === "block" ? "ghost" : "outline"}
-                      onClick={() => run(() => answerAsk(vmKey, ask.id, answer))}
-                    >
-                      {label}
-                    </Button>
-                  ))}
-                </li>
+                <AskRow key={ask.id} vmKey={vmKey} ask={ask} run={run} />
               ))}
             </ul>
           </CardBody>

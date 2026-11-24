@@ -4,7 +4,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { homeDir } from "@tauri-apps/api/path";
 import { Button, Card, Toaster } from "@driif/motiv";
 import { Check, Plus, RotateCw, ShieldOff, TriangleAlert } from "lucide-react";
-import { listNetEvents, NetEvent, onNetEvent } from "./features/network/api";
+import { Ask as NetAsk, listAsks, listNetEvents, NetEvent, onNetAsks, onNetEvent } from "./features/network/api";
+import { PendingAsks } from "./features/network/PendingAsks";
 import { onStartup, Startup, startupStatus } from "./features/onboarding/api";
 import {
   Detection,
@@ -292,6 +293,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [net, setNet] = useState<Record<string, NetEvent[]>>({});
   /** Per VM key, the last `seq` that the Network tab showed. */
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
+  /** Per VM key, the requests that wait for an answer. */
+  const [asks, setAsks] = useState<Record<string, NetAsk[]>>({});
   const [listening, setListening] = useState(false);
   const backfilled = useRef(new Set<string>());
   /** Per VM key, the count of its releases. A backfill of an older count is dropped. */
@@ -507,6 +510,13 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     };
   }, []);
 
+  useEffect(() => {
+    const stop = onNetAsks((vmKey) => listAsks(vmKey).then((list) => setAsks((current) => ({ ...current, [vmKey]: list }))));
+    return () => {
+      stop.then((unlisten) => unlisten());
+    };
+  }, []);
+
   // The backfill starts after the listener, so no event falls between the two.
   const keys = [...cages.flatMap((c) => c.vms.map((v) => v.key)), ...sessions.flatMap((s) => s.vmKey ?? [])];
   vmKeys.current = new Set(keys);
@@ -522,12 +532,14 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       }
       setNet(forget);
       setLastSeen(forget);
+      setAsks(forget);
     }
     if (!listening) return;
     for (const key of keys) {
       if (backfilled.current.has(key)) continue;
       backfilled.current.add(key);
       const generation = netGeneration.current.get(key);
+      listAsks(key).then((list) => setAsks((current) => ({ ...current, [key]: list })));
       listNetEvents(key).then(
         (events) => netGeneration.current.get(key) === generation && addNet(key, events),
         (e) => setError(errorMessage(e)),
@@ -611,6 +623,18 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       vmCage ? (net[vmCage.key] ?? []).filter((e) => !e.allowed && e.seq > (lastSeen[vmCage.key] ?? 0)).length : 0,
     ]),
   );
+
+  const waiting = Object.fromEntries(
+    joined.map(({ session, vmCage }) => [session.id, vmCage ? (asks[vmCage.key]?.length ?? 0) : 0]),
+  );
+  /** The Network tab of the selected session shows its asks itself. */
+  const askGroups = Object.entries(asks)
+    .filter(([key, list]) => list.length > 0 && !(key === vmCage?.key && view.kind === "network" && !showSettings && !showCages && !roundFolder))
+    .map(([vmKey, list]) => {
+      const members = joined.filter((j) => j.vmCage?.key === vmKey).map((j) => j.session);
+      return { vmKey, sessionId: members[0]?.id, names: members.map((m) => m.name).join(", "), asks: list };
+    })
+    .filter((group) => group.sessionId !== undefined);
 
   /** Saves at once on the screen, then in the backend. */
   function saveLayout(sessionId: string, layout: PaneNode | null) {
@@ -1060,6 +1084,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         workspaces={workspaces}
         selectedId={session?.id}
         blocked={blocked}
+        waiting={waiting}
         run={run}
         vm={vm}
         onOpen={showSession}
@@ -1159,6 +1184,14 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
               {notice}
             </Notice>
           ))}
+          <PendingAsks
+            groups={askGroups}
+            run={run}
+            onOpen={(id) => {
+              select(id);
+              setView({ kind: "network" });
+            }}
+          />
           {banner}
           {!showSettings && !showCages && !roundFolder && session && (vmCage?.pendingRestart || selectedCageChanged) && (
             <Notice
