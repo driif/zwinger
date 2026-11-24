@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use tauri::ipc::Channel;
 use tauri::{State, Webview};
 
-use crate::cage;
 use crate::cage::manager::Listing;
+use crate::cage::{self, FolderList};
 use crate::error::Result;
 use crate::folder_watch::FolderWatches;
 use crate::session::{Pos, Viewport};
@@ -91,23 +91,23 @@ pub fn set_project_accent(manager: Managed<'_>, session_id: String, accent: Opti
 }
 
 #[tauri::command]
-pub fn list_folders(manager: Managed<'_>, session_id: String) -> Result<Vec<String>> {
+pub fn list_folders(manager: Managed<'_>, session_id: String) -> Result<FolderList> {
     manager.list_folders(&session_id)
 }
 
 /// Sends the folders of the project now and on each change, until
-/// `unwatch_folders`, a new page in the webview, or its close. `None` while
-/// the project folder cannot be read.
+/// `unwatch_folders`, a new page in the webview, or its close. The reason
+/// while the project folder cannot be read.
 #[tauri::command]
 pub fn watch_folders(
     manager: Managed<'_>,
     watches: State<'_, FolderWatches>,
     webview: Webview,
     session_id: String,
-    on_event: Channel<Option<Vec<String>>>,
+    on_event: Channel<FolderList>,
 ) -> Result<u64> {
     let root = manager.session_folder(&session_id)?;
-    watches.watch(webview.label(), root, move |folders| on_event.send(folders).is_ok())
+    Ok(watches.watch(webview.label(), root, move |folders| on_event.send(folders).is_ok()))
 }
 
 #[tauri::command]

@@ -1212,8 +1212,8 @@ impl<R: SandboxRuntime> Manager<R> {
         Ok(lock(&self.state).session(session_id)?.folder.clone())
     }
 
-    pub fn list_folders(&self, session_id: &str) -> Result<Vec<String>> {
-        cage::list_folders(&self.session_folder(session_id)?)
+    pub fn list_folders(&self, session_id: &str) -> Result<cage::FolderList> {
+        Ok(cage::list_folders(&self.session_folder(session_id)?))
     }
 
     /// Adds the host agent to the cage, or changes it: its runtime, and
@@ -2016,7 +2016,7 @@ mod tests {
         let (manager, _, id) = manager();
         let folder = manager.list().sessions[0].session.folder.clone();
         std::fs::create_dir(folder.join("web")).unwrap();
-        assert_eq!(manager.list_folders(&id).unwrap(), ["web"]);
+        assert_eq!(manager.list_folders(&id).unwrap(), crate::cage::FolderList::Listed(vec!["web".into()]));
         assert!(matches!(manager.list_folders("nope"), Err(Error::SessionNotFound)));
     }
 

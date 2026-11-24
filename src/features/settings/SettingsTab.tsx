@@ -1,7 +1,9 @@
 import { Button, Card, CardBody, CardHeader, FloatingField, RadioGroup, Select, TextField } from "@driif/motiv";
-import { Trash2 } from "lucide-react";
+import { Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { setHarness, setProjectAccent } from "./api";
+import { setHarness, setProjectAccent, Unreadable } from "./api";
+import { UNREADABLE } from "../projects/followFolders";
+import { Notice } from "../../shared/Notice";
 import { deleteSession, renameSession, setSessionCage } from "../projects/api";
 import { deleteCage } from "../cages/api";
 import { CageView, SessionView } from "../../shared/api";
@@ -22,6 +24,8 @@ interface Props {
   /** The cage that only this session uses: Delete offers to delete it too. */
   soleCage?: CageView;
   folders: string[];
+  /** Why the project folder cannot be read. */
+  unreadable?: Unreadable;
   /** `undefined` until the first detection. */
   editors?: Editors;
   runtimes: Runtimes;
@@ -32,7 +36,7 @@ interface Props {
 
 const HEX = /^#[0-9a-f]{6}$/i;
 
-export function SettingsTab({ session, onProjectEditor, cages, defaultCage, soleCage, folders, editors, runtimes, run, intent, onIntentDone }: Props) {
+export function SettingsTab({ session, onProjectEditor, cages, defaultCage, soleCage, folders, unreadable, editors, runtimes, run, intent, onIntentDone }: Props) {
   const { cage, vmCage } = sessionCage(session, cages);
   // By key, not by `vmCage`: that is null for a planned VM, and for a shared VM that runs for other projects.
   const startHistory = cages.flatMap((c) => c.vms).find((v) => v.key === session.vmKey)?.startHistory ?? [];
@@ -221,7 +225,12 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, sole
             titleAs="h2"
             description="The folder where the pi agent starts. Put its skills and instructions there."
           />
-          <CardBody>
+          <CardBody className="stack">
+            {unreadable && (
+              <Notice icon={<TriangleAlert size={14} className="warn" />}>
+                {UNREADABLE[unreadable]}: <span className="mono">{session.folder}</span>
+              </Notice>
+            )}
             <RadioGroup
               ref={harnessGroup}
               name={`harness-${session.id}`}

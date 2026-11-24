@@ -1,10 +1,20 @@
+import type { FolderList, Unreadable } from "../settings/api.ts";
+
 /** The folder commands, passed in so that a test can replace them. */
 export interface FolderApi {
-  watch: (sessionId: string, onFolders: (folders: string[] | undefined) => void) => Promise<number>;
+  watch: (sessionId: string, onFolders: (folders: FolderList) => void) => Promise<number>;
   unwatch: (token: number) => unknown;
   rescan: (token: number) => Promise<unknown>;
-  list: (sessionId: string) => Promise<string[]>;
+  list: (sessionId: string) => Promise<FolderList>;
 }
+
+/** Why the project folder cannot be read. The folder path follows it. */
+export const UNREADABLE: Record<Unreadable, string> = {
+  missing: "The project folder does not exist",
+  notAFolder: "The project path is not a folder",
+  permissionDenied: "No permission to read the project folder",
+  other: "The project folder cannot be read",
+};
 
 /** The key of a displayed list: a list of one folder must not show for an other folder. */
 export const folderKey = (session: { id: string; folder: string }) => `${session.id}\n${session.folder}`;
@@ -12,12 +22,11 @@ export const folderKey = (session: { id: string; folder: string }) => `${session
 /**
  * Follows the folders of a project from the watch. `reload` tells the watch
  * to read again. If the watch fails or ends, each `reload` reads the folders
- * directly. `undefined` means that the project folder cannot be read.
- * Nothing arrives after `close`.
+ * directly. A failed direct read is `"other"`. Nothing arrives after `close`.
  */
 export function followFolders(
   sessionId: string,
-  onFolders: (folders: string[] | undefined) => void,
+  onFolders: (folders: FolderList) => void,
   api: FolderApi,
 ) {
   let closed = false;
@@ -30,7 +39,7 @@ export function followFolders(
     const newest = () => !closed && current === reads;
     api.list(sessionId).then(
       (folders) => newest() && onFolders(folders),
-      () => newest() && onFolders(undefined),
+      () => newest() && onFolders("other"),
     );
   };
   const fallBack = () => {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use notify::{RecursiveMode, Watcher};
 
-use crate::cage;
+use crate::cage::{self, FolderList};
 use crate::error::{Error, Result};
 
 /// The quiet time that ends a burst of changes.
@@ -127,56 +127,59 @@ impl Drop for FolderWatch {
     }
 }
 
-/// An attached watch with its first list, before its worker starts.
+/// A watch with its first list, before its worker starts.
 struct Ready {
     shared: Arc<Shared>,
     root: PathBuf,
     attach: Attach,
-    watcher: Box<dyn Send>,
-    first: Vec<String>,
+    /// `None` when the attach failed, such as for a missing root.
+    watcher: Option<Box<dyn Send>>,
+    first: FolderList,
 }
 
 /// Attaches the watcher to `root`, then reads the first list, so a change
-/// between the two is not lost. A missing root or a failed attach is an error.
-fn prepare(root: PathBuf, attach: Attach) -> Result<Ready> {
+/// between the two is not lost. A root that cannot be read is watched too:
+/// the worker reads it on each poll until it can be read.
+fn prepare(root: PathBuf, attach: Attach) -> Ready {
     let shared = Arc::new(Shared::default());
-    let watcher = attach(&root, Arc::downgrade(&shared))?;
-    let first = cage::list_folders(&root)?;
-    Ok(Ready { shared, root, attach, watcher, first })
+    let watcher = attach(&root, Arc::downgrade(&shared)).ok();
+    let first = cage::list_folders(&root);
+    Ready { shared, root, attach, watcher, first }
 }
 
 impl Ready {
     /// Starts the worker. It sends the first list, and then each list that
     /// differs from the last one, until the watch drops or `send` returns
-    /// false. `None` means that the root cannot be read. Then it drops the
-    /// OS watcher and calls `on_exit`.
+    /// false. Then it drops the OS watcher and calls `on_exit`.
     fn spawn(
         self,
-        mut send: impl FnMut(Option<Vec<String>>) -> bool + Send + 'static,
+        mut send: impl FnMut(FolderList) -> bool + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> FolderWatch {
         let Ready { shared, root, attach, mut watcher, first } = self;
         let worker = shared.clone();
         std::thread::spawn(move || {
-            let mut last = Some(first);
+            let mut last = first;
             // True when the last attach failed. Each later wake tries again.
-            let mut detached = false;
+            let mut detached = watcher.is_none();
             if send(last.clone()) {
                 loop {
                     let wake = worker.wait();
                     if wake == Wake::Stop || (wake == Wake::Changed && !worker.settle()) {
                         break;
                     }
-                    let mut folders = cage::list_folders(&root).ok();
+                    let mut folders = cage::list_folders(&root);
                     // A root that came back, or a read that finds a change
                     // that the watcher did not report, gets a new watcher.
                     // The read after the attach finds a change between the two.
-                    if folders.is_some() && (last.is_none() || detached || (wake != Wake::Changed && folders != last)) {
+                    let readable = matches!(folders, FolderList::Listed(_));
+                    let was_readable = matches!(last, FolderList::Listed(_));
+                    if readable && (!was_readable || detached || (wake != Wake::Changed && folders != last)) {
                         match attach(&root, Arc::downgrade(&worker)) {
                             Ok(new) => {
-                                watcher = new;
+                                watcher = Some(new);
                                 detached = false;
-                                folders = cage::list_folders(&root).ok();
+                                folders = cage::list_folders(&root);
                             }
                             Err(_) => detached = true,
                         }
@@ -211,12 +214,7 @@ fn lock(watches: &Mutex<HashMap<u64, (String, FolderWatch)>>) -> MutexGuard<'_, 
 impl FolderWatches {
     /// Watches the direct children of `root` for the webview `owner`. The
     /// watch ends at `remove`, at `drop_owner`, or when `send` returns false.
-    pub fn watch(
-        &self,
-        owner: &str,
-        root: PathBuf,
-        send: impl FnMut(Option<Vec<String>>) -> bool + Send + 'static,
-    ) -> Result<u64> {
+    pub fn watch(&self, owner: &str, root: PathBuf, send: impl FnMut(FolderList) -> bool + Send + 'static) -> u64 {
         self.watch_with(owner, root, attach_notify, send)
     }
 
@@ -225,9 +223,9 @@ impl FolderWatches {
         owner: &str,
         root: PathBuf,
         attach: Attach,
-        send: impl FnMut(Option<Vec<String>>) -> bool + Send + 'static,
-    ) -> Result<u64> {
-        let ready = prepare(root, attach)?;
+        send: impl FnMut(FolderList) -> bool + Send + 'static,
+    ) -> u64 {
+        let ready = prepare(root, attach);
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         let watches = Arc::downgrade(&self.watches);
         // A worker that ends removes its own entry. The spawn is under the
@@ -240,7 +238,7 @@ impl FolderWatches {
         };
         let mut map = lock(&self.watches);
         map.insert(token, (owner.to_owned(), ready.spawn(send, on_exit)));
-        Ok(token)
+        token
     }
 
     pub fn remove(&self, token: u64) {
@@ -270,6 +268,7 @@ impl FolderWatches {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cage::Unreadable;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 
     /// Long enough for FSEvents to report a change.
@@ -288,23 +287,28 @@ mod tests {
         Ok(Box::new(()))
     }
 
-    fn start(root: &Path, attach: Attach) -> (FolderWatch, Receiver<Option<Vec<String>>>) {
+    fn start(root: &Path, attach: Attach) -> (FolderWatch, Receiver<FolderList>) {
         let (tx, rx) = mpsc::channel();
-        let watch = prepare(root.to_owned(), attach).unwrap().spawn(move |folders| tx.send(folders).is_ok(), || {});
+        let watch = prepare(root.to_owned(), attach).spawn(move |folders| tx.send(folders).is_ok(), || {});
         (watch, rx)
     }
 
-    fn watch(root: &Path) -> (FolderWatch, Receiver<Option<Vec<String>>>) {
+    fn watch(root: &Path) -> (FolderWatch, Receiver<FolderList>) {
         start(root, attach_notify)
     }
 
-    fn frame(rx: &Receiver<Option<Vec<String>>>) -> Option<Vec<String>> {
+    fn frame(rx: &Receiver<FolderList>) -> FolderList {
         rx.recv_timeout(WAIT).expect("a frame in time")
     }
 
-    fn next(rx: &Receiver<Option<Vec<String>>>) -> Vec<String> {
-        frame(rx).expect("a list of a readable root")
+    fn next(rx: &Receiver<FolderList>) -> Vec<String> {
+        match frame(rx) {
+            FolderList::Listed(names) => names,
+            other => panic!("a list of a readable root, not {other:?}"),
+        }
     }
+
+    const MISSING: FolderList = FolderList::Unreadable(Unreadable::Missing);
 
     fn until(done: impl Fn() -> bool) {
         let end = Instant::now() + WAIT;
@@ -377,7 +381,7 @@ mod tests {
             }
             assert!(begin.elapsed() < WAIT, "the changes held back the list");
         };
-        assert_eq!(list, Some(vec!["web".to_owned()]));
+        assert_eq!(list, FolderList::Listed(vec!["web".to_owned()]));
         assert!(begin.elapsed() < MAX_DELAY + DEBOUNCE * 2);
     }
 
@@ -386,11 +390,11 @@ mod tests {
         let root = temp_dir();
         let watches = FolderWatches::default();
         let (tx, rx) = mpsc::channel();
-        let token = watches.watch_with("main", root.clone(), attach_none, move |f| tx.send(f).is_ok()).unwrap();
+        let token = watches.watch_with("main", root.clone(), attach_none, move |f| tx.send(f).is_ok());
         assert!(next(&rx).is_empty());
         std::fs::create_dir(root.join("web")).unwrap();
         watches.rescan(token).unwrap();
-        assert_eq!(rx.recv_timeout(POLL / 2), Ok(Some(vec!["web".to_owned()])));
+        assert_eq!(rx.recv_timeout(POLL / 2), Ok(FolderList::Listed(vec!["web".to_owned()])));
     }
 
     #[test]
@@ -403,13 +407,13 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_root_is_unknown_until_it_comes_back() {
+    fn a_missing_root_is_missing_until_it_comes_back() {
         let root = temp_dir();
         std::fs::create_dir(root.join("web")).unwrap();
         let (_watch, rx) = watch(&root);
         assert_eq!(next(&rx), ["web"]);
         std::fs::remove_dir_all(&root).unwrap();
-        assert_eq!(frame(&rx), None);
+        assert_eq!(frame(&rx), MISSING);
         std::fs::create_dir_all(root.join("app")).unwrap();
         assert_eq!(next(&rx), ["app"]);
         std::fs::create_dir(root.join("web")).unwrap();
@@ -417,12 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_root_that_goes_and_comes_back_sends_none_then_empty() {
+    fn an_empty_root_that_goes_and_comes_back_sends_missing_then_empty() {
         let root = temp_dir();
         let (_watch, rx) = watch(&root);
         assert!(next(&rx).is_empty());
         std::fs::remove_dir(&root).unwrap();
-        assert_eq!(frame(&rx), None);
+        assert_eq!(frame(&rx), MISSING);
         std::fs::create_dir(&root).unwrap();
         assert!(next(&rx).is_empty());
         std::fs::create_dir(root.join("web")).unwrap();
@@ -444,7 +448,7 @@ mod tests {
         let (_watch, rx) = start(&root, attach_late);
         assert!(next(&rx).is_empty());
         std::fs::remove_dir(&root).unwrap();
-        assert_eq!(frame(&rx), None);
+        assert_eq!(frame(&rx), MISSING);
         // The root comes back with `web` in one step, so no read sees it empty.
         let staged = root.with_extension("staged");
         std::fs::create_dir_all(staged.join("web")).unwrap();
@@ -453,9 +457,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_root_is_an_error() {
-        let root = temp_dir().join("gone");
-        assert!(prepare(root, attach_notify).is_err());
+    fn a_root_missing_at_the_start_is_followed_until_it_comes_back() {
+        let root = temp_dir().join("late");
+        let (_watch, rx) = watch(&root);
+        assert_eq!(frame(&rx), MISSING);
+        std::fs::create_dir(&root).unwrap();
+        assert!(next(&rx).is_empty());
+        std::fs::create_dir(root.join("web")).unwrap();
+        assert_eq!(next(&rx), ["web"]);
     }
 
     #[test]
@@ -473,7 +482,7 @@ mod tests {
     fn a_failed_first_send_retires_the_watch() {
         let root = temp_dir();
         let watches = FolderWatches::default();
-        watches.watch_with("main", root, attach_none, |_| false).unwrap();
+        watches.watch_with("main", root, attach_none, |_| false);
         until(|| len(&watches) == 0);
     }
 
@@ -482,12 +491,10 @@ mod tests {
         let root = temp_dir();
         let watches = FolderWatches::default();
         let mut sends = 0;
-        let token = watches
-            .watch_with("main", root.clone(), attach_none, move |_| {
-                sends += 1;
-                sends == 1
-            })
-            .unwrap();
+        let token = watches.watch_with("main", root.clone(), attach_none, move |_| {
+            sends += 1;
+            sends == 1
+        });
         assert_eq!(len(&watches), 1);
         std::fs::create_dir(root.join("web")).unwrap();
         watches.rescan(token).unwrap();
@@ -501,8 +508,8 @@ mod tests {
         let watches = FolderWatches::default();
         let (main_tx, main_rx) = mpsc::channel();
         let (other_tx, other_rx) = mpsc::channel();
-        watches.watch("main", root.clone(), move |f| main_tx.send(f).is_ok()).unwrap();
-        watches.watch("other", root.clone(), move |f| other_tx.send(f).is_ok()).unwrap();
+        watches.watch("main", root.clone(), move |f| main_tx.send(f).is_ok());
+        watches.watch("other", root.clone(), move |f| other_tx.send(f).is_ok());
         next(&main_rx);
         next(&other_rx);
         watches.drop_owner("main");
@@ -516,9 +523,9 @@ mod tests {
     fn a_stale_token_does_not_end_a_new_watch() {
         let root = temp_dir();
         let watches = FolderWatches::default();
-        let old = watches.watch_with("main", root.clone(), attach_none, |_| true).unwrap();
+        let old = watches.watch_with("main", root.clone(), attach_none, |_| true);
         watches.drop_owner("main");
-        let new = watches.watch_with("main", root, attach_none, |_| true).unwrap();
+        let new = watches.watch_with("main", root, attach_none, |_| true);
         watches.remove(old);
         assert!(watches.rescan(new).is_ok());
     }

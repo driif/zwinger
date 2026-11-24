@@ -92,9 +92,11 @@ the two new files once and keeps `projects.json` unchanged.
 
 The project map and the harness folder list show the top-level folders of the project folder. Hidden folders and
 symlinks are not shown. When you create, rename or delete a top-level folder, for example in Finder or in a terminal, the
-map and the list change soon after. A change to a file or to a folder at a lower level does not change them. If the
-project folder is removed, they show no folders until the folder comes back. The saved map positions of the folders
-stay while the project folder is missing. zwinger also reads the folders again when the window gets the focus and after
+map and the list change soon after. A change to a file or to a folder at a lower level does not change them. If zwinger
+cannot read the project folder, the overview and the harness list show no folders and show a notice with the reason: the
+folder does not exist, the path is not a folder, or zwinger has no permission to read it. An empty folder shows no notice.
+The notice goes away soon after the folder can be read again. The saved map positions of the folders stay while the
+project folder cannot be read. zwinger also reads the folders again when the window gets the focus and after
 each change on the project page.
 
 ## Mounts

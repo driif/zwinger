@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { FolderList } from "../settings/api.ts";
 import { type FolderApi, folderKey, followFolders } from "./followFolders.ts";
 
 function deferred<T>() {
@@ -16,8 +17,8 @@ const flush = () => new Promise((resolve) => setTimeout(resolve));
 
 /** A mocked backend: each watch gets a channel and a token that the test resolves. */
 function backend() {
-  const watches: { id: string; send: (folders: string[] | undefined) => void; token: ReturnType<typeof deferred<number>> }[] = [];
-  const reads: { id: string; result: ReturnType<typeof deferred<string[]>> }[] = [];
+  const watches: { id: string; send: (folders: FolderList) => void; token: ReturnType<typeof deferred<number>> }[] = [];
+  const reads: { id: string; result: ReturnType<typeof deferred<FolderList>> }[] = [];
   const unwatched: number[] = [];
   const rescans: { token: number; result: ReturnType<typeof deferred<void>> }[] = [];
   const api: FolderApi = {
@@ -33,7 +34,7 @@ function backend() {
       return result.promise;
     },
     list: (id) => {
-      const result = deferred<string[]>();
+      const result = deferred<FolderList>();
       reads.push({ id, result });
       return result.promise;
     },
@@ -43,7 +44,7 @@ function backend() {
 
 test("a folder change from the channel sets the list", async () => {
   const { api, watches } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   followFolders("a", (f) => seen.push(f), api);
   watches[0].send(["web"]);
   watches[0].token.resolve(1);
@@ -54,7 +55,7 @@ test("a folder change from the channel sets the list", async () => {
 
 test("a session switch closes the old watch and ignores its late lists", async () => {
   const { api, watches, unwatched } = backend();
-  const seen: [string, string[]][] = [];
+  const seen: [string, FolderList][] = [];
   const a = followFolders("a", (f) => seen.push(["a", f]), api);
   watches[0].token.resolve(1);
   await flush();
@@ -69,7 +70,7 @@ test("a session switch closes the old watch and ignores its late lists", async (
 
 test("unmount closes the watch, and no list arrives after it", async () => {
   const { api, watches, unwatched } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.resolve(7);
   await flush();
@@ -89,7 +90,7 @@ test("a token that arrives after unmount is unwatched", async () => {
 
 test("a failed watch falls back to a read now and on each reload", async () => {
   const { api, watches, reads } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.reject(new Error("no watch"));
   await flush();
@@ -117,7 +118,7 @@ test("a reload tells a working watch to read again", async () => {
 
 test("a watch that has ended falls back to a direct read", async () => {
   const { api, watches, reads, rescans } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.resolve(4);
   await flush();
@@ -140,7 +141,7 @@ test("a list of one folder does not show for an other folder of the same project
 
 test("an older fallback read does not replace a newer list", async () => {
   const { api, watches, reads } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.reject(new Error("no watch"));
   await flush();
@@ -154,7 +155,7 @@ test("an older fallback read does not replace a newer list", async () => {
 
 test("a fallback read that ends after unmount sets nothing", async () => {
   const { api, watches, reads } = backend();
-  const seen: string[][] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.reject(new Error("no watch"));
   await flush();
@@ -164,18 +165,18 @@ test("a fallback read that ends after unmount sets nothing", async () => {
   assert.deepEqual(seen, []);
 });
 
-test("an unreadable root from the channel is undefined, and an empty list stays empty", async () => {
+test("an unreadable root from the channel is its reason, and an empty list stays empty", async () => {
   const { api, watches } = backend();
-  const seen: (string[] | undefined)[] = [];
+  const seen: FolderList[] = [];
   followFolders("a", (f) => seen.push(f), api);
-  watches[0].send(undefined);
+  watches[0].send("permissionDenied");
   watches[0].send([]);
-  assert.deepEqual(seen, [undefined, []]);
+  assert.deepEqual(seen, ["permissionDenied", []]);
 });
 
-test("the newest fallback read that fails sets undefined", async () => {
+test("the newest fallback read that fails sets other", async () => {
   const { api, watches, reads } = backend();
-  const seen: (string[] | undefined)[] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.reject(new Error("no watch"));
   await flush();
@@ -184,12 +185,12 @@ test("the newest fallback read that fails sets undefined", async () => {
   follow.reload();
   reads[1].result.reject(new Error("missing root"));
   await flush();
-  assert.deepEqual(seen, [[], undefined]);
+  assert.deepEqual(seen, [[], "other"]);
 });
 
 test("a failed fallback read that is superseded or closed sets nothing", async () => {
   const { api, watches, reads } = backend();
-  const seen: (string[] | undefined)[] = [];
+  const seen: FolderList[] = [];
   const follow = followFolders("a", (f) => seen.push(f), api);
   watches[0].token.reject(new Error("no watch"));
   await flush();

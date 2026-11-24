@@ -28,18 +28,21 @@ export const setProjectAccent = (sessionId: string, accent: string | null) => {
   return write;
 };
 
+/** Why the project folder cannot be read. */
+export type Unreadable = "missing" | "notAFolder" | "permissionDenied" | "other";
+
+/** The top-level folders of the project, or why its folder cannot be read. */
+export type FolderList = string[] | Unreadable;
+
 export const listFolders = (sessionId: string) =>
-  call<string[]>("list_folders", { sessionId });
+  call<FolderList>("list_folders", { sessionId });
 
 /**
- * Sends the folders of the project now and on each change, or undefined while
- * the project folder cannot be read. Resolves to the token for `unwatchFolders`.
+ * Sends the folders of the project now and on each change, or the reason
+ * while the project folder cannot be read. Resolves to the token for `unwatchFolders`.
  */
-export const watchFolders = (sessionId: string, onFolders: (folders: string[] | undefined) => void) =>
-  call<number>("watch_folders", {
-    sessionId,
-    onEvent: new Channel<string[] | null>((folders) => onFolders(folders ?? undefined)),
-  });
+export const watchFolders = (sessionId: string, onFolders: (folders: FolderList) => void) =>
+  call<number>("watch_folders", { sessionId, onEvent: new Channel<FolderList>(onFolders) });
 
 export const unwatchFolders = (token: number) => call<void>("unwatch_folders", { token });
 

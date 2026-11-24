@@ -24,6 +24,7 @@ import { ESTIMATE, expiresSoon } from "./tokenExpiry";
 import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
 import { useProjectFolders } from "./useProjectFolders";
+import { UNREADABLE } from "./followFolders";
 import { RunSummary } from "../tasks/api";
 import {
   AGENT_NAMES,
@@ -360,7 +361,7 @@ export function ProjectPage({
   useEffect(() => {
     if (intent && !currentIntent) onIntentDone();
   }, [intent, currentIntent, onIntentDone]);
-  const { folders, reload } = useProjectFolders(session);
+  const { folders, unreadable, reload } = useProjectFolders(session);
   /** The host notices that the user dismissed in the current running period of a project. */
   const [dismissed, setDismissed] = useState<{ session: string; notices: string[] }>();
   if (dismissed?.session === session.id && status.state !== "running") setDismissed(undefined);
@@ -573,6 +574,11 @@ export function ProjectPage({
                           : "Next: open an agent, or a shell on this Mac in the project folder."}
                       </Notice>
                     )}
+                    {cage && unreadable && (
+                      <Notice icon={<TriangleAlert size={14} className="warn" />}>
+                        {UNREADABLE[unreadable]}: <span className="mono">{session.folder}</span>
+                      </Notice>
+                    )}
                     {cage ? (
                       <Suspense>
                         <ProjectMap
@@ -675,6 +681,7 @@ export function ProjectPage({
                     defaultCage={defaultCage}
                     soleCage={soleCage}
                     folders={folders ?? []}
+                    unreadable={unreadable}
                     editors={editors}
                     runtimes={runtimes}
                     run={edit}

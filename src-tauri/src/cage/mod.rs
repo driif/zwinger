@@ -725,24 +725,54 @@ pub fn guest_path(path: &str) -> Result<String> {
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// Why the folders of a session folder cannot be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Unreadable {
+    Missing,
+    NotAFolder,
+    PermissionDenied,
+    Other,
+}
+
+/// The top-level folders of a session folder, or why they cannot be listed.
+/// Serialized as the list of names, or as the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum FolderList {
+    Listed(Vec<String>),
+    Unreadable(Unreadable),
+}
+
 /// The top-level folders of a session folder, for display: real directories
 /// only (no symlinks, no hidden names), sorted, at most `FOLDER_LIMIT`.
-pub fn list_folders(folder: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(folder)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+pub fn list_folders(folder: &Path) -> FolderList {
+    let read = || -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(folder)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Ok(name) = entry.file_name().into_string()
+                && !name.starts_with('.')
+            {
+                names.push(name);
+            }
         }
-        if let Ok(name) = entry.file_name().into_string()
-            && !name.starts_with('.')
-        {
-            names.push(name);
-        }
+        names.sort();
+        names.truncate(FOLDER_LIMIT);
+        Ok(names)
+    };
+    match read() {
+        Ok(names) => FolderList::Listed(names),
+        Err(e) => FolderList::Unreadable(match e.kind() {
+            std::io::ErrorKind::NotFound => Unreadable::Missing,
+            std::io::ErrorKind::NotADirectory => Unreadable::NotAFolder,
+            std::io::ErrorKind::PermissionDenied => Unreadable::PermissionDenied,
+            _ => Unreadable::Other,
+        }),
     }
-    names.sort();
-    names.truncate(FOLDER_LIMIT);
-    Ok(names)
 }
 
 #[cfg(test)]
@@ -1224,13 +1254,17 @@ mod tests {
         }
     }
 
+    fn listed(names: &[&str]) -> FolderList {
+        FolderList::Listed(names.iter().map(|n| (*n).to_owned()).collect())
+    }
+
     #[test]
     fn list_folders_returns_visible_real_directories() {
         let (_, root) = project_with_dirs(&["project/web", "project/api", "project/.git", "outside"]);
         let folder = root.join("project");
         std::fs::write(folder.join("README.md"), "x").unwrap();
         std::os::unix::fs::symlink(root.join("outside"), folder.join("link")).unwrap();
-        assert_eq!(list_folders(&folder).unwrap(), ["api", "web"]);
+        assert_eq!(list_folders(&folder), listed(&["api", "web"]));
     }
 
     #[test]
@@ -1240,10 +1274,32 @@ mod tests {
         for i in 0..60 {
             std::fs::create_dir(folder.join(format!("d{i:02}"))).unwrap();
         }
-        let names = list_folders(&folder).unwrap();
+        let FolderList::Listed(names) = list_folders(&folder) else { panic!("a readable folder") };
         assert_eq!(names.len(), FOLDER_LIMIT);
         assert_eq!(names[0], "d00");
         assert_eq!(names[49], "d49");
+    }
+
+    #[test]
+    fn list_folders_tells_an_empty_folder_from_an_unreadable_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_, root) = project_with_dirs(&["project", "locked"]);
+        assert_eq!(list_folders(&root.join("project")), listed(&[]));
+        assert_eq!(list_folders(&root.join("gone")), FolderList::Unreadable(Unreadable::Missing));
+        std::fs::write(root.join("file"), "x").unwrap();
+        assert_eq!(list_folders(&root.join("file")), FolderList::Unreadable(Unreadable::NotAFolder));
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = list_folders(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result, FolderList::Unreadable(Unreadable::PermissionDenied));
+    }
+
+    #[test]
+    fn a_folder_list_serializes_as_names_or_reason() {
+        assert_eq!(serde_json::to_string(&listed(&["web"])).unwrap(), r#"["web"]"#);
+        let unreadable = FolderList::Unreadable(Unreadable::PermissionDenied);
+        assert_eq!(serde_json::to_string(&unreadable).unwrap(), r#""permissionDenied""#);
     }
 
     #[test]
