@@ -184,8 +184,9 @@ The network page groups the requests by host. The newest host is first. For each
 
 - the time, allowed or blocked, and the number of requests.
 - the latest request: method, path, status, reason and note. The reason `ask` is your answer to an ask, and
-  `ask-timeout` is an ask with no answer. If a tool does not use the proxy, the reason is "direct
-  connection blocked — this tool ignores the proxy".
+  `ask-timeout` is an ask with no answer. If a tool does not use the proxy and looks up a host name,
+  the reason is "direct connection blocked — this tool ignores the proxy". A tool that connects to an IP address
+  without the proxy is blocked too, but its attempt does not show.
 - the credentials that the proxy added.
 - **Allow** or **Block** for the host, its wildcard or its service. For the service on this Mac, the host shows as
   `host.microsandbox.internal:<port>`, with **Remove** in place of the rule actions.
