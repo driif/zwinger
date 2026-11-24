@@ -272,6 +272,8 @@ function MapFlow({
   );
   const { layout, viewport } = choice;
   const [initial] = useState(viewport);
+  // With no chosen view, the canvas stays hidden until the first fit after node measurement, so it does not jump.
+  const [fitted, setFitted] = useState(initial !== null);
   // The viewport of a pan, wheel or pinch that has not ended yet.
   const gesture = useRef<Viewport>(undefined);
   // The input event of the last gesture. A wheel gesture ends about 150 ms after its last event. Until then, the moves
@@ -412,7 +414,7 @@ function MapFlow({
   const check = () => {
     const box = container.current;
     if (!nodesInitializedRef.current || !box || box.clientWidth === 0 || box.clientHeight === 0) return;
-    fitMap();
+    fitMap().then(() => setFitted(true));
   };
   useEffect(() => {
     if (!visible || !fits) return;
@@ -537,7 +539,7 @@ function MapFlow({
         deleteKeyCode={null}
         minZoom={0.3}
         defaultViewport={initial ?? undefined}
-        fitView={initial === null}
+        style={fitted ? undefined : { visibility: "hidden" }}
       >
         <Background variant={BackgroundVariant.Dots} />
         <Panel position="bottom-left">
