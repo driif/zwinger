@@ -66,7 +66,7 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
   While you drag with the pointer, a copy of the row follows the pointer and the row stays dim at its place.
 - **Move to** in the menu of a session shows the other workspaces. Select one to move the session to the end of that
-  workspace. The workspace then expands.
+  workspace. The workspace then expands, and the session row keeps the keyboard focus.
 - A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,
   a dialog asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,
   and **Cancel** puts the session back. Until the restart, the project page edits the new cage and shows the state of

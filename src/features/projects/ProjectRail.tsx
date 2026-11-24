@@ -231,9 +231,13 @@ export function ProjectRail({
   children,
 }: Props) {
   const tree = useRef<HTMLUListElement>(null);
-  const [collapsed, setCollapsed] = useState<Set<string>>(
-    () => new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]),
-  );
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
   const [focused, setFocused] = useState<string>();
   const [dragging, setDragging] = useState(false);
   /** The label of the row that the pointer drags. A keyboard drag moves the row itself, so it has no overlay. */
@@ -252,6 +256,8 @@ export function ProjectRail({
   /** The row of a keyboard drag. A keyboard drag moves the draft one step per arrow key, and its drop saves the draft. */
   const keyboardDrag = useRef<string | undefined>(undefined);
   const keyboardStep = useRef<KeyboardCoordinateGetter>(() => undefined);
+  /** The row of a session that Move to moves, until its move is saved or cancelled. */
+  const moved = useRef<string | undefined>(undefined);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     // Enter opens a row, so only Space picks up and drops.
@@ -261,14 +267,24 @@ export function ProjectRail({
     }),
   );
 
+  // The workspaces are empty until they load, and there is always at least one. Deleted workspaces are pruned.
   useEffect(() => {
-    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed]));
-  }, [collapsed]);
+    if (workspaces.length === 0) return;
+    const ids = new Set(workspaces.map((w) => `w|${w.id}`));
+    try {
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...collapsed].filter((id) => ids.has(id))));
+    } catch {
+      // Without storage, the rail does not remember collapsed workspaces.
+    }
+  }, [collapsed, workspaces]);
 
-  // A session that moves to another workspace is a new element, so it gets the focus again.
+  // A session that moves to another workspace is a new element, so it gets the focus again. The cage dialog keeps the
+  // focus while it is open.
   useEffect(() => {
-    if (keyboardDrag.current) focusRow(keyboardDrag.current);
-  }, [draft]);
+    const id = keyboardDrag.current ?? (moving ? undefined : moved.current);
+    if (id) focusRow(id);
+    if (!draft && !moving) moved.current = undefined;
+  }, [draft, moving]);
 
   const toggle = (id: string) =>
     setCollapsed((current) => {
@@ -548,6 +564,7 @@ export function ProjectRail({
           label: w.name,
           icon: <ChevronRight size={14} />,
           run: () => {
+            moved.current = `s|${session.id}`;
             expand(`w|${w.id}`);
             drop(moveSession(workspaces, session.id, w.id), session.id);
           },
