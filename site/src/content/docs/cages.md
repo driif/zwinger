@@ -151,8 +151,16 @@ projects.
 - **CPUs**: 1 to 8. The default is 1.
 - **Memory**: 512 to 8192 MiB. The default is 512 MiB.
 
-zwinger refuses a value outside these bounds and keeps the old value. zwinger does not compare the values with the
-cores or the memory of your Mac. The cage value replaces the default of the VM runtime.
+zwinger refuses a value outside these bounds and keeps the old value. The cage value replaces the default of the VM
+runtime.
+
+Below the fields, zwinger shows the CPUs and the memory of your Mac. It shows a warning when a value can prevent a VM
+start:
+
+- The CPUs are more than the logical CPUs of your Mac.
+- The memory is more than the memory of your Mac minus 2 GiB, which macOS and zwinger need.
+
+The warning does not block the save. zwinger does not add up the values of VMs that run at the same time.
 
 The next start of a VM applies a change. A running VM keeps its values until it restarts, and its status shows that
 a restart is pending.

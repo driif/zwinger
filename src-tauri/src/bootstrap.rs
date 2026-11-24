@@ -218,6 +218,25 @@ fn sysctl(name: &str) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The logical CPUs and the physical memory of this Mac.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostCapacity {
+    pub cpus: u32,
+    pub memory_mib: u64,
+}
+
+/// `cpus` is `hw.logicalcpu`, `memory` is `hw.memsize` in bytes.
+fn host_capacity_from(cpus: Option<&str>, memory: Option<&str>) -> Option<HostCapacity> {
+    let cpus = cpus?.parse().ok()?;
+    let memory: u64 = memory?.parse().ok()?;
+    Some(HostCapacity { cpus, memory_mib: memory / (1024 * 1024) })
+}
+
+pub fn host_capacity() -> Option<HostCapacity> {
+    host_capacity_from(sysctl("hw.logicalcpu").as_deref(), sysctl("hw.memsize").as_deref())
+}
+
 /// Fast: three `sysctl` calls and one `statvfs`.
 pub fn system_checks(data: &Path, home: &Path, minimum: &str) -> Vec<Check> {
     let free = rustix::fs::statvfs(data).ok().map(|s| s.f_bavail.saturating_mul(s.f_frsize));
@@ -432,6 +451,16 @@ pub fn prepare_runtime<R: SandboxRuntime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_capacity_comes_from_sysctl() {
+        assert_eq!(
+            host_capacity_from(Some("10"), Some("17179869184")),
+            Some(HostCapacity { cpus: 10, memory_mib: 16384 })
+        );
+        assert_eq!(host_capacity_from(None, Some("17179869184")), None);
+        assert_eq!(host_capacity_from(Some("ten"), Some("17179869184")), None);
+    }
 
     #[test]
     fn hypervisor_support_comes_from_sysctl() {

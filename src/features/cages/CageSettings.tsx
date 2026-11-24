@@ -10,12 +10,14 @@ import {
   TextField,
 } from "@driif/motiv";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderPlus, X } from "lucide-react";
+import { FolderPlus, TriangleAlert, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { addMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
 import { resolveFolder } from "../projects/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
-import { setCageResources } from "./api";
+import { hostCapacity, setCageResources } from "./api";
+import { capacityText, HostCapacity, resourceWarning } from "./hostCapacity";
+import { Notice } from "../../shared/Notice";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
 import { errorMessage } from "../../shared/errorMessage";
@@ -75,6 +77,11 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
   const memoryMib = resources.memoryMib ?? String(saved.memoryMib);
   const resourcesChanged = cpus !== String(saved.cpus) || memoryMib !== String(saved.memoryMib);
   const applied = vm?.status.state === "running" ? vm.appliedResources : null;
+  const [host, setHost] = useState<HostCapacity | null>(null);
+  useEffect(() => {
+    hostCapacity().then(setHost, () => setHost(null));
+  }, []);
+  const warning = host ? resourceWarning(Number(cpus), Number(memoryMib), host) : undefined;
 
   function saveResources(event: FormEvent) {
     event.preventDefault();
@@ -247,7 +254,9 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
               />
             </div>
             {resources.error && <p role="alert">{resources.error}</p>}
+            {warning && <Notice icon={<TriangleAlert size={14} />}>{warning}</Notice>}
             <p className="muted">
+              {host && `${capacityText(host)}. `}
               A running VM keeps its values until it restarts.
               {applied && ` It runs with ${applied.cpus} CPUs and ${applied.memoryMib} MiB.`}
             </p>

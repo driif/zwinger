@@ -1,4 +1,5 @@
 import { call } from "../../shared/api";
+import type { HostCapacity } from "./hostCapacity";
 
 /** A cage with no mounts, rules or agents. Resolves to its id. */
 export const createCage = (name: string) => call<string>("create_cage", { name });
@@ -17,3 +18,6 @@ export const deleteCage = (cageId: string) => call<void>("delete_cage", { cageId
 /** Applies on the next start of each VM of the cage. */
 export const setCageResources = (cageId: string, cpus: number, memoryMib: number) =>
   call<void>("set_cage_resources", { cageId, cpus, memoryMib });
+
+/** `null` if zwinger cannot read it. */
+export const hostCapacity = () => call<HostCapacity | null>("host_capacity");

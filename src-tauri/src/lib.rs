@@ -485,6 +485,7 @@ pub fn run() {
             commands::cages::remove_host_agent,
             commands::cages::set_agents_unprompted,
             commands::cages::set_cage_resources,
+            commands::cages::host_capacity,
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,

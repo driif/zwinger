@@ -35,7 +35,7 @@ A running microVM of a cage, the unit of isolation. By default all sessions of a
 _Avoid_: shield, cage (for the process)
 
 **Resources**:
-The CPUs (1 to 8) and the memory (512 to 8192 MiB) of each VM of a cage. A cage with no stored value gets 1 CPU and 512 MiB, the microsandbox defaults. A change applies on the next start of each VM; a running VM keeps the values it started with (`applied_resources`) and shows a pending restart. The bounds are not checked against the host.
+The CPUs (1 to 8) and the memory (512 to 8192 MiB) of each VM of a cage. A cage with no stored value gets 1 CPU and 512 MiB, the microsandbox defaults. A change applies on the next start of each VM; a running VM keeps the values it started with (`applied_resources`) and shows a pending restart. The bounds do not depend on the host, and a save keeps the values as they are. The settings show the logical CPUs and the memory of the Mac, and warn when the CPUs are more than the Mac has or the memory is more than the Mac memory minus 2 GiB: such a VM can fail to start.
 _Avoid_: limits, size
 
 **Mount**:

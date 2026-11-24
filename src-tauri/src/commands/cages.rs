@@ -152,6 +152,12 @@ pub fn set_cage_resources(manager: Managed<'_>, cage_id: String, cpus: u32, memo
     manager.set_resources(&cage_id, cpus, memory_mib)
 }
 
+/// The CPUs and memory of this Mac, for the resource warnings. `None` if `sysctl` fails.
+#[tauri::command]
+pub async fn host_capacity() -> Option<crate::bootstrap::HostCapacity> {
+    crate::bootstrap::host_capacity()
+}
+
 #[tauri::command]
 pub fn set_agents_unprompted(manager: Managed<'_>, cage_id: String, on: bool) -> Result<()> {
     manager.set_agents_unprompted(&cage_id, on)
