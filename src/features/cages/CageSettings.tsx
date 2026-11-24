@@ -16,6 +16,7 @@ import { addMount, setAgentsUnprompted, setMountReadonly } from "../settings/api
 import { resolveFolder } from "../projects/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
 import { hostCapacity, setCageResources } from "./api";
+import { PublishedPorts } from "./PublishedPorts";
 import { capacityText, HostCapacity, resourceWarning } from "./hostCapacity";
 import { Notice } from "../../shared/Notice";
 import type { Intent, Run, Runtimes } from "../../App";
@@ -268,6 +269,8 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
           </form>
         </CardBody>
       </Card>
+
+      <PublishedPorts cage={cage} vm={vm} run={run} />
 
       <Card variant="outlined" padding="md">
         <CardHeader

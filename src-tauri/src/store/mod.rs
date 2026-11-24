@@ -685,6 +685,7 @@ mod tests {
             host_agents: vec![HostAgentUse { kind: AgentKind::Claude, profile: true, login: true }],
             agents_unprompted: false,
             resources: Resources::default(),
+            published_ports: Vec::new(),
         };
         assert_eq!(cage.network.credentials().len(), 2);
         assert_eq!((sessions, cages), (vec![session], vec![cage]));

@@ -1,5 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
-import { Ban, Bot, Folder, FolderOpen, FolderPlus, FolderSymlink, Globe, KeyRound, Laptop, type LucideIcon, Package, Plus, UserCog } from "lucide-react";
+import { Ban, Bot, Folder, FolderOpen, FolderPlus, FolderSymlink, Globe, KeyRound, Laptop, type LucideIcon, Package, Plug, Plus, UserCog } from "lucide-react";
 import { GUEST_HOST, type NetEvent, type Service } from "../network/api.ts";
 import { AGENT_NAMES, type AgentKind, type CageView, type SessionView, type Target, type VmCage } from "../../shared/api.ts";
 import { covers, decide, domainError, ruleDomains, ruleLabel, ruleMatches, serviceIcon, serviceOf } from "../network/network.ts";
@@ -257,6 +257,36 @@ export function mapLayout(
       jump: "settings",
     });
     edge(`source:${mount.guest}`, `mount:${mount.guest}`);
+  }
+  // A published port: this Mac connects in to a guest port, so its edge goes from the host side.
+  if (cage.publishedPorts.length > 0) y += GAP;
+  for (const port of cage.publishedPorts) {
+    y += ROW;
+    const live =
+      vm?.status.state === "running" && vm.appliedPorts.some((p) => p.guest === port.guest && p.host === port.host);
+    const url = `http://localhost:${port.host}`;
+    const state = live
+      ? `${url} reaches guest port ${port.guest}. Each process on this Mac can connect`
+      : port.on
+        ? `${url} reaches guest port ${port.guest} after the next VM start`
+        : `Off: guest port ${port.guest} is not published`;
+    inner(`port:${port.guest}`, NODE_X, y, NODE_W, {
+      icon: Plug,
+      label: `port ${port.guest}`,
+      title: state,
+      tone: live ? "warn" : "muted",
+      badges: [],
+      jump: "settings",
+    });
+    outer(`published:${port.guest}`, HOST_X, y, HOST_W, {
+      icon: Laptop,
+      label: `localhost:${port.host}`,
+      title: state,
+      tone: live ? "warn" : "muted",
+      badges: [],
+      jump: "settings",
+    });
+    edge(`published:${port.guest}`, `port:${port.guest}`, !live);
   }
   y += ROW;
   outer("source:new-folder", HOST_X, y, HOST_W, {

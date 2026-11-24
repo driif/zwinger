@@ -97,6 +97,7 @@ impl Project {
             host_agents: self.host_agents,
             agents_unprompted: self.agents_unprompted,
             resources: Resources::default(),
+            published_ports: Vec::new(),
         };
         (session, cage)
     }

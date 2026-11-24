@@ -91,6 +91,10 @@ pub enum Error {
     InvalidRule(String),
     #[error("a host port must be 1-65535, not {0}")]
     InvalidHostPort(u16),
+    #[error("invalid published port: {0}")]
+    InvalidPublishedPort(String),
+    #[error("port {0} of this Mac is in use; pick a different port")]
+    HostPortInUse(u16),
     #[error("the network proxy of the cage does not start, so the cage does not start: {0}")]
     Proxy(String),
     #[error("secret {0} has no stored value; set it again")]

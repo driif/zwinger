@@ -290,6 +290,8 @@ export interface CageView {
   agentsUnprompted: boolean;
   /** The CPUs and memory of each VM of the cage. A change applies on the next start. */
   resources: Resources;
+  /** The guest ports that each VM of the cage publishes on 127.0.0.1 of this Mac. A change applies on the next start. */
+  publishedPorts: PublishedPort[];
   /** `library`: the token comes from the credential library. */
   claudeToken: { stored: boolean; library: boolean; expiresAt: number | null } | null;
   /** The shared VM, also when it is stopped, then the own VMs that start, run, stop or failed. */
@@ -318,6 +320,15 @@ export interface VmView {
   startHistory: StartRecord[];
   /** The resources that the running VM started with. */
   appliedResources: Resources | null;
+  /** The ports that the running VM publishes on this Mac. A port that was in use at the start is not here. */
+  appliedPorts: PublishedPort[];
+}
+
+/** A guest TCP port that a VM publishes on `127.0.0.1:<host>` of this Mac, while `on`. */
+export interface PublishedPort {
+  guest: number;
+  host: number;
+  on: boolean;
 }
 
 export interface Resources {

@@ -165,6 +165,36 @@ The warning does not block the save. zwinger does not add up the values of VMs t
 The next start of a VM applies a change. A running VM keeps its values until it restarts, and its status shows that
 a restart is pending.
 
+## Published ports
+
+A server that runs in the VM, for example a dev server on port 3000, is not reachable from the Mac. **Settings >
+Published ports** of a project, or **Cages > Edit**, publishes a guest port on this Mac:
+
+1. Type the **Guest port**, the port where the server listens in the VM. The server must listen on `0.0.0.0` or on
+   the VM's address, not only on `127.0.0.1` of the VM.
+2. Optional: type the **Port on this Mac**. Empty means the same port as the guest port.
+3. Click **Publish**, then restart the VM.
+4. Click **Open** to open `http://localhost:<port>` in your browser.
+
+:::caution
+A published port listens on `127.0.0.1` only, so other computers cannot connect. But each app and each user on this
+Mac can connect, and so can web pages in your browser. Publish only a server that you trust, and turn the port off
+when you do not use it.
+:::
+
+- A port is off or on. A new port is on. Off keeps the port in the list.
+- A cage has at most 16 ports. A guest port and a port on this Mac can each occur once in a cage.
+- zwinger refuses to save a port on this Mac that a different program uses.
+- The next start of a VM applies a change. A running VM keeps its ports until it restarts.
+- At the start, zwinger skips a port that is now in use and shows a notice. The VM starts without that port. When
+  projects of one cage have their own VMs, only the first VM that starts gets the port.
+- The port closes when the VM stops.
+- The traffic does not go through the proxy of the cage. It is not in the network activity, and Offline and the rules
+  do not apply to it.
+
+The map shows each published port as an edge from `localhost:<port>` on the Mac side to the port in the cage. The
+edge is active while the VM publishes the port.
+
 ## Terminals in the cage
 
 A VM shell (⌘⇧T) and an agent session (⌘P) run in the cage. A VM shell starts in the project's folder in the VM

@@ -316,7 +316,9 @@ impl<R: SandboxRuntime> Manager<R> {
         env.extend(
             guest_placeholders(&cage.logins, &cage.network).into_iter().map(|n| (n.clone(), secrets::placeholder(&n))),
         );
-        let net = GuestNet { port: proxy.port, env };
+        run.published =
+            crate::cage::publishable(&cage.published_ports, proxy.port, crate::cage::host_port_free, &mut run.notices);
+        let net = GuestNet { port: proxy.port, env, published: run.published.clone() };
         let installed = runtimes::installed(&self.data, &wanted);
         run.notices.extend(download_notices(&wanted, &installed));
         run.placeholders = guest_placeholders(&cage.logins, &cage.network);
@@ -2358,6 +2360,13 @@ mod tests {
         credential(&manager, &id, "api.github.com", "ZWINGER_LIVE", Some("live-value")).unwrap();
         allow(&manager, &id, "example.com");
         allow(&manager, &id, "deb.debian.org");
+        let published = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = crate::cage::PublishedPort {
+            guest: std::num::NonZeroU16::new(8000).unwrap(),
+            host: std::num::NonZeroU16::new(published).unwrap(),
+            on: true,
+        };
+        manager.set_published_ports(&id, vec![port]).unwrap();
         manager.start(&id).await.unwrap();
         let vm = match lock(&manager.state).vms.get(&id) {
             Some(Vm::Running { vm, .. }) => vm.clone(),
@@ -2366,6 +2375,26 @@ mod tests {
         let run = |script: &'static str| sh(&manager, &vm, script);
 
         assert_eq!(run("cat /workspace/hello.txt").await, (0, "from the host".to_owned()));
+        // A published port: a guest server answers on 127.0.0.1 of this Mac, and only there.
+        let serve = "nohup node -e \"require('http').createServer((q, r) => r.end('from the guest')).listen(8000)\" \
+            >/dev/null 2>&1 &";
+        assert_eq!(run(serve).await.0, 0);
+        let mut answer = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", published)) {
+                use std::io::{Read, Write};
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let _ = stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n");
+                answer.clear();
+                let _ = stream.read_to_string(&mut answer);
+                if answer.ends_with("from the guest") {
+                    break;
+                }
+            }
+        }
+        assert!(answer.ends_with("from the guest"), "{answer}");
+        assert!(!crate::cage::host_port_free(published));
         assert_eq!(run("test ! -e /Users").await.0, 0, "/Users is visible");
         assert_ne!(run("echo x > /mnt/ro/f").await.0, 0, "a read-only mount took a write");
         assert!(!readonly.join("f").exists());
@@ -2422,5 +2451,7 @@ mod tests {
         let test = manager.test_network(&id, "example.com").await.unwrap();
         assert!(test.proxy.ok && test.target.is_some_and(|t| t.ok));
         manager.stop(&id, None).await.unwrap();
+        // The published port stops with the VM.
+        assert!(crate::cage::host_port_free(published));
     }
 }

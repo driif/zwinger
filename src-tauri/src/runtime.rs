@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
 use crate::agent::{AgentKind, STATE_DIR, launch};
 use crate::cage::manager::task_guest_folder;
-use crate::cage::{Members, WORKSPACE};
+use crate::cage::{Members, PublishedPort, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::netlog;
 
@@ -88,10 +88,12 @@ pub const PTY_ENV: [(&str, &str); 3] = [("PATH", launch::PATH), ("TERM", "xterm-
 
 /// What the guest needs to use the cage's proxy: the host port that the
 /// VM may reach, and the env of every process (see [`launch::net_env`]).
+/// Also the ports that the VM publishes on this Mac (ADR 0010).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestNet {
     pub port: u16,
     pub env: Vec<(String, String)>,
+    pub published: Vec<PublishedPort>,
 }
 
 /// A host folder that a start mounts read-only, such as a host agent's
@@ -183,15 +185,17 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
 }
 
 /// The outer wall of the cage (ADR 0003): all egress is denied but TCP to
-/// the proxy's port on the host, with no DNS. Ingress is denied. The VM runs
+/// the proxy's port on the host, with no DNS. Ingress is denied but TCP from
+/// this Mac's loopback to the published guest ports (ADR 0010). The VM runs
 /// with the SingleTenant profile: the public-only floor of MultiTenant
 /// denies the host, so the guest could not reach the proxy.
-pub fn sandbox_policy(port: u16) -> Result<microsandbox::NetworkPolicy> {
-    microsandbox::NetworkPolicy::builder()
-        .default_deny()
-        .rule(|r| r.egress().tcp().port(port).allow_host())
-        .build()
-        .map_err(|e| Error::Proxy(e.to_string()))
+pub fn sandbox_policy(port: u16, published: &[PublishedPort]) -> Result<microsandbox::NetworkPolicy> {
+    let mut policy =
+        microsandbox::NetworkPolicy::builder().default_deny().rule(|r| r.egress().tcp().port(port).allow_host());
+    if !published.is_empty() {
+        policy = policy.rule(|r| r.ingress().tcp().ports(published.iter().map(|p| p.guest.get())).allow_loopback());
+    }
+    policy.build().map_err(|e| Error::Proxy(e.to_string()))
 }
 
 const LABEL: (&str, &str) = ("app", "zwinger");
@@ -261,7 +265,7 @@ impl Microsandbox {
         state: &Path,
         binds: &[Bind],
     ) -> Result<SandboxBuilder> {
-        let policy = sandbox_policy(net.port)?;
+        let policy = sandbox_policy(net.port, &net.published)?;
         let mut builder = Sandbox::builder(format!("{NAME_PREFIX}{key}"))
             .image(IMAGE)
             .label(LABEL.0, LABEL.1)
@@ -288,6 +292,10 @@ impl Microsandbox {
             .volume(STATE_DIR, |m| m.bind(state))
             .env("PI_CODING_AGENT_DIR", AGENT_DIR)
             .network(|n| n.policy(policy));
+        // Never all addresses: only this Mac reaches a published port.
+        for port in &net.published {
+            builder = builder.port_bind(std::net::Ipv4Addr::LOCALHOST.into(), port.host.get(), port.guest.get());
+        }
         for bind in binds {
             builder = builder.volume(&bind.guest, |m| m.bind(&bind.host).readonly());
         }
@@ -771,7 +779,12 @@ mod tests {
         let mut cage = Cage::new("c".into(), "c".into());
         cage.resources = Resources::new(4, 2048).unwrap();
         let members = Members { sessions: std::slice::from_ref(&session), cage: &cage };
-        let net = GuestNet { port: 41234, env: Vec::new() };
+        let port = |guest, host| PublishedPort {
+            guest: std::num::NonZeroU16::new(guest).unwrap(),
+            host: std::num::NonZeroU16::new(host).unwrap(),
+            on: true,
+        };
+        let net = GuestNet { port: 41234, env: Vec::new(), published: vec![port(3000, 8080), port(5173, 5173)] };
         let builder = Microsandbox { pi: temp_dir() }.sandbox_builder("c", members, &net, &temp_dir(), &[]).unwrap();
         let config = microsandbox::with_backend(
             std::sync::Arc::new(backend) as std::sync::Arc<dyn microsandbox::Backend>,
@@ -780,11 +793,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((config.spec.resources.cpus, config.spec.resources.memory_mib), (4, 2048));
+        // Each published port listens on 127.0.0.1 only.
+        assert_eq!(
+            serde_json::to_value(config.spec.network.ports).unwrap(),
+            json!([
+                { "host_port": 8080, "guest_port": 3000, "protocol": "tcp", "host_bind": "127.0.0.1" },
+                { "host_port": 5173, "guest_port": 5173, "protocol": "tcp", "host_bind": "127.0.0.1" },
+            ])
+        );
+    }
+
+    #[test]
+    fn only_this_macs_loopback_reaches_a_published_port() {
+        let port = PublishedPort {
+            guest: std::num::NonZeroU16::new(3000).unwrap(),
+            host: std::num::NonZeroU16::new(8080).unwrap(),
+            on: true,
+        };
+        let policy = sandbox_policy(41234, &[port]).unwrap();
+        assert_eq!(policy.default_ingress, NetworkAction::Deny);
+        assert_eq!(
+            serde_json::to_value(&policy.rules[1]).unwrap(),
+            json!({
+                "direction": "ingress",
+                "destination": { "group": "loopback" },
+                "protocols": ["tcp"],
+                "ports": [{ "start": 3000, "end": 3000 }],
+                "action": "allow",
+            })
+        );
     }
 
     #[test]
     fn the_vm_reaches_only_the_proxy_port() {
-        let policy = sandbox_policy(41234).unwrap();
+        let policy = sandbox_policy(41234, &[]).unwrap();
         assert_eq!(policy.default_egress, NetworkAction::Deny);
         assert_eq!(policy.default_ingress, NetworkAction::Deny);
         assert_eq!(

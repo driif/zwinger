@@ -198,6 +198,8 @@ pub(crate) struct HostRun {
     pub(crate) installed: Vec<Installed>,
     /// The names of the cage's credentials and host logins, as the wrappers have them.
     pub(crate) placeholders: Vec<String>,
+    /// The ports that the VM publishes on this Mac.
+    pub(crate) published: Vec<cage::PublishedPort>,
 }
 
 impl HostRun {
@@ -302,6 +304,9 @@ pub struct VmView {
     /// The resources that the running VM started with. Not `resources`: the
     /// UI merges a VM view into its cage.
     pub applied_resources: Option<cage::Resources>,
+    /// The ports that the running VM publishes on this Mac. A port that was
+    /// in use at the start is not here. Not `published_ports`, as above.
+    pub applied_ports: Vec<cage::PublishedPort>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1381,6 +1386,36 @@ impl<R: SandboxRuntime> Manager<R> {
         })
     }
 
+    /// Replaces the published ports of the cage. Applies on the next start of
+    /// each VM of the cage. A port that is new or turned on must be free on
+    /// this Mac, unless a running VM of the cage publishes it now.
+    pub fn set_published_ports(&self, cage_id: &str, ports: Vec<cage::PublishedPort>) -> Result<()> {
+        let (saved, running) = {
+            let state = lock(&self.state);
+            let saved = state.cage(cage_id)?.published_ports.clone();
+            let running: Vec<u16> = state
+                .vms
+                .values()
+                .filter_map(|vm| match vm {
+                    Vm::Running { applied, host, .. } if applied.1.id == cage_id => Some(&host.published),
+                    _ => None,
+                })
+                .flatten()
+                .map(|p| p.host.get())
+                .collect();
+            (saved, running)
+        };
+        let checked = ports.iter().filter(|p| p.on && !saved.contains(p) && !running.contains(&p.host.get()));
+        // Before the edit, so the check does no I/O under the state lock.
+        if let Some(busy) = checked.map(|p| p.host.get()).find(|&host| !cage::host_port_free(host)) {
+            return Err(Error::HostPortInUse(busy));
+        }
+        self.edit_cage(cage_id, |c, _| {
+            c.published_ports = ports;
+            Ok(())
+        })
+    }
+
     /// Stops the VM that runs for the session and saves the sessions
     /// without it. The cage stays. Then it deletes the run records of the
     /// session. A VM with other members is not stopped: the delete fails
@@ -1500,17 +1535,19 @@ fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> V
         Some(Vm::Failed { message, .. }) => (Status::Error { message: message.clone() }, false, Vec::new()),
     };
     let members = state.members(members).into_iter().map(|m| m.name).collect();
-    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings, applied_resources) = match vm {
-        Some(Vm::Running { runtimes, host, proxy, applied, .. }) => (
-            runtimes.clone(),
-            proxy.login_expires(),
-            host.notices.clone(),
-            host.guest_logins.clone(),
-            Some(host.timings.clone()),
-            Some(applied.1.resources),
-        ),
-        _ => (Vec::new(), None, Vec::new(), Vec::new(), None, None),
-    };
+    let (runtimes, login_expires_at, host_notices, guest_logins, start_timings, applied_resources, applied_ports) =
+        match vm {
+            Some(Vm::Running { runtimes, host, proxy, applied, .. }) => (
+                runtimes.clone(),
+                proxy.login_expires(),
+                host.notices.clone(),
+                host.guest_logins.clone(),
+                Some(host.timings.clone()),
+                Some(applied.1.resources),
+                host.published.clone(),
+            ),
+            _ => (Vec::new(), None, Vec::new(), Vec::new(), None, None, Vec::new()),
+        };
     VmView {
         key: key.to_owned(),
         own: key != cage.id,
@@ -1524,6 +1561,7 @@ fn vm_view<V>(state: &State<V>, cage: &Cage, key: &str, vm: Option<&Vm<V>>) -> V
         start_timings,
         start_history: state.history.of(key),
         applied_resources,
+        applied_ports,
     }
 }
 
@@ -1668,6 +1706,57 @@ mod tests {
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
         assert!(!manager.bin_dir(&id).exists());
+    }
+
+    #[tokio::test]
+    async fn published_ports_are_checked_saved_and_reach_the_vm_at_its_next_start() {
+        let (manager, runtime, id) = manager();
+        let port = |guest, host, on| crate::cage::PublishedPort {
+            guest: std::num::NonZeroU16::new(guest).unwrap(),
+            host: std::num::NonZeroU16::new(host).unwrap(),
+            on,
+        };
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (a, b) = (free(), free());
+        manager.start(&id).await.unwrap();
+        assert!(runtime.net.lock().unwrap().as_ref().unwrap().published.is_empty());
+
+        // A busy port and a doubled port change nothing.
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let used = busy.local_addr().unwrap().port();
+        let error = manager.set_published_ports(&id, vec![port(3000, used, true)]).unwrap_err();
+        assert!(matches!(error, Error::HostPortInUse(p) if p == used), "{error}");
+        let error = manager.set_published_ports(&id, vec![port(3000, a, true), port(3000, b, true)]).unwrap_err();
+        assert!(matches!(error, Error::InvalidPublishedPort(_)), "{error}");
+        assert!(manager.list().cages[0].cage.published_ports.is_empty());
+        // An off port is not checked: it is not published.
+        let wanted = vec![port(3000, a, true), port(5173, used, false)];
+        manager.set_published_ports(&id, wanted.clone()).unwrap();
+        let view = manager.list().cages.remove(0);
+        assert_eq!(view.cage.published_ports, wanted);
+        assert!(view.shared().pending_restart);
+        assert!(view.shared().applied_ports.is_empty());
+
+        manager.stop(&id, None).await.unwrap();
+        manager.start(&id).await.unwrap();
+        assert_eq!(runtime.net.lock().unwrap().as_ref().unwrap().published, [port(3000, a, true)]);
+        let view = manager.list().cages[0].shared();
+        assert_eq!(view.applied_ports, [port(3000, a, true)]);
+        assert!(!view.pending_restart);
+        // The running VM's own port is not "in use" for an edit of the same cage.
+        manager.set_published_ports(&id, vec![port(3000, a, false)]).unwrap();
+        manager.set_published_ports(&id, vec![port(3000, a, true)]).unwrap();
+
+        // A port that is busy at the start is skipped, with a notice.
+        manager.stop(&id, None).await.unwrap();
+        drop(busy);
+        manager.set_published_ports(&id, vec![port(3000, a, true), port(5173, used, true)]).unwrap();
+        let _busy = std::net::TcpListener::bind(("127.0.0.1", used)).unwrap();
+        manager.start(&id).await.unwrap();
+        let view = manager.list().cages[0].shared();
+        assert_eq!(view.applied_ports, [port(3000, a, true)]);
+        assert!(view.host_notices.iter().any(|n| n.contains("Guest port 5173")), "{:?}", view.host_notices);
+        manager.stop(&id, None).await.unwrap();
     }
 
     #[tokio::test]

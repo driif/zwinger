@@ -12,6 +12,7 @@ pub(crate) mod testing;
 pub(crate) mod undo;
 pub(crate) mod vm_state;
 
+use std::num::NonZeroU16;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,21 @@ pub struct Cage {
     /// The CPUs and memory of each VM of the cage. Applies on the next start.
     #[serde(default)]
     pub resources: Resources,
+    /// The guest ports that each VM of the cage publishes on this Mac. Applies on the next start.
+    #[serde(default)]
+    pub published_ports: Vec<PublishedPort>,
+}
+
+/// The most published ports of one cage.
+pub(crate) const PUBLISHED_PORTS: usize = 16;
+
+/// A guest TCP port that a VM publishes on `127.0.0.1:<host>` of this Mac
+/// (ADR 0010). Only while `on`; off keeps it in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedPort {
+    pub guest: NonZeroU16,
+    pub host: NonZeroU16,
+    pub on: bool,
 }
 
 fn yes() -> bool {
@@ -156,6 +172,54 @@ impl FileId {
     }
 }
 
+/// Nothing listens on port `port` of this Mac's loopback: a bind there
+/// works, and a connect is refused (a listener on all addresses lets the bind work).
+pub(crate) fn host_port_free(port: u16) -> bool {
+    let at = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpListener::bind(at).is_ok()
+        && std::net::TcpStream::connect_timeout(&at, std::time::Duration::from_millis(200)).is_err()
+}
+
+/// The ports that a VM start publishes: each port that is on, except the
+/// proxy port and a port that is not `free`. A notice names each port that it skips.
+pub(crate) fn publishable(
+    ports: &[PublishedPort],
+    proxy: u16,
+    free: impl Fn(u16) -> bool,
+    notices: &mut Vec<String>,
+) -> Vec<PublishedPort> {
+    let mut published = Vec::new();
+    for port in ports.iter().filter(|p| p.on) {
+        let host = port.host.get();
+        if host != proxy && free(host) {
+            published.push(*port);
+        } else {
+            notices.push(format!(
+                "Guest port {} is not published: port {host} of this Mac is in use. Pick a different port, then restart the VM.",
+                port.guest
+            ));
+        }
+    }
+    published
+}
+
+/// At most [`PUBLISHED_PORTS`], and no guest port or host port twice.
+fn check_published(ports: &[PublishedPort]) -> Result<()> {
+    if ports.len() > PUBLISHED_PORTS {
+        return Err(Error::InvalidPublishedPort(format!("a cage publishes at most {PUBLISHED_PORTS} ports")));
+    }
+    for (i, port) in ports.iter().enumerate() {
+        let before = &ports[..i];
+        if before.iter().any(|p| p.guest == port.guest) {
+            return Err(Error::InvalidPublishedPort(format!("guest port {} is published twice", port.guest)));
+        }
+        if before.iter().any(|p| p.host == port.host) {
+            return Err(Error::InvalidPublishedPort(format!("port {} of this Mac is used twice", port.host)));
+        }
+    }
+    Ok(())
+}
+
 impl Cage {
     pub fn new(id: String, name: String) -> Self {
         Self {
@@ -167,6 +231,7 @@ impl Cage {
             host_agents: Vec::new(),
             agents_unprompted: true,
             resources: Resources::default(),
+            published_ports: Vec::new(),
         }
     }
 
@@ -205,6 +270,7 @@ impl Cage {
     /// [`Bound::check`] adds the rules that need a session.
     pub fn check(&self) -> Result<()> {
         self.network.check()?;
+        check_published(&self.published_ports)?;
         self.claude_token_binding()?;
         secrets::check_unique(&self.logins)?;
         for (i, used) in self.host_agents.iter().enumerate() {
@@ -1450,5 +1516,66 @@ mod tests {
         cage.network.rule_mut(&rule).unwrap().credentials[0].inject =
             Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() };
         assert!(cage.check().is_ok());
+    }
+
+    fn port(guest: u16, host: u16, on: bool) -> PublishedPort {
+        PublishedPort { guest: NonZeroU16::new(guest).unwrap(), host: NonZeroU16::new(host).unwrap(), on }
+    }
+
+    #[test]
+    fn an_older_cage_publishes_no_port_and_a_port_is_never_zero() {
+        let mut old = serde_json::to_value(Cage::new("c".into(), "c".into())).unwrap();
+        old.as_object_mut().unwrap().remove("publishedPorts");
+        let cage: Cage = serde_json::from_value(old).unwrap();
+        assert!(cage.published_ports.is_empty());
+
+        let mut cage = Cage::new("c".into(), "c".into());
+        cage.published_ports.push(port(3000, 8080, true));
+        let json = serde_json::to_value(&cage).unwrap();
+        assert_eq!(json["publishedPorts"], serde_json::json!([{ "guest": 3000, "host": 8080, "on": true }]));
+        assert_eq!(serde_json::from_value::<Cage>(json).unwrap(), cage);
+        for bad in [r#"{"guest":0,"host":1,"on":true}"#, r#"{"guest":1,"host":65536,"on":true}"#] {
+            assert!(serde_json::from_str::<PublishedPort>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_cage_publishes_each_guest_port_and_each_host_port_once() {
+        let check = |ports: Vec<PublishedPort>| {
+            let mut cage = Cage::new("c".into(), "c".into());
+            cage.published_ports = ports;
+            cage.check()
+        };
+        assert!(check(vec![port(3000, 3000, true), port(5173, 8080, false)]).is_ok());
+        for ports in [
+            vec![port(3000, 3000, true), port(3000, 8080, false)],
+            vec![port(3000, 8080, true), port(5173, 8080, false)],
+            (1..=PUBLISHED_PORTS as u16 + 1).map(|p| port(p, p, true)).collect(),
+        ] {
+            assert!(matches!(check(ports), Err(Error::InvalidPublishedPort(_))));
+        }
+    }
+
+    #[test]
+    fn a_start_publishes_only_the_free_ports_that_are_on() {
+        let ports = [port(3000, 3000, true), port(4000, 4000, false), port(5000, 41234, true), port(6000, 6001, true)];
+        let mut notices = Vec::new();
+        let published = publishable(&ports, 41234, |host| host != 6001, &mut notices);
+        assert_eq!(published, [port(3000, 3000, true)]);
+        assert_eq!(notices.len(), 2);
+        assert!(notices[0].contains("Guest port 5000") && notices[0].contains("41234"), "{notices:?}");
+        assert!(notices[1].contains("Guest port 6000") && notices[1].contains("6001"), "{notices:?}");
+    }
+
+    #[test]
+    fn a_port_with_a_listener_is_not_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let used = listener.local_addr().unwrap().port();
+        assert!(!host_port_free(used));
+        drop(listener);
+        assert!(host_port_free(used));
+        // A listener on all addresses also takes the port.
+        let all = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        assert!(!host_port_free(all.local_addr().unwrap().port()));
     }
 }

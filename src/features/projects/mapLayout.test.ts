@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { CageView, Rule, SessionView } from "../../shared/api.ts";
+import type { CageView, Rule, SessionView, VmCage } from "../../shared/api.ts";
 import { GUEST_HOST, type NetEvent, type Service } from "../network/api.ts";
 import { type ItemData, mapEdit, mapLayout } from "./mapLayout.ts";
 
@@ -15,7 +15,7 @@ const session = {
 const cage: CageView = {
   id: "dev", name: "Dev", mounts: [], hostAgents: [], logins: [], agentsUnprompted: false,
   network: { default: "block", offline: false, rules: [] }, claudeToken: null, vms: [],
-  resources: { cpus: 1, memoryMib: 512 },
+  resources: { cpus: 1, memoryMib: 512 }, publishedPorts: [],
 };
 const metrics = { rowHeight: 24, space: 4, charWidth: 8 };
 
@@ -40,6 +40,21 @@ test("the map shows the host port grant, and offline or a Block rule blocks it",
   const ruled = { ...granted, network: { ...granted.network, rules: [rule] } };
   assert.equal(node(ruled)?.data.tone, "blocked");
   assert.match(String(node(ruled)?.data.title), /but the rule \*\.microsandbox\.internal blocks it\. /);
+});
+
+test("each published port has an edge from this Mac into the cage, live only while the VM publishes it", () => {
+  const published = { ...cage, publishedPorts: [{ guest: 3000, host: 8080, on: true }, { guest: 5173, host: 5173, on: false }] };
+  const layout = (vm: VmCage | null) => mapLayout(session, published, vm, [], [], [], 0, metrics);
+  const stopped = layout(null);
+  assert.equal(stopped.nodes.find((n) => n.id === "published:3000")?.data.label, "localhost:8080");
+  assert.equal(stopped.nodes.find((n) => n.id === "port:3000")?.data.label, "port 3000");
+  assert.equal(stopped.edges.find((e) => e.id === "published:3000>port:3000")?.className, "blocked");
+  assert.match(String(stopped.nodes.find((n) => n.id === "port:5173")?.data.title), /^Off/);
+  const vm = { ...published, status: { state: "running" }, appliedPorts: [{ guest: 3000, host: 8080, on: true }] } as VmCage;
+  const running = layout(vm);
+  assert.equal(running.edges.find((e) => e.id === "published:3000>port:3000")?.className, undefined);
+  assert.equal(running.edges.find((e) => e.id === "published:5173>port:5173")?.className, "blocked");
+  assert.match(String(running.nodes.find((n) => n.id === "port:3000")?.data.title), /^http:\/\/localhost:8080 reaches guest port 3000/);
 });
 
 test("a dragged folder keeps its saved position inside the boundary", () => {

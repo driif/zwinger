@@ -1,4 +1,4 @@
-import { call } from "../../shared/api";
+import { call, type PublishedPort } from "../../shared/api";
 import type { HostCapacity } from "./hostCapacity";
 
 /** A cage with no mounts, rules or agents. Resolves to its id. */
@@ -18,6 +18,10 @@ export const deleteCage = (cageId: string) => call<void>("delete_cage", { cageId
 /** Applies on the next start of each VM of the cage. */
 export const setCageResources = (cageId: string, cpus: number, memoryMib: number) =>
   call<void>("set_cage_resources", { cageId, cpus, memoryMib });
+
+/** Replaces the published ports of the cage. Applies on the next start of each VM of the cage. */
+export const setPublishedPorts = (cageId: string, ports: PublishedPort[]) =>
+  call<void>("set_published_ports", { cageId, ports });
 
 /** `null` if zwinger cannot read it. */
 export const hostCapacity = () => call<HostCapacity | null>("host_capacity");

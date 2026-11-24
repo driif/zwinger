@@ -152,6 +152,16 @@ pub fn set_cage_resources(manager: Managed<'_>, cage_id: String, cpus: u32, memo
     manager.set_resources(&cage_id, cpus, memory_mib)
 }
 
+/// Applies on the next start of each VM of the cage (ADR 0010).
+#[tauri::command]
+pub fn set_published_ports(
+    manager: Managed<'_>,
+    cage_id: String,
+    ports: Vec<crate::cage::PublishedPort>,
+) -> Result<()> {
+    manager.set_published_ports(&cage_id, ports)
+}
+
 /// The CPUs and memory of this Mac, for the resource warnings. `None` if `sysctl` fails.
 #[tauri::command]
 pub async fn host_capacity() -> Option<crate::bootstrap::HostCapacity> {
