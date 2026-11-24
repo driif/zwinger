@@ -10,6 +10,7 @@
 //! carries plain HTTP only.
 
 pub mod ask;
+pub mod authority;
 pub mod ca;
 pub mod decide;
 pub mod dial;
@@ -451,6 +452,16 @@ fn blocked(host: &str, reason: &str) -> Response<ProxyBody> {
     response
 }
 
+/// An authority that [`authority::parse`] refuses. Nothing is decided or
+/// logged: the proxy has no host that it can name.
+fn invalid_target() -> Response<ProxyBody> {
+    failed(
+        StatusCode::BAD_REQUEST,
+        "invalid target",
+        "zwinger: the target host or port is not valid (no userinfo, percent-encoding or short IP forms)\n".into(),
+    )
+}
+
 /// A response that the proxy makes itself, with `reason` in [`ERROR_HEADER`].
 fn failed(status: StatusCode, reason: &str, body: String) -> Response<ProxyBody> {
     let mut response = text(status, body);
@@ -606,11 +617,6 @@ async fn serve(shared: Arc<Shared>, tcp: TcpStream, permit: Permit) {
     guard(shared.shutdown.clone(), activity, connection).await;
 }
 
-/// The host of a request target in lowercase, with no brackets and no final dot.
-fn normal_host(host: &str) -> String {
-    host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase()
-}
-
 /// Where a connection of the guest goes: the host that the proxy checked.
 #[derive(Clone)]
 struct Origin {
@@ -620,16 +626,17 @@ struct Origin {
 }
 
 impl Origin {
-    fn default_port(&self) -> u16 {
-        if self.https { 443 } else { 80 }
+    /// The origin that [`authority::parse`] reads from `raw`. `None` for an
+    /// authority that it refuses.
+    fn read(https: bool, raw: &str) -> Option<Self> {
+        let default_port = if https { 443 } else { 80 };
+        let authority::Authority { host, port } = authority::parse(raw, default_port).ok()?;
+        Some(Self { https, host, port })
     }
 
     /// `authority` names this origin.
     fn is(&self, authority: &str) -> bool {
-        let Ok(authority) = authority.parse::<http::uri::Authority>() else {
-            return false;
-        };
-        normal_host(authority.host()) == self.host && authority.port_u16().unwrap_or(self.default_port()) == self.port
+        Self::read(self.https, authority).is_some_and(|o| o.host == self.host && o.port == self.port)
     }
 
     /// A log entry for a request to this origin. The gateway name carries
@@ -660,11 +667,11 @@ async fn outer(shared: Arc<Shared>, activity: Activity, permit: Permit, req: Req
     if req.method() == Method::CONNECT {
         return connect(shared, activity, permit, req).await;
     }
-    match (req.uri().scheme_str(), req.uri().host()) {
-        (Some("http"), Some(host)) => {
-            let origin = Origin { https: false, host: normal_host(host), port: req.uri().port_u16().unwrap_or(80) };
-            forward(shared, req, origin, permit, None).await
-        }
+    match (req.uri().scheme_str(), req.uri().authority()) {
+        (Some("http"), Some(authority)) => match Origin::read(false, authority.as_str()) {
+            Some(origin) => forward(shared, req, origin, permit, None).await,
+            None => invalid_target(),
+        },
         _ => failed(
             StatusCode::BAD_REQUEST,
             "bad request",
@@ -685,7 +692,9 @@ async fn connect(
     let Some(authority) = req.uri().authority() else {
         return failed(StatusCode::BAD_REQUEST, "bad request", "zwinger: CONNECT needs host:port\n".into());
     };
-    let origin = Origin { https: true, host: normal_host(authority.host()), port: authority.port_u16().unwrap_or(443) };
+    let Some(origin) = Origin::read(true, authority.as_str()) else {
+        return invalid_target();
+    };
     let snapshot = shared.live.snapshot();
     let host_port = match shared.decide(&snapshot, &origin, None) {
         Decision::Block(reason) => {
@@ -849,11 +858,16 @@ fn is_websocket(req: &Request<Incoming>) -> bool {
         && req.headers().get(UPGRADE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
-/// The authorities that the request names: its URI and its `host` field.
-fn named(parts: &http::request::Parts) -> Vec<String> {
-    let mut names: Vec<String> = parts.uri.authority().map(|a| a.as_str().to_owned()).into_iter().collect();
-    names.extend(parts.headers.get_all(HOST).iter().filter_map(|v| v.to_str().ok().map(str::to_owned)));
-    names
+/// The request names `origin` and no other authority: in its URI and in
+/// one `host` field at most. A `host` value that is not text fails.
+fn names_only(parts: &http::request::Parts, origin: &Origin) -> bool {
+    let hosts = parts.headers.get_all(HOST);
+    if hosts.iter().count() > 1 {
+        return false;
+    }
+    let uri = parts.uri.authority().map(|a| Some(a.as_str()));
+    let fields = hosts.iter().map(|v| v.to_str().ok());
+    uri.into_iter().chain(fields).all(|name| name.is_some_and(|n| origin.is(n)))
 }
 
 /// The answer to the ask of one MITM tunnel. Its later requests that the
@@ -935,7 +949,7 @@ async fn forward(
     let (mut parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map_or("/", |p| p.as_str()).to_owned();
     let mut entry = origin.entry(parts.method.as_str(), Some(&path));
-    if named(&parts).iter().any(|a| !origin.is(a)) {
+    if !names_only(&parts, &origin) {
         entry.status = Some(StatusCode::MISDIRECTED_REQUEST.as_u16());
         entry.reason = "misdirected".into();
         shared.log(entry);
@@ -1389,9 +1403,9 @@ impl tower_service::Service<Uri> for Connector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let (upstreams, tls) = (self.upstreams.clone(), self.tls.clone());
         Box::pin(async move {
-            let host = normal_host(uri.host().ok_or(ConnectError::Name)?);
             let https = uri.scheme_str() == Some("https");
-            let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+            let authority = uri.authority().ok_or(ConnectError::Name)?;
+            let Origin { host, port, .. } = Origin::read(https, authority.as_str()).ok_or(ConnectError::Name)?;
             let permits = upstreams.limits.acquire(&host).await.map_err(ConnectError::Dial)?;
             let pinned = if https { upstreams.pinned(&host, port) } else { None };
             let tcp = dial::dial(upstreams.resolver.as_ref(), &host, port, pinned).await.map_err(ConnectError::Dial)?;
@@ -1838,6 +1852,137 @@ mod tests {
         let request = Request::get("/").header(HOST, "api.test:8443").body(Empty::new()).unwrap();
         assert_eq!(send_over(io, request).await.0, StatusCode::MISDIRECTED_REQUEST);
         assert_eq!(f.entries().last().unwrap().reason, "misdirected");
+    }
+
+    /// Writes `head` to a new connection to the proxy and returns the
+    /// first bytes of the answer.
+    async fn raw_plain(f: &Fixture, head: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        tcp.write_all(head.replace("{auth}", &f.auth()).as_bytes()).await.unwrap();
+        let mut answer = vec![0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut answer)).await.unwrap().unwrap_or(0);
+        String::from_utf8_lossy(&answer[..n]).into_owned()
+    }
+
+    /// Writes `head` in a new MITM tunnel to `authority` and returns the
+    /// first bytes of the answer.
+    async fn raw_in_tls(f: &Fixture, authority: &str, head: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = tunnel(f, authority).await.unwrap().into_inner();
+        tls.write_all(head).await.unwrap();
+        let mut answer = vec![0; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut answer)).await.unwrap().unwrap_or(0);
+        String::from_utf8_lossy(&answer[..n]).into_owned()
+    }
+
+    fn status_of(answer: &str) -> Option<&str> {
+        answer.get(9..12)
+    }
+
+    /// Absolute-form plain HTTP: a target that the parser refuses is a 400
+    /// with no log entry and no dial; a `host` field that names another
+    /// authority is a 421.
+    #[tokio::test]
+    async fn plain_http_reads_its_target_once_and_refuses_an_ambiguous_one() {
+        let f = fixture(NetworkPolicy { default: DefaultAction::Allow, ..Default::default() }, Vec::new(), Vec::new())
+            .await;
+        let port = upstream().await;
+        let refused = [
+            format!("GET http://user@api.test:{port}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n"),
+            format!("GET http://evil.test:{port}@api.test:{port}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n"),
+            "GET http://api.test:abc/ HTTP/1.1\r\nproxy-authorization: {auth}\r\n\r\n".into(),
+            "GET http://api.test:0/ HTTP/1.1\r\nproxy-authorization: {auth}\r\n\r\n".into(),
+            format!(
+                "GET http://api.test:{}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n",
+                u32::from(port) + 65536
+            ),
+            format!("GET http://api%2etest:{port}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n"),
+            format!("GET http://2130706433:{port}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n"),
+            format!("GET http://api.test..:{port}/ HTTP/1.1\r\nproxy-authorization: {{auth}}\r\n\r\n"),
+        ];
+        for head in &refused {
+            assert_eq!(status_of(&raw_plain(&f, head).await), Some("400"), "{head}");
+        }
+        assert!(f.entries().is_empty(), "{:?}", f.entries());
+
+        let misdirected = [
+            format!("host: evil.test:{port}\r\n"),
+            format!("host: api.test:{port}\r\nhost: evil.test:{port}\r\n"),
+            format!("host: evil.test@api.test:{port}\r\n"),
+            "host: api.test\r\n".to_owned(),
+        ];
+        for host in &misdirected {
+            let head = format!("GET http://api.test:{port}/ HTTP/1.1\r\n{host}proxy-authorization: {{auth}}\r\n\r\n");
+            assert_eq!(status_of(&raw_plain(&f, &head).await), Some("421"), "{host}");
+        }
+        assert!(f.entries().iter().all(|e| !e.allowed && e.host == "api.test"), "{:?}", f.entries());
+
+        let same = format!(
+            "GET http://API.Test.:{port}/ HTTP/1.1\r\nhost: api.test:{port}\r\nproxy-authorization: {{auth}}\r\n\r\n"
+        );
+        assert_eq!(status_of(&raw_plain(&f, &same).await), Some("200"));
+        assert_eq!(f.entries().last().unwrap().host, "api.test");
+    }
+
+    /// The credential of `a1.test` goes only to a request that names
+    /// exactly `a1.test` and the CONNECT port, by one reading of the
+    /// authority. Every ambiguous spelling is refused before any dial.
+    #[tokio::test]
+    async fn only_the_canonical_authority_gets_a_credential() {
+        let recipients = temp_ca();
+        let (a1, seen) = tls_recipient(&recipients, "a1.test").await;
+        let policy = NetworkPolicy {
+            default: DefaultAction::Allow,
+            rules: vec![bound("a1.test", Source::Local)],
+            ..Default::default()
+        };
+        let values = [(local("KEY"), SecretValue::new("local-fixture"))].into();
+        let f = start(policy, values, Vec::new(), Vec::new(), Some(recipients.der().clone())).await;
+
+        let connects = [
+            format!("user@a1.test:{a1}"),
+            format!("a1.test:{a1}@evil.test:443"),
+            format!("a1.test:+{a1}"),
+            format!("a1.test:{}", u32::from(a1) + 65536),
+            "a1.test:abc".to_owned(),
+            "a1.test:0".to_owned(),
+            "127.1:443".to_owned(),
+            format!("a1.test..:{a1}"),
+            format!("a1%2etest:{a1}"),
+        ];
+        for authority in &connects {
+            assert!(connect_only(&f, authority).await.is_err(), "CONNECT {authority}");
+        }
+        assert!(f.entries().is_empty(), "{:?}", f.entries());
+
+        let authority = format!("a1.test:{a1}");
+        let heads: Vec<Vec<u8>> = vec![
+            format!("GET / HTTP/1.1\r\nhost: {authority}\r\nhost: evil.test\r\n\r\n").into(),
+            format!("GET / HTTP/1.1\r\nhost: evil.test@{authority}\r\n\r\n").into(),
+            format!("GET / HTTP/1.1\r\nhost: a1.test:0{a1}\r\n\r\n").into(),
+            b"GET / HTTP/1.1\r\nhost: a1.test\r\n\r\n".to_vec(),
+            format!("GET https://{authority}/ HTTP/1.1\r\nhost: evil.test\r\n\r\n").into(),
+            format!("GET https://user@{authority}/ HTTP/1.1\r\nhost: {authority}\r\n\r\n").into(),
+            [format!("GET / HTTP/1.1\r\nhost: {authority}").as_bytes(), b"\xff\r\n\r\n"].concat(),
+        ];
+        for head in &heads {
+            let answer = raw_in_tls(&f, &authority, head).await;
+            assert!(
+                status_of(&answer).is_some_and(|s| s.starts_with('4')),
+                "{} -> {answer:?}",
+                String::from_utf8_lossy(head)
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty(), "a misdirected request reached the recipient");
+
+        // An equal spelling is the same host: it gets the credential.
+        let head = format!("GET / HTTP/1.1\r\nhost: A1.TEST.:{a1}\r\n\r\n");
+        let answer = raw_in_tls(&f, &format!("A1.Test.:{a1}"), head.as_bytes()).await;
+        assert_eq!(status_of(&answer), Some("200"), "{answer}");
+        assert_eq!(seen.lock().unwrap().last().cloned().flatten().as_deref(), Some("Bearer local-fixture"));
+        let last = f.entries().pop().unwrap();
+        assert_eq!((last.host.as_str(), last.credentials.as_slice()), ("a1.test", ["KEY".to_owned()].as_slice()));
     }
 
     /// The authorization field of each request at a recipient.
@@ -2519,9 +2664,8 @@ mod tests {
     #[tokio::test]
     async fn a_connect_with_a_malformed_port_opens_no_tunnel_for_a_443_grant() {
         let f = host_port_fixture(443).await;
-        assert_eq!(connect_only(&f, &format!("{GUEST_HOST}:abc")).await.err(), Some(StatusCode::FORBIDDEN));
-        let entry = f.entries().pop().unwrap();
-        assert_eq!((entry.reason.as_str(), entry.note.as_deref()), ("host-port", Some(HOST_PORT_AUTHORITY)));
+        assert_eq!(connect_only(&f, &format!("{GUEST_HOST}:abc")).await.err(), Some(StatusCode::BAD_REQUEST));
+        assert!(f.entries().is_empty(), "{:?}", f.entries());
     }
 
     fn ask_policy() -> NetworkPolicy {

@@ -27,6 +27,14 @@ The proxy checks each request in this sequence:
    allow is blocked.
 6. The default.
 
+Before these checks, the proxy reads the host and the port of the request one time, and uses only that result for the
+rules, the credentials and the log. Case and one final dot do not change the host: `API.Example.com.` is
+`api.example.com`. The proxy refuses a target with a user name (`user@host`), percent-encoding, a port that is not 1
+to 65535 in digits, an empty label, characters other than letters, digits, `-`, `_` and `.` (send an international name
+as punycode), a short or hex IPv4 form such as `127.1`, or an IPv6 address with no brackets. It answers `400` and logs
+nothing. A request whose `host` field names a different host or port than its URI or its CONNECT is refused with `421`
+and the reason `misdirected`.
+
 A Block rule always has priority over an Allow rule. A rule change applies to the next request, with no restart.
 
 ### Ask
