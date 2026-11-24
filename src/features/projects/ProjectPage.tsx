@@ -21,7 +21,7 @@ import {
   removeHostAgent,
 } from "../settings/api";
 import { confirmPaths, setClaudeToken } from "./api";
-import { dayStart, ESTIMATE, expiresSoon, expiryLabel } from "./tokenExpiry";
+import { dayEnd, ESTIMATE, expiresSoon, expiryLabel } from "./tokenExpiry";
 import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
 import { useProjectFolders } from "./useProjectFolders";
@@ -123,7 +123,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
         return setClaudeToken(cage.id, null, "library", false, profile).then(onDone);
       }
       if (claude && login && token.trim()) {
-        return setClaudeToken(cage.id, token.trim(), "local", false, profile, dayStart(expiry)).then(onDone);
+        return setClaudeToken(cage.id, token.trim(), "local", false, profile, dayEnd(expiry)).then(onDone);
       }
       return putHostAgent(cage.id, { kind, profile, login }, !claude && login && blocked && allow).then(onDone);
     });
@@ -187,7 +187,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
                 <FloatingField label="Setup token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
                 <DatePicker
                   label="Expires (optional)"
-                  hint="The date that claude setup-token prints. Empty: one year after you save the token."
+                  hint="The last day on which the token is valid. Empty: one year after you save the token."
                   value={expiry}
                   onChange={(e) => setExpiry(e.target.value)}
                 />

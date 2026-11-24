@@ -246,7 +246,7 @@ the next VM shell get its placeholder variable.
 - A credential on a Block rule is inactive. The proxy does not use it until the rule allows the host again.
 - A wildcard host rule (`*.a.io`) cannot have a credential.
 - A change of the value applies to the next request.
-- A Claude Code setup token is stored as `CLAUDE_CODE_OAUTH_TOKEN` with its save date. Its expiry is the date that you enter with the token, else an estimate of 365 days after save. The proxy uses it only for `api.anthropic.com` through an exact-host Allow rule. Under default Block, the project offers an **Allow api.anthropic.com** action. Block rules take priority over Allow rules.
+- A Claude Code setup token is stored as `CLAUDE_CODE_OAUTH_TOKEN` with its save date. Its expiry is the end of the day that you enter with the token, else an estimate of 365 days after save. The proxy uses it only for `api.anthropic.com` through an exact-host Allow rule. Under default Block, the project offers an **Allow api.anthropic.com** action. Block rules take priority over Allow rules.
 - Claude setup tokens have no refresh host. Claude cages no longer block `console.anthropic.com` or `platform.claude.com` for this login.
 
 ### Shared credentials

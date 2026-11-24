@@ -1521,8 +1521,23 @@ pub(crate) fn probe_error(out: &[u8], code: i32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN};
+    use super::{EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN, claude_token_problem};
     use crate::cage::testing::*;
+
+    #[test]
+    fn a_claude_token_is_valid_until_its_expiry_moment() {
+        // The app stores an entered date as the next local midnight, so the
+        // token works through the whole entered day.
+        let entry = |expires_at| secrets::VaultEntry {
+            value: SecretValue::new("sk-ant-oat-real"),
+            saved_at: Some(0),
+            expires_at: Some(expires_at),
+        };
+        let now = secrets::now_ms();
+        assert_eq!(claude_token_problem(Some(&entry(now + 60_000))), None);
+        assert_eq!(claude_token_problem(Some(&entry(now))), Some(EXPIRED_CLAUDE_TOKEN));
+        assert_eq!(claude_token_problem(Some(&entry(now - 1))), Some(EXPIRED_CLAUDE_TOKEN));
+    }
 
     #[tokio::test]
     async fn start_refuses_old_node() {

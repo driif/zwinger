@@ -346,7 +346,8 @@ pub enum Inserted {
 pub struct VaultEntry {
     pub value: SecretValue,
     pub saved_at: Option<i64>,
-    /// The exact expiry that the user entered, in ms since the epoch.
+    /// The exact expiry that the user entered, in ms since the epoch: the
+    /// end of the entered day, so the token is valid through that day.
     pub expires_at: Option<i64>,
 }
 
