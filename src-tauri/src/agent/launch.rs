@@ -184,6 +184,23 @@ pub const HOST_STATUS_DIR: &str = "host-status";
 /// path, so an agent on a Mac that has this file gets no status hooks.
 pub const GEMINI_MAC_DEFAULTS: &str = "/Library/Application Support/GeminiCli/system-defaults.json";
 
+/// True when Gemini CLI on this Mac already has a system defaults file that
+/// zwinger's env var would replace. Gemini CLI finds it as
+/// `$GEMINI_CLI_SYSTEM_DEFAULTS_PATH`, else `system-defaults.json` next to
+/// `$GEMINI_CLI_SYSTEM_SETTINGS_PATH`, else [`GEMINI_MAC_DEFAULTS`].
+pub fn gemini_has_own_defaults(env: impl Fn(&str) -> Option<String>, exists: impl Fn(&Path) -> bool) -> bool {
+    if env("GEMINI_CLI_SYSTEM_DEFAULTS_PATH").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    if let Some(settings) = env("GEMINI_CLI_SYSTEM_SETTINGS_PATH").filter(|v| !v.is_empty()) {
+        let next = Path::new(&settings).parent().map(|dir| dir.join("system-defaults.json"));
+        if next.is_some_and(|path| exists(&path)) {
+            return true;
+        }
+    }
+    exists(Path::new(GEMINI_MAC_DEFAULTS))
+}
+
 /// The status hooks of one launch of an agent on the Mac. The hooks write to
 /// the terminal in [`TTY_ENV`], as in the VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -977,6 +994,18 @@ fn put(dir: &Path, name: &str, text: &str, mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_status_never_replaces_the_macs_own_system_defaults() {
+        let none = |_: &str| None::<String>;
+        assert!(!gemini_has_own_defaults(none, |_| false));
+        assert!(gemini_has_own_defaults(none, |p| p == Path::new(GEMINI_MAC_DEFAULTS)));
+        let defaults = |n: &str| (n == "GEMINI_CLI_SYSTEM_DEFAULTS_PATH").then(|| "/org/d.json".to_owned());
+        assert!(gemini_has_own_defaults(defaults, |_| false));
+        let settings = |n: &str| (n == "GEMINI_CLI_SYSTEM_SETTINGS_PATH").then(|| "/org/settings.json".to_owned());
+        assert!(gemini_has_own_defaults(settings, |p| p == Path::new("/org/system-defaults.json")));
+        assert!(!gemini_has_own_defaults(settings, |_| false));
+    }
 
     #[test]
     fn a_mac_agent_runs_the_detected_install_with_no_bypass_flag_and_no_env() {

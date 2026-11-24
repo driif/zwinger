@@ -372,7 +372,8 @@ impl<R: SandboxRuntime> Manager<R> {
                         .inspect_err(|e| eprintln!("the status hooks of agents on the Mac were not written: {e}"))
                         .ok()
                         .and_then(|()| {
-                            let defaults = Path::new(launch::GEMINI_MAC_DEFAULTS).exists();
+                            let defaults =
+                                launch::gemini_has_own_defaults(|name| std::env::var(name).ok(), Path::exists);
                             launch::host_status(agent, &dir, defaults)
                         });
                     Ok((detection.last().agent(agent).cloned(), status))

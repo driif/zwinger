@@ -106,9 +106,10 @@ option or an environment variable. A Mac shell gets no hooks, so an agent that y
 - **Pi** reports all three states. It starts with `-e` and the status extension of zwinger, in addition to your own
   extensions.
 - **Gemini CLI** reports all three states. `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` points at the system defaults file of
-  zwinger, so your own Gemini settings win. Gemini CLI runs hooks only in a trusted folder. If your Mac has its own
-  `/Library/Application Support/GeminiCli/system-defaults.json`, zwinger does not replace it, and Gemini CLI reports
-  no status.
+  zwinger, so your own Gemini settings win. Gemini CLI runs hooks only in a trusted folder. If your Mac already has Gemini system defaults
+  (`GEMINI_CLI_SYSTEM_DEFAULTS_PATH` is set, a `system-defaults.json` is next to `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, or
+  `/Library/Application Support/GeminiCli/system-defaults.json` exists), zwinger does not replace them, and Gemini CLI
+  reports no status.
 - **Codex** reports no status. Codex runs hooks from a command-line option only after you trust them, or with an
   option that skips the trust check for all hooks. The guard does not allow that option.
 - **Antigravity CLI** reports no status.
