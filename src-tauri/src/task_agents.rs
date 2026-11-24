@@ -870,10 +870,10 @@ mod tests {
 
     #[test]
     fn git_scope_excludes_other_sessions_and_the_round_copy() {
-        let root = std::env::temp_dir().join(format!("zwinger-git-scope-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-git-scope-{}", uuid::Uuid::new_v4()));
         let session = root.join("session");
         let copy = session.join(".zwinger/tasks/fix/01");
-        let workdir = std::env::temp_dir().join(format!("zwinger-other-workdir-{}", uuid::Uuid::new_v4()));
+        let workdir = crate::test_dir::root().join(format!("zwinger-other-workdir-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workdir).unwrap();
         std::fs::create_dir_all(&copy).unwrap();
         std::fs::write(root.join("outside.txt"), "outside").unwrap();
@@ -951,7 +951,7 @@ mod tests {
     }
 
     fn temp_repo(name: &str) -> std::path::PathBuf {
-        let repo = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
+        let repo = crate::test_dir::root().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
         git_init(&repo);
         repo
     }

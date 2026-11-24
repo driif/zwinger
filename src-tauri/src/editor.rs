@@ -304,7 +304,7 @@ mod tests {
     use crate::session::Session;
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-editor-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-editor-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
     }

@@ -118,7 +118,7 @@ mod tests {
     const HELPER_LOCK: &str = "ZWINGER_HELPER_LOCK";
 
     fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

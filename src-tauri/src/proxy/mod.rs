@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     fn temp_ca() -> Arc<Ca> {
-        Arc::new(Ca::load(&std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap())
+        Arc::new(Ca::load(&crate::test_dir::root().join(uuid::Uuid::new_v4().to_string())).unwrap())
     }
 
     async fn start(

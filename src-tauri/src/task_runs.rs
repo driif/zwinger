@@ -2541,7 +2541,7 @@ pub(crate) mod tests {
     }
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-run-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-run-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -4078,7 +4078,8 @@ pub(crate) mod tests {
 
         let file = |name: &str| src.dir.join(name);
         std::fs::write(file("messages.jsonl"), "").unwrap();
-        let cases: [(&str, &dyn Fn(String) -> String, &str); 8] = [
+        type Damage = dyn Fn(String) -> String;
+        let cases: [(&str, &Damage, &str); 8] = [
             ("messages.jsonl", &|m| m + "{\"partial", "partial line"),
             (
                 "messages.jsonl",
@@ -4254,7 +4255,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn changed_files_repeat_the_checks_after_the_last_write_stage() {
-        let cases: [(&str, fn(&str) -> Fake); 4] = [
+        type MakeFake = fn(&str) -> Fake;
+        let cases: [(&str, MakeFake); 4] = [
             ("same files", |s| git_at(COMMIT, s)),
             ("other HEAD", |s| git_at(BASE, s)),
             ("other worktree or index", |s| {
@@ -4416,7 +4418,8 @@ pub(crate) mod tests {
         assert_eq!(load(&src).unwrap().from, "revise");
         let path = src.dir.join("checkpoint.json");
         let original = std::fs::read(&path).unwrap();
-        let cases: [(&dyn Fn(&mut Value), &str); 7] = [
+        type Corrupt = dyn Fn(&mut Value);
+        let cases: [(&Corrupt, &str); 7] = [
             (
                 &|c| drop(c["artifacts"].as_object_mut().unwrap().remove("crossreview.json")),
                 "crossreview.json is not in it",

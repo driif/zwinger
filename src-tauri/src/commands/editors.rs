@@ -226,7 +226,7 @@ mod tests {
             open_location(&prefs(None, None), &[editor("zed")], None, "/p/a.rs".into(), (1, None), failing).await;
         assert!(matches!(result, Err(Error::EditorFailed(..))));
 
-        let bundle = std::env::temp_dir().join(format!("zwinger-launch-{}", uuid::Uuid::new_v4())).join("Zed.app");
+        let bundle = crate::test_dir::root().join(format!("zwinger-launch-{}", uuid::Uuid::new_v4())).join("Zed.app");
         let launch = editor::location_launch("zed", &bundle, Path::new("/p/a.rs"), 1, None);
         assert!(matches!(run(&launch, "Zed").await, Err(Error::EditorLauncherMissing(..))));
     }

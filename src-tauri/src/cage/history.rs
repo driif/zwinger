@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn a_saved_history_loads_and_a_bad_file_loads_empty() {
-        let dir = std::env::temp_dir().join(format!("zwinger-history-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-history-{}", uuid::Uuid::new_v4()));
         let path = dir.join(FILE);
         assert!(StartHistory::load(&path).of("a").is_empty());
         let mut history = StartHistory::default();
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn a_loaded_file_keeps_only_the_newest_ten_per_vm() {
-        let dir = std::env::temp_dir().join(format!("zwinger-history-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-history-{}", uuid::Uuid::new_v4()));
         let path = dir.join(FILE);
         let records =
             Records::from([("a".to_owned(), (1..=13).map(record).collect()), ("b".to_owned(), vec![record(1)])]);

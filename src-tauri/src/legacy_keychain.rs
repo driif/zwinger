@@ -1398,7 +1398,7 @@ mod tests {
         let report = world.import(&source);
         assert!(report.saved);
         assert_eq!(outcomes(&report), [(key.clone(), Outcome::Same, None)]);
-        assert_eq!(status(&world.root).unwrap().pending, [key.clone()]);
+        assert_eq!(status(&world.root).unwrap().pending, std::slice::from_ref(&key));
         assert_eq!(outcomes(&world.clean(&source, &[&key])), [(key.clone(), Outcome::Cleaned, None)]);
         assert!(!source.has(&key));
         world.receipt_has_no_value();
@@ -1521,7 +1521,7 @@ mod tests {
                 (later.clone(), Outcome::Imported, None),
             ])
         );
-        assert_eq!(source.reads(), [later.clone()]);
+        assert_eq!(source.reads(), std::slice::from_ref(&later));
         assert_eq!(world.value(Owner::cage(&cage), "KEY"), None);
 
         // A twin that comes after the import.
@@ -1619,7 +1619,7 @@ mod tests {
         let beta_row = report.rows.iter().find(|r| r.account == beta).unwrap();
         assert_eq!((beta_row.outcome, beta_row.code), (Outcome::Denied, Some(ERR_USER_CANCELED)));
         assert!(!source.has(&alpha) && source.has(&beta));
-        assert_eq!(status(&world.root).unwrap().pending, [beta.clone()]);
+        assert_eq!(status(&world.root).unwrap().pending, std::slice::from_ref(&beta));
 
         world.restart();
         source.deny_deletes.lock().unwrap().clear();

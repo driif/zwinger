@@ -187,7 +187,7 @@ mod tests {
     use super::*;
 
     fn path() -> PathBuf {
-        std::env::temp_dir().join(format!("zwinger-prefs-{}", uuid::Uuid::new_v4())).join("preferences.json")
+        crate::test_dir::root().join(format!("zwinger-prefs-{}", uuid::Uuid::new_v4())).join("preferences.json")
     }
 
     #[test]

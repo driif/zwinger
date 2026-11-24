@@ -275,7 +275,7 @@ mod tests {
     const OWN: &str = "0b5c7c4e-2f61-4e43-9a0e-4b7a3c1d9e21-2";
 
     fn data() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-vm-state-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-vm-state-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

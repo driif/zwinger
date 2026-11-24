@@ -1004,7 +1004,7 @@ mod tests {
     /// terminal.
     fn run_printing(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool, vars: &str) -> (String, String) {
         let script = wrapper(kind, host(), unprompted).unwrap();
-        let terminal = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
+        let terminal = crate::test_dir::root().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
         // The test process has pipes; substitute the TTY check to exercise the interactive branch.
         let script = if tty {
             script.replace(TTY, "true").replace(TTY_NAME, &quote(&terminal.display().to_string()))
@@ -1300,7 +1300,7 @@ mod tests {
 
     impl Temp {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
+            let dir = crate::test_dir::root().join(format!("zwinger-{name}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -1553,7 +1553,7 @@ mod tests {
 
     #[test]
     fn profile_makes_bash_report_its_folder_once() {
-        let root = std::env::temp_dir().join(format!("zwinger-osc7-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-osc7-{}", uuid::Uuid::new_v4()));
         let dir = root.join("a b/\u{e4}%");
         std::fs::create_dir_all(&dir).unwrap();
         let script = format!(
@@ -1577,7 +1577,7 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), "||\n", "{}", String::from_utf8_lossy(&out.stderr));
         // `set -u` with no environment: /bin/sh is bash in sh mode on macOS, so only dash tests the guard.
-        let file = std::env::temp_dir().join(format!("zwinger-profile-{}.sh", uuid::Uuid::new_v4()));
+        let file = crate::test_dir::root().join(format!("zwinger-profile-{}.sh", uuid::Uuid::new_v4()));
         std::fs::write(&file, profile()).unwrap();
         let has_dash = std::process::Command::new("dash").arg("-c").arg(":").status().is_ok_and(|s| s.success());
         for shell in std::iter::once("/bin/sh").chain(has_dash.then_some("dash")) {
@@ -1617,7 +1617,7 @@ mod tests {
     /// A temp root with `tools` and `bin`. `bin` has only the commands that
     /// the trust script needs, so a host openssl or updater is not on `PATH`.
     fn trust_root() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("zwinger-trust-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-trust-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("tools")).unwrap();
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let commands =
@@ -2121,7 +2121,7 @@ mod tests {
 
     #[test]
     fn status_script_picks_the_state_from_the_tool_name() {
-        let tty = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
+        let tty = crate::test_dir::root().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
         let script = status_script();
         let run = |arg: &str, input: &str| {
             let mut child = std::process::Command::new("/bin/sh")
@@ -2162,7 +2162,7 @@ mod tests {
     fn write_makes_executable_wrappers_for_the_given_agents() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         write(&dir, &[AgentKind::Pi, AgentKind::Claude, AgentKind::Gemini], bare(), true).unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
@@ -2178,7 +2178,7 @@ mod tests {
         assert!(pi.contains("agent_start") && pi.contains("agent_settled"));
         write(&dir, &[AgentKind::Claude], bare(), false).unwrap();
         assert!(!std::fs::read_to_string(dir.join("claude")).unwrap().contains("dangerously"));
-        let empty = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
+        let empty = crate::test_dir::root().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&empty).unwrap();
         write(&empty, &[], Found::default(), false).unwrap();
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 1);
@@ -2206,7 +2206,7 @@ mod tests {
         let argv = command(AgentKind::Claude, found, None).unwrap();
         assert!(argv.contains(&"GITHUB_TOKEN=$MSB_GITHUB_TOKEN$".to_owned()), "{argv:?}");
 
-        let dir = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         write(&dir, &[AgentKind::Pi], found, true).unwrap();
         let env = dir.join(ENV_FILE).display().to_string();

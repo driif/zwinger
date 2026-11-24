@@ -760,7 +760,7 @@ mod tests {
     const QUIET: Duration = Duration::from_millis(1500);
 
     fn temp_round() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-room-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-room-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
         stage(&dir, "plan");

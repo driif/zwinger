@@ -472,7 +472,7 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-profile-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-profile-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
     }

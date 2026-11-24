@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn set_layout_keeps_finite_positions() {
-        let dir = std::env::temp_dir().join(format!("zwinger-layout-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-layout-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = Session::new(dir.to_str().unwrap(), Some("c".into()), []).unwrap();
         session.set_layout(Some(
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn set_accent_takes_only_rrggbb_and_keeps_the_old_value_on_error() {
-        let dir = std::env::temp_dir().join(format!("zwinger-accent-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-accent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = Session::new(dir.to_str().unwrap(), None, []).unwrap();
         assert_eq!(session.accent, None);
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn set_viewport_keeps_finite_values_and_clamps_the_zoom() {
-        let dir = std::env::temp_dir().join(format!("zwinger-viewport-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-viewport-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut session = Session::new(dir.to_str().unwrap(), Some("c".into()), []).unwrap();
         let view = Viewport { x: -2791.75, y: 1299.625, zoom: 0.5 };

@@ -417,7 +417,7 @@ config-file = other
 
     #[test]
     fn reads_the_files_in_order_and_skips_folders() {
-        let home = std::env::temp_dir().join(format!("zwinger-ghostty-{}", uuid::Uuid::new_v4()));
+        let home = crate::test_dir::root().join(format!("zwinger-ghostty-{}", uuid::Uuid::new_v4()));
         assert!(matches!(import(&home), Err(Error::MissingPath(_))));
         let [app, xdg, agterm] = config_paths(&home);
         for path in [&app, &xdg] {

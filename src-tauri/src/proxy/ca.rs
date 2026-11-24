@@ -155,7 +155,7 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("zwinger-ca-{}", uuid::Uuid::new_v4()))
+        crate::test_dir::root().join(format!("zwinger-ca-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]

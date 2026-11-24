@@ -584,7 +584,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn round(stage: &str) -> (PathBuf, Room) {
-        let dir = std::env::temp_dir().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("turns")).unwrap();
         std::fs::write(dir.join("turns/plan-opus.prompt.md"), "public").unwrap();
         std::fs::write(dir.join("turns/plan-sol.prompt.md"), "public").unwrap();
@@ -763,7 +763,7 @@ mod tests {
         let path = dir.join("turns/plan-opus.raw.err");
         let record = format!("{}\n", text_event("At boundary"));
         let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(&vec![b'x'; 90]).unwrap();
+        file.write_all(&[b'x'; 90]).unwrap();
         file.write_all(b"\n").unwrap();
         file.write_all(record.as_bytes()).unwrap();
         file.write_all(&vec![b'\n'; CATCH_UP as usize - record.len()]).unwrap();
@@ -837,7 +837,7 @@ mod tests {
         assert!(matches!(tail.cursors["turns/plan-sol.raw.err"].format, Format::Legacy));
         std::fs::remove_file(&path).unwrap();
         tail.tick(&dir, &room);
-        std::fs::write(&path, format!("{{\"type\":\"turn.started\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"id\":\"three\",\"type\":\"agent_message\",\"text\":\"visible\"}}}}\n")).unwrap();
+        std::fs::write(&path, "{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"three\",\"type\":\"agent_message\",\"text\":\"visible\"}}\n").unwrap();
         let records = tail.tick(&dir, &room).records;
         assert!(records.iter().any(|(_, record)| record.to_string().contains("visible")));
         assert!(matches!(tail.cursors["turns/plan-sol.raw.err"].format, Format::Structured));

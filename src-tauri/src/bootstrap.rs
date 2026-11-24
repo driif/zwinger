@@ -506,7 +506,7 @@ mod tests {
     }
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-legacy-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-legacy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn the_checks_of_this_mac_run() {
-        let checks = system_checks(&std::env::temp_dir(), &std::env::temp_dir(), "11.0");
+        let checks = system_checks(crate::test_dir::root(), crate::test_dir::root(), "11.0");
         assert_eq!(
             checks.iter().map(|c| c.name).collect::<Vec<_>>(),
             ["Processor", "macOS", "Virtualization", "Disk space", "VM folder"]

@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn seed_selects_the_api_key_mode_once() {
-        let state = std::env::temp_dir().join(format!("zwinger-agy-{}", uuid::Uuid::new_v4()));
+        let state = crate::test_dir::root().join(format!("zwinger-agy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state).unwrap();
         seed(&state).unwrap();
         let file = state.join("agy/.gemini/antigravity-cli/settings.json");

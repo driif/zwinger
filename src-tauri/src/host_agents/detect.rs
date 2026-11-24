@@ -288,7 +288,7 @@ mod tests {
     }
 
     fn data() -> PathBuf {
-        std::env::temp_dir().join(format!("zwinger-detect-{}", uuid::Uuid::new_v4()))
+        crate::test_dir::root().join(format!("zwinger-detect-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]

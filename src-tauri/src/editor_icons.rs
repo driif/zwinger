@@ -165,7 +165,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn bundle(icon: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("zwinger-icons-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-icons-{}", uuid::Uuid::new_v4()));
         let resources = root.join("Editor.app/Contents/Resources");
         std::fs::create_dir_all(&resources).unwrap();
         let mut info = plist::Dictionary::new();

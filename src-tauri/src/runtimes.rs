@@ -632,7 +632,7 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zwinger-runtimes-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dir::root().join(format!("zwinger-runtimes-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -872,7 +872,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_install_codex() {
-        let data = std::env::temp_dir().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
+        let data = crate::test_dir::root().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
         let runtimes = Runtimes::new(data.clone());
         runtimes.install("codex", None, false, |_| {}).await.unwrap();
         let list = runtimes.list().unwrap();

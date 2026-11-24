@@ -61,7 +61,7 @@ fn only_the_fixture_service_is_imported_and_removed() {
     fixture.add_generic_password(sentinel_service, "other/account", b"fixture-other").unwrap();
 
     let source = apple::AppleKeychain::for_keychain(fixture.clone());
-    assert_eq!(source.accounts().unwrap(), [account.clone()]);
+    assert_eq!(source.accounts().unwrap(), std::slice::from_ref(&account));
     let result = import(&manager, &source).unwrap();
     assert!(result.saved && result.rows.len() == 1 && result.rows[0].outcome == Outcome::Imported);
     assert!(vault.get(&Owner::cage(&cage), "EXAMPLE").unwrap().is_some_and(|v| v.expose() == "fixture-import"));
@@ -78,7 +78,7 @@ fn only_the_fixture_service_is_imported_and_removed() {
     fixture.add_generic_password(SERVICE, &account, b"first").unwrap();
     let old = source.revision(&account).unwrap();
     let restarted = apple::AppleKeychain::for_keychain(fixture.clone());
-    assert_eq!(restarted.accounts().unwrap(), [account.clone()]);
+    assert_eq!(restarted.accounts().unwrap(), std::slice::from_ref(&account));
     assert_eq!(restarted.revision(&account).unwrap(), old);
     assert_eq!(restarted.delete(&account, &old, Some(&SecretValue::new("different"))), Err(SourceError::Changed));
     fixture.find_generic_password(SERVICE, &account).unwrap().1.set_password(b"changed").unwrap();

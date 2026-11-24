@@ -31,6 +31,8 @@ mod task_recovery;
 mod task_runs;
 mod task_state;
 mod terminal;
+#[cfg(test)]
+mod test_dir;
 mod updates;
 mod workspaces;
 
@@ -558,7 +560,7 @@ mod tests {
 
     #[test]
     fn open_data_makes_the_folder_and_takes_the_lock() {
-        let dir = std::env::temp_dir().join(format!("zwinger-open-{}", uuid::Uuid::new_v4())).join("data");
+        let dir = crate::test_dir::root().join(format!("zwinger-open-{}", uuid::Uuid::new_v4())).join("data");
         let (data, lock) = open_data(&dir).unwrap();
         assert_eq!(data, dir.canonicalize().unwrap());
         assert!(lock.is_some());
@@ -568,7 +570,7 @@ mod tests {
     /// A plain test: `boot` makes its own runtime context, as in the app's setup.
     #[test]
     fn boot_reaps_loads_and_names_the_removed_vms() {
-        let data = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        let data = crate::test_dir::root().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(data.join("proj")).unwrap();
         let data = data.canonicalize().unwrap();
         let [id] = stored(&data, [data.join("proj")]);
@@ -623,7 +625,7 @@ mod tests {
     /// A new root with app data in `data` and two stored sessions whose
     /// folders are outside it.
     fn two() -> (PathBuf, [String; 2]) {
-        let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
         let folders = ["a", "b"].map(|name| {
@@ -1153,7 +1155,7 @@ mod tests {
     #[test]
     fn a_direct_upgrade_from_the_shields_store_converts_it_and_moves_the_state() {
         let runtime = FakeRuntime::default();
-        let root = std::env::temp_dir().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dir::root().join(format!("zwinger-boot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("data")).unwrap();
         std::fs::create_dir_all(root.join("proj")).unwrap();
         let root = root.canonicalize().unwrap();

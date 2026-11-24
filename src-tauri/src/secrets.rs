@@ -745,7 +745,7 @@ pub mod tests {
     use super::*;
 
     fn file_vault() -> (FileVault, PathBuf) {
-        let data = std::env::temp_dir().join(format!("zwinger-vault-{}", uuid::Uuid::new_v4()));
+        let data = crate::test_dir::root().join(format!("zwinger-vault-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&data).unwrap();
         let vault = FileVault::new(&data).unwrap();
         let dir = vault.dir.clone();
@@ -881,7 +881,7 @@ pub mod tests {
     fn a_temp_name_collision_fails_the_write_and_keeps_the_object() {
         let (vault, dir) = file_vault();
         vault.set(&c("p"), "KEY", &SecretValue::new("old")).unwrap();
-        let outside = std::env::temp_dir().join(format!("zwinger-sentinel-{}", uuid::Uuid::new_v4()));
+        let outside = crate::test_dir::root().join(format!("zwinger-sentinel-{}", uuid::Uuid::new_v4()));
         fs::write(&outside, "sentinel").unwrap();
         let link = dir.join(format!("{TEMP_PREFIX}{}", std::process::id()));
         std::os::unix::fs::symlink(&outside, &link).unwrap();
@@ -965,7 +965,7 @@ pub mod tests {
     #[test]
     fn foreign_objects_and_their_targets_stay() {
         let (vault, dir) = file_vault();
-        let outside = std::env::temp_dir().join(format!("zwinger-sentinel-{}", uuid::Uuid::new_v4()));
+        let outside = crate::test_dir::root().join(format!("zwinger-sentinel-{}", uuid::Uuid::new_v4()));
         fs::write(&outside, "sentinel").unwrap();
         let link = dir.join(format!("{TEMP_PREFIX}7"));
         std::os::unix::fs::symlink(&outside, &link).unwrap();
