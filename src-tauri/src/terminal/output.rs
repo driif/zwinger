@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 use crate::cage::manager::{AgentSink, FolderSink, State, lock};
 use crate::runtime::{PtyEvent, TerminalKind};
-use crate::terminal::{AgentState, TerminalFolder, resolve_folder};
+use crate::terminal::{AgentState, FRESH_NOTICE, QUICK_EXIT, TerminalFolder, resolve_folder, starts_fresh};
 
 /// The output bytes kept per session, for a view that attaches later.
 pub(crate) const RING: usize = 1 << 20;
@@ -444,6 +444,7 @@ pub(crate) async fn pump<V>(
 ) {
     // A VM shell can run an agent through its wrapper too.
     let vm = !kind.on_host();
+    let started = Instant::now();
     let mut frames = Frames::new(events);
     let room = lock(&output).room.clone();
     loop {
@@ -459,9 +460,33 @@ pub(crate) async fn pump<V>(
                 }
             }
         }
-        let Some((bytes, exit)) = frames.next().await else {
+        let Some((mut bytes, exit)) = frames.next().await else {
             return;
         };
+        // A resume that found no conversation: the agent starts fresh once.
+        let ran = started.elapsed();
+        let fresh = match exit {
+            Some(_) if ran < QUICK_EXIT => {
+                lock(&state).terminals.iter_mut().find(|t| t.id == id).and_then(|t| t.fresh.take())
+            }
+            _ => None,
+        };
+        if let (Some(code), Some(open)) = (exit, fresh) {
+            let reported = {
+                let mut output = lock(&output);
+                if !bytes.is_empty() {
+                    output.push(PtyEvent::Output(std::mem::take(&mut bytes)));
+                }
+                output.osc.agent.is_some()
+            };
+            if starts_fresh(kind, ran, code, reported)
+                && let Some(events) = open(id.clone()).await
+            {
+                lock(&output).push(PtyEvent::Output(FRESH_NOTICE.as_bytes().to_vec()));
+                frames = Frames::new(events);
+                continue;
+            }
+        }
         if let Some(code) = exit
             && let Some(t) = lock(&state).terminals.iter_mut().find(|t| t.id == id)
         {

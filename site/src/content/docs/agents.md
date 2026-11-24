@@ -22,6 +22,10 @@ In a VM shell (⌘⇧T), the commands `claude`, `codex`, `pi`, `gemini` and `agy
 `gemini --resume latest`, `agy -c`). It continues a session of the agent terminals only, never a call of a
 [task run](/tasks/#agent-state).
 
+If the agent exits in less than 5 seconds after a continue, with an error or with no turn, it had no earlier
+conversation. zwinger then starts the agent again in the same terminal without the continue option, one time only, and
+the terminal shows "No earlier conversation; started a new one."
+
 ## Agents with no cage
 
 A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,

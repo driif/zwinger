@@ -79,7 +79,7 @@ One interactive process of a session, and its saved record (`terminals`: stable 
 _Avoid_: session (for a process), tab
 
 **Agent terminal**:
-A terminal that runs an agent's own CLI and TUI (Claude Code, Codex, pi, Gemini CLI) in the harness, else in the session's guest folder. zwinger has no chat UI of its own: the user sees the agent's interface with all its functions. "Continue last session" starts the CLI with its continue flag (`claude -c`, `codex resume --last`, `pi -c`, `gemini --resume latest`). It runs in a VM; in a session with no cage it runs on the Mac with a guard (ADR 0008).
+A terminal that runs an agent's own CLI and TUI (Claude Code, Codex, pi, Gemini CLI) in the harness, else in the session's guest folder. zwinger has no chat UI of its own: the user sees the agent's interface with all its functions. "Continue last session" starts the CLI with its continue flag (`claude -c`, `codex resume --last`, `pi -c`, `gemini --resume latest`). If the agent exits within 5 s after a continue, with an error or with no turn reported, the backend starts it once again without the continue flag under the same process id, and the terminal shows "No earlier conversation; started a new one." It runs in a VM; in a session with no cage it runs on the Mac with a guard (ADR 0008).
 _Avoid_: agent session, chat
 
 **Pane layout**:

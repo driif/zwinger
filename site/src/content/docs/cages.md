@@ -70,7 +70,9 @@ in its own cage if it must not see the others.
 - **Terminals after a restart.** A VM terminal opens again at the size that it had. An agent that had a conversation
   continues it, with its continue option (`claude -c`, `codex resume --last`, `pi -c`, `gemini --resume latest`,
   `agy -c`). An agent whose folder moved, or that had no conversation yet, starts a new session. Codex, Gemini CLI and
-  Antigravity CLI do not report their turns to zwinger, so they always continue when their folder stays the same.
+  Antigravity CLI do not report their turns to zwinger, so they always continue when their folder stays the same. If
+  such a continue finds no conversation and the agent exits at once, the agent starts a new session in the same
+  terminal.
 - **Restart after a cage edit.** **Restart** on the project page restarts the VM with all its projects. It asks first
   when the VM has other projects. Their VM terminals open again, and their running tasks are cancelled. After a
   change of the project's cage, **Restart** stops the old VM and starts the new cage for this project only.

@@ -4,11 +4,14 @@ pub(crate) mod host;
 pub(crate) mod output;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 
 use crate::agent::AgentKind;
 use crate::agent::launch;
@@ -38,6 +41,9 @@ pub(crate) struct Terminal {
     /// The last size of its view, as rows and columns. A restart opens the
     /// terminal again at this size.
     pub(crate) size: (u16, u16),
+    /// Set for a resumed agent: it starts the agent fresh if the resume
+    /// exits at once ([`starts_fresh`]). The exit takes it.
+    pub(crate) fresh: Option<FreshStart>,
 }
 
 impl Terminal {
@@ -226,6 +232,73 @@ pub(crate) fn locate<V>(state: &Mutex<State<V>>, id: &str, raw: &str) -> Result<
     Ok((session_id, path))
 }
 
+/// A resumed agent that exits within this time found no conversation to
+/// continue: Codex and Gemini CLI report no turns, so their resume can exit at once.
+pub(crate) const QUICK_EXIT: Duration = Duration::from_secs(5);
+
+/// The line that a fresh start writes in the terminal.
+pub(crate) const FRESH_NOTICE: &str = "\r\nNo earlier conversation; started a new one.\r\n";
+
+/// Starts the agent of a resumed terminal again without its continue flag,
+/// under the same process id. It gives the events of the new process, or
+/// `None` if it did not start or the terminal is gone.
+pub(crate) type FreshStart =
+    Box<dyn FnOnce(String) -> Pin<Box<dyn Future<Output = Option<Receiver<PtyEvent>>> + Send>> + Send>;
+
+/// The kind that starts the agent of a resumed terminal without its continue
+/// flag. `None`: the terminal did not resume an agent.
+fn fresh_kind(kind: TerminalKind) -> Option<TerminalKind> {
+    match kind {
+        TerminalKind::Agent { agent, resume: true } => Some(TerminalKind::Agent { agent, resume: false }),
+        TerminalKind::HostAgent { agent, resume: true } => Some(TerminalKind::HostAgent { agent, resume: false }),
+        _ => None,
+    }
+}
+
+/// A resumed agent that exited after `ran` with `code` starts again without
+/// its continue flag: it exited within [`QUICK_EXIT`], with an error or with
+/// no turn reported (`reported`). The fresh start does not resume, so it
+/// happens once.
+pub(crate) fn starts_fresh(kind: TerminalKind, ran: Duration, code: i32, reported: bool) -> bool {
+    fresh_kind(kind).is_some() && ran < QUICK_EXIT && (code != 0 || !reported)
+}
+
+/// How a new process of a terminal starts: its folder until its first
+/// report, its size and its fresh start ([`Terminal::fresh`]).
+struct Launch {
+    start: TerminalFolder,
+    size: (u16, u16),
+    fresh: Option<FreshStart>,
+}
+
+/// Puts the fresh process `pty` in place of the exited process `id`. If the
+/// terminal is gone (a close or a stop), it kills the fresh process.
+fn swap<V>(
+    state: &mut State<V>,
+    id: &str,
+    kind: TerminalKind,
+    pty: Pty,
+    group: Option<host::HostGroup>,
+) -> Option<Receiver<PtyEvent>> {
+    match state.terminals.iter_mut().find(|t| t.id == id && t.exit_code.is_none()) {
+        Some(t) => {
+            t.input = pty.input;
+            t.host_group = group;
+            t.kind = kind;
+            Some(pty.events)
+        }
+        None => {
+            match group {
+                Some(group) => group.kill(),
+                None => {
+                    let _ = pty.input.send(PtyInput::Kill);
+                }
+            }
+            None
+        }
+    }
+}
+
 /// What an agent in a terminal does, as its hooks report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,7 +357,7 @@ impl<R: SandboxRuntime> Manager<R> {
         cols: u16,
     ) -> Result<String> {
         let host_argv = match kind {
-            TerminalKind::Host => Some(host::shell_argv()),
+            TerminalKind::Host => Some((host::shell_argv(), None)),
             // Checked at each open, so a stale UI or a cage change after the
             // confirm cannot start the agent on the Mac.
             TerminalKind::HostAgent { agent, resume } => {
@@ -294,27 +367,49 @@ impl<R: SandboxRuntime> Manager<R> {
                 let detection = self.host.clone();
                 let found = blocking(move || Ok(detection.last().agent(agent).cloned())).await?;
                 let argv = found
-                    .and_then(|found| launch::host_argv(&found, resume))
+                    .as_ref()
+                    .and_then(|found| launch::host_argv(found, resume))
                     .ok_or_else(|| Error::HostAgentMissing(agent.label().to_owned()))?;
-                Some(host::login_exec(argv))
+                let fresh = found.filter(|_| resume).and_then(|found| launch::host_argv(&found, false));
+                Some((host::login_exec(argv), fresh.map(host::login_exec)))
             }
             TerminalKind::Shell | TerminalKind::Agent { .. } => None,
         };
-        if let Some(argv) = host_argv {
+        if let Some((argv, fresh_argv)) = host_argv {
             let folder = lock(&self.state).session(session_id)?.folder.clone();
             if !folder.is_dir() {
                 return Err(Error::MissingPath(folder.display().to_string()));
             }
             let start = TerminalFolder::host(folder.clone());
+            let fresh = fresh_kind(kind).zip(fresh_argv).map(|(fresh, argv)| {
+                let (state, session, folder) = (self.state.clone(), session_id.to_owned(), folder.clone());
+                Box::new(move |id: String| {
+                    Box::pin(async move {
+                        let mut state = lock(&state);
+                        if state.effective_cage(&session).ok()?.is_some() {
+                            return None;
+                        }
+                        let (rows, cols) = state.process(&id).ok()?.size;
+                        let (pty, group) = host::open_host_pty(&folder, argv, rows, cols).ok()?;
+                        swap(&mut state, &id, fresh, pty, Some(group))
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>
+                }) as FreshStart
+            });
             // The last cage check and the spawn hold the state lock, which
             // every cage change also takes: no cage can come in between.
-            return self.register(session_id, terminal_id, kind, start, (rows, cols), |state| {
-                if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
-                    return Err(Error::HasCage);
-                }
-                let (pty, group) = host::open_host_pty(&folder, argv, rows, cols)?;
-                Ok((pty, Some(group)))
-            });
+            return self.register(
+                session_id,
+                terminal_id,
+                kind,
+                Launch { start, size: (rows, cols), fresh },
+                |state| {
+                    if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
+                        return Err(Error::HasCage);
+                    }
+                    let (pty, group) = host::open_host_pty(&folder, argv, rows, cols)?;
+                    Ok((pty, Some(group)))
+                },
+            );
         }
         let argv = kind.vm_argv().ok_or(Error::NotRunning)?;
         let (key, vm, cwd, applied) = {
@@ -335,13 +430,36 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let start = TerminalFolder::guest(cwd.clone(), &applied);
         let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
+        let fresh = fresh_kind(kind).and_then(|fresh| {
+            let argv = fresh.vm_argv()?;
+            let (state, runtime, vm, key, cwd) =
+                (self.state.clone(), self.runtime.clone(), vm.clone(), key.clone(), cwd.clone());
+            Some(Box::new(move |id: String| {
+                Box::pin(async move {
+                    let (rows, cols) = lock(&state).process(&id).ok()?.size;
+                    let pty = runtime.open_pty(&vm, &argv, &cwd, rows, cols).await.ok()?;
+                    let mut state = lock(&state);
+                    match state.vms.get(&key) {
+                        Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => {
+                            swap(&mut state, &id, fresh, pty, None)
+                        }
+                        _ => {
+                            let _ = pty.input.send(PtyInput::Kill);
+                            None
+                        }
+                    }
+                }) as Pin<Box<dyn Future<Output = _> + Send>>
+            }) as FreshStart)
+        });
         // The VM may have stopped, or stopped and started again, while
         // the process opened. Its stop did not see this process, so kill it.
-        self.register(session_id, terminal_id, kind, start, (rows, cols), |state| match state.vms.get(&key) {
-            Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
-            _ => {
-                let _ = pty.input.send(PtyInput::Kill);
-                Err(Error::NotRunning)
+        self.register(session_id, terminal_id, kind, Launch { start, size: (rows, cols), fresh }, |state| {
+            match state.vms.get(&key) {
+                Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => Ok((pty, None)),
+                _ => {
+                    let _ = pty.input.send(PtyInput::Kill);
+                    Err(Error::NotRunning)
+                }
             }
         })
     }
@@ -355,8 +473,7 @@ impl<R: SandboxRuntime> Manager<R> {
         session_id: &str,
         terminal_id: Option<&str>,
         kind: TerminalKind,
-        start: TerminalFolder,
-        size: (u16, u16),
+        Launch { start, size, fresh }: Launch,
         open: impl FnOnce(&State<R::Vm>) -> Result<(Pty, Option<host::HostGroup>)>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -395,6 +512,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 terminal_id: Some(terminal),
                 host_group,
                 size,
+                fresh,
             });
             pty.events
         };
@@ -901,6 +1019,7 @@ mod tests {
                     terminal_id: Some(terminal.clone()),
                     host_group: None,
                     size: (24, 80),
+                    fresh: None,
                 });
                 terminal
             };
@@ -942,6 +1061,57 @@ mod tests {
         manager.stop(&id, None).await.unwrap();
         assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
         assert_eq!(*runtime.log.lock().unwrap(), [format!("start {id}"), "kill".into(), format!("stop {id}")]);
+    }
+
+    #[test]
+    fn only_a_quick_exit_of_a_resume_starts_fresh() {
+        use super::{QUICK_EXIT, starts_fresh};
+        let quick = Duration::from_secs(1);
+        let resumed =
+            [agent(AgentKind::Codex, true), TerminalKind::HostAgent { agent: AgentKind::Gemini, resume: true }];
+        for kind in resumed {
+            assert!(starts_fresh(kind, quick, 1, false), "{kind:?}");
+            assert!(starts_fresh(kind, quick, 1, true), "an error");
+            assert!(starts_fresh(kind, quick, 0, false), "no conversation");
+            assert!(!starts_fresh(kind, quick, 0, true), "the user quit a resumed conversation");
+            assert!(!starts_fresh(kind, QUICK_EXIT, 1, false), "a slow exit");
+        }
+        for kind in [agent(AgentKind::Codex, false), TerminalKind::Shell, TerminalKind::Host] {
+            assert!(!starts_fresh(kind, quick, 1, false), "{kind:?} did not resume");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_exits_at_once_starts_the_agent_fresh_once() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        let process = manager.open_session(&id, agent(AgentKind::Pi, true), 24, 80).await.unwrap();
+        let opened = || runtime.argvs.lock().unwrap().len();
+        let before = opened();
+        manager.send(&process, PtyInput::Kill).unwrap();
+        until(|| opened() == before + 1).await;
+        assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/pi"]);
+        until(|| manager.list().sessions[0].processes[0].kind == agent(AgentKind::Pi, false)).await;
+        let listed = &manager.list().sessions[0].processes[0];
+        assert_eq!((listed.id.as_str(), listed.exit_code), (process.as_str(), None), "the same process id");
+        let ring = {
+            let state = lock(&manager.state);
+            let output = lock(&state.process(&process).unwrap().output);
+            String::from_utf8_lossy(&output.ring.iter().copied().collect::<Vec<u8>>()).into_owned()
+        };
+        assert!(ring.contains(super::FRESH_NOTICE), "{ring:?}");
+
+        // The fresh start does not resume, so it does not start again.
+        manager.send(&process, PtyInput::Kill).unwrap();
+        until(|| manager.list().sessions[0].processes[0].exit_code == Some(137)).await;
+        assert_eq!(opened(), before + 1);
+
+        // A terminal that did not resume does not start again.
+        let pi = manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
+        let before = opened();
+        manager.send(&pi, PtyInput::Kill).unwrap();
+        until(|| manager.list().sessions[0].processes.iter().any(|p| p.id == pi && p.exit_code == Some(137))).await;
+        assert_eq!(opened(), before);
     }
 
     #[tokio::test]
