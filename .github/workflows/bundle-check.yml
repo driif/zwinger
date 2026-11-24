@@ -33,7 +33,8 @@ jobs:
           xcodebuild -version
           sw_vers
           actool --version --output-format human-readable-text
-          work=$(mktemp -d)
+          # tauri-bundler compiles in a tempfile dir, which is hidden (.tmpXXXXXX).
+          work=$(mktemp -d "${RUNNER_TEMP}/.tmpXXXXXX")
           cp -R src-tauri/icons/zwinger.icon "$work/Icon.icon"
           mkdir "$work/out"
           set +e
