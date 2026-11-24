@@ -8,7 +8,8 @@ the outside into the cage are always blocked.
 
 ## Network policy
 
-The network policy belongs to the cage of a project: the projects of one cage share it. Open it with ⌘4.
+The network policy belongs to the cage of a project: the projects of one cage share it. Open it with ⌘4, or edit it in
+**Cages > Edit** with no project.
 
 - **Default**: Block, Ask or Allow all hosts that no rule names. See [Ask](#ask).
 - **Rules**: each rule names a service of the catalog (for example GitHub or npm, with its domains) or a host, and says

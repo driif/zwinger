@@ -1,10 +1,11 @@
-import { Badge, Button, Card, CardBody, CardHeader, FloatingField } from "@driif/motiv";
+import { Button, Card, CardHeader, FloatingField } from "@driif/motiv";
 import { ArrowLeft, Copy, Pencil, Plus, Settings, Trash2 } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { copyName, createCage, deleteCage, duplicateCage, renameCage } from "./api";
 import { CageSettings, StartDiagnostics } from "./CageSettings";
 import { CageView, SessionView, Workspace } from "../../shared/api";
 import type { Run, Runtimes } from "../../App";
+import { NetworkPolicy } from "../network/NetworkPolicy";
 
 interface Props {
   cages: CageView[];
@@ -24,35 +25,6 @@ function inUse(cage: CageView, sessions: SessionView[], workspaces: Workspace[])
   const workspace = workspaces.find((w) => w.defaultCage === cage.id);
   if (workspace) return `It is the default cage of workspace ${workspace.name}.`;
   if (cage.vms.some((v) => v.status.state !== "stopped" && v.status.state !== "error")) return "Its VM runs.";
-}
-
-/** The network policy of the cage, read-only. The Network tab of a project that uses the cage edits it. */
-function NetworkSummary({ cage }: { cage: CageView }) {
-  const { network } = cage;
-  return (
-    <Card variant="outlined" padding="md">
-      <CardHeader
-        title="Network policy"
-        titleAs="h2"
-        description="Edit it in the Network tab of a project that uses this cage."
-      />
-      <CardBody className="stack">
-        <p>
-          {network.offline ? "Offline: all requests are blocked. " : ""}
-          Hosts with no rule: {network.default === "allow" ? "allowed" : network.default === "ask" ? "ask" : "blocked"}.
-          {network.hostPort ? ` Port ${network.hostPort} of this Mac is open to the cage.` : ""}
-        </p>
-        {network.rules.length === 0 && <p className="muted">No rules.</p>}
-        {network.rules.map((rule) => (
-          <p key={rule.id} className="row">
-            <Badge tone={rule.action === "allow" ? "success" : "danger"}>{rule.action === "allow" ? "Allow" : "Block"}</Badge>
-            <span className="mono grow">{rule.target.kind === "host" ? rule.target.host : rule.target.id}</span>
-            {(rule.credentials?.length ?? 0) > 0 && <span className="muted">{rule.credentials?.map((c) => c.name).join(", ")}</span>}
-          </p>
-        ))}
-      </CardBody>
-    </Card>
-  );
 }
 
 /** The list of cages: create, rename, edit and delete. */
@@ -85,7 +57,7 @@ export function CagesPage({ cages, sessions, workspaces, runtimes, run, editing,
         </header>
         <div className="tab-body">
           <CageSettings key={edited.id} cage={edited} vm={editedVm} runtimes={runtimes} run={run} />
-          <NetworkSummary cage={edited} />
+          <NetworkPolicy key={edited.id} cage={edited} run={run} />
           <StartDiagnostics vm={editedVm} startHistory={editedVm.startHistory} />
         </div>
       </section>

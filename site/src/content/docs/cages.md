@@ -16,10 +16,13 @@ Hypervisor.framework). The VM is the unit of isolation.
 - **Create cage** adds a cage with no mounts, rules or agents.
 - **Rename** changes the name of the cage. The projects keep their names.
 - **Duplicate** adds a copy named "<name> copy" with the mounts, network rules, agents and settings of the cage. The copy
-  has no credential values of its own: set them again in the Network tab of a project that uses the copy. Credentials
+  has no credential values of its own: set them again in **Edit** or in the Network tab of a project that uses the copy. Credentials
   from the [credential library](/network/#shared-credentials) keep their shared value.
-- **Edit** shows the mounts, the agent settings and a read-only summary of the network policy of the cage. Edit the
-  network policy in the **Network** tab of a project that uses the cage.
+- **Edit** shows the mounts, the agent settings and the [network policy](/network/) of the cage. Edit the default,
+  Offline, the service on this Mac, the rules, their methods and credentials, and the profiles here, also when no
+  project uses the cage. A network edit goes to each running VM of the cage and applies to the next request, with no
+  restart. The network test, the requests that wait for an answer and the network activity are in the **Network** tab
+  of a project, because they belong to a running VM.
 - **Delete** removes the cage, its own credential values and the agent state of all its VMs. Values from the
   [credential library](/network/#shared-credentials) stay. A project that kept an own VM
   of the cage after a cage change goes back to the shared VM. You cannot delete a cage that a project uses, that is the
