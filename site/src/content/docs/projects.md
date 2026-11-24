@@ -50,8 +50,8 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   to cancel. An empty name gives a workspace the name "Workspace" again.
 - A menu closes when you select its **…** or chevron button again, press Escape, click outside it, or move the focus
   out of it, for example with Tab. Escape and the button put the focus back on the row or button that opened the menu.
-- **Copy path** in a session menu, a launch menu or the command menu copies the project folder. The copy button after
-  the folder, below the project name, does the same. A short message
+- **Copy path** in a session menu, a launch menu or the command menu copies the project folder. The folder field below
+  the project name shows the folder (point to it to read a long folder in full). Its **Copy** button does the same. A short message
   names the project and the path, and goes away after two seconds. If the copy fails, the error shows instead. A new
   copy removes the message of the earlier copy. Only the result of the last copy shows.
 - **Delete workspace** in the menu of a workspace deletes it. If it has sessions, zwinger asks first. Its sessions

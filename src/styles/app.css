@@ -222,6 +222,7 @@ p {
 /* Row 1: the title, its status dot and the actions. Row 2: the status, the cage and the folder. */
 .page-header {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--motiv-space);
 }
 
@@ -240,8 +241,7 @@ p {
   margin-inline-end: auto;
 }
 
-/* The small icon buttons of the page are one size: the copy button here, the tab menus and the pane actions. */
-.page-meta,
+/* The small icon buttons of the page are one size: the tab menus and the pane actions. */
 .terminal-tab-item,
 .pane-header {
   --motiv-control-height: calc(var(--motiv-space) * 6);
@@ -251,12 +251,14 @@ p {
   gap: var(--motiv-space);
   font-size: var(--motiv-font-size-sm);
   white-space: nowrap;
+  /* CopyField is 13 spaces plus its 2px border high. This space makes it as high as an sm button. */
+  --zw-path-space: calc((var(--motiv-control-height) - 2px) / 13);
 }
 
 .page-path {
+  --motiv-space: var(--zw-path-space);
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  margin-inline-start: var(--zw-gap);
 }
 
 /* The project mark before the title. */

@@ -5,13 +5,12 @@ import {
   CardHeader,
   CopyField,
   ElasticTabs,
-  IconButton,
   FloatingField,
   SegmentedControl,
   SpringCheckbox,
 } from "@driif/motiv";
 import { ActionMenu, SplitButton } from "@driif/motiv/action-menu";
-import { Bot, Copy, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
+import { Bot, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -463,7 +462,7 @@ export function ProjectPage({
                 {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
               </Button>
             </div>
-            <p className="page-meta muted row">
+            <div className="page-meta muted row">
               {!cage && !vmCage ? (
                 "no cage"
               ) : status.state === "error" ? (
@@ -476,10 +475,15 @@ export function ProjectPage({
               {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
               {!cage && vmCage && <span>· no cage</span>}
               {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
-              <span aria-hidden="true">·</span>
-              <span className="page-path mono" title={session.folder}>{tildePath(session.folder, home)}</span>
-              <IconButton size="sm" icon={<Copy size={14} />} label="Copy path" onClick={() => onLaunch(copyPath)} />
-            </p>
+              <CopyField
+                className="page-path mono"
+                value={session.folder}
+                display={tildePath(session.folder, home)}
+                title={session.folder}
+                // The copy action shows the "Copied …" message, as the other Copy path commands do.
+                onCopy={() => onLaunch(copyPath)}
+              />
+            </div>
           </header>
           {adding && detection && cage && (
             <AddAgent
