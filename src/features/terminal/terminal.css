@@ -20,13 +20,48 @@
   padding: 0;
 }
 
-/* The tab menu opens below its tab and covers the panes. */
+/* One tab: the name button and the menu button in one frame, as high as the New button.
+   The tab menu opens below its tab and covers the panes. */
 .terminal-tab-item {
+  --motiv-button-color: var(--motiv-color-text-muted);
+  --motiv-button-bg-hover: transparent;
+  --motiv-button-px: calc(var(--motiv-space) * 2);
   position: relative;
+  box-sizing: border-box;
   display: flex;
   align-items: center;
+  height: calc(var(--motiv-space) * 8);
   min-width: 0;
+  padding-inline-end: var(--motiv-space);
+  border: 1px solid color-mix(in oklch, var(--motiv-color-border) 50%, transparent);
+  border-radius: var(--motiv-radius-sm);
   touch-action: none;
+}
+
+.terminal-tab-item:hover {
+  background: var(--motiv-color-surface-hover);
+}
+
+.terminal-tab-item:has([aria-current]) {
+  --motiv-button-color: var(--motiv-color-text);
+  background: var(--motiv-color-surface);
+  border-color: var(--motiv-color-border);
+}
+
+/* The menu button shows on hover, on focus, on the selected tab and while its menu is open. It keeps its space. */
+.terminal-tab-menu {
+  opacity: 0;
+}
+
+.terminal-tab-item:is(:hover, :focus-within, :has([aria-current], [aria-expanded="true"])) .terminal-tab-menu {
+  opacity: 1;
+}
+
+/* A dormant or exited terminal: a small dot after the name. */
+.terminal-tab-name + .dot {
+  display: inline-block;
+  margin-inline-start: calc(var(--motiv-space) * 1.5);
+  vertical-align: middle;
 }
 
 .terminal-tab-item .action-menu {
@@ -60,7 +95,7 @@
 }
 
 .pane-layout {
-  --zw-pane-header: calc(var(--motiv-space) * 6);
+  --zw-pane-header: var(--motiv-row-height);
   position: relative;
   flex: 1;
   min-height: 0;
@@ -224,8 +259,8 @@
   box-sizing: border-box;
   display: flex;
   align-items: center;
-  gap: var(--motiv-space);
-  padding: 0 var(--motiv-space);
+  gap: calc(var(--motiv-space) * 2);
+  padding: 0 0 0 var(--motiv-space);
   border-bottom: 1px solid var(--motiv-color-border);
   color: var(--motiv-color-text-muted);
   font-size: var(--motiv-font-size-sm);
@@ -263,6 +298,11 @@
 .pane-actions-trigger {
   position: relative;
   z-index: 2;
+}
+
+.pane-actions {
+  display: flex;
+  align-items: center;
 }
 
 .pane-actions-trigger {

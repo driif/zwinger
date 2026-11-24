@@ -50,7 +50,8 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   to cancel. An empty name gives a workspace the name "Workspace" again.
 - A menu closes when you select its **…** or chevron button again, press Escape, click outside it, or move the focus
   out of it, for example with Tab. Escape and the button put the focus back on the row or button that opened the menu.
-- **Copy path** in a session menu, a launch menu or the command menu copies the project folder. A short message
+- **Copy path** in a session menu, a launch menu or the command menu copies the project folder. The copy button after
+  the folder, below the project name, does the same. A short message
   names the project and the path, and goes away after two seconds. If the copy fails, the error shows instead. A new
   copy removes the message of the earlier copy. Only the result of the last copy shows.
 - **Delete workspace** in the menu of a workspace deletes it. If it has sessions, zwinger asks first. Its sessions
@@ -127,15 +128,17 @@ A project has three kinds of terminal:
 | Agent session | In the cage | The [harness folder](/agents/), else the VM shell's folder |
 
 The terminal view of a project has a tab strip above its panes. It shows all terminals of the project, each with the
-icon of its kind, its name or title, its state (dormant or exited) and its [agent status](/agents/#agent-status) glyph.
-The tab of the focused pane is selected.
+icon of its kind, its name or title, a small dot when it is dormant or exited (a red dot for a non-zero exit code;
+point to it to read the state) and its [agent status](/agents/#agent-status) glyph. The tab of the focused pane is
+selected. Its frame and its text show more strongly than the other tabs.
 
 - Click a tab to show its terminal in the focused pane. A terminal that has no pane takes the place of the terminal
   in the focused pane. The replaced terminal continues to run.
 - Drag a tab to change the order. zwinger saves the order. **Move left** and **Move right** in the tab menu do the
   same with the keyboard.
-- The menu of a tab (right-click or the **…** button) has **Open** for a dormant or exited terminal, **Continue last
-  session** for an agent, and **Close**.
+- The menu of a tab (right-click or the **…** button in the tab) has **Open** for a dormant or exited terminal, **Continue last
+  session** for an agent, and **Close**. The **…** button shows on the selected tab, when you point to a tab, and when
+  a tab has the keyboard focus.
 - **New** at the end of the strip opens a new shell or agent.
 
 - A terminal that has no process is **dormant**. This occurs after a cage stop or an app restart. **Open** starts a
@@ -155,7 +158,7 @@ terminal's history; deleting a project removes the history of all its terminals.
 **Close** or the delete shows an error and keeps the terminal or project. Fix the cause, then try again.
 
 A terminal's name is its kind and number, for example "Mac shell 2". When the shell or terminal app sets a window title
-(OSC 0 or OSC 2), the tab and the pane header show that title. The two labels change together. The title stays
+(OSC 0 or OSC 2), the tab shows that title. In a split, the pane header shows it too. The labels change together. The title stays
 with its process: an empty title, an exit, a reopen or a close shows the name again. The actions of the tab and
 the pane keep the name, for example "Actions for Mac shell 2". A long title is shortened to the width of the tab
 or header. Point to the title to read all of it.
@@ -174,12 +177,13 @@ Click a pane header, for example its name or badge, to focus that pane. The keys
 editor commands and pane shortcuts use that pane. The buttons in the header do their own action and do not move the
 focus.
 
-After the name or title, the pane header shows the current folder of the terminal. A Mac folder below your home folder
+The pane header shows the badge and the current folder of the terminal. The tab already names the terminal, so the
+header shows the name or title only when the layout has two or more panes. Assistive technology always reads the name. A Mac folder below your home folder
 starts with `~`. A VM terminal shows its folder in the VM, for example `/workspace/src`. A long folder is shortened in
 the middle. Point to it to read the full path. The folder follows `cd`: a Mac shell's folder comes from macOS, and a
 VM shell's folder comes from the report at each prompt. A new terminal shows its start folder until the first report.
-When the folder is unknown, the header shows no folder. A narrow pane does not show the folder on the screen. Point
-to the name to read the title and the full folder. Assistive technology also reads the full folder.
+When the folder is unknown, the header shows no folder. A narrow pane does not show the folder on the screen. In a
+split, point to the name to read the title and the full folder. Assistive technology also reads the full folder.
 
 To resize panes, drag their divider or press Tab to focus it. Use Left and Right on a vertical divider, or Up and Down
 on a horizontal one. Each arrow press moves the divider by one percent of its split. Home and End move it to the

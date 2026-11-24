@@ -5,12 +5,13 @@ import {
   CardHeader,
   CopyField,
   ElasticTabs,
+  IconButton,
   FloatingField,
   SegmentedControl,
   SpringCheckbox,
 } from "@driif/motiv";
 import { ActionMenu, SplitButton } from "@driif/motiv/action-menu";
-import { Bot, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
+import { Bot, Copy, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -399,83 +400,86 @@ export function ProjectPage({
   const newTerminals = actions.filter((a) => a.type === "session");
   const editorActions = actions.filter((a) => a.type === "editor");
   const defaultEditor = editorActions.find((a) => a.editor.id === ownEditors?.default);
+  const copyPath = actions.find((a) => a.type === "copyPath")!;
 
   return (
     <section className="page" hidden={covered}>
       {!covered && (
         <>
-          <header className="page-header row" style={{ "--zw-project-accent": session.accent ?? undefined } as CSSProperties}>
-            <div className="grow">
+          <header className="page-header" style={{ "--zw-project-accent": session.accent ?? undefined } as CSSProperties}>
+            <div className="page-header-top row">
               <h1 className="page-title project-title">{session.name}</h1>
-              <p className="muted row">
-                <span className={`dot ${status.state}`} />
-                {!cage && !vmCage ? (
-                  "no cage"
-                ) : status.state === "error" ? (
-                  <span className="danger">{status.message}</span>
-                ) : status.state === "starting" ? (
-                  <StartProgress phase={status.phase} />
+              <span className={`dot ${status.state}`} />
+              <SplitButton
+                size="sm"
+                variant="outline"
+                iconLeft={<Laptop size={14} />}
+                onClick={() => onLaunch(newTerminals[0])}
+                menuLabel="New terminal"
+                items={[
+                  ...launchItems(newTerminals, onLaunch),
+                  // Host agents are set up here, next to the agents that they add.
+                  ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
+                    label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+                    onSelect: () => onAdding(agent.kind),
+                  })),
+                ]}
+              >
+                New terminal
+              </SplitButton>
+              <Button size="sm" variant="ghost" iconLeft={<ListChecks size={14} />} onClick={() => jump("tasks")}>
+                Tasks {session.tasks.length > 0 && <span className="muted">{session.tasks.length}</span>}
+              </Button>
+              {editors &&
+                (defaultEditor ? (
+                  <SplitButton
+                    size="sm"
+                    variant="outline"
+                    iconLeft={<EditorIcon icon={defaultEditor.editor.icon} />}
+                    onClick={onOpenDefaultEditor}
+                    menuLabel="Editors"
+                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                  >
+                    Open in {defaultEditor.editor.name}
+                  </SplitButton>
                 ) : (
-                  status.state
-                )}
-                {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
-                {!cage && vmCage && <span>· no cage</span>}
-                {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
-              </p>
-              <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
+                  // A SplitButton disables its menu with its main action, so with no editor only the menu shows.
+                  <ActionMenu
+                    size="sm"
+                    variant="outline"
+                    label="No editor"
+                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                  />
+                ))}
+              <Button
+                size="sm"
+                variant={running ? "secondary" : "primary"}
+                iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
+                loading={status.state === "stopping"}
+                disabled={(!cage && !running) || status.state === "starting"}
+                title={cage || running ? undefined : "This project has no cage."}
+                onClick={onToggle}
+              >
+                {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
+              </Button>
             </div>
-            <SplitButton
-              size="sm"
-              variant="outline"
-              iconLeft={<Laptop size={14} />}
-              onClick={() => onLaunch(newTerminals[0])}
-              menuLabel="New terminal"
-              items={[
-                ...launchItems(newTerminals, onLaunch),
-                // Host agents are set up here, next to the agents that they add.
-                ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
-                  label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
-                  onSelect: () => onAdding(agent.kind),
-                })),
-              ]}
-            >
-              New terminal
-            </SplitButton>
-            <Button size="sm" variant="ghost" iconLeft={<ListChecks size={14} />} onClick={() => jump("tasks")}>
-              Tasks {session.tasks.length > 0 && <span className="muted">{session.tasks.length}</span>}
-            </Button>
-            {editors &&
-              (defaultEditor ? (
-                <SplitButton
-                  size="sm"
-                  variant="outline"
-                  iconLeft={<EditorIcon icon={defaultEditor.editor.icon} />}
-                  onClick={onOpenDefaultEditor}
-                  menuLabel="Editors"
-                  items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
-                >
-                  Open in {defaultEditor.editor.name}
-                </SplitButton>
+            <p className="page-meta muted row">
+              {!cage && !vmCage ? (
+                "no cage"
+              ) : status.state === "error" ? (
+                <span className="danger">{status.message}</span>
+              ) : status.state === "starting" ? (
+                <StartProgress phase={status.phase} />
               ) : (
-                // A SplitButton disables its menu with its main action, so with no editor only the menu shows.
-                <ActionMenu
-                  size="sm"
-                  variant="outline"
-                  label="No editor"
-                  items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
-                />
-              ))}
-            <Button
-              size="sm"
-              variant={running ? "secondary" : "primary"}
-              iconLeft={status.state === "starting" ? undefined : running ? <Square size={14} /> : <Play size={14} />}
-              loading={status.state === "stopping"}
-              disabled={(!cage && !running) || status.state === "starting"}
-              title={cage || running ? undefined : "This project has no cage."}
-              onClick={onToggle}
-            >
-              {status.state === "starting" ? <StartProgress phase={status.phase} /> : running ? "Stop cage" : "Start cage"}
-            </Button>
+                status.state
+              )}
+              {cage && <span>· cage {cage.name}{session.effectiveCage?.inherited ? " (inherited)" : ""}</span>}
+              {!cage && vmCage && <span>· no cage</span>}
+              {status.state === "running" && vmCage?.loginExpiresAt != null && <span>· login valid until {time(vmCage.loginExpiresAt)}</span>}
+              <span aria-hidden="true">·</span>
+              <span className="page-path mono" title={session.folder}>{tildePath(session.folder, home)}</span>
+              <IconButton size="sm" icon={<Copy size={14} />} label="Copy path" onClick={() => onLaunch(copyPath)} />
+            </p>
           </header>
           {adding && detection && cage && (
             <AddAgent

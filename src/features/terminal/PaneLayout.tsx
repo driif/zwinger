@@ -1,9 +1,9 @@
-import { Badge, Button, Dialog, IconButton, IconButtonGroup, Splitter } from "@driif/motiv";
+import { Badge, Button, Dialog, IconButton, Splitter } from "@driif/motiv";
 import { Code, Columns2, Ellipsis, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
-import { KindIcon, paneName } from "./labels";
+import { paneName } from "./labels";
 import { StartProgress } from "../projects/StartProgress";
 import { place, Rect, setRatio } from "./panes";
 import { folderLabel } from "./folders";
@@ -273,10 +273,10 @@ export function PaneLayout({
               setFocusRequest((n) => n + 1);
             }}
           >
-            <KindIcon kind={pane.kind} />
-            <Badge>{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>
+            <Badge size="sm">{pane.kind.type === "host" || pane.kind.type === "hostAgent" ? "Mac" : "VM"}</Badge>
             <span className="grow pane-label">
-              <span className="pane-name" title={pane.folder ? `${title || name}\n${pane.folder.path}` : title}>
+              {/* The tab already names a single pane. A split names each pane. */}
+              <span className={places.length > 1 ? "pane-name" : "sr-only"} title={pane.folder ? `${title || name}\n${pane.folder.path}` : title}>
                 {title || name}
               </span>
               {pane.folder && (
@@ -286,9 +286,9 @@ export function PaneLayout({
                 </span>
               )}
             </span>
-            <IconButtonGroup size="sm" className="pane-actions" label={`Actions for ${name}`}>
-              {actions.map((action) => <IconButton key={action.label} label={action.label} icon={action.icon} onClick={action.run} />)}
-            </IconButtonGroup>
+            <div role="group" className="pane-actions" aria-label={`Actions for ${name}`}>
+              {actions.map((action) => <IconButton key={action.label} size="sm" label={action.label} icon={action.icon} onClick={action.run} />)}
+            </div>
             <IconButton
               size="sm"
               className="pane-actions-trigger"

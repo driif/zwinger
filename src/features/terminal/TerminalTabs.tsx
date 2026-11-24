@@ -78,19 +78,20 @@ export function TerminalTabs({ session, panes, selected, newItems, onShow, onReo
                 >
                   <Button
                     size="sm"
-                    variant={pane.key === selected ? "secondary" : "ghost"}
+                    variant="ghost"
                     iconLeft={<KindIcon kind={kind} />}
                     aria-current={pane.key === selected || undefined}
                     title={hasCage ? `${name}: this session has a cage, so an agent with no cage does not open in it.` : liveName}
                     onClick={() => onShow(pane.key)}
                   >
                     <span className="terminal-tab-name">{liveName}</span>
-                    {state && <span className="muted"> · {state}</span>}
+                    {state && <span className={process?.exitCode ? "dot error" : "dot"} role="img" aria-label={state} title={state} />}
                     {hasCage && <span className="danger"> · the session has a cage</span>}
                   </Button>
                   <AgentStatusGlyph state={process?.exitCode === null ? process.agent : null} />
                   <IconButton
                     size="sm"
+                    className="terminal-tab-menu"
                     icon={<Ellipsis size={12} />}
                     label={`Actions for ${name}`}
                     aria-haspopup="menu"

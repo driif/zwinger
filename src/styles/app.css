@@ -219,6 +219,46 @@ p {
   font-size: var(--motiv-font-size-lg);
 }
 
+/* Row 1: the title, its status dot and the actions. Row 2: the status, the cage and the folder. */
+.page-header {
+  display: grid;
+  gap: var(--motiv-space);
+}
+
+.page-header-top {
+  flex-wrap: wrap;
+}
+
+.page-header-top .page-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-header-top > .dot {
+  margin-inline-end: auto;
+}
+
+/* The small icon buttons of the page are one size: the copy button here, the tab menus and the pane actions. */
+.page-meta,
+.terminal-tab-item,
+.pane-header {
+  --motiv-control-height: calc(var(--motiv-space) * 6);
+}
+
+.page-meta {
+  gap: var(--motiv-space);
+  font-size: var(--motiv-font-size-sm);
+  white-space: nowrap;
+}
+
+.page-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* The project mark before the title. */
 .project-title::before {
   content: "";
