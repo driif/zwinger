@@ -41,9 +41,13 @@
   color: var(--motiv-color-text-muted);
 }
 
+/* The motiv focus ring is a box-shadow, so it goes on the node card, not on `outline`. */
 .map .react-flow__node:focus-visible {
-  outline: var(--motiv-focus-ring);
-  border-radius: var(--motiv-radius-md);
+  outline: none;
+}
+
+.map .react-flow__node:focus-visible > :is(.map-node, .map-boundary) {
+  box-shadow: var(--motiv-focus-ring);
 }
 
 .map .react-flow__edge.blocked path {

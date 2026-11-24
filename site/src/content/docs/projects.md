@@ -295,7 +295,7 @@ the selected app. IntelliJ IDEA, WebStorm, RustRover, PyCharm and GoLand open it
 ## Map
 
 The project overview (⌘1) shows a map of the project: the folders, the mounts, the hosts and the agent profiles. You
-can drag the nodes. zwinger saves their positions. **Reset layout** in the toolbar above the canvas clears them.
+can drag the nodes. zwinger saves their positions. Press Tab to move the keyboard focus to a node; a ring marks it. **Reset layout** in the toolbar above the canvas clears them.
 
 To add a mount, drag from **New folder from this Mac** to the handle on the left edge of the cage boundary.
 The folder picker opens in Settings. Choose a folder on your Mac, then review its host folder, guest path and access.
