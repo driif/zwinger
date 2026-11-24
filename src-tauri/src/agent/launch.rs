@@ -357,6 +357,9 @@ fn codex_hooks() -> String {
     let hooks = serde_json::json!({
         "UserPromptSubmit": [{ "hooks": hook("active") }],
         "PermissionRequest": [{ "hooks": hook("blocked") }],
+        // `request_user_input` asks the user questions and waits for the answers.
+        // Its `PostToolUse` comes after the answers.
+        "PreToolUse": [{ "matcher": "^request_user_input$", "hooks": hook("blocked") }],
         // After the user approves a permission, the tool runs.
         "PostToolUse": [{ "hooks": hook("active") }],
         "Stop": [{ "hooks": hook("done") }],
@@ -372,6 +375,8 @@ fn codex_hooks() -> String {
 fn gemini_status() -> String {
     let hooks = serde_json::json!({
         "BeforeAgent": [{ "hooks": hook("active") }],
+        // `ask_user` asks the user questions and waits for the answers.
+        "BeforeTool": [{ "matcher": "^ask_user$", "hooks": hook("blocked") }],
         "Notification": [{ "matcher": "ToolPermission", "hooks": hook("blocked") }],
         // After the user approves a permission, the tool runs.
         "AfterTool": [{ "hooks": hook("active") }],
@@ -381,17 +386,38 @@ fn gemini_status() -> String {
     serde_json::to_string_pretty(&settings).expect("JSON")
 }
 
-/// A pi extension. pi asks for no permissions, so it is never blocked.
+/// A pi extension. pi asks for no permissions, but an extension can ask the
+/// user in a dialog. A custom component is not a sure question: it also
+/// shows loaders and other UI that waits for nothing.
 fn pi_status() -> String {
     format!(
         "// zwinger writes this file at each cage start.\n\
-         import {{ writeFileSync }} from \"node:fs\";\n\
-         const status = (state) => {{\n  \
-           try {{\n    writeFileSync(\"/dev/tty\", `\\x1b{}${{state}}\\x07`);\n  }} catch {{}}\n\
+         import {{ appendFileSync }} from \"node:fs\";\n\
+         const tty = process.env.{TTY_ENV};\n\
+         const write = (state) => {{\n  \
+           if (!tty) return;\n  \
+           try {{\n    appendFileSync(tty, `\\x1b{}${{state}}\\x07`);\n  }} catch {{}}\n\
+         }};\n\
+         const asks = new Set([\"select\", \"confirm\", \"input\", \"editor\"]);\n\
+         let state = \"{NO_STATE}\";\n\
+         let asking = false;\n\
+         const report = (next) => {{\n  \
+           state = next;\n  \
+           if (!asking) write(state);\n\
          }};\n\
          export default function (pi) {{\n  \
-           pi.on(\"agent_start\", () => status(\"active\"));\n  \
-           pi.on(\"agent_settled\", () => status(\"done\"));\n\
+           pi.on(\"agent_start\", () => report(\"active\"));\n  \
+           pi.on(\"agent_settled\", () => report(\"done\"));\n  \
+           pi.on(\"ui_prompt_start\", (event) => {{\n    \
+             if (!asks.has(event.kind)) return;\n    \
+             asking = true;\n    \
+             write(\"blocked\");\n  \
+           }});\n  \
+           pi.on(\"ui_prompt_end\", () => {{\n    \
+             if (!asking) return;\n    \
+             asking = false;\n    \
+             write(state);\n  \
+           }});\n\
          }}\n",
         agent_osc()
     )
@@ -2175,7 +2201,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join(CLAUDE_STATUS)).unwrap()).unwrap();
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{BIN_DIR}/{STATUS} done"));
         let pi = std::fs::read_to_string(dir.join(PI_STATUS)).unwrap();
-        assert!(pi.contains("agent_start") && pi.contains("agent_settled"));
+        assert!(pi.contains("agent_start") && pi.contains("agent_settled") && pi.contains("ui_prompt_start"));
         write(&dir, &[AgentKind::Claude], bare(), false).unwrap();
         assert!(!std::fs::read_to_string(dir.join("claude")).unwrap().contains("dangerously"));
         let empty = crate::test_dir::root().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
@@ -2231,21 +2257,75 @@ mod tests {
         for (event, name) in [
             ("UserPromptSubmit", "active"),
             ("PermissionRequest", "blocked"),
+            ("PreToolUse", "blocked"),
             ("PostToolUse", "active"),
             ("Stop", "done"),
             ("Interrupt", "done"),
         ] {
             assert_eq!(codex[event][0]["hooks"][0]["command"], state(name), "{event}");
         }
+        // Only a question blocks; each other tool runs.
+        assert_eq!(codex["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(codex["PreToolUse"][0]["matcher"], "^request_user_input$");
         let gemini: serde_json::Value = serde_json::from_str(&gemini_status()).unwrap();
         assert_eq!(gemini["hooksConfig"]["notifications"], false);
         let hooks = &gemini["hooks"];
-        for (event, name) in
-            [("BeforeAgent", "active"), ("Notification", "blocked"), ("AfterTool", "active"), ("AfterAgent", "done")]
-        {
+        for (event, name) in [
+            ("BeforeAgent", "active"),
+            ("BeforeTool", "blocked"),
+            ("Notification", "blocked"),
+            ("AfterTool", "active"),
+            ("AfterAgent", "done"),
+        ] {
             assert_eq!(hooks[event][0]["hooks"][0]["command"], state(name), "{event}");
         }
         assert_eq!(hooks["Notification"][0]["matcher"], "ToolPermission");
+        assert_eq!(hooks["BeforeTool"].as_array().unwrap().len(), 1);
+        assert_eq!(hooks["BeforeTool"][0]["matcher"], "^ask_user$");
+    }
+
+    #[test]
+    fn pi_status_blocks_on_a_dialog_and_writes_only_to_the_wrapper_terminal() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("skipped: no node");
+            return;
+        }
+        let root = Temp::new("pi-status");
+        let extension = root.path("pi-status.mjs");
+        std::fs::write(&extension, pi_status()).unwrap();
+        let tty = root.path("tty");
+        // A fake pi that sends the events in order.
+        let driver = format!(
+            "const handlers = {{}};\n\
+             const pi = {{ on: (name, handler) => {{ handlers[name] = handler; }} }};\n\
+             (await import({:?})).default(pi);\n\
+             for (const [name, kind] of JSON.parse(process.argv[1])) handlers[name]({{ kind }});\n",
+            format!("file://{extension}")
+        );
+        let run = |env: Option<&str>, events: &str| {
+            let mut command = std::process::Command::new("node");
+            command.env_remove(TTY_ENV).arg("--input-type=module").arg("-e").arg(&driver).arg(events);
+            if let Some(env) = env {
+                command.env(TTY_ENV, env);
+            }
+            let out = command.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let written = std::fs::read(&tty).unwrap_or_default();
+            let _ = std::fs::remove_file(&tty);
+            String::from_utf8(written).unwrap()
+        };
+        let osc = |states: &[&str]| states.iter().map(|s| format!("\x1b{}{s}\x07", agent_osc())).collect::<String>();
+        let events = r#"[["agent_start"],["ui_prompt_start","select"],["ui_prompt_end","select"],
+            ["ui_prompt_start","custom"],["ui_prompt_end","custom"],["agent_settled"]]"#;
+        assert_eq!(run(Some(&tty), events), osc(&["active", "blocked", "active", "done"]));
+        // A state change during a dialog shows after it.
+        let events = r#"[["ui_prompt_start","confirm"],["agent_settled"],["ui_prompt_end","confirm"]]"#;
+        assert_eq!(run(Some(&tty), events), osc(&["blocked", "done"]));
+        // A dialog before the first run clears the state after it.
+        let events = r#"[["ui_prompt_start","input"],["ui_prompt_end","input"]]"#;
+        assert_eq!(run(Some(&tty), events), osc(&["blocked", NO_STATE]));
+        // With no terminal from the wrapper, it writes nothing.
+        assert_eq!(run(None, r#"[["agent_start"],["ui_prompt_start","select"]]"#), "");
     }
 
     #[test]

@@ -79,13 +79,17 @@ the number of blocked agents. The badge goes when you bring the zwinger window t
 For interactive terminals, zwinger adds status hooks to each agent. The hooks write status signals to the terminal;
 they do not change your agent settings or a read-only agent profile:
 
-- **Claude Code** reports all three states.
+- **Claude Code** reports all three states. It is blocked on a permission prompt and on a question
+  (`AskUserQuestion`).
 - **Codex** reports all three states. Its hooks are in `/etc/codex/hooks.json` in the VM, as system hooks, so Codex
   does not ask you to trust them. If the VM image has its own `/etc/codex/hooks.json`, zwinger keeps it, and Codex
-  reports no status. With **Agents run without permission prompts** on, Codex never asks, so it is never blocked.
+  reports no status. It is blocked on a permission prompt and on a question (`request_user_input`). With **Agents
+  run without permission prompts** on, Codex never asks for a permission, but it can still ask a question.
 - **Gemini CLI** reports all three states. Its hooks are in a system defaults file, so your own Gemini settings win
-  and your own hooks run too. Gemini CLI runs hooks only in a trusted folder.
-- **Pi** reports active and done; it does not report blocked.
+  and your own hooks run too. Gemini CLI runs hooks only in a trusted folder. It is blocked on a permission prompt
+  and on a question (`ask_user`).
+- **Pi** reports all three states. It asks for no permissions; it is blocked while an extension dialog (select,
+  confirm, input or editor) waits for you. A custom extension screen does not show blocked.
 - **Antigravity CLI** reports no status. Its tab shows no glyph.
 
 A headless call, such as `claude -p`, `codex exec`, `gemini -p` or `agy -p`, reports no status. An agent with no cage shows no
