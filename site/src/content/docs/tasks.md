@@ -158,7 +158,7 @@ also when the cage is stopped. A cancelled stage saves no diff. If git fails aft
 diff says so and keeps the last saved diff. For a run with no saved diff, the room reads the working dir if the cage runs.
 Show the diff reads the working dir that the run recorded when it started, not the current working dir of the task.
 
-A cage stop cancels its runs.
+A cage stop cancels its runs. The stop asks first and names the runs that it cancels.
 
 ## Commit or open a PR
 

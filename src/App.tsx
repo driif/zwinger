@@ -983,46 +983,42 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     },
     stop: (sessionId) =>
       confirmShared(
-        (others) => `Its VM also runs ${others}: their VM terminals and running tasks end.`,
+        (shared, others) =>
+          `Stop cage ${shared.cage}? ${others ? `Its VM also runs ${others}: their VM terminals and running tasks end.` : "Its VM terminals end."}`,
         "Stop",
         (confirmed) => stopCage(sessionId, confirmed),
       ),
-    async setOwn(sessionId, own) {
-      const target = joined.find((j) => j.session.id === sessionId);
-      const name = target?.session.name ?? "this project";
-      const change = () =>
-        confirmShared(
-          (others) => `It restarts without ${name}. The terminals of ${others} reopen; their running tasks are cancelled.`,
-          "Restart",
-          (confirmed) => setSessionVm(sessionId, own, confirmed).finally(pullNotices),
-        );
-      // A VM with other members asks in `change`.
-      if (target?.vmCage?.status.state === "running" && target.vmCage.members.length <= 1)
-        await confirmFirst(
-          `Stop the VM of ${name}? Its VM terminals and running tasks end. Its next start uses ${own ? "a VM of its own" : "the shared VM of its cage"}.`,
-          "Stop",
-          change,
-        );
-      else await change();
+    setOwn(sessionId, own) {
+      const name = joined.find((j) => j.session.id === sessionId)?.session.name ?? "this project";
+      return confirmShared(
+        (shared, others) =>
+          others
+            ? `Restart cage ${shared.cage}? It restarts without ${name}. The terminals of ${others} reopen; their running tasks are cancelled.`
+            : `Stop the VM of ${name}? Its VM terminals and running tasks end. Its next start uses ${own ? "a VM of its own" : "the shared VM of its cage"}.`,
+        (shared) => (shared.members.length > 0 ? "Restart" : "Stop"),
+        (confirmed) => setSessionVm(sessionId, own, confirmed).finally(pullNotices),
+      );
     },
   };
 
   /**
-   * Runs `act` on a session's VM. A VM with other members refuses with `StopShared`: the user confirms `say` of them,
-   * then `act` runs again with what the user saw.
+   * Runs `act` on a session's VM. A VM with other members refuses with `StopShared`, and a VM with the session alone
+   * can refuse with `StopAlone` (members empty): the user confirms `say` with the tasks that it cancels, then `act` runs
+   * again with what the user saw.
    */
   async function confirmShared(
-    say: (others: string) => string,
-    verb: "Stop" | "Restart",
+    say: (shared: StopShared, others: string) => string,
+    verb: "Stop" | "Restart" | ((shared: StopShared) => string),
     act: (confirmed: StopShared | null) => Promise<void>,
   ) {
     try {
       await act(null);
     } catch (e) {
-      const shared = errorDetail<StopShared>(e, "StopShared");
+      const shared = errorDetail<StopShared>(e, "StopShared") ?? errorDetail<StopShared>(e, "StopAlone");
       if (!shared) throw e;
       const others = shared.members.map((m) => m.name).join(", ");
-      await confirmFirst(`${verb} cage ${shared.cage}? ${say(others)}${cancels(shared.tasks)}`, verb, () => act(shared));
+      const confirm = typeof verb === "string" ? verb : verb(shared);
+      await confirmFirst(`${say(shared, others)}${cancels(shared.tasks)}`, confirm, () => act(shared));
     }
   }
 
@@ -1045,7 +1041,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       target && cageChanged(target)
         ? vm.stop(sessionId).then(() => vm.start(sessionId))
         : confirmShared(
-            (others) => `Its VM also runs ${others}: their terminals reopen; their running tasks are cancelled.`,
+            (shared, others) =>
+              `Restart cage ${shared.cage}? ${others ? `Its VM also runs ${others}: their terminals reopen; their running tasks are cancelled.` : "Its terminals reopen."}`,
             "Restart",
             (confirmed) => restartCage(sessionId, confirmed).finally(pullNotices),
           ),

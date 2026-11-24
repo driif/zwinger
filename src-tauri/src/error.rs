@@ -140,6 +140,8 @@ pub enum Error {
     RestartToAdd { cage: String, members: Vec<Member>, tasks: Vec<String>, generation: u64 },
     #[error("cage {cage} also runs for {}; a stop ends their VM terminals and task runs", names(.members))]
     StopShared { cage: String, members: Vec<Member>, tasks: Vec<String>, generation: u64 },
+    #[error("a stop of cage {cage} ends the VM terminals and the task runs of this session")]
+    StopAlone { cage: String, tasks: Vec<String>, generation: u64 },
     #[error("the sessions of the VM changed; look at them and try again")]
     StaleRestart,
     #[error("this session has a cage, so an agent with no cage does not open in it; open the agent in the cage")]
@@ -369,6 +371,10 @@ impl Serialize for Error {
                 "detail",
                 &serde_json::json!({ "cage": cage, "members": members, "tasks": tasks, "generation": generation }),
             )?,
+            Error::StopAlone { cage, tasks, generation } => map.serialize_entry(
+                "detail",
+                &serde_json::json!({ "cage": cage, "members": [], "tasks": tasks, "generation": generation }),
+            )?,
             _ => {}
         }
         map.end()
@@ -430,6 +436,19 @@ mod tests {
                     "generation": 4,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn a_stop_alone_has_no_members() {
+        assert_eq!(
+            serde_json::to_value(Error::StopAlone {
+                cage: "c".into(),
+                tasks: vec!["Fix login in A".into()],
+                generation: 2
+            })
+            .unwrap()["detail"],
+            json!({ "cage": "c", "members": [], "tasks": ["Fix login in A"], "generation": 2 })
         );
     }
 

@@ -153,7 +153,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 Vm::Stopping { .. } => return Err(Error::Stopping),
                 Vm::Failed { .. } => return Err(Error::NotRunning),
             };
-            confirm_stop(&state, &self.runs, generation, applied, session_id, confirmed)?;
+            confirm_stop(&state, &self.runs, generation, applied, session_id, confirmed, Alone::Tasks)?;
             let cage = state.cage(&applied.1.id)?.clone();
             let wanted = ids(&applied.0);
             let members = members_of(&state, &wanted, key);
@@ -911,7 +911,7 @@ impl<R: SandboxRuntime> Manager<R> {
             };
             match vm {
                 Vm::Running { generation, applied, .. } => {
-                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed)?;
+                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed, Alone::Tasks)?;
                     (key.to_owned(), *generation)
                 }
                 Vm::Starting { .. } => return Err(Error::Starting),
@@ -925,7 +925,8 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Puts the session in a VM of its own (`own`), or back in the shared VM
     /// of its effective cage, and saves the choice. A new own VM gets a new
     /// key with an empty state; a released own VM loses its state. A VM that
-    /// runs with the session alone stops first. A VM with other members
+    /// runs with the session alone stops first, after a confirmation
+    /// ([`Error::StopAlone`]). A VM with other members
     /// restarts without the session after the save; it needs a confirmation
     /// as for [`Manager::stop`]. The new VM starts with the next start. A
     /// released state that cannot be deleted gives [`Error::VmStateLeft`]
@@ -943,7 +944,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             match state.vm_of(session_id) {
                 Some((key, Vm::Running { generation, applied, .. })) => {
-                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed)?;
+                    confirm_stop(&state, &self.runs, *generation, applied, session_id, confirmed, Alone::Always)?;
                     let others: Vec<String> = ids(&applied.0).into_iter().filter(|id| id != session_id).collect();
                     Some((key.to_owned(), *generation, others))
                 }
@@ -1166,9 +1167,18 @@ pub struct Confirmed {
     pub generation: u64,
 }
 
+/// When a stop of a VM with no other members needs a confirmation.
+#[derive(Clone, Copy)]
+enum Alone {
+    /// Only while the session has running tasks, which the stop cancels.
+    Tasks,
+    /// Always: the change also loses the VM.
+    Always,
+}
+
 /// A stop of the running VM `generation` for `session_id`. With other
 /// members, it needs a confirmation of this VM and these members, compared
-/// as a set.
+/// as a set; with none, as `alone` says, with [`Error::StopAlone`].
 fn confirm_stop<V>(
     state: &State<V>,
     runs: &Registry,
@@ -1176,22 +1186,22 @@ fn confirm_stop<V>(
     applied: &(Vec<Session>, Cage),
     session_id: &str,
     confirmed: Option<&Confirmed>,
+    alone: Alone,
 ) -> Result<()> {
     let others: Vec<String> = applied.0.iter().filter(|m| m.id != session_id).map(|m| m.id.clone()).collect();
-    match confirmed {
-        Some(c) => {
-            let seen: HashSet<&String> = c.members.iter().collect();
-            if c.generation != generation || seen != others.iter().collect() {
-                return Err(Error::StaleRestart);
-            }
-            Ok(())
+    if let Some(c) = confirmed {
+        let seen: HashSet<&String> = c.members.iter().collect();
+        if c.generation != generation || seen != others.iter().collect() {
+            return Err(Error::StaleRestart);
         }
-        None if others.is_empty() => Ok(()),
-        None => {
-            let cage = state.cage(&applied.1.id).map_or_else(|_| applied.1.name.clone(), |c| c.name.clone());
-            let tasks = running_tasks(state, runs, &ids(&applied.0));
-            Err(Error::StopShared { cage, members: state.members(others), tasks, generation })
-        }
+        return Ok(());
+    }
+    let tasks = running_tasks(state, runs, &ids(&applied.0));
+    let cage = state.cage(&applied.1.id).map_or_else(|_| applied.1.name.clone(), |c| c.name.clone());
+    match alone {
+        _ if !others.is_empty() => Err(Error::StopShared { cage, members: state.members(others), tasks, generation }),
+        Alone::Tasks if tasks.is_empty() => Ok(()),
+        _ => Err(Error::StopAlone { cage, tasks, generation }),
     }
 }
 

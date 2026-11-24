@@ -1004,7 +1004,14 @@ mod tests {
         })
         .await
         .unwrap();
-        manager.stop(&id, None).await.unwrap();
+        // A stop of a VM with one session names the task runs that it cancels.
+        let Err(Error::StopAlone { tasks, generation, .. }) = manager.stop(&id, None).await else {
+            panic!("a stop that cancels a task run asks first");
+        };
+        let name = manager.list().sessions.into_iter().find(|s| s.session.id == id).unwrap().session.name;
+        assert_eq!(tasks, [format!("Fix in {name}")]);
+        let confirmed = crate::cage::lifecycle::Confirmed { members: vec![], generation };
+        manager.stop(&id, Some(&confirmed)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), handle.settled()).await.unwrap();
         let round = manager.task_dir(&id, "fix").join("01");
         assert!(std::fs::read_to_string(round.join("events.jsonl")).unwrap().contains("the cage stopped"));

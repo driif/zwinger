@@ -60,7 +60,10 @@ export interface RestartToAdd {
   generation: number;
 }
 
-/** The `detail` of `StopShared`: the VM `generation` also runs for these other sessions. */
+/**
+ * The `detail` of `StopShared`: the VM `generation` also runs for these other sessions. `StopAlone` has the same
+ * detail with no members: the VM runs for the session alone.
+ */
 export interface StopShared {
   cage: string;
   members: Member[];

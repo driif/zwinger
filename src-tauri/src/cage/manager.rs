@@ -2991,7 +2991,11 @@ mod tests {
         // Back to the shared VM: the own VM stops and its state goes.
         manager.start(&b).await.unwrap();
         assert!(manager.state_dir(&own).unwrap().is_dir());
-        manager.set_session_vm(&b, false, None).await.unwrap();
+        let Err(Error::StopAlone { tasks, generation, .. }) = manager.set_session_vm(&b, false, None).await else {
+            panic!("a switch out of a VM with one session asks first");
+        };
+        assert!(tasks.is_empty());
+        manager.set_session_vm(&b, false, Some(&Confirmed { members: vec![], generation })).await.unwrap();
         assert!(!manager.state_dir(&own).unwrap().exists());
         assert_eq!(vm_key(&manager, &b), Some(shared.clone()));
         assert_eq!(vm_states(&manager, &shared), [(shared, Status::Running)]);
