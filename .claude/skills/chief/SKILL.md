@@ -11,7 +11,7 @@ Go to the user only for a product decision that the code does not answer, or for
 ## Loop
 
 1. **Pick.** User reports first (`gh issue list --label bug`). Then a bug in a main flow (project, cage start, terminal, agent, task run) goes first.
-   Then tickets by value to the user, not by number. Close tickets that are superseded or of low value, with a one-line reason.
+   Then issues with the label `next`, then other tickets by value to the user, not by number. Close tickets that are superseded or of low value, with a one-line reason.
 2. **Brief.** Write a short brief in the subagent prompt: the issue text, the files to start from, the done criteria.
    Quote the lines of `CONTEXT.md`, the ADRs and `docs/designs/` that the ticket touches. No quote means it touches none.
    Do not write preflight reports, proof receipts or hash records.
