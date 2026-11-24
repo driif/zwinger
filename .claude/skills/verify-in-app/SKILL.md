@@ -15,4 +15,4 @@ Only the orchestrator runs this, in the main tree.
 5. Check the look: one control height per row, one left edge, one font scale, the same as the screens next to it.
 6. Stop the dev server and its children. Report each fault as a bug. A fault goes before any ticket.
 
-If the app cannot be driven (no window access), say so in the report. Do not claim that it was seen working.
+If the screenshot is black, the terminal app has no Screen Recording permission (System Settings > Privacy & Security). Ask the user once to grant it. Until then, say in the report that the app was not seen. Do not claim that it was seen working.
