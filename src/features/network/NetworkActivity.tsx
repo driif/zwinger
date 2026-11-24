@@ -1,10 +1,11 @@
-import { Button, Card, CardBody, CardHeader, FilterChips } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, FilterChips, FloatingField } from "@driif/motiv";
 import { Ban, Check, Download, KeyRound, Play, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { exportNetEvents, NetEvent, putRule, Service, setHostPort, wildcardFor } from "./api";
 import { Action, CageView, Target } from "../../shared/api";
 import type { Run } from "../../App";
 import { decide, serviceFor } from "./network";
+import { ActivityFilter, ActivityGroup, groupActivity } from "./activity";
 
 const FILTERS = [
   { value: "all", label: "All" },
@@ -28,15 +29,6 @@ const reasonText = (reason: string) =>
     ? `rule ${reason.slice("rule:".length)}`
     : (REASONS[reason] ?? reason);
 
-interface Group {
-  /** The host, with its port for the gateway name of this Mac. */
-  key: string;
-  host: string;
-  count: number;
-  last: NetEvent;
-  credentials: string[];
-}
-
 interface Props {
   /** The effective cage: a rule that the view adds goes to it. `null`: the view adds no rules. */
   cage: CageView | null;
@@ -52,30 +44,12 @@ interface Props {
 }
 
 export function NetworkActivity({ cage, vmKey, running, events, catalog, onStart, run }: Props) {
-  const [filter, setFilter] = useState("all");
+  const [filter, setFilter] = useState<ActivityFilter>("all");
+  const [search, setSearch] = useState("");
   // Per host: the wildcard, `null` if there is none. A host that is not here is still loading.
   const [wildcards, setWildcards] = useState<Record<string, string | null>>({});
 
-  const groups = new Map<string, Group>();
-  for (const event of events) {
-    if (filter !== "all" && event.allowed !== (filter === "allowed")) continue;
-    const key =
-      event.port === undefined ? event.host : `${event.host}:${event.port}`;
-    const group = groups.get(key) ?? {
-      key,
-      host: event.host,
-      count: 0,
-      last: event,
-      credentials: [],
-    };
-    group.count += 1;
-    group.last = event;
-    group.credentials = [
-      ...new Set([...group.credentials, ...event.credentials]),
-    ];
-    groups.set(key, group);
-  }
-  const shown = [...groups.values()].sort((a, b) => b.last.at - a.last.at);
+  const shown = groupActivity(events, filter, search);
   const missing = shown
     .filter((g) => g.last.port === undefined)
     .map((g) => g.host)
@@ -93,7 +67,7 @@ export function NetworkActivity({ cage, vmKey, running, events, catalog, onStart
     );
   }, [missing]);
 
-  function actions({ host, last }: Group) {
+  function actions({ host, last }: ActivityGroup) {
     if (!cage) return null;
     // The gateway name of this Mac takes no rule: only the host port grant opens it.
     if (last.port !== undefined)
@@ -186,12 +160,28 @@ export function NetworkActivity({ cage, vmKey, running, events, catalog, onStart
           options={FILTERS}
           value={[filter]}
           onChange={(selected) =>
-            setFilter(selected.find((f) => f !== filter) ?? "all")
+            setFilter((selected.find((f) => f !== filter) ?? "all") as ActivityFilter)
           }
+        />
+        <FloatingField
+          type="search"
+          label="Search hosts"
+          className="mono"
+          value={search}
+          hint={
+            events.length > 0
+              ? `Searches the ${events.length} kept requests since ${new Date(events[0].at).toLocaleString()}.`
+              : "Searches the kept requests of the session's VM."
+          }
+          onChange={(e) => setSearch(e.target.value)}
         />
         {shown.length === 0 &&
           (events.length > 0 ? (
-            <p className="muted">No {filter} activity.</p>
+            <p className="muted">
+              {search.trim()
+                ? `No ${filter === "all" ? "" : `${filter} `}host contains “${search.trim()}”.`
+                : `No ${filter} activity.`}
+            </p>
           ) : running ? (
             <p className="muted">
               No network activity yet. The hosts show here when the agent

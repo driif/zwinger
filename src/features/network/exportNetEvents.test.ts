@@ -16,7 +16,7 @@ const stubs: Record<string, string> = {
   "lucide-react": icons.map((name) => `export const ${name}=()=>null;`).join(""),
   "@driif/motiv": `const R=globalThis.exportTestReact;
     const div=({children,actions})=>R.createElement('div',null,actions,children);
-    export const Card=div, CardBody=div, CardHeader=div, FilterChips=()=>null;
+    export const Card=div, CardBody=div, CardHeader=div, FilterChips=()=>null, FloatingField=()=>null;
     export const Button=(props)=>{globalThis.exportTestButtons.set(String(props.children),props);return R.createElement('button',null,props.children);};`,
 };
 const inNetwork = (url?: string) => url?.includes("/src/features/network/") ?? false;

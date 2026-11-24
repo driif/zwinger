@@ -191,6 +191,11 @@ The network page groups the requests by host. The newest host is first. For each
 - **Allow** or **Block** for the host, its wildcard or its service. For the service on this Mac, the host shows as
   `host.microsandbox.internal:<port>`, with **Remove** in place of the rule actions.
 
+**Show** limits the list to all, allowed or blocked requests. **Search hosts** keeps the hosts that contain the text, in
+any case. For the service on this Mac, the search also matches the port, for example `:11434`. The search and **Show**
+apply together. They search only the requests that the log keeps (see [Retention](#retention)). The hint under the
+field gives their number and the time of the oldest one.
+
 The log keeps the names of the query parameters, never their values, headers or bodies.
 
 ### Retention
