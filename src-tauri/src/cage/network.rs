@@ -1215,7 +1215,7 @@ mod tests {
         };
         let reloaded = reload();
         let cage_b = lock(&reloaded.state).cage(&b).unwrap().clone();
-        assert_eq!(reloaded.vault_values(&cage_b).unwrap()[&shared()], SecretValue::new("rotated-fixture"));
+        assert_eq!(reloaded.vault_values(&cage_b).unwrap().0[&shared()], SecretValue::new("rotated-fixture"));
         let b1 = cage_b.network.rules[0].id.clone();
         reloaded.set_rule_credential(&b, &b1, SHARED, None, Source::Library, None).unwrap();
         drop(reloaded);

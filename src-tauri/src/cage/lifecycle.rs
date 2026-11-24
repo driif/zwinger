@@ -50,6 +50,14 @@ pub(crate) const TUI_PROBE: Duration = Duration::from_secs(4);
 /// The terminal size of the TUI probe.
 const TUI_PROBE_SIZE: (u16, u16) = (24, 80);
 
+/// The notice of a cage whose Claude login has no token.
+const NO_CLAUDE_TOKEN: &str = "Claude Code has no token in this cage. \
+    Run claude setup-token and save the token in this cage, then restart the cage.";
+
+/// The notice of a cage whose Claude token has expired.
+const EXPIRED_CLAUDE_TOKEN: &str = "The Claude Code token of this cage has expired. \
+    Run claude setup-token and save the new token in this cage, then restart the cage.";
+
 /// The bytes of a probe's stderr that a notice shows.
 pub(crate) const PROBE_ERR: usize = 512;
 
@@ -242,10 +250,10 @@ impl<R: SandboxRuntime> Manager<R> {
         progress.begin(Phase::Vault);
         let values = self.vault_values(&cage);
         timings.add(Phase::Vault, started.elapsed());
-        let live = values.map(|values| {
+        let live = values.map(|(values, notice)| {
             let live = Live::new(cage.network.clone(), values);
             lock(&self.state).live.insert(key.clone(), live.clone());
-            live
+            (live, notice)
         });
         Claimed { key, members, cage, progress, live, timings }
     }
@@ -262,7 +270,7 @@ impl<R: SandboxRuntime> Manager<R> {
             state.live.remove(id);
             Err(e)
         };
-        let live = match live {
+        let (live, token_notice) = match live {
             Ok(live) => live,
             Err(e) => return fail(e, &mut timings),
         };
@@ -279,6 +287,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Ok(prepared) => prepared,
             Err(e) => return fail(e, &mut timings),
         };
+        run.notices.extend(token_notice);
         for (kind, took) in profiles {
             timings.add(Phase::Profile(kind), took);
         }
@@ -777,16 +786,18 @@ impl<R: SandboxRuntime> Manager<R> {
         pi::check_node(&version)
     }
 
-    /// The vault value of each credential. An account whose restore failed
-    /// is restored first; if that fails again, the start fails. The Claude
+    /// The vault value of each credential, and a notice when the Claude
+    /// token is missing or expired. An account whose restore failed is
+    /// restored first; if that fails again, the start fails. The Claude
     /// token's date is checked on the entry that is loaded, after that restore.
-    /// A missing library value fails the start; a same-name local value never replaces it.
-    pub(crate) fn vault_values(&self, cage: &Cage) -> Result<HashMap<CredentialRef, SecretValue>> {
+    /// A Claude token that is missing, has no date or has expired is not
+    /// injected: the cage starts without the Claude login and shows the notice.
+    /// A different missing library value fails the start; a same-name local
+    /// value never replaces it.
+    pub(crate) fn vault_values(&self, cage: &Cage) -> Result<(HashMap<CredentialRef, SecretValue>, Option<String>)> {
         let login = cage.host_agent(AgentKind::Claude).is_some_and(|agent| agent.login);
         let bound = cage.claude_token_binding()?;
-        if login && !bound {
-            return Err(Error::ClaudeTokenNeeded);
-        }
+        let mut notice = (login && !bound).then(|| NO_CLAUDE_TOKEN.to_owned());
         let mut values = HashMap::new();
         for credential in cage.network.credentials() {
             let key = credential.key();
@@ -794,11 +805,13 @@ impl<R: SandboxRuntime> Manager<R> {
             self.settle(&owner, &key.name)?;
             let entry = self.vault.entry(&owner, &key.name)?;
             if bound && credential.name == CLAUDE_TOKEN {
-                let saved_at = entry.as_ref().and_then(|entry| entry.saved_at).ok_or(Error::ClaudeTokenNeeded)?;
+                let Some(saved_at) = entry.as_ref().and_then(|entry| entry.saved_at) else {
+                    notice = Some(NO_CLAUDE_TOKEN.to_owned());
+                    continue;
+                };
                 if saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms() {
-                    return Err(Error::HostLoginExpired(
-                        "the Claude Code token has expired; run claude setup-token again".into(),
-                    ));
+                    notice = Some(EXPIRED_CLAUDE_TOKEN.to_owned());
+                    continue;
                 }
             }
             match entry {
@@ -806,7 +819,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 None => return Err(Error::SecretMissing(credential.name.clone())),
             };
         }
-        Ok(values)
+        Ok((values, notice))
     }
 
     /// Checks that `argv` runs in the VM and ends with code 0. The error is
@@ -1085,7 +1098,8 @@ struct Claimed<V> {
     members: Vec<Session>,
     cage: Cage,
     progress: Arc<Progress<V>>,
-    live: Result<Arc<Live>>,
+    /// The proxy state, and the notice of a missing or expired Claude token.
+    live: Result<(Arc<Live>, Option<String>)>,
     timings: Timings,
 }
 
@@ -1412,6 +1426,7 @@ pub(crate) fn probe_error(out: &[u8], code: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN};
     use crate::cage::testing::*;
 
     #[tokio::test]
@@ -1710,11 +1725,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_expired_or_missing_host_login_fails_the_start() {
+    async fn an_expired_or_missing_claude_token_starts_the_cage_with_a_notice() {
         let logins = FakeLogins::default();
-        let (manager, runtime, id, vault) = host_manager(logins, NOW);
+        let (manager, _, id, vault) = host_manager(logins, NOW);
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
-        assert!(matches!(manager.start(&id).await, Err(Error::ClaudeTokenNeeded)));
+        manager.start(&id).await.unwrap();
+        assert_eq!(manager.list().cages[0].shared().status, Status::Running);
+        assert!(manager.list().cages[0].shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
+        manager.stop(&id, None).await.unwrap();
         manager.set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false).unwrap();
         vault
             .put(
@@ -1726,9 +1744,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
-        assert_eq!(manager.list().cages[0].shared().status, Status::Stopped);
-        assert!(runtime.log.lock().unwrap().is_empty());
+        manager.start(&id).await.unwrap();
+        let view = manager.list().cages.remove(0);
+        assert_eq!(view.shared().status, Status::Running);
+        assert!(view.shared().host_notices.contains(&EXPIRED_CLAUDE_TOKEN.to_owned()));
+        assert!(!view.shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
+        manager.stop(&id, None).await.unwrap();
         // pi's login names its provider, so pi needs one to be added with a login.
         assert!(matches!(
             manager.put_host_agent(&id, uses(AgentKind::Pi, false, true), false).await,
@@ -1743,8 +1764,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_expired_token_restored_by_settle_fails_the_start() {
-        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+    async fn an_expired_token_restored_by_settle_starts_the_cage_with_a_notice() {
+        let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
         manager.set_claude_token(&id, Some(SecretValue::new("fresh")), Source::Local, true, false).unwrap();
         // A failed rollback left the prior, expired entry to restore.
         let expired = secrets::VaultEntry {
@@ -1753,8 +1774,8 @@ mod tests {
         };
         lock(&manager.unsettled)
             .insert((Owner::Cage(id.clone().into()), "CLAUDE_CODE_OAUTH_TOKEN".into()), Some(expired));
-        assert!(matches!(manager.start(&id).await, Err(Error::HostLoginExpired(_))));
-        assert!(runtime.log.lock().unwrap().is_empty());
+        manager.start(&id).await.unwrap();
+        assert!(manager.list().cages[0].shared().host_notices.contains(&EXPIRED_CLAUDE_TOKEN.to_owned()));
     }
 
     #[tokio::test]
@@ -1769,7 +1790,8 @@ mod tests {
             Manager::new(FakeRuntime::default(), Store::new(dir), vault, manager.data.clone(), manager.host.clone())
                 .unwrap();
         assert!(reloaded.list().cages[0].cage.logins.is_empty());
-        assert!(matches!(reloaded.start(&id).await, Err(Error::ClaudeTokenNeeded)));
+        reloaded.start(&id).await.unwrap();
+        assert!(reloaded.list().cages[0].shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
     }
 
     #[tokio::test]

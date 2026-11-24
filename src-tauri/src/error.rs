@@ -93,8 +93,6 @@ pub enum Error {
     Proxy(String),
     #[error("secret {0} has no stored value; set it again")]
     SecretMissing(String),
-    #[error("Claude Code needs a token; run claude setup-token and save it in this cage")]
-    ClaudeTokenNeeded,
     #[error("credential vault: {0}")]
     Vault(String),
     #[error(
