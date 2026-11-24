@@ -1135,7 +1135,9 @@ impl<R: SandboxRuntime> Manager<R> {
     /// that was missing at the first load after the update, are theirs: the
     /// session folder and the mounts of its cage.
     pub fn confirm_paths(&self, session_id: &str) -> Result<()> {
-        if let Some(cage) = lock(&self.state).effective_cage(session_id)? {
+        // The state lock is released before the edits: each edit takes it.
+        let cage = lock(&self.state).effective_cage(session_id)?;
+        if let Some(cage) = cage {
             self.edit_cage(&cage.id, |c, _| {
                 c.fill_ids();
                 Ok(())
@@ -2161,6 +2163,29 @@ mod tests {
 
     fn effective(manager: &Manager<FakeRuntime>, session: &str) -> Option<EffectiveCage> {
         manager.list().sessions.into_iter().find(|s| s.session.id == session).unwrap().effective_cage
+    }
+
+    #[test]
+    fn confirm_paths_of_a_session_with_a_cage_does_not_deadlock() {
+        let (manager, _, id) = manager();
+        manager.add_mount(&id, temp_dir().to_str().unwrap(), "/mnt/data", false).unwrap();
+        {
+            let mut state = lock(&manager.state);
+            state.sessions[0].folder_id = None;
+            state.cages[0].mounts.iter_mut().for_each(|m| m.id = None);
+        }
+        let manager = Arc::new(manager);
+        let (done, rx) = std::sync::mpsc::channel();
+        let confirm = {
+            let (manager, id) = (manager.clone(), id.clone());
+            std::thread::spawn(move || done.send(manager.confirm_paths(&id)).unwrap())
+        };
+        rx.recv_timeout(Duration::from_secs(5)).expect("confirm_paths returns").unwrap();
+        confirm.join().unwrap();
+
+        let state = lock(&manager.state);
+        assert!(state.sessions[0].folder_id.is_some());
+        assert!(state.cages[0].mounts.iter().all(|m| m.id.is_some()));
     }
 
     #[test]
