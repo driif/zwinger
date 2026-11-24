@@ -575,6 +575,8 @@ struct Round {
     base: Option<String>,
     /// The last diff that the run saved.
     diff: Option<String>,
+    /// The last model that the CLI of each agent reported, by name.
+    models: HashMap<String, String>,
 }
 
 /// What the groups of the run made so far, for the next prompts. A
@@ -1057,6 +1059,12 @@ impl<R: SandboxRuntime> Actor<R> {
     }
 
     fn record_as(&mut self, name: &str, stage: &str, base: &str, reply: Reply) -> Option<Value> {
+        if let Some(model) = reply.model
+            && self.run.models.get(name) != Some(&model)
+        {
+            self.book.writer.event("model", &format!("{name} {model}"));
+            self.run.models.insert(name.to_owned(), model);
+        }
         if !reply.raw.is_empty() {
             self.book.writer.write(&format!("{base}.raw"), reply.raw.as_bytes());
         }
@@ -2446,7 +2454,10 @@ pub(crate) mod tests {
                 let bytes = match agent {
                     "codex" => codex_result_lines(text),
                     "pi" => pi_result_line(text),
-                    _ => claude_result_line(text),
+                    _ => {
+                        let init = json!({ "type": "system", "subtype": "init", "model": "claude-fake" });
+                        [format!("{init}\n").into_bytes(), claude_result_line(text)].concat()
+                    }
                 };
                 String::from_utf8(bytes).unwrap()
             };
@@ -2750,6 +2761,11 @@ pub(crate) mod tests {
         let gates: Value = serde_json::from_slice(&std::fs::read(run.dir.join("gates.json")).unwrap()).unwrap();
         assert_eq!(gates, json!([{ "command": "pnpm build", "code": 0, "output": "ok\n" }]));
         assert!(events(&run).iter().any(|(k, _)| k == "no_detection"));
+        // The reported model is recorded once; Codex reports none.
+        let models: Vec<_> = events(&run).into_iter().filter(|(k, _)| k == "model").map(|(_, d)| d).collect();
+        assert_eq!(models, ["claude claude-fake"]);
+        let reported: Vec<_> = read_room(&run.dir).participants.into_iter().map(|p| p.reported_model).collect();
+        assert_eq!(reported, [Some("claude-fake".to_owned()), None]);
         let stages = states(&run.dir);
         assert!(stages.contains(&("exchange-2".to_owned(), "skipped")));
         assert!(stages.contains(&("tiebreak".to_owned(), "skipped")));

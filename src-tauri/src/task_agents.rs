@@ -351,6 +351,8 @@ pub struct Reply {
     pub raw: String,
     pub retried: bool,
     pub failure: Option<Failure>,
+    /// The model that the CLI reported for the call, if it reports one.
+    pub model: Option<String>,
 }
 
 /// The end of a shell command.
@@ -425,6 +427,9 @@ pub struct Exec<R: SandboxRuntime> {
 struct Result_ {
     text: String,
     error: Option<String>,
+    /// The model that the CLI reported. Codex and Gemini CLI report none
+    /// that names the model that ran.
+    model: Option<String>,
 }
 
 enum Mapper {
@@ -508,7 +513,8 @@ impl<R: SandboxRuntime> Exec<R> {
         Err(failure)
     }
 
-    /// One agent call. Returns the final text of the agent.
+    /// One agent call. Returns the final text of the agent and the model
+    /// that the CLI reported.
     pub async fn agent(
         &self,
         agent: &Participant,
@@ -517,7 +523,7 @@ impl<R: SandboxRuntime> Exec<R> {
         limits: Limits,
         cancel: &mut watch::Receiver<bool>,
         live: Live<'_>,
-    ) -> Result<String, Failure> {
+    ) -> Result<(String, Option<String>), Failure> {
         let mut mapper = match agent.kind {
             AgentKind::Claude => Mapper::Claude(claude::Mapper::default()),
             AgentKind::Codex => Mapper::Codex(codex::Mapper::default()),
@@ -567,7 +573,7 @@ impl<R: SandboxRuntime> Exec<R> {
         if code != 0 {
             return Err(Failure::Exit { code, stderr });
         }
-        Ok(result.text)
+        Ok((result.text, result.model))
     }
 
     /// One agent call that must end with a JSON object. A reply with no JSON
@@ -585,12 +591,12 @@ impl<R: SandboxRuntime> Exec<R> {
         let mut prompt = prompt.to_owned();
         loop {
             match self.agent(agent, access, &prompt, limits, cancel, live).await {
-                Ok(raw) if raw.len() > REPLY_LIMIT => {
-                    return Reply { json: None, failure: Some(Failure::TooLarge(raw.len())), raw, retried };
+                Ok((raw, model)) if raw.len() > REPLY_LIMIT => {
+                    return Reply { json: None, failure: Some(Failure::TooLarge(raw.len())), raw, retried, model };
                 }
-                Ok(raw) => match parse(&raw).await {
+                Ok((raw, model)) => match parse(&raw).await {
                     Some(json) => {
-                        return Reply { json: Some(json), raw, retried, failure: None };
+                        return Reply { json: Some(json), raw, retried, failure: None, model };
                     }
                     None if !retried => {
                         retried = true;
@@ -602,11 +608,12 @@ impl<R: SandboxRuntime> Exec<R> {
                             raw,
                             retried,
                             failure: Some(Failure::Agent("the reply had no JSON object".into())),
+                            model,
                         };
                     }
                 },
                 Err(failure) => {
-                    return Reply { json: None, raw: String::new(), retried, failure: Some(failure) };
+                    return Reply { json: None, raw: String::new(), retried, failure: Some(failure), model: None };
                 }
             }
         }
@@ -769,8 +776,11 @@ fn is_commit(id: &str) -> bool {
     matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The `result` event ends a Claude Code call.
+/// The `result` event ends a Claude Code call. The `init` event names the model.
 fn claude_result(event: &Value, result: &mut Result_) {
+    if event["type"] == "system" && event["subtype"] == "init" {
+        result.model = model(&event["model"]);
+    }
     if event["type"] != "result" {
         return;
     }
@@ -811,11 +821,15 @@ fn gemini_result(event: &Value, result: &mut Result_) {
     }
 }
 
-/// The last assistant message of a pi run is its reply.
+/// The last assistant message of a pi run is its reply. It names the model
+/// that pi asked for and, if the provider said so, the model that answered.
 fn pi_result(event: &Value, result: &mut Result_) {
     let message = &event["message"];
     if event["type"] != "message_end" || message["role"] != "assistant" {
         return;
+    }
+    if let Some(model) = model(&message["responseModel"]).or_else(|| model(&message["model"])) {
+        result.model = Some(model);
     }
     if message["stopReason"] == "error" {
         result.error = Some(text_or(&message["errorMessage"], "pi failed"));
@@ -826,6 +840,12 @@ fn pi_result(event: &Value, result: &mut Result_) {
     if !text.is_empty() {
         result.text = text.join("");
     }
+}
+
+/// A model name of a CLI event: a short text with no control characters.
+fn model(value: &Value) -> Option<String> {
+    let name = value.as_str()?.trim();
+    (!name.is_empty() && name.len() <= 200 && !name.chars().any(char::is_control)).then(|| name.to_owned())
 }
 
 fn text_or(value: &Value, default: &str) -> String {
@@ -1280,6 +1300,37 @@ PATH=$ORIGINAL_PATH exec git "$@"
             &mut r,
         );
         assert_eq!(r.error.as_deref(), Some("401"));
+    }
+
+    /// The event shapes of Claude Code 2.1.331 and pi 1.6.0. Codex 0.171.0
+    /// `exec --json` names no model: `thread.started` has only the thread id.
+    #[test]
+    fn the_reported_model_of_each_cli() {
+        let mut r = Result_::default();
+        let init = json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" });
+        claude_result(&init, &mut r);
+        claude_result(&serde_json::from_slice(&claude_result_line("hi")).unwrap(), &mut r);
+        assert_eq!(r.model.as_deref(), Some("claude-opus-5-5"));
+
+        let mut r = Result_::default();
+        let message = |extra: Value| {
+            let mut message = json!({ "role": "assistant", "content": [], "provider": "anthropic", "model": "sonnet" });
+            message.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            json!({ "type": "message_end", "message": message })
+        };
+        pi_result(&message(json!({})), &mut r);
+        assert_eq!(r.model.as_deref(), Some("sonnet"));
+        pi_result(&message(json!({ "responseModel": "claude-sonnet-4-5-20250929" })), &mut r);
+        assert_eq!(r.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+
+        let mut r = Result_::default();
+        for line in String::from_utf8(codex_result_lines("done")).unwrap().lines() {
+            codex_result(&serde_json::from_str(line).unwrap(), &mut r);
+        }
+        codex_result(&json!({ "type": "thread.started", "thread_id": "t" }), &mut r);
+        assert_eq!(r.model, None);
+        assert_eq!(model(&json!("bad\nname")), None);
+        assert_eq!(model(&json!(" ")), None);
     }
 }
 

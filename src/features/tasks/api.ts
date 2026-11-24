@@ -142,6 +142,8 @@ export interface RoomParticipant {
   model: string | null;
   /** False for an older run or an external round, which saved no model. */
   modelRecorded: boolean;
+  /** The last model that its CLI reported in the run: Claude Code and pi report one, Codex and Gemini CLI do not. */
+  reportedModel: string | null;
 }
 
 export interface Room {

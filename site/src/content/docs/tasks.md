@@ -115,9 +115,9 @@ verdicts and the degraded agents. During a run you can:
 
 Each agent of a run has a name. Agents of different kinds use the kind, for example `claude` and `codex`. Two agents of
 the same kind use `claude-1` and `claude-2` (or `codex-1`, `pi-1` and so on), in the order of the task. The name never
-contains the model. The room shows each agent with the icon of its kind, its kind and its model, or `default model`
-if the task gives no model. The default model is the one that the CLI selects; zwinger does not know which model that
-is. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
+contains the model. The room shows each agent with the icon of its kind, its kind and its model. If the task gives no
+model, the CLI selects its default model. Claude Code and pi report that model in their output, and the room shows it
+after the first call of the agent. Codex and Gemini CLI do not report it, so the room shows `default model`. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
 
 The room shows the independent reviewer, if the run has one, in its own card with its kind, model, stage and result.
 The exchange stages are the turns that the run started with. A run from an earlier version and a duo round folder

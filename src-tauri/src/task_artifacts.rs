@@ -109,6 +109,9 @@ pub struct RoomParticipant {
     /// `model: None` does not mean the configured default.
     #[serde(default = "recorded")]
     pub model_recorded: bool,
+    /// The last model that its CLI reported in the run (a `model` event).
+    #[serde(default, skip_deserializing)]
+    pub reported_model: Option<String>,
 }
 
 fn recorded() -> bool {
@@ -721,6 +724,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 kind: Some(agent.kind),
                 model: agent.model,
                 model_recorded: true,
+                reported_model: None,
             })
         });
 
@@ -752,6 +756,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 id,
                 model: None,
                 model_recorded: false,
+                reported_model: None,
             })
             .collect()
     });
@@ -769,6 +774,16 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
             inherited: e["inherited"].as_str().map(str::to_owned),
         })
         .collect();
+    // The last model that the CLI of each agent reported.
+    let reported = |id: &str| {
+        events.iter().rev().filter(|e| e.kind == "model").find_map(|e| {
+            let (name, model) = e.detail.split_once(' ')?;
+            (name == id).then(|| model.to_owned())
+        })
+    };
+    let roster: Vec<RoomParticipant> =
+        roster.into_iter().map(|p| RoomParticipant { reported_model: reported(&p.id), ..p }).collect();
+    let independent_reviewer = independent_reviewer.map(|p| RoomParticipant { reported_model: reported(&p.id), ..p });
     // A continuation names the run that it continues, and its first stage
     // if the source started that stage before it stopped.
     let repeated = run
@@ -1210,6 +1225,7 @@ fn project(files: &BTreeMap<&str, (i64, Option<&[u8]>)>) -> Room {
                 kind: None,
                 model: None,
                 model_recorded: false,
+                reported_model: None,
             }),
             state: stages.iter().find(|s| s.id == "independent-review").map_or("pending", |s| s.state),
             review,
@@ -1344,6 +1360,7 @@ fn roster(manifest: Option<&Value>, run: Option<&Value>) -> Option<Vec<RoomParti
             kind: Some(p.kind),
             model: p.model,
             model_recorded: true,
+            reported_model: None,
         }))
     };
     saved.or_else(recorded).map(Vec::from)
@@ -1850,6 +1867,23 @@ mod tests {
         assert_eq!(room.agents, ["pi-1", "pi-2"]);
         assert_eq!(room.participants[0].model.as_deref(), Some("a/b.c"));
         assert!(room.participants.iter().all(|p| p.model_recorded));
+    }
+
+    #[test]
+    fn the_room_shows_the_last_model_that_each_cli_reported() {
+        let dir = temp_dir();
+        let run = json!({ "agents": [{ "kind": "claude", "model": null }, { "kind": "codex", "model": null }] });
+        std::fs::write(dir.join("run.json"), run.to_string()).unwrap();
+        let events = [
+            json!({ "at": "t", "kind": "model", "detail": "claude claude-opus-5-5" }),
+            json!({ "at": "t", "kind": "model", "detail": "claude claude-sonnet-4-5" }),
+        ];
+        let lines: String = events.iter().map(|e| format!("{e}\n")).collect();
+        std::fs::write(dir.join("events.jsonl"), lines).unwrap();
+        let room = read_room(&dir);
+        let reported: Vec<_> = room.participants.iter().map(|p| p.reported_model.as_deref()).collect();
+        assert_eq!(reported, [Some("claude-sonnet-4-5"), None]);
+        assert!(!room.messages.iter().any(|m| m.kind == "event"));
     }
 
     #[test]
