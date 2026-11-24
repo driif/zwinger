@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: macos-26
     permissions:
       contents: write
     steps:
@@ -28,7 +28,8 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
       - run: bash scripts/fetch-pi.sh
-      # The adaptive app icon (src-tauri/icons/zwinger.icon) needs actool 26. The default Xcode of macos-15 is 16.
+      # The adaptive app icon (src-tauri/icons/zwinger.icon) needs actool 26 on a macOS 26 host. On macos-15, the
+      # AssetCatalogAgent of Xcode 26 crashes (dyld symbols missing) and no Assets.car is made (issue #98).
       - name: Use Xcode 26
         run: |
           xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)

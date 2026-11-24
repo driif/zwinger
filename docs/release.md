@@ -14,8 +14,10 @@ of the project; the app has the public key in `src-tauri/tauri.conf.json` and re
    git push origin main v0.2.0
    ```
 
-3. The `Release` workflow (`.github/workflows/release.yml`) builds on a `macos-15` (arm64) runner and makes a
+3. The `Release` workflow (`.github/workflows/release.yml`) builds on a `macos-26` (arm64) runner and makes a
    **draft** release with the `.dmg`, the updater archive (`.app.tar.gz` and its `.sig`) and `latest.json`.
+   The runner must be macOS 26: the actool of Xcode 26 compiles the adaptive icon only on a macOS 26 host.
+   To test the bundle without a tag, run the `Bundle check` workflow (`actool_only` compiles only the icon).
 4. Check the draft, then publish it. Apps see the update only after you publish: `releases/latest` ignores drafts.
 
 The workflow needs two repository secrets:

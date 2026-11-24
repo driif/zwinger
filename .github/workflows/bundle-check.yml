@@ -11,7 +11,7 @@ on:
       runner:
         description: Runner image
         type: string
-        default: macos-15
+        default: macos-26
 
 permissions:
   contents: read
