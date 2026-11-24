@@ -242,3 +242,13 @@ longer than 22 bytes, the "VM folder" check fails at start.
 
 Earlier builds of zwinger used other folders. **Settings > Storage** shows them with their size and can remove the data
 of zwinger from them.
+
+**Unused VM folders.** Each VM has an agent state folder (`projects/<VM key>`), a wrapper folder (`bin/<VM key>`) and
+a profile folder (`profiles/<VM key>`) in the app data folder. An interrupted removal of a project or a cage can leave
+them. **Settings > Storage** lists each VM key that no project, cage or VM uses, with the size of its folders. Select
+the keys, then click **Remove selected** and confirm. The agent history in these folders is lost.
+
+- zwinger never lists or removes a link, or a VM key whose old state in `shields/<VM key>` is not moved yet.
+- A key that a project, a cage or a VM took since the list showed it stays.
+- While zwinger could not stop the VMs of an earlier run, the removal is refused: start a cage or restart zwinger,
+  then try again.

@@ -1,4 +1,4 @@
-import { Button, Card, CardBody, CardHeader, CopyField, GlideNav, LiquidSwitch } from "@driif/motiv";
+import { Button, Card, CardBody, CardHeader, CopyField, GlideNav, LiquidSwitch, SpringCheckbox } from "@driif/motiv";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ExternalLink, RefreshCw, Trash2 } from "lucide-react";
@@ -10,10 +10,13 @@ import {
   Legacy,
   legacyStorage,
   LegacyView,
+  Leftover,
+  leftoverVmFolders,
   Prefs,
   PrefsPatch,
   proxyCaFingerprint,
   removeLegacyRuntime,
+  removeLeftoverVmFolders,
   storage,
   StorageView,
 } from "./api";
@@ -157,15 +160,80 @@ function LegacyHomes({ homes, onRemoved }: { homes: LegacyView[]; onRemoved: (me
   );
 }
 
+/** The folders of VM keys that nothing uses. The user picks the keys, then Remove asks first. */
+function Leftovers({ leftovers, onRemoved }: { leftovers: Leftover[]; onRemoved: (message: string) => void }) {
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const picked = chosen.filter((key) => leftovers.some((l) => l.key === key));
+
+  function remove() {
+    setBusy(true);
+    removeLeftoverVmFolders(picked)
+      .then(
+        (removed) => onRemoved(`Removed the folders of ${removed.length} VM ${removed.length === 1 ? "key" : "keys"}.`),
+        (e) => onRemoved(errorMessage(e)),
+      )
+      .finally(() => {
+        setBusy(false);
+        setAsking(false);
+        setChosen([]);
+      });
+  }
+
+  return (
+    <>
+      <ul className="list">
+        {leftovers.map((l) => (
+          <li key={l.key} className="row">
+            <span className="grow">
+              <SpringCheckbox
+                label={<span className="mono">{l.key}</span>}
+                title={l.folders.join("\n")}
+                checked={picked.includes(l.key)}
+                disabled={busy}
+                onChange={(e) => setChosen(e.target.checked ? [...picked, l.key] : picked.filter((k) => k !== l.key))}
+              />
+            </span>
+            <span className="muted">{size(l.size)}</span>
+          </li>
+        ))}
+      </ul>
+      {asking ? (
+        <div className="row">
+          <span className="grow muted">
+            Remove deletes the agent state, the wrappers and the profiles of {picked.length} VM{" "}
+            {picked.length === 1 ? "key" : "keys"}. The agent history in them is lost.
+          </span>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => setAsking(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" variant="danger" loading={busy} onClick={remove}>
+            Remove
+          </Button>
+        </div>
+      ) : (
+        <div className="row end">
+          <Button size="sm" variant="outline" iconLeft={<Trash2 size={14} />} disabled={picked.length === 0} onClick={() => setAsking(true)}>
+            Remove selected
+          </Button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function Storage() {
   const [view, setView] = useState<StorageView>();
   const [legacy, setLegacy] = useState<LegacyView[]>([]);
+  const [leftovers, setLeftovers] = useState<Leftover[]>([]);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string>();
   const load = () =>
     Promise.all([
       storage().then(setView, (e) => setMessage(errorMessage(e))),
       legacyStorage().then(setLegacy, (e) => setMessage(errorMessage(e))),
+      leftoverVmFolders().then(setLeftovers, (e) => setMessage(errorMessage(e))),
     ]);
 
   useEffect(() => {
@@ -204,6 +272,22 @@ function Storage() {
             </li>
           </ul>
           <p className="muted">Clean up removes the images that no cage uses. A cage downloads its image again when it needs it.</p>
+          {leftovers.length > 0 && (
+            <>
+              <h3>Unused VM folders</h3>
+              <p className="muted">
+                No project, cage or running VM uses these VM keys. An interrupted removal of a project or cage can leave
+                them.
+              </p>
+              <Leftovers
+                leftovers={leftovers}
+                onRemoved={(text) => {
+                  setMessage(text);
+                  load();
+                }}
+              />
+            </>
+          )}
           {legacy.length > 0 && (
             <>
               <h3>Data of earlier versions</h3>

@@ -727,7 +727,7 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// [`Error::NotReaped`], with the homes whose reap failed, unless
     /// [`Manager::last_run_reaped`].
-    fn check_reaped(&self) -> Result<()> {
+    pub(crate) fn check_reaped(&self) -> Result<()> {
         if self.last_run_reaped() {
             return Ok(());
         }

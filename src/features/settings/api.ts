@@ -260,6 +260,21 @@ export const legacyStorage = () => call<LegacyView[]>("legacy_storage");
 export const removeLegacyRuntime = (legacy: Legacy) =>
   call<void>("remove_legacy_runtime", { legacy });
 
+/** A VM key that no project, cage or VM uses, with its state, wrapper and profile folders. `size` in bytes, `null`: unknown. */
+export interface Leftover {
+  key: string;
+  folders: string[];
+  size: number | null;
+}
+
+export const leftoverVmFolders = () => call<Leftover[]>("leftover_vm_folders");
+
+/**
+ * Removes the folders of the chosen keys that are still unused. Fails with `NotReaped` while a VM of an earlier run can
+ * still use them. Resolves to the keys that it removed.
+ */
+export const removeLeftoverVmFolders = (keys: string[]) => call<string[]>("remove_leftover_vm_folders", { keys });
+
 /** Removes the cached images that no project uses. Resolves to the freed bytes, if known. */
 export const cleanImages = () => call<number | null>("clean_images");
 

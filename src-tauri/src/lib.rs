@@ -527,6 +527,8 @@ pub fn run() {
             commands::settings::import_ghostty_config,
             commands::settings::storage,
             commands::settings::clean_images,
+            commands::settings::leftover_vm_folders,
+            commands::settings::remove_leftover_vm_folders,
             commands::settings::legacy_storage,
             commands::settings::remove_legacy_runtime,
             commands::settings::legacy_keychain_status,

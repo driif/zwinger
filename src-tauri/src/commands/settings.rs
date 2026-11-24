@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -6,6 +6,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager as _, State};
 
 use crate::bootstrap::{self, Bootstrap, Legacy, Startup};
+use crate::cage::leftovers::{Leftover, dir_size};
 use crate::cage::manager::Manager;
 use crate::error::{Error, Result};
 use crate::host_agents::HostAgents;
@@ -57,15 +58,6 @@ pub struct StorageView {
     runtimes: Option<u64>,
 }
 
-/// Does not follow links. `None` if a part cannot be read.
-fn dir_size(path: &Path) -> Option<u64> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_dir() {
-        return Some(meta.len());
-    }
-    std::fs::read_dir(path).ok()?.map(|entry| dir_size(&entry.ok()?.path())).sum()
-}
-
 #[tauri::command]
 pub async fn storage(app: AppHandle) -> Result<StorageView> {
     let app_data = app.path().app_data_dir().map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -73,6 +65,18 @@ pub async fn storage(app: AppHandle) -> Result<StorageView> {
     let dir = app_data.join("runtimes");
     let runtimes = tokio::task::spawn_blocking(move || dir_size(&dir)).await.ok().flatten();
     Ok(StorageView { app_data, images, runtimes })
+}
+
+/// The VM keys with a state, wrapper or profile folder that nothing uses.
+#[tauri::command]
+pub async fn leftover_vm_folders(manager: Managed<'_>) -> Result<Vec<Leftover>> {
+    Ok(manager.leftovers())
+}
+
+/// Removes the folders of the chosen unused VM keys. Resolves to the keys that it removed.
+#[tauri::command]
+pub async fn remove_leftover_vm_folders(manager: Managed<'_>, keys: Vec<String>) -> Result<Vec<String>> {
+    manager.remove_leftovers(&keys)
 }
 
 /// Removes the cached images that no project uses. Resolves to the freed bytes, if known.
