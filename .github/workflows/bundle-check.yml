@@ -28,7 +28,9 @@ jobs:
           test -n "$xcode"
           echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
       # Compiles the .icon with the same actool arguments as tauri-bundler (crates/tauri-bundler/src/bundle/macos/icon.rs).
+      # Only in actool_only mode: release.yml does not run it, so the full check must not either.
       - name: actool probe
+        if: ${{ inputs.actool_only }}
         run: |
           xcodebuild -version
           sw_vers
@@ -74,7 +76,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - if: ${{ !inputs.actool_only }}
-        run: pnpm tauri build --bundles app
+        run: pnpm tauri build --bundles app -v
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
