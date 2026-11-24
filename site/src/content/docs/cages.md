@@ -163,6 +163,11 @@ start:
 
 The warning does not block the save. zwinger does not add up the values of VMs that run at the same time.
 
+For each running VM of the cage, the shared VM and the own VMs, zwinger also shows its actual use: the CPUs in use
+(1.0 is one CPU fully in use) and the memory in use, of the values that the VM started with. The VM runtime measures
+it each second. zwinger reads it every 3 seconds, only while the Resources card is open and the window is visible. A
+VM that just started shows no use until its first measurement.
+
 The next start of a VM applies a change. A running VM keeps its values until it restarts, and its status shows that
 a restart is pending.
 

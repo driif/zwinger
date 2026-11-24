@@ -169,6 +169,15 @@ pub async fn host_capacity() -> Option<crate::bootstrap::HostCapacity> {
     crate::bootstrap::host_capacity()
 }
 
+/// The CPU and memory use of each running VM of the cage, by VM key.
+#[tauri::command]
+pub async fn vm_usage(
+    manager: Managed<'_>,
+    cage_id: String,
+) -> Result<std::collections::BTreeMap<String, crate::runtime::Usage>> {
+    Ok(manager.vm_usage(&cage_id).await)
+}
+
 #[tauri::command]
 pub fn set_agents_unprompted(manager: Managed<'_>, cage_id: String, on: bool) -> Result<()> {
     manager.set_agents_unprompted(&cage_id, on)

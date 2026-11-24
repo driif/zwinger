@@ -15,9 +15,9 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { addMount, setAgentsUnprompted, setMountReadonly } from "../settings/api";
 import { resolveFolder } from "../projects/api";
 import { AGENT_NAMES, CageView, StartRecord, VmCage } from "../../shared/api";
-import { hostCapacity, setCageResources } from "./api";
+import { hostCapacity, setCageResources, vmUsage, VmUsage } from "./api";
 import { PublishedPorts } from "./PublishedPorts";
-import { capacityText, HostCapacity, resourceWarning } from "./hostCapacity";
+import { capacityText, HostCapacity, resourceWarning, usageText } from "./hostCapacity";
 import { Notice } from "../../shared/Notice";
 import type { Intent, Run, Runtimes } from "../../App";
 import { InstallControl } from "../tasks/roomParts";
@@ -30,6 +30,8 @@ export const WORKSPACE = "/workspace";
 /** The same bounds as `cage::CPUS` and `cage::MEMORY_MIB` in the backend. */
 const CPUS = { min: 1, max: 8 };
 const MEMORY_MIB = { min: 512, max: 8192 };
+/** The runtime samples each second; a read of each 3 s keeps the cost low. */
+const USAGE_POLL_MS = 3000;
 
 /** The same rules as `cage::guest_path` in the backend. */
 function guestError(path: string) {
@@ -83,6 +85,21 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
     hostCapacity().then(setHost, () => setHost(null));
   }, []);
   const warning = host ? resourceWarning(Number(cpus), Number(memoryMib), host) : undefined;
+  const running = cage.vms.filter((v) => v.status.state === "running");
+  const [usage, setUsage] = useState<Record<string, VmUsage>>({});
+  useEffect(() => {
+    if (running.length === 0) return;
+    const poll = () => {
+      if (document.visibilityState === "visible") vmUsage(cage.id).then(setUsage, () => setUsage({}));
+    };
+    poll();
+    const timer = window.setInterval(poll, USAGE_POLL_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [cage.id, running.length]);
 
   function saveResources(event: FormEvent) {
     event.preventDefault();
@@ -261,6 +278,16 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
               A running VM keeps its values until it restarts.
               {applied && ` It runs with ${applied.cpus} CPUs and ${applied.memoryMib} MiB.`}
             </p>
+            {running.map(
+              (v) =>
+                usage[v.key] &&
+                v.appliedResources && (
+                  <p key={v.key} className="muted">
+                    {v.own ? `The own VM of ${v.members.join(", ")}` : "The shared VM"}{" "}
+                    {usageText(usage[v.key], v.appliedResources.cpus)}.
+                  </p>
+                ),
+            )}
             <div className="row end">
               <Button size="sm" type="submit" disabled={!resourcesChanged}>
                 Save

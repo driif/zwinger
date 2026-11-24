@@ -20,7 +20,7 @@ use crate::network::{self, Action, RuleDraft, Source, Target};
 use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
-use crate::runtime::SandboxRuntime;
+use crate::runtime::{SandboxRuntime, Usage};
 use crate::runtimes::{self, Installed};
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
@@ -622,6 +622,26 @@ impl<R: SandboxRuntime> Manager<R> {
             _ => Vec::new(),
         });
         host.chain(running).collect()
+    }
+
+    /// The CPU and memory use of each running VM of the cage, by VM key. A
+    /// VM with no sample yet is left out.
+    pub async fn vm_usage(&self, cage_id: &str) -> BTreeMap<String, Usage> {
+        let running: Vec<(String, Arc<R::Vm>)> = lock(&self.state)
+            .vms
+            .iter()
+            .filter_map(|(key, vm)| match vm {
+                Vm::Running { vm, applied, .. } if applied.1.id == cage_id => Some((key.clone(), vm.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut usage = BTreeMap::new();
+        for (key, vm) in running {
+            if let Ok(sample) = self.runtime.usage(&vm).await {
+                usage.insert(key, sample);
+            }
+        }
+        usage
     }
 
     pub fn list(&self) -> Listing {
@@ -1823,6 +1843,31 @@ mod tests {
         assert_eq!(view.applied_resources, Some(crate::cage::Resources::new(8, 8192).unwrap()));
         assert!(!view.pending_restart);
         manager.stop(&id, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vm_usage_has_each_running_vm_of_the_cage_with_a_sample() {
+        let (manager, runtime, a) = manager();
+        let b = own_member(&manager, &a, &temp_dir());
+        manager.set_session_vm(&b, true, None).await.unwrap();
+        let own = vm_key(&manager, &b).unwrap();
+        assert!(manager.vm_usage(&a).await.is_empty());
+        manager.start(&a).await.unwrap();
+        manager.start(&b).await.unwrap();
+        let sample = |cpu, mib: u64| crate::runtime::Usage {
+            cpu_percent: cpu,
+            memory_bytes: mib << 20,
+            memory_limit_bytes: 512 << 20,
+        };
+        runtime.usage.lock().unwrap().insert(a.clone(), sample(12.5, 200));
+        // The own VM has no sample yet.
+        assert_eq!(manager.vm_usage(&a).await, BTreeMap::from([(a.clone(), sample(12.5, 200))]));
+        runtime.usage.lock().unwrap().insert(own.clone(), sample(150.0, 300));
+        assert_eq!(manager.vm_usage(&a).await.len(), 2);
+        assert!(manager.vm_usage("other").await.is_empty());
+        manager.stop(&b, None).await.unwrap();
+        assert_eq!(manager.vm_usage(&a).await.keys().collect::<Vec<_>>(), [&a]);
+        manager.stop(&a, None).await.unwrap();
     }
 
     #[tokio::test]

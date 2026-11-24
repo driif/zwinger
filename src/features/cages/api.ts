@@ -25,3 +25,13 @@ export const setPublishedPorts = (cageId: string, ports: PublishedPort[]) =>
 
 /** `null` if zwinger cannot read it. */
 export const hostCapacity = () => call<HostCapacity | null>("host_capacity");
+
+/** The CPU and memory use of a running VM. A `cpuPercent` of 100 is one CPU fully in use. */
+export interface VmUsage {
+  cpuPercent: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+}
+
+/** The use of each running VM of the cage, by VM key. A VM with no sample yet is not in it. */
+export const vmUsage = (cageId: string) => call<Record<string, VmUsage>>("vm_usage", { cageId });

@@ -499,6 +499,7 @@ pub fn run() {
             commands::cages::set_cage_resources,
             commands::cages::set_published_ports,
             commands::cages::host_capacity,
+            commands::cages::vm_usage,
             commands::tasks::put_task,
             commands::tasks::remove_task,
             commands::tasks::start_task_run,

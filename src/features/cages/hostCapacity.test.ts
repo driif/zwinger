@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { capacityText, resourceWarning } from "./hostCapacity.ts";
+import { capacityText, resourceWarning, usageText } from "./hostCapacity.ts";
 
 const mac = { cpus: 8, memoryMib: 16384 };
 
@@ -24,4 +24,9 @@ test("both problems show in one warning", () => {
 
 test("the capacity shows the memory in GiB", () => {
   assert.equal(capacityText(mac), "This Mac: 8 CPUs, 16 GiB");
+});
+
+test("the use of a VM shows the CPUs in use and the memory in MiB", () => {
+  const usage = { cpuPercent: 137.4, memoryBytes: 300 * 1024 * 1024, memoryLimitBytes: 512 * 1024 * 1024 };
+  assert.equal(usageText(usage, 2), "uses 1.4 of 2 CPUs and 300 of 512 MiB");
 });

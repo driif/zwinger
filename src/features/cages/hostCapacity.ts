@@ -1,3 +1,5 @@
+import type { VmUsage } from "./api";
+
 /** The logical CPUs and the physical memory of this Mac. */
 export interface HostCapacity {
   cpus: number;
@@ -19,4 +21,11 @@ export function resourceWarning(cpus: number, memoryMib: number, host: HostCapac
   if (memoryMib > safe) problems.push(`more memory than this Mac can give a VM (${Math.max(safe, 0)} MiB)`);
   if (problems.length === 0) return undefined;
   return `The VM can fail to start: ${problems.join(" and ")}.`;
+}
+
+const MIB = 1024 * 1024;
+
+/** The use of a VM that started with `cpus` CPUs. */
+export function usageText({ cpuPercent, memoryBytes, memoryLimitBytes }: VmUsage, cpus: number) {
+  return `uses ${(cpuPercent / 100).toFixed(1)} of ${cpus} CPUs and ${Math.round(memoryBytes / MIB)} of ${Math.round(memoryLimitBytes / MIB)} MiB`;
 }

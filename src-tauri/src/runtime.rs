@@ -190,6 +190,20 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     /// Follows the raw runtime log lines of the VM that are written from now
     /// on. The lines stop when the receiver is dropped.
     fn net_lines(&self, vm: &Self::Vm) -> impl Future<Output = Result<Receiver<String>>> + Send;
+    /// The last CPU and memory sample of the running VM.
+    fn usage(&self, vm: &Self::Vm) -> impl Future<Output = Result<Usage>> + Send;
+}
+
+/// The CPU and memory use of a running VM, as its runtime samples it each second.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    /// 100 is one vCPU fully in use; at most 100 times the CPUs of the VM.
+    pub cpu_percent: f32,
+    /// The guest memory in use.
+    pub memory_bytes: u64,
+    /// The memory of the VM.
+    pub memory_limit_bytes: u64,
 }
 
 /// The outer wall of the cage (ADR 0003): all egress is denied but TCP to
@@ -340,6 +354,11 @@ impl SandboxRuntime for Microsandbox {
 
     async fn reap(&self) -> Result<Vec<String>> {
         reap_zwinger().await
+    }
+
+    async fn usage(&self, vm: &Sandbox) -> Result<Usage> {
+        let m = vm.metrics().await?;
+        Ok(Usage { cpu_percent: m.cpu_percent, memory_bytes: m.memory_bytes, memory_limit_bytes: m.memory_limit_bytes })
     }
 
     async fn reap_home(&self, home: &Path) -> Result<Vec<String>> {
@@ -493,6 +512,7 @@ fn group_argv(argv: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 pub mod fake {
+    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -561,6 +581,8 @@ pub mod fake {
         pub burst: Arc<Mutex<usize>>,
         /// The burst bytes that the PTY reader has taken so far.
         pub burst_sent: Arc<std::sync::atomic::AtomicUsize>,
+        /// The sample of each VM key. A key with none has no sample yet.
+        pub usage: Arc<Mutex<HashMap<String, Usage>>>,
     }
 
     pub struct FakePipe {
@@ -633,6 +655,11 @@ pub mod fake {
             self.stopping.fetch_sub(1, Ordering::SeqCst);
             self.log.lock().unwrap().push(format!("stop {}", vm.key));
             Ok(())
+        }
+
+        async fn usage(&self, vm: &FakeVm) -> Result<Usage> {
+            let found = self.usage.lock().unwrap().get(&vm.key).copied();
+            found.ok_or_else(|| Error::Io(std::io::Error::other("no sample yet")))
         }
 
         async fn reap(&self) -> Result<Vec<String>> {
