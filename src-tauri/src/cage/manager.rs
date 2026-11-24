@@ -21,7 +21,7 @@ use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::SandboxRuntime;
-use crate::runtimes::Installed;
+use crate::runtimes::{self, Installed};
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
@@ -604,6 +604,24 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Only the first sink counts.
     pub fn set_progress_sink(&self, sink: ProgressSink) {
         let _ = self.progress_sink.set(sink);
+    }
+
+    /// The runtime dirs that must stay: those that the wrappers of a running
+    /// VM run, and the cached Linux build of each agent version on this Mac,
+    /// which the next start or wrapper refresh picks.
+    pub fn runtimes_in_use(&self) -> runtimes::InUse {
+        let detection = self.host.last();
+        let host = detection
+            .agents
+            .iter()
+            .chain(&detection.antigravity)
+            .filter_map(|agent| runtimes::version_key(agent.kind.name(), &agent.version));
+        let state = lock(&self.state);
+        let running = state.vms.values().flat_map(|vm| match vm {
+            Vm::Running { host, .. } => host.installed.iter().filter_map(|r| runtimes::in_use_key(&r.guest)).collect(),
+            _ => Vec::new(),
+        });
+        host.chain(running).collect()
     }
 
     pub fn list(&self) -> Listing {
@@ -1679,6 +1697,18 @@ mod tests {
             .insert(id.clone(), Vm::Starting { cage: id.clone(), members: vec![id.clone()], phase: Phase::Vault });
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_running_vm_keeps_the_runtimes_that_its_wrappers_run() {
+        let (manager, _, id) = manager();
+        runtimes::fake_install(&manager.data, "claude");
+        assert!(manager.runtimes_in_use().iter().all(|key| !key.starts_with("claude/")));
+        manager.start(&id).await.unwrap();
+        let in_use = manager.runtimes_in_use();
+        assert!(in_use.iter().any(|key| key.starts_with("claude/")), "{in_use:?}");
+        manager.stop(&id, None).await.unwrap();
+        assert!(manager.runtimes_in_use().iter().all(|key| !key.starts_with("claude/")));
     }
 
     #[tokio::test]

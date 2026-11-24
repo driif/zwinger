@@ -219,6 +219,49 @@ pub fn root(data: &Path) -> PathBuf {
     data.join("runtimes")
 }
 
+/// The name of the runtime dir of `version`, as `package` makes it. It needs
+/// no pin, so it also names a version that is no longer pinned.
+fn folder(name: &str, version: &str) -> Result<String> {
+    let (arch, _) = arch()?;
+    pinned_version(name)?;
+    check_version(name, version)?;
+    Ok(if name == "codex" { format!("{version}-linux-{arch}") } else { version.to_owned() })
+}
+
+/// The version of the runtime dir `folder`, if it is one for this arch.
+fn version_of(name: &str, folder: &str) -> Option<String> {
+    let version = match name {
+        "codex" => folder.strip_suffix(&format!("-linux-{}", arch().ok()?.0))?,
+        _ => folder,
+    };
+    check_version(name, version).ok()?;
+    Some(version.to_owned())
+}
+
+/// The dirs of the runtimes in use, as `<name>/<folder>` below [`root`].
+pub type InUse = BTreeSet<String>;
+
+/// The `<name>/<folder>` key of a guest runtime dir below [`GUEST_DIR`].
+pub fn in_use_key(guest: &str) -> Option<String> {
+    guest.strip_prefix(GUEST_DIR)?.strip_prefix('/').map(str::to_owned)
+}
+
+/// The `<name>/<folder>` key of `version` of the runtime `name`.
+pub fn version_key(name: &str, version: &str) -> Option<String> {
+    Some(format!("{name}/{}", folder(name, version).ok()?))
+}
+
+/// `a` is an older version than `b`: the numbers of `x.y.z` compare first,
+/// then a version with a pre-release is older than one without.
+fn older(a: &str, b: &str) -> bool {
+    let parts = |v: &str| {
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p.to_owned())));
+        let numbers: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (numbers, pre.is_none(), pre)
+    };
+    parts(a) < parts(b)
+}
+
 fn runtime_dir(data: &Path, package: &Package) -> PathBuf {
     root(data).join(package.name).join(&package.folder)
 }
@@ -234,6 +277,19 @@ pub struct RuntimeView {
     /// The pinned version.
     pub version: String,
     pub installed: bool,
+    /// The pinned version is not installed, and an older version is: an
+    /// install of the pinned version is an update.
+    pub update: bool,
+    /// The installed versions that are not the pinned one, newest first.
+    pub others: Vec<OtherVersion>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherVersion {
+    pub version: String,
+    /// A running VM's wrappers or an agent on this Mac use it, so it cannot be deleted.
+    pub in_use: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -313,15 +369,71 @@ impl Runtimes {
         Self { data, installing: Mutex::new(HashMap::new()) }
     }
 
-    pub fn list(&self) -> Result<Vec<RuntimeView>> {
+    pub fn list(&self, in_use: &InUse) -> Result<Vec<RuntimeView>> {
         NAMES
             .iter()
             .map(|name| {
                 let package = package(name, pinned_version(name)?)?;
                 let installed = is_installed(&runtime_dir(&self.data, &package), &package);
-                Ok(RuntimeView { name: package.name, version: package.version, installed })
+                let mut others: Vec<OtherVersion> = self
+                    .versions(name)
+                    .into_iter()
+                    .filter(|v| *v != package.version)
+                    .map(|version| OtherVersion {
+                        in_use: version_key(name, &version).is_some_and(|key| in_use.contains(&key)),
+                        version,
+                    })
+                    .collect();
+                others.sort_by(|a, b| {
+                    if older(&a.version, &b.version) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+                });
+                let update = !installed && others.iter().any(|o| older(&o.version, &package.version));
+                Ok(RuntimeView { name: package.name, version: package.version, installed, update, others })
             })
             .collect()
+    }
+
+    /// The complete installed versions of `name`, for this arch.
+    fn versions(&self, name: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(root(&self.data).join(name)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| version_of(name, entry.file_name().to_str()?))
+            .filter(|version| self.is_complete(name, version))
+            .collect()
+    }
+
+    /// The binary of the version is there. Unlike [`is_cached`], this needs no
+    /// pin, so it also finds an Antigravity CLI version that is no longer pinned.
+    fn is_complete(&self, name: &str, version: &str) -> bool {
+        let binary = if name == "codex" { "bin/codex" } else { name };
+        folder(name, version).is_ok_and(|folder| root(&self.data).join(name).join(folder).join(binary).is_file())
+    }
+
+    /// Deletes an installed version that is not the pinned one and that
+    /// nothing in `in_use` uses. The dir moves out of the mounted folder at
+    /// once, then it is removed.
+    pub async fn remove(&self, name: &str, version: &str, in_use: &InUse) -> Result<()> {
+        let folder = folder(name, version)?;
+        let name = NAMES.iter().copied().find(|n| *n == name).ok_or_else(|| Error::UnknownRuntime(name.to_owned()))?;
+        if version == pinned_version(name)? {
+            return Err(Error::RuntimePinned(name.to_owned(), version.to_owned()));
+        }
+        if in_use.contains(&format!("{name}/{folder}")) {
+            return Err(Error::RuntimeInUse(name.to_owned(), version.to_owned()));
+        }
+        let dir = root(&self.data).join(name).join(&folder);
+        if std::fs::symlink_metadata(&dir).is_err() {
+            return Ok(());
+        }
+        let work = self.data.join(WORK);
+        std::fs::create_dir_all(&work)?;
+        let gone = work.join(uuid::Uuid::new_v4().to_string());
+        std::fs::rename(&dir, &gone)?;
+        tokio::fs::remove_dir_all(&gone).await?;
+        Ok(())
     }
 
     fn confirmed(&self) -> BTreeSet<String> {
@@ -848,7 +960,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         let guest = format!("{GUEST_DIR}/codex/{}", codex.folder);
         assert_eq!((found[0].name, &found[0].guest), ("codex", &guest));
-        let list = Runtimes::new(data.clone()).list().unwrap();
+        let list = Runtimes::new(data.clone()).list(&InUse::new()).unwrap();
         assert_eq!(
             list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(),
             [("claude", false), ("codex", true), ("agy", false)]
@@ -867,6 +979,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_older_version_shows_an_update_and_can_be_deleted_when_unused() {
+        let data = temp_dir();
+        let runtimes = Runtimes::new(data.clone());
+        for version in ["2.1.100", "2.1.99", "9.0.0"] {
+            fake_install_version(&data, "claude", version);
+        }
+        // A dir with no binary and a dir that is no version are no runtimes.
+        std::fs::create_dir_all(root(&data).join("claude/2.1.50")).unwrap();
+        std::fs::create_dir_all(root(&data).join("claude/notes")).unwrap();
+        let in_use = InUse::from([version_key("claude", "2.1.99").unwrap()]);
+        let claude = |list: Vec<RuntimeView>| list.into_iter().find(|r| r.name == "claude").unwrap();
+        let view = claude(runtimes.list(&in_use).unwrap());
+        assert!(!view.installed && view.update);
+        let others: Vec<_> = view.others.iter().map(|o| (o.version.as_str(), o.in_use)).collect();
+        assert_eq!(others, [("9.0.0", false), ("2.1.100", false), ("2.1.99", true)]);
+
+        assert!(matches!(runtimes.remove("claude", "2.1.99", &in_use).await, Err(Error::RuntimeInUse(..))));
+        assert!(matches!(runtimes.remove("claude", CLAUDE_VERSION, &in_use).await, Err(Error::RuntimePinned(..))));
+        assert!(runtimes.remove("claude", "../x", &in_use).await.is_err());
+        runtimes.remove("claude", "2.1.100", &in_use).await.unwrap();
+        runtimes.remove("claude", "9.0.0", &in_use).await.unwrap();
+        assert!(!root(&data).join("claude/2.1.100").exists());
+        // Only a newer pinned version is an update.
+        let view = claude(runtimes.list(&in_use).unwrap());
+        assert!(view.update);
+        runtimes.remove("claude", "2.1.99", &InUse::new()).await.unwrap();
+        fake_install_version(&data, "claude", "9.0.0");
+        assert!(!claude(runtimes.list(&InUse::new()).unwrap()).update);
+        // The pinned version stays installed with its files.
+        fake_install(&data, "claude");
+        let view = claude(runtimes.list(&InUse::new()).unwrap());
+        assert!(view.installed && !view.update);
+        assert_eq!(view.others.len(), 1);
+    }
+
+    #[test]
+    fn versions_compare_by_their_numbers() {
+        assert!(older("2.1.99", "2.1.100"));
+        assert!(older("0.163.0-alpha.1", "0.163.0"));
+        assert!(!older("2.1.306", "2.1.306"));
+        assert!(!older("10.0.0", "9.9.9"));
+        assert_eq!(
+            in_use_key(&format!("{GUEST_DIR}/codex/1.0.0-linux-arm64")).as_deref(),
+            Some("codex/1.0.0-linux-arm64")
+        );
+        assert_eq!(in_use_key("/opt/zwinger/pi"), None);
+    }
+
     /// Downloads the real pinned Codex from the npm registry. Needs network:
     /// `cargo test -- --ignored live_install`.
     #[tokio::test]
@@ -875,7 +1036,7 @@ mod tests {
         let data = crate::test_dir::root().join(format!("zwinger-live-{}", uuid::Uuid::new_v4()));
         let runtimes = Runtimes::new(data.clone());
         runtimes.install("codex", None, false, |_| {}).await.unwrap();
-        let list = runtimes.list().unwrap();
+        let list = runtimes.list(&InUse::new()).unwrap();
         assert!(list.iter().any(|r| r.name == "codex" && r.installed));
         let _ = std::fs::remove_dir_all(data);
     }

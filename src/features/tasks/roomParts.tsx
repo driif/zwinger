@@ -33,7 +33,7 @@ export function InstallControl({ runtime, runtimes }: { runtime: RuntimeView; ru
   if (!progress)
     return (
       <Button size="sm" variant="outline" iconLeft={<Download size={14} />} onClick={() => runtimes.onInstall(runtime.name)}>
-        Install
+        {runtime.update ? `Update to ${runtime.version}` : "Install"}
       </Button>
     );
   if (progress.stage === "extract") return <span className="muted">Checking and unpacking {name}…</span>;

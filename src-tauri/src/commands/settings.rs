@@ -114,8 +114,20 @@ pub async fn remove_legacy_runtime(app: AppHandle, legacy: Legacy) -> Result<()>
 }
 
 #[tauri::command]
-pub fn list_runtimes(runtimes: State<'_, Runtimes>) -> Result<Vec<RuntimeView>> {
-    runtimes.list()
+pub fn list_runtimes(runtimes: State<'_, Runtimes>, manager: Managed<'_>) -> Result<Vec<RuntimeView>> {
+    runtimes.list(&manager.runtimes_in_use())
+}
+
+/// Deletes an installed version that is not pinned and that no running VM
+/// and no agent on this Mac uses.
+#[tauri::command]
+pub async fn delete_runtime(
+    runtimes: State<'_, Runtimes>,
+    manager: Managed<'_>,
+    name: String,
+    version: String,
+) -> Result<()> {
+    runtimes.remove(&name, &version, &manager.runtimes_in_use()).await
 }
 
 /// `version` `None` installs the pinned version. An unpinned version needs

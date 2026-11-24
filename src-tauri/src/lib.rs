@@ -489,6 +489,7 @@ pub fn run() {
             commands::settings::list_runtimes,
             commands::settings::install_runtime,
             commands::settings::cancel_runtime_install,
+            commands::settings::delete_runtime,
             commands::settings::host_agents,
             commands::settings::detect_host_agents,
             commands::cages::put_host_agent,

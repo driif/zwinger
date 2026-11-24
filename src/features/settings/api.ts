@@ -78,8 +78,13 @@ export type RuntimeName = "claude" | "codex" | "agy";
 
 export interface RuntimeView {
   name: RuntimeName;
+  /** The pinned version. */
   version: string;
   installed: boolean;
+  /** The pinned version is not installed and an older one is: Install is an update. */
+  update: boolean;
+  /** The installed versions that are not pinned, newest first. */
+  others: { version: string; inUse: boolean }[];
 }
 
 export type InstallProgress =
@@ -158,6 +163,10 @@ export const setAgentsUnprompted = (cageId: string, on: boolean) =>
 /** Deletes the agent's login that was made in the guest. */
 export const removeGuestLogin = (vmKey: string, agent: AgentKind) =>
   call<void>("remove_guest_login", { vmKey, agent });
+
+/** Deletes an installed version that is not pinned. It fails while a running VM or an agent on this Mac uses it. */
+export const deleteRuntime = (name: RuntimeName, version: string) =>
+  call<void>("delete_runtime", { name, version });
 
 /** Stops the download. The install then fails with a cancel error. */
 export const cancelRuntimeInstall = (name: RuntimeName) =>

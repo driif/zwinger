@@ -229,3 +229,11 @@ zwinger includes pi. Install Claude Code, Codex and Antigravity CLI one time in 
 projects. zwinger downloads a pinned version and checks its hash: the SHA-512 of the npm package for Claude Code and
 Codex, the SHA-256 of the official GitHub release asset for Antigravity CLI. A runtime that you install while a cage
 runs is available in the cage at once, with no restart.
+
+When a new zwinger version pins a newer version than the one that you installed, **Settings > Runtimes** shows it as
+available and offers **Update to** that version. The update downloads and checks the new version in the same way as
+an install. Running cages get the new version at once; an agent that runs keeps its version until you start it again.
+
+**Settings > Runtimes** also lists the other installed versions, for example an earlier pinned version or the Linux
+build of the version on your Mac. **Delete** removes a version. You cannot delete the pinned version, a version that
+the agents of a running cage use (**in use**), or the Linux build of the agent version on your Mac.

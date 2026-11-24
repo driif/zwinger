@@ -314,6 +314,10 @@ export function AppSettings({
     getVersion().then(setVersion);
   }, []);
 
+  useEffect(() => {
+    if (tab === "runtimes") runtimes.reload();
+  }, [tab]);
+
   const panels: Record<string, ReactNode> = {
     agents: (
       <HostAgentsSettings
@@ -336,12 +340,37 @@ export function AppSettings({
           <CardBody>
             <ul className="list">
               {runtimes.list.map((runtime) => (
-                <li key={runtime.name} className="row">
-                  <strong>{AGENT_NAMES[runtime.name]}</strong>
-                  <span className="grow muted">
-                    {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
-                  </span>
-                  {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
+                <li key={runtime.name} className="list">
+                  <div className="row">
+                    <strong>{AGENT_NAMES[runtime.name]}</strong>
+                    <span className="grow muted">
+                      {runtime.installed
+                        ? `${runtime.version} installed`
+                        : runtime.update
+                          ? `${runtime.version} is available`
+                          : `${runtime.version}, not installed`}
+                    </span>
+                    {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
+                  </div>
+                  {runtime.others.map((other) => (
+                    <div key={other.version} className="row">
+                      <span className="grow muted">{other.version}</span>
+                      {other.inUse ? (
+                        <span className="muted" title="A running project or the agent on this Mac uses this version.">
+                          in use
+                        </span>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          iconLeft={<Trash2 size={14} />}
+                          onClick={() => runtimes.onDelete(runtime.name, other.version)}
+                        >
+                          Delete
+                        </Button>
+                      )}
+                    </div>
+                  ))}
                 </li>
               ))}
             </ul>

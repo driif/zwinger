@@ -13,6 +13,7 @@ import {
   getPreferences,
   hostAgents,
   InstallProgress,
+  deleteRuntime,
   installRuntime,
   listRuntimes,
   Prefs,
@@ -189,6 +190,9 @@ export interface Runtimes {
   installs: Partial<Record<RuntimeName, InstallProgress>>;
   /** No `version` installs the pinned version. `confirm` accepts a version with no pinned hash. */
   onInstall: (name: RuntimeName, version?: string, confirm?: boolean) => void;
+  onDelete: (name: RuntimeName, version: string) => void;
+  /** Reads the list again: a VM start or stop changes which versions are in use. */
+  reload: () => void;
 }
 
 /** The order of the start phases. A late reply must not take the phase back. */
@@ -499,6 +503,8 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           if (version) detect(true);
         }
       }),
+    onDelete: (name, version) => run(() => deleteRuntime(name, version).finally(reloadRuntimes)),
+    reload: reloadRuntimes,
   };
 
   // Merged by seq: the live events and the backfill can overlap.
