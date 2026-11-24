@@ -15,10 +15,22 @@ use crate::error::{Error, Result};
 const DEBOUNCE: Duration = Duration::from_millis(150);
 /// The longest time that a list waits for a burst to end.
 const MAX_DELAY: Duration = Duration::from_millis(500);
-/// How often the worker reads the root without a signal. This finds a
+/// How often the worker checks the root without a signal. This finds a
 /// removed root, a root that came back, and changes that the OS watcher did
-/// not report.
+/// not report. The check reads only the root's own metadata ([`Stamp`]);
+/// the full list follows only when it changed.
 const POLL: Duration = Duration::from_secs(1);
+
+/// What a poll compares to find a change of the root without listing it:
+/// the identity of the root, its mtime (an entry added, removed or renamed),
+/// its ctime and mode (a permission change). `None`: no metadata.
+type Stamp = Option<(u64, u64, i64, i64, i64, i64, u32)>;
+
+fn stamp(root: &Path) -> Stamp {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(root).ok()?;
+    Some((m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), m.mode()))
+}
 
 /// The signals to a worker. Flags, so that any number of changes takes the same storage.
 #[derive(Default)]
@@ -32,6 +44,8 @@ struct Flags {
 struct Shared {
     flags: Mutex<Flags>,
     wake: Condvar,
+    /// The count of the full lists of the root, after the first one.
+    lists: AtomicU64,
 }
 
 #[derive(PartialEq)]
@@ -135,6 +149,8 @@ struct Ready {
     /// `None` when the attach failed, such as for a missing root.
     watcher: Option<Box<dyn Send>>,
     first: FolderList,
+    /// The stamp of the root, read before `first`.
+    stamp: Stamp,
 }
 
 /// Attaches the watcher to `root`, then reads the first list, so a change
@@ -143,8 +159,9 @@ struct Ready {
 fn prepare(root: PathBuf, attach: Attach) -> Ready {
     let shared = Arc::new(Shared::default());
     let watcher = attach(&root, Arc::downgrade(&shared)).ok();
+    let stamp = stamp(&root);
     let first = cage::list_folders(&root);
-    Ready { shared, root, attach, watcher, first }
+    Ready { shared, root, attach, watcher, first, stamp }
 }
 
 impl Ready {
@@ -156,9 +173,13 @@ impl Ready {
         mut send: impl FnMut(FolderList) -> bool + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> FolderWatch {
-        let Ready { shared, root, attach, mut watcher, first } = self;
+        let Ready { shared, root, attach, mut watcher, first, stamp: mut last_stamp } = self;
         let worker = shared.clone();
         std::thread::spawn(move || {
+            let list = |root: &Path| {
+                worker.lists.fetch_add(1, Ordering::Relaxed);
+                cage::list_folders(root)
+            };
             let mut last = first;
             // True when the last attach failed. Each later wake tries again.
             let mut detached = watcher.is_none();
@@ -168,18 +189,28 @@ impl Ready {
                     if wake == Wake::Stop || (wake == Wake::Changed && !worker.settle()) {
                         break;
                     }
-                    let mut folders = cage::list_folders(&root);
-                    // A root that came back, or a read that finds a change
-                    // that the watcher did not report, gets a new watcher.
-                    // The read after the attach finds a change between the two.
-                    let readable = matches!(folders, FolderList::Listed(_));
+                    // The stamp is read before the list, so a change during the list shows at the next poll.
+                    let now = stamp(&root);
                     let was_readable = matches!(last, FolderList::Listed(_));
-                    if readable && (!was_readable || detached || (wake != Wake::Changed && folders != last)) {
+                    // An idle poll of a readable root with the same stamp has nothing new to read. An unreadable
+                    // root is read on each poll: a read can fail for a reason that the stamp does not show.
+                    if wake == Wake::Poll && was_readable && !detached && now.is_some() && now == last_stamp {
+                        continue;
+                    }
+                    let replaced = now.zip(last_stamp).is_some_and(|(n, l)| (n.0, n.1) != (l.0, l.1));
+                    last_stamp = now;
+                    let mut folders = list(&root);
+                    // A root that came back or was replaced, or a read that finds a change that the watcher did
+                    // not report, gets a new watcher. The read after the attach finds a change between the two.
+                    let readable = matches!(folders, FolderList::Listed(_));
+                    if readable && (!was_readable || detached || replaced || (wake != Wake::Changed && folders != last))
+                    {
                         match attach(&root, Arc::downgrade(&worker)) {
                             Ok(new) => {
                                 watcher = Some(new);
                                 detached = false;
-                                folders = cage::list_folders(&root);
+                                last_stamp = stamp(&root);
+                                folders = list(&root);
                             }
                             Err(_) => detached = true,
                         }
@@ -322,6 +353,33 @@ mod tests {
         lock(&watches.watches).len()
     }
 
+    /// The cost of one idle poll of a root with 10k entries.
+    #[test]
+    #[ignore = "a measurement: cargo test --release -- --ignored --nocapture idle_poll_cost"]
+    fn idle_poll_cost() {
+        let root = temp_dir();
+        for i in 0..10_000 {
+            if i % 2 == 0 {
+                std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+            } else {
+                std::fs::write(root.join(format!("f{i}")), "").unwrap();
+            }
+        }
+        let runs = 200;
+        let begin = Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(cage::list_folders(&root));
+        }
+        let list = begin.elapsed() / runs;
+        let begin = Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(stamp(&root));
+        }
+        let check = begin.elapsed() / runs;
+        println!("full listing: {list:?} per poll; stamp check: {check:?} per poll");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn sends_the_first_list() {
         let root = temp_dir();
@@ -403,6 +461,33 @@ mod tests {
         let (_watch, rx) = start(&root, attach_none);
         assert!(next(&rx).is_empty());
         std::fs::create_dir(root.join("web")).unwrap();
+        assert_eq!(next(&rx), ["web"]);
+    }
+
+    #[test]
+    fn an_idle_poll_reads_only_the_stamp_of_the_root() {
+        let root = temp_dir();
+        std::fs::create_dir(root.join("web")).unwrap();
+        let (watch, rx) = start(&root, attach_none);
+        assert_eq!(next(&rx), ["web"]);
+        std::thread::sleep(POLL * 3);
+        assert_eq!(watch.shared.lists.load(Ordering::Relaxed), 0);
+        // A rescan, as on a window focus, still reads the full list.
+        watch.shared.set(|f| f.rescan = true);
+        until(|| watch.shared.lists.load(Ordering::Relaxed) == 1);
+    }
+
+    #[test]
+    fn a_poll_finds_a_root_that_became_unreadable_and_readable_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir();
+        std::fs::create_dir(root.join("web")).unwrap();
+        let (_watch, rx) = start(&root, attach_none);
+        assert_eq!(next(&rx), ["web"]);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = frame(&rx);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(unreadable, FolderList::Unreadable(Unreadable::PermissionDenied));
         assert_eq!(next(&rx), ["web"]);
     }
 
