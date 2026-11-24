@@ -104,7 +104,7 @@ const TaskRoom = lazy(() => import("./features/tasks/TaskRoom").then((m) => ({ d
 /** The same size as the ring in the backend. */
 const NET_RING = 2000;
 
-export type TabView = "overview" | "network" | "settings";
+export type TabView = "overview" | "tasks" | "network" | "settings";
 
 /** What the main area shows for the selected session. */
 export type View =
@@ -543,7 +543,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     for (const { id } of sessions) if (!(id in runs)) reloadRuns(id);
   }, [sessionIds]);
 
-  // The tree shows the stage of each live run, so the list polls while one runs.
+  // The task list shows the stage of each live run, so the list polls while one runs.
   const liveRunSessions = Object.keys(runs).filter((id) => runs[id].some((r) => isLive(r.state))).join(" ");
   useEffect(() => {
     if (!liveRunSessions) return;
@@ -602,7 +602,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
 
   // A deleted task has no view.
   useEffect(() => {
-    if (view.kind === "task" && session && !session.tasks.some((t) => t.id === view.taskId)) setView({ kind: "overview" });
+    if (view.kind === "task" && session && !session.tasks.some((t) => t.id === view.taskId)) setView({ kind: "tasks" });
   }, [view, session]);
 
   const blocked = Object.fromEntries(
@@ -636,7 +636,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     focusPane(key, target.id);
   }
 
-  /** ⌘W or a pane's close button: hides the pane. The terminal and its process stay in the tree. */
+  /** ⌘W or a pane's close button: hides the pane. The terminal and its process stay in the tab strip. */
   function hidePane(key = focused) {
     if (!session || !key) return;
     const layout = remove(session.paneLayout, key);
@@ -655,18 +655,17 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     setSettingsTab(undefined);
     setShowCages(false);
     setSelectedId(id);
-    if (id === session?.id || !["overview", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
+    if (id === session?.id || !["overview", "tasks", "network", "settings"].includes(view.kind)) setView({ kind: "overview" });
   }
 
-  function openView(sessionId: string, next: View) {
+  /** A session click opens the terminal view with its focused pane. */
+  function showSession(sessionId: string) {
     setRoundFolder(undefined);
     setSettingsTab(undefined);
     setShowCages(false);
     setSelectedId(sessionId);
     const target = sessions.find((s) => s.id === sessionId);
-    // A session click opens the terminal view with its focused pane.
-    if (next.kind === "terminal") showPane(next.key ?? (target && focusedOf(target)), target);
-    else setView(next);
+    showPane(target && focusedOf(target), target);
   }
 
   async function addProject(folder: string, workspace?: string) {
@@ -894,7 +893,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
     });
   }
 
-  /** Saves the order of the session's terminals. A terminal that opened or closed during the drag fails the order: the tree then shows the saved order. */
+  /** Saves the order of the session's terminals. A terminal that opened or closed during the drag fails the order: the tab strip then shows the saved order. */
   const moveTerminals = (sessionId: string, ids: string[]) =>
     reorderTerminals(sessionId, ids).then(refresh, (e) => {
       if (errorCode(e) !== INVALID_ORDER) setError(errorMessage(e));
@@ -1060,19 +1059,11 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         cages={cages}
         workspaces={workspaces}
         selectedId={session?.id}
-        view={view}
         blocked={blocked}
-        runs={runs}
-        panes={panes}
         run={run}
         vm={vm}
-        onOpen={openView}
-        onRunsChange={reloadRuns}
+        onOpen={showSession}
         onToggle={toggle}
-        onNewSession={(id, kind) => run(() => newSession(kind, joined.find((j) => j.session.id === id)))}
-        onClosePane={closePane}
-        onReopen={(pane) => run(() => reopen(pane))}
-        onMoveTerminals={moveTerminals}
         onNew={actions.newProject}
         onSettings={actions.appSettings}
         onCages={() => openCages()}
@@ -1287,6 +1278,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
             onToggle={() => toggle(selected)}
             onNewSession={(kind) => run(() => newSession(kind))}
             onReopen={(pane) => run(() => reopen(pane))}
+            onShowPane={(key) => showPane(key)}
+            onClosePane={closePane}
+            onMoveTerminals={(ids) => moveTerminals(session.id, ids)}
             onFocus={(key) => focusPane(key)}
             onLayout={(layout) => saveLayout(session.id, layout)}
             onPaneExit={(processId) => {

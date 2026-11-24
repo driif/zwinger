@@ -18,7 +18,7 @@ export function resolveFolderTarget({ x, y }: Point): FolderTarget | undefined {
   if (!under) return;
   const rail = under.closest<HTMLElement>("[data-drop=rail]");
   if (rail) {
-    // Only the nearest row counts: a terminal, task or group row inside a session refuses the drop.
+    // Only the nearest row counts: it names its workspace.
     const row = under.closest<HTMLElement>("[role=treeitem]");
     if (!row) return { kind: "rail", element: rail };
     const workspace = row.dataset.workspaceDrop;

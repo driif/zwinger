@@ -8,7 +8,7 @@ import { CageView, SessionCage, SessionView } from "./api";
 import { copyName, duplicateCage } from "../features/cages/api";
 import { restartPending } from "../features/cages/sessionCage";
 import type { Intent, Pane, Run, View } from "../App";
-import { paneName } from "../features/projects/ProjectRail";
+import { paneName } from "../features/terminal/labels";
 import { editorLabel } from "../features/terminal/folders";
 import { isDefaultEditor, LaunchAction, launchActions, projectEditors, projectLaunchCommand } from "../features/launcher/actions";
 import { Editors } from "../features/launcher/api";

@@ -16,7 +16,7 @@ const motiv = `const div=({children})=>globalThis.paneTestReact.createElement('d
 const stubs: Record<string, string> = {
   "@driif/motiv": motiv,
   "lucide-react": icon,
-  "../projects/ProjectRail": "export const KindIcon=()=>null; export const paneName=()=>'';",
+  "./labels": "export const KindIcon=()=>null; export const paneName=()=>'';",
   "../projects/StartProgress": "export const StartProgress=()=>null;",
   "./panes": "export const place=()=>({panes:[],splits:[]}); export const setRatio=(x)=>x;",
   "./folders": "export const folderLabel=()=>'';",

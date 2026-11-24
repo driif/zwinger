@@ -162,7 +162,7 @@ the cage, and has no sandbox. A cage stop ends the VM shells and the agent sessi
 The effective cage sets where an agent opens: a project with a cage opens the agent in the cage, and a project with no
 cage opens the agent on your Mac. A VM that still runs with an old cage does not count. An agent with no cage has no
 bypass option, no credentials, no proxy or CA environment variables and no state-folder override. zwinger shows a
-warning before each open, and the terminal row shows a no-cage icon and no status glyph. It can read all your files,
+warning before each open, and the terminal tab shows a no-cage icon and no status glyph. It can read all your files,
 including the vault file. See [Agents with no cage](/agents/#agents-with-no-cage).
 
 ## Start and stop

@@ -110,15 +110,6 @@
   padding-left: calc(var(--motiv-space) * 3);
 }
 
-.tree-row.level-3 {
-  padding-left: calc(var(--motiv-space) * 8);
-  color: var(--motiv-color-text-muted);
-}
-
-.tree-row.level-4 {
-  padding-left: calc(var(--motiv-space) * 12);
-}
-
 /* A collapsed or empty workspace that a dragged session is over. */
 .tree-item.drop-target > .tree-row {
   outline: 1px dashed var(--motiv-color-primary);
@@ -171,15 +162,6 @@
   text-overflow: ellipsis;
   font-size: var(--motiv-font-size-sm);
   font-weight: 400;
-}
-
-.tree-project.forbidden-target {
-  outline: 1px dashed var(--motiv-color-danger);
-}
-
-.rail.forbidden,
-.rail.forbidden * {
-  cursor: not-allowed;
 }
 
 .tree-chevron {

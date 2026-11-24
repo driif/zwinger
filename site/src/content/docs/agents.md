@@ -33,7 +33,7 @@ login shell, so it gets the `PATH` of your profile. zwinger uses only an agent b
 of their npm folder (for example `/opt/homebrew/bin/node` or the nvm version that has the package). If that folder has
 no `node` (bun, pnpm or a Homebrew formula), the agent uses the `node` of your `PATH`.
 
-An agent row from the time when the project had a cage also starts on your Mac: **Continue last session** continues
+An agent tab from the time when the project had a cage also starts on your Mac: **Continue last session** continues
 the last session of the agent on your Mac, not the session in the VM.
 
 Nothing isolates this agent. It runs as your macOS user and can read all your files. This includes the
@@ -48,17 +48,17 @@ An agent with no cage gets a guard:
 - No proxy and no CA environment variables from zwinger, and no override of the agent's state folder (`HOME`,
   `CODEX_HOME` or `PI_CODING_AGENT_DIR`). Your shell profile can still set proxy variables.
 
-The terminal row shows a no-cage icon. Point to it to read "No cage: runs on this Mac". The row shows no
+The terminal tab shows a no-cage icon. Point to it to read "No cage: runs on this Mac". The tab shows no
 [agent status](#agent-status) glyph. A cage stop does not end the agent; an app exit ends it, as it ends the Mac shells.
 
 zwinger checks the project again at each open. If the project gets a cage, the agent with no cage does not open again:
-its row says "the session has a cage". Open the agent in the cage instead.
+its tab says "the session has a cage". Open the agent in the cage instead.
 
 Tasks need a cage. A project with no cage cannot run a task.
 
 ## Agent status
 
-The terminal, session and workspace rows show an agent status glyph while an agent runs in a VM terminal. This
+The terminal tabs and the session and workspace rows show an agent status glyph while an agent runs in a VM terminal. This
 includes an agent that you start in a VM shell:
 
 - **Active:** the agent is working.
@@ -67,7 +67,7 @@ includes an agent that you start in a VM shell:
 
 Point to a glyph to read its status. A session with several agents shows the most urgent state: **blocked > active > done**.
 A workspace uses the same rule across its sessions. The glyph disappears when the agent exits. In a VM shell, the
-shell stays open and its row shows no glyph again.
+shell stays open and its tab shows no glyph again.
 
 When an agent goes to **blocked** while zwinger is in the background, the dock icon bounces once and its badge shows
 the number of blocked agents. The badge goes when you bring the zwinger window to the front.
@@ -82,7 +82,7 @@ they do not change your agent settings or a read-only agent profile:
 - **Gemini CLI** reports all three states. Its hooks are in a system defaults file, so your own Gemini settings win
   and your own hooks run too. Gemini CLI runs hooks only in a trusted folder.
 - **Pi** reports active and done; it does not report blocked.
-- **Antigravity CLI** reports no status. Its row shows no glyph.
+- **Antigravity CLI** reports no status. Its tab shows no glyph.
 
 A headless call, such as `claude -p`, `codex exec`, `gemini -p` or `agy -p`, reports no status. An agent with no cage shows no
 glyph, because zwinger does not install its hooks on your Mac.

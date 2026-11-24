@@ -9,6 +9,10 @@ VM shell (⌘⇧T).
 
 ## Create a task
 
+The **Tasks** tab of the project page lists the tasks of the project, each with the state of its latest run. **Tasks**
+in the page header opens it, also from the terminal view. Click a task to open its room. **New task** adds a task. The
+menu of a task (right-click or the **…** button) has **Start run**, **Edit** and **Delete**.
+
 A task has these fields:
 
 - **Title** and **Request**.

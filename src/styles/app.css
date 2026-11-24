@@ -262,6 +262,22 @@ p {
   flex-direction: column;
 }
 
+.task-list {
+  display: grid;
+  gap: var(--motiv-space);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-list > li {
+  position: relative;
+}
+
+.task-list .action-menu {
+  top: 100%;
+}
+
 .facts {
   margin: 0;
   display: flex;

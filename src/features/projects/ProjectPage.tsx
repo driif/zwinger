@@ -10,7 +10,7 @@ import {
   SpringCheckbox,
 } from "@driif/motiv";
 import { ActionMenu, SplitButton } from "@driif/motiv/action-menu";
-import { Bot, Info, Laptop, Play, Square, TriangleAlert } from "lucide-react";
+import { Bot, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -43,7 +43,9 @@ import type { MapEdit } from "./mapLayout";
 import { NetworkTab } from "../network/NetworkTab";
 import { SettingsTab } from "../settings/SettingsTab";
 import { TaskDialog } from "../tasks/TaskDialog";
+import { TaskList } from "../tasks/TaskList";
 import { TerminalTab } from "../terminal";
+import { TerminalTabs } from "../terminal/TerminalTabs";
 import { Notice } from "../../shared/Notice";
 import { tildePath } from "../../shared/paths";
 import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
@@ -228,10 +230,11 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   );
 }
 
-// Agents and Terminal are no tabs: the tree names each agent and terminal, so tabs would show them twice.
+// The terminals are no tab here: they have their own tab strip above the panes.
 
 const TABS = [
   { value: "overview", label: "Overview" },
+  { value: "tasks", label: "Tasks" },
   { value: "network", label: "Network" },
   { value: "settings", label: "Settings" },
 ];
@@ -280,6 +283,12 @@ interface Props {
   onNewSession: (kind: TerminalKind | "agent") => void;
   /** Opens a dormant or exited terminal again. */
   onReopen: (pane: Pane) => void;
+  /** Shows the terminal in the focused pane. */
+  onShowPane: (key: string) => void;
+  /** Removes the terminal and ends its process. */
+  onClosePane: (key: string) => void;
+  /** Saves the order of all terminals of the session. */
+  onMoveTerminals: (ids: string[]) => void;
   onFocus: (key: string) => void;
   onLayout: (layout: PaneNode) => void;
   onPaneExit: (processId: string, code: number) => void;
@@ -337,6 +346,9 @@ export function ProjectPage({
   onProjectEditor,
   onOpenDefaultEditor,
   covered,
+  onShowPane,
+  onClosePane,
+  onMoveTerminals,
   ...terminal
 }: Props) {
   const status = vmCage?.status ?? { state: "stopped" };
@@ -352,7 +364,7 @@ export function ProjectPage({
   // The tab that shows again after a terminal or task view. The tabs stay
   // mounted meanwhile, so a draft in them is kept.
   const [tab, setTab] = useState<TabView>("overview");
-  const isTab = view.kind === "overview" || view.kind === "network" || view.kind === "settings";
+  const isTab = view.kind === "overview" || view.kind === "tasks" || view.kind === "network" || view.kind === "settings";
   if (isTab && view.kind !== tab) setTab(view.kind);
 
   const edit: Run = (action) =>
@@ -425,6 +437,9 @@ export function ProjectPage({
             >
               New terminal
             </SplitButton>
+            <Button size="sm" variant="ghost" iconLeft={<ListChecks size={14} />} onClick={() => jump("tasks")}>
+              Tasks {session.tasks.length > 0 && <span className="muted">{session.tasks.length}</span>}
+            </Button>
             {editors &&
               (defaultEditor ? (
                 <SplitButton
@@ -611,6 +626,16 @@ export function ProjectPage({
                     </dl>
                   </div>
                 ),
+                tasks: (
+                  <TaskList
+                    session={session}
+                    cageRunning={!!cage && status.state === "running"}
+                    runs={runs}
+                    run={run}
+                    onView={onView}
+                    onRunsChange={onRunsChange}
+                  />
+                ),
                 network: !cage && !vmCage ? (
                   <div className="tab-body">{noCage}</div>
                 ) : (
@@ -675,16 +700,27 @@ export function ProjectPage({
                 cage={cage}
                 taskId={view.taskId}
                 onDone={async (taskId) => {
-                  // The tree and the task view need the saved task.
+                  // The task list and the task view need the saved task.
                   await onRefresh();
-                  onView(taskId ? { kind: "task", taskId } : { kind: "overview" });
+                  onView(taskId ? { kind: "task", taskId } : { kind: "tasks" });
                 }}
               />
             </div>
           )}
         </>
       )}
-      <div className="view" hidden={view.kind !== "terminal"}>
+      <div className="view terminal-view" hidden={view.kind !== "terminal"}>
+        <TerminalTabs
+          session={session}
+          panes={panes.filter((p) => p.sessionId === session.id)}
+          selected={view.kind === "terminal" ? focused : undefined}
+          newItems={launchItems(newTerminals, onLaunch)}
+          onShow={onShowPane}
+          onReopen={terminal.onReopen}
+          onNewSession={terminal.onNewSession}
+          onClose={onClosePane}
+          onMove={onMoveTerminals}
+        />
         <TerminalTab
           session={session}
           status={status}

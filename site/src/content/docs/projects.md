@@ -34,8 +34,8 @@ keeps its saved color, and you can try again.
 ## Workspaces
 
 The rail shows your projects in **workspaces**. In the rail, a project is a **session**. Each session is in one
-workspace. The tree is workspace → session → Terminals and Tasks. Use the Up and Down arrow keys to move between
-visible rows. A ring marks the row that has keyboard focus.
+workspace. The tree has two levels: workspace → session. The terminals and tasks of a session are on its page. Use the
+Up and Down arrow keys to move between visible rows. A ring marks the row that has keyboard focus.
 
 To resize the project list, drag its right edge or press Tab to focus the edge and use the Left and Right arrow keys.
 Home sets the minimum width and End sets the maximum. Double-click the edge to restore the default width.
@@ -54,7 +54,7 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
 - **Delete workspace** in the menu of a workspace deletes it. If it has sessions, zwinger asks first. Its sessions
   then move to the end of the workspace above it, or of the workspace below it if it is the first. A session that
   inherits its cage gets the cage of its new workspace at its next start. The last workspace cannot be deleted.
-- The rail remembers which workspaces and sessions are collapsed, also after a restart.
+- The rail remembers which workspaces are collapsed, also after a restart.
 - **Default cage…** in the menu of a workspace sets the cage of the sessions in it that inherit their cage. A session
   row shows a cage icon when the session has a cage. Its tooltip names the cage, with "(inherited)" if the cage comes
   from the workspace, and says if the session uses the shared VM of the cage or its own VM.
@@ -74,11 +74,9 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   end of the workspace above or to the start of the workspace below. A collapsed workspace expands. A workspace moves
   one place for each arrow key.
 - If the sidebar changed during a drag, zwinger shows "The sidebar changed. Try again." and shows the saved order.
-- A terminal stays in its session. You can change only the order of the terminals in a session.
 - Click a session to open its terminal view.
 - Drop a folder from Finder on a workspace or a session row to create a project in that workspace. A folder dropped
-  on empty rail space goes to the first workspace. A Terminals or Tasks row, a terminal row and a task row do not
-  accept a folder. While you drag the folder, a dashed outline shows the row or the rail space that receives it. A file
+  on empty rail space goes to the first workspace. While you drag the folder, a dashed outline shows the row or the rail space that receives it. A file
   gets no outline. A duo round folder gets no outline either: it opens its room wherever you drop it.
 
 zwinger saves the workspaces in `workspaces.json`, the projects in `sessions.json` and their cage settings in
@@ -126,8 +124,17 @@ A project has three kinds of terminal:
 | VM shell | In the cage | `/workspace`, or `/workspace/<slug>` in a shared VM |
 | Agent session | In the cage | The [harness folder](/agents/), else the VM shell's folder |
 
-The tree shows all terminals of a project in one Terminals group. Drag a terminal to change the order. zwinger saves
-the order.
+The terminal view of a project has a tab strip above its panes. It shows all terminals of the project, each with the
+icon of its kind, its name or title, its state (dormant or exited) and its [agent status](/agents/#agent-status) glyph.
+The tab of the focused pane is selected.
+
+- Click a tab to show its terminal in the focused pane. A terminal that has no pane takes the place of the terminal
+  in the focused pane. The replaced terminal continues to run.
+- Drag a tab to change the order. zwinger saves the order. **Move left** and **Move right** in the tab menu do the
+  same with the keyboard.
+- The menu of a tab (right-click or the **…** button) has **Open** for a dormant or exited terminal, **Continue last
+  session** for an agent, and **Close**.
+- **New** at the end of the strip opens a new shell or agent.
 
 - A terminal that has no process is **dormant**. This occurs after a cage stop or an app restart. **Open** starts a
   new process in the same place. After an app restart, a dormant Mac shell shows its prior output read-only when it
@@ -137,7 +144,7 @@ the order.
   **Open** starts a new process with an empty screen. After an app restart, the terminal is dormant again.
   Stopping the cage also makes a VM terminal dormant.
 - A cage stop does not end a Mac shell. A project delete and the app exit end it.
-- Only **Close** in the tree removes a terminal and ends its process.
+- Only **Close** in the tab menu removes a terminal and ends its process.
 
 Mac shell history stays in the app data folder under `terminal-history`. Each file has a 1 MiB limit and keeps at most
 the 16 most recent shell runs of its terminal. Its folders are private to your account (0700) and its files are private
@@ -146,9 +153,9 @@ terminal's history; deleting a project removes the history of all its terminals.
 **Close** or the delete shows an error and keeps the terminal or project. Fix the cause, then try again.
 
 A terminal's name is its kind and number, for example "Mac shell 2". When the shell or terminal app sets a window title
-(OSC 0 or OSC 2), the tree row and the pane header show that title. The two labels change together. The title stays
-with its process: an empty title, an exit, a reopen or a close shows the name again. The actions of the row and
-the pane keep the name, for example "Actions for Mac shell 2". A long title is shortened to the width of the row
+(OSC 0 or OSC 2), the tab and the pane header show that title. The two labels change together. The title stays
+with its process: an empty title, an exit, a reopen or a close shows the name again. The actions of the tab and
+the pane keep the name, for example "Actions for Mac shell 2". A long title is shortened to the width of the tab
 or header. Point to the title to read all of it.
 
 zwinger keeps the last 1 MiB of output of each terminal. When you show the terminal again, for example after a window
@@ -177,7 +184,7 @@ on a horizontal one. Each arrow press moves the divider by one percent of its sp
 limits of 10% and 90%.
 
 When you close a pane, the terminal is hidden but continues to run. A hidden terminal releases its WebGL context.
-When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tree.
+When you show it again, it redraws its output and uses WebGL if available. To end its process, use **Close** in the tab menu.
 
 ## Search in a terminal
 

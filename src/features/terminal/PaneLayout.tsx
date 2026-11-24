@@ -3,7 +3,7 @@ import { Code, Columns2, Ellipsis, Play, Rows2, X } from "lucide-react";
 import { CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PaneNode, CageStatus } from "../../shared/api";
 import type { Pane } from "../../App";
-import { KindIcon, paneName } from "../projects/ProjectRail";
+import { KindIcon, paneName } from "./labels";
 import { StartProgress } from "../projects/StartProgress";
 import { place, Rect, setRatio } from "./panes";
 import { folderLabel } from "./folders";
