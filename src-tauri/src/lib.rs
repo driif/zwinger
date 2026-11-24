@@ -304,6 +304,11 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;
                 }
+                if instance::notify(&data).is_ok() {
+                    // The open window comes to the front. This process has
+                    // touched no data, so it can end at once.
+                    std::process::exit(0);
+                }
                 let handle = app.handle().clone();
                 app.dialog()
                     .message("zwinger is already open with the same app data. Use the open window, or quit it first.")
@@ -312,6 +317,10 @@ pub fn run() {
                     .show(move |_| handle.exit(0));
                 return Ok(());
             };
+            let handle = app.handle().clone();
+            if let Err(e) = lock.listen(move || commands::window::focus_main_window(&handle)) {
+                eprintln!("a second launch cannot bring this window to the front: {e}");
+            }
             app.manage(lock);
             app.manage(commands::window::WindowReveal::default());
             app.manage(blocked_badge::BlockedBadge::default());

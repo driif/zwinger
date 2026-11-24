@@ -4,11 +4,17 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const UPDATE_HELPER_ARG: &str = "--zwinger-update-handoff";
+
+/// The socket of the lock holder, next to the lock file. A later launch with
+/// the same data connects to it to bring the open window to the front.
+const SOCKET: &str = "zwinger.sock";
 
 /// Holds the lock until it is dropped or the process exits.
 pub struct InstanceLock {
@@ -21,6 +27,33 @@ impl InstanceLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Calls `on_launch` on a thread each time a later launch with the same
+    /// data calls [`notify`].
+    pub fn listen(&self, on_launch: impl Fn() + Send + 'static) -> io::Result<()> {
+        let path = self.path.with_file_name(SOCKET);
+        // Only the lock holder binds, so a socket file here is from an old process.
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_ok() {
+                    on_launch();
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Tells the process that holds the lock of `data` that a second launch
+/// happened. An error: no process listens, for example while it starts.
+pub fn notify(data: &Path) -> io::Result<()> {
+    UnixStream::connect(data.join(SOCKET)).map(drop)
 }
 
 /// `None`: a different process holds the lock. The lock file is never deleted.
@@ -246,6 +279,29 @@ mod tests {
         std::fs::write(&file, "").unwrap();
         let err = acquire(&file).err().expect("an error");
         assert!(err.to_string().contains("zwinger.lock"), "{err}");
+    }
+
+    #[test]
+    fn a_second_launch_notifies_the_lock_holder() {
+        // A socket path has at most 103 bytes, and the test folder is longer.
+        let dir = PathBuf::from(format!("/tmp/zw-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(notify(&dir).is_err(), "no process listens yet");
+        // A socket file of an old process does not block the new one.
+        drop(UnixListener::bind(dir.join(SOCKET)).unwrap());
+        assert!(notify(&dir).is_err());
+
+        let lock = acquire(&dir).unwrap().unwrap();
+        let (sender, launches) = std::sync::mpsc::channel();
+        lock.listen(move || sender.send(()).unwrap()).unwrap();
+        let mode = std::fs::metadata(dir.join(SOCKET)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        for _ in 0..2 {
+            notify(&dir).unwrap();
+            launches.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        drop(lock);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

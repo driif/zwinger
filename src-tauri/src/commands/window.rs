@@ -53,6 +53,18 @@ pub(crate) fn reveal_main_window(app: AppHandle, background_color: String) -> Re
     Ok(())
 }
 
+/// Brings the main window to the front for a second launch. Before the first
+/// reveal, the reveal shows and focuses the window itself.
+pub(crate) fn focus_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    if !app.try_state::<WindowReveal>().is_some_and(|state| state.is_revealed()) {
+        return;
+    }
+    if let Err(e) = window.unminimize().and_then(|()| window.show()).and_then(|()| window.set_focus()) {
+        eprintln!("the window cannot come to the front: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
