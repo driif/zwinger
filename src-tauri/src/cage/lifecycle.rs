@@ -51,12 +51,21 @@ pub(crate) const TUI_PROBE: Duration = Duration::from_secs(4);
 const TUI_PROBE_SIZE: (u16, u16) = (24, 80);
 
 /// The notice of a cage whose Claude login has no token.
-const NO_CLAUDE_TOKEN: &str = "Claude Code has no token in this cage. \
-    Run claude setup-token and save the token in this cage, then restart the cage.";
+pub(crate) const NO_CLAUDE_TOKEN: &str = "Claude Code has no token in this cage. \
+    Run claude setup-token and save the token in this cage.";
 
 /// The notice of a cage whose Claude token has expired.
-const EXPIRED_CLAUDE_TOKEN: &str = "The Claude Code token of this cage has expired. \
-    Run claude setup-token and save the new token in this cage, then restart the cage.";
+pub(crate) const EXPIRED_CLAUDE_TOKEN: &str = "The Claude Code token of this cage has expired. \
+    Run claude setup-token and save the new token in this cage.";
+
+/// The notice for the Claude token `entry` of a bound cage: missing, with
+/// no date or expired. A valid token has none.
+fn claude_token_problem(entry: Option<&secrets::VaultEntry>) -> Option<&'static str> {
+    let Some(saved_at) = entry.and_then(|entry| entry.saved_at) else {
+        return Some(NO_CLAUDE_TOKEN);
+    };
+    (saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms()).then_some(EXPIRED_CLAUDE_TOKEN)
+}
 
 /// The bytes of a probe's stderr that a notice shows.
 pub(crate) const PROBE_ERR: usize = 512;
@@ -793,15 +802,12 @@ impl<R: SandboxRuntime> Manager<R> {
             let owner = key.vault_key(&cage.id);
             self.settle(&owner, &key.name)?;
             let entry = self.vault.entry(&owner, &key.name)?;
-            if bound && credential.name == CLAUDE_TOKEN {
-                let Some(saved_at) = entry.as_ref().and_then(|entry| entry.saved_at) else {
-                    notice = Some(NO_CLAUDE_TOKEN.to_owned());
-                    continue;
-                };
-                if saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms() {
-                    notice = Some(EXPIRED_CLAUDE_TOKEN.to_owned());
-                    continue;
-                }
+            if bound
+                && credential.name == CLAUDE_TOKEN
+                && let Some(problem) = claude_token_problem(entry.as_ref())
+            {
+                notice = Some(problem.to_owned());
+                continue;
             }
             match entry {
                 Some(entry) => values.insert(key, entry.value),
@@ -809,6 +815,20 @@ impl<R: SandboxRuntime> Manager<R> {
             };
         }
         Ok((values, notice))
+    }
+
+    /// The Claude token notice of `cage`, with the check of
+    /// [`Manager::vault_values`] but no other value read.
+    pub(crate) fn claude_token_notice(&self, cage: &Cage) -> Result<Option<&'static str>> {
+        let login = cage.host_agent(AgentKind::Claude).is_some_and(|agent| agent.login);
+        let bound = cage.claude_token_binding()?;
+        if !bound {
+            return Ok(login.then_some(NO_CLAUDE_TOKEN));
+        }
+        let key = cage.claude_token_ref();
+        let owner = key.vault_key(&cage.id);
+        self.settle(&owner, &key.name)?;
+        Ok(claude_token_problem(self.vault.entry(&owner, &key.name)?.as_ref()))
     }
 
     /// Checks that `argv` runs in the VM and ends with code 0. The error is

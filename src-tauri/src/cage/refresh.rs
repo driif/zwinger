@@ -13,7 +13,8 @@ use std::sync::Arc;
 use crate::agent::{AgentKind, guest_login, launch};
 use crate::cage::Cage;
 use crate::cage::lifecycle::{
-    DOWNLOAD_HINT, apply_profile, download_notices, guest_placeholders, host_login, mounted, profiles_dir,
+    DOWNLOAD_HINT, EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN, apply_profile, download_notices, guest_placeholders,
+    host_login, mounted, profiles_dir,
 };
 use crate::cage::manager::{Manager, State, Vm, blocking, lock};
 use crate::error::Result;
@@ -116,6 +117,11 @@ impl<R: SandboxRuntime> Manager<R> {
         let changed: Vec<AgentKind> =
             NATIVE.into_iter().filter(|&k| applied.host_agent(k) != config.host_agent(k)).collect();
         let state_dir = self.state_dir(&key)?;
+        // The stored cage has the token binding that the proxy uses now.
+        let token_notice = {
+            let _edit = lock(&self.secret_edit);
+            self.claude_token_notice(&current)?
+        };
         let (host, data, old) = (self.host.clone(), self.data.clone(), live.logins());
         let (vm_key, logins_of) = (key.clone(), config.logins.clone());
         let uses: Vec<_> = NATIVE.into_iter().map(|k| (k, config.host_agent(k).cloned())).collect();
@@ -179,8 +185,8 @@ impl<R: SandboxRuntime> Manager<R> {
             host.placeholders = guest_placeholders(&config.logins, &network);
             host.installed = found.installed;
             host.guest_logins = found.guest_logins;
-            host.notices.retain(|n| !n.ends_with(DOWNLOAD_HINT));
-            for notice in found.notices {
+            host.notices.retain(|n| !n.ends_with(DOWNLOAD_HINT) && n != NO_CLAUDE_TOKEN && n != EXPIRED_CLAUDE_TOKEN);
+            for notice in found.notices.into_iter().chain(token_notice.map(str::to_owned)) {
                 if !host.notices.contains(&notice) {
                     host.notices.push(notice);
                 }
@@ -265,6 +271,7 @@ pub(crate) fn rewrite_wrappers<V>(
 #[cfg(test)]
 mod tests {
     use super::live_config;
+    use crate::cage::lifecycle::{EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN};
     use crate::cage::testing::*;
 
     fn starts(runtime: &FakeRuntime) -> usize {
@@ -331,6 +338,20 @@ mod tests {
         assert!(!wrapper.contains("sk-ant-oat-real"));
         // The profile is in the folder that the VM mounts at its start.
         assert!(manager.profile_dir(&id).join("claude/skills/review/SKILL.md").is_file());
+        assert_eq!(starts(&runtime), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_claude_token_clears_the_token_notice_with_no_restart() {
+        let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
+        runtimes::fake_install(&manager.data, "claude");
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
+        manager.start(&id).await.unwrap();
+        assert!(manager.list().cages[0].shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
+        manager.set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, false).unwrap();
+        manager.refresh_agents(Some(&id)).await;
+        let notices = manager.list().cages.remove(0).shared().host_notices;
+        assert!(!notices.iter().any(|n| n == NO_CLAUDE_TOKEN || n == EXPIRED_CLAUDE_TOKEN), "{notices:?}");
         assert_eq!(starts(&runtime), 1);
     }
 
