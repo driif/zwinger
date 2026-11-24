@@ -141,6 +141,14 @@ export interface VmControl {
   setOwn: (sessionId: string, own: boolean) => Promise<void>;
 }
 
+/** A failed action. It stays until the user dismisses it, or until the action with the same `key` succeeds. */
+interface AppError {
+  key: string;
+  text: string;
+  /** The name of the project the action belongs to. */
+  project?: string;
+}
+
 /** The user cancelled a confirmation: `run` shows no error. */
 class Cancelled extends Error {}
 
@@ -279,7 +287,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const [view, setView] = useState<View>({ kind: "overview" });
   /** Per session, the terminal of the pane that has the focus. */
   const [focusedPanes, setFocusedPanes] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string>();
+  const [errors, setErrors] = useState<AppError[]>([]);
   const [appNotices, setAppNotices] = useState<string[]>([]);
   /** The confirmation of the last copied path. An object, so that a second copy of the same path starts a new timer. */
   const [copied, setCopied] = useState<{ text: string }>();
@@ -351,6 +359,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
           setSessions(next.sessions);
           setCages(next.cages);
           setWorkspaces(groups);
+          clearError("refresh");
           for (const [id, event] of agentEvents.current) {
             if (event.version <= version) agentEvents.current.delete(id);
           }
@@ -358,30 +367,37 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
         return next.sessions;
       },
       (e) => {
-        if (request === refreshes.current) setError(errorMessage(e));
+        if (request === refreshes.current) showError(e, undefined, "refresh");
       },
     );
   };
 
+  /** Shows a failed action, newest first. The same error again moves to the top. */
+  const showError = (e: unknown, project?: string, key = `${project}\n${errorMessage(e)}`) =>
+    setErrors((all) => [{ key, text: errorMessage(e), project }, ...all.filter((x) => x.key !== key)].slice(0, 5));
+
+  const clearError = (key: string) => setErrors((all) => all.filter((x) => x.key !== key));
+
   const run: Run = (action) => {
-    setError(undefined);
+    // An action on a screen of the app belongs to no project. The name is read now, so a later navigation does not change it.
+    const project = showSettings || showCages ? undefined : session?.name;
     const done = action().then(refresh, (e) => {
-      if (!(e instanceof Cancelled)) setError(errorMessage(e));
+      if (!(e instanceof Cancelled)) showError(e, project);
       return refresh();
     });
     refresh();
     return done;
   };
 
-  const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => setError(errorMessage(e)));
+  const reloadRuntimes = () => listRuntimes().then(setRuntimeList, (e) => showError(e));
 
   // Detection runs at app start and on request, never in a loop.
   const detect = (fresh: boolean) => {
     setDetection(undefined);
-    (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => setError(errorMessage(e)));
+    (fresh ? detectHostAgents() : hostAgents()).then(setDetection, (e) => showError(e));
   };
 
-  const loadEditors = () => detectEditors().then(setEditors, (e) => setError(errorMessage(e)));
+  const loadEditors = () => detectEditors().then(setEditors, (e) => showError(e));
 
   useEffect(() => {
     if (!copied) return;
@@ -544,7 +560,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       listAsks(key).then((list) => setAsks((current) => ({ ...current, [key]: list })));
       listNetEvents(key).then(
         (events) => netGeneration.current.get(key) === generation && addNet(key, events),
-        (e) => setError(errorMessage(e)),
+        (e) => showError(e),
       );
     }
   }, [keys.join(" "), listening]);
@@ -641,10 +657,17 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** Saves at once on the screen, then in the backend. */
   function saveLayout(sessionId: string, layout: PaneNode | null) {
     setSessions((current) => current.map((s) => (s.id === sessionId ? { ...s, paneLayout: layout } : s)));
-    setPaneLayout(sessionId, layout).then(refresh, (e) => {
-      setError(errorMessage(e));
-      return refresh();
-    });
+    const key = `layout:${sessionId}`;
+    setPaneLayout(sessionId, layout).then(
+      () => {
+        clearError(key);
+        return refresh();
+      },
+      (e) => {
+        showError(e, sessions.find((s) => s.id === sessionId)?.name, key);
+        return refresh();
+      },
+    );
   }
 
   /** A focus event of the pane calls it too, so an unchanged focus keeps the state. */
@@ -877,8 +900,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       }
       if (target?.kind !== "rail") return;
       const workspace = target.workspace;
-      setError(undefined);
-      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder, workspace }), (e) => setError(errorMessage(e)));
+      resolveFolder(dropped).then((folder) => setDropFolder({ dropped, folder, workspace }), (e) => showError(e));
     });
     return () => {
       drag++;
@@ -922,7 +944,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   /** Saves the order of the session's terminals. A terminal that opened or closed during the drag fails the order: the tab strip then shows the saved order. */
   const moveTerminals = (sessionId: string, ids: string[]) =>
     reorderTerminals(sessionId, ids).then(refresh, (e) => {
-      if (errorCode(e) !== INVALID_ORDER) setError(errorMessage(e));
+      if (errorCode(e) !== INVALID_ORDER) showError(e, sessions.find((s) => s.id === sessionId)?.name);
       return refresh();
     });
 
@@ -944,7 +966,7 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
   const pullNotices = () =>
     takeAppNotices().then(
       (notes) => notes.length > 0 && setAppNotices((all) => [...all, ...notes]),
-      (e) => setError(errorMessage(e)),
+      (e) => showError(e),
     );
 
   const cancels = (tasks: string[]) => (tasks.length > 0 ? ` Cancelled tasks: ${tasks.join(", ")}.` : "");
@@ -1139,7 +1161,10 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
       <RailHandle
         width={railWidth}
         onResize={setRailWidth}
-        onDone={(width) => writePrefs({ ...prefs, railWidth: width }).catch((e) => setError(errorMessage(e)))}
+        onDone={(width) => writePrefs({ ...prefs, railWidth: width }).then(
+            () => clearError("rail-width"),
+            (e) => showError(e, undefined, "rail-width"),
+          )}
       />
       <main className="main">
         <div className="notices">
@@ -1177,6 +1202,15 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
               {copied.text}
             </Notice>
           )}
+          {errors.map((error) => (
+            <Notice
+              key={error.key}
+              icon={<TriangleAlert size={14} className="danger" />}
+              onDismiss={() => clearError(error.key)}
+            >
+              {error.project ? `${error.project}: ${error.text}` : error.text}
+            </Notice>
+          ))}
           {appNotices.map((notice) => (
             <Notice
               key={notice}
@@ -1322,10 +1356,9 @@ function Workspace({ firstSession, prefs, onPrefs, banner, update, onUpdate, app
               terminalFolders.hide(processId);
               refresh();
             }}
-            onPaneError={(e) => setError(errorMessage(e))}
+            onPaneError={(e) => showError(e, session.name)}
           />
         )}
-        {error && <p className="status danger mono">{error}</p>}
       </main>
       <Toaster />
     </div>

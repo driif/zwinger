@@ -31,6 +31,10 @@ has its own color, also when two projects share a cage. A color change does not 
 If zwinger cannot save the color, a notice shows the project name and the error, also on a different page. The project
 keeps its saved color, and you can try again.
 
+A failed action shows an error notice at the top. When the action belongs to a project, the notice starts with the
+project name. The notice stays when you open a different project or another action succeeds. Click **Dismiss** to
+remove it. At most five errors show, the newest first.
+
 ## Workspaces
 
 The rail shows your projects in **workspaces**. In the rail, a project is a **session**. Each session is in one
