@@ -128,6 +128,11 @@ export function setLook(prefs: TerminalPrefs, colors: TerminalColors) {
   }
 }
 
+/** Fits all visible terminals to their elements, for example after a zoom change. */
+export function fitAll() {
+  for (const entry of live) entry.fit();
+}
+
 /** Outlines the matches in the terminal colors. The search addon reports its match count only with decorations. */
 export function searchOptions(): ISearchOptions {
   const { foreground, cursor } = look!.colors;

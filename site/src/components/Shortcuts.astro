@@ -31,6 +31,10 @@ const rows = [
     if (!description) throw new Error(`Shortcuts.astro: no description for the shortcut action "${s.action}".`);
     return { label: s.label, description, terminal: "terminal" in s && s.terminal };
   }),
+  // The View menu handles ⌘=, ⌘− and ⌘0; src/features/appearance/zoom.ts handles ⌘+.
+  { label: "⌘+ or ⌘=", description: "Zoom in on the whole app.", terminal: false },
+  { label: "⌘−", description: "Zoom out on the whole app.", terminal: false },
+  { label: "⌘0", description: "Show the whole app at its actual size.", terminal: false },
   // The terminal itself handles ⌘F (src/features/terminal/engine.ts), not the app shortcuts.
   { label: "⌘F", description: "Search the output of the terminal.", terminal: true },
 ];

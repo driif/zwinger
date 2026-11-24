@@ -35,13 +35,14 @@ mod terminal;
 mod test_dir;
 mod updates;
 mod workspaces;
+mod zoom;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter as _, Manager as _, RunEvent, WindowEvent, Wry};
 
@@ -90,6 +91,17 @@ fn menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
                     &PredefinedMenuItem::copy(app, None)?,
                     &PredefinedMenuItem::paste(app, None)?,
                     &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "View",
+                true,
+                &[
+                    // ⌘+ (⌘⇧=) has no item: the UI handles it (src/features/appearance/zoom.ts).
+                    &MenuItem::with_id(app, zoom::MENU_IN, "Zoom In", true, Some("CmdOrCtrl+="))?,
+                    &MenuItem::with_id(app, zoom::MENU_OUT, "Zoom Out", true, Some("CmdOrCtrl+-"))?,
+                    &MenuItem::with_id(app, zoom::MENU_RESET, "Actual Size", true, Some("CmdOrCtrl+0"))?,
                 ],
             )?,
             &Submenu::with_items(
@@ -246,6 +258,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .menu(menu)
+        .on_menu_event(|app, event| {
+            let step = match event.id().as_ref() {
+                zoom::MENU_IN => zoom::Step::In,
+                zoom::MENU_OUT => zoom::Step::Out,
+                zoom::MENU_RESET => zoom::Step::Reset,
+                _ => return,
+            };
+            if let Err(e) = zoom::zoom(app, step) {
+                eprintln!("zoom failed: {e}");
+            }
+        })
         .on_window_event(|window, event| {
             if let WindowEvent::Focused(true) = event {
                 blocked_badge::focused(window.app_handle());
@@ -312,7 +335,11 @@ pub fn run() {
             let vault = Arc::new(secrets::FileVault::new(&data)?);
             let minimum = app.config().bundle.macos.minimum_system_version.clone().unwrap_or_default();
             app.manage(Bootstrap::default());
-            app.manage(preferences::Preferences::load(data.join("preferences.json")));
+            let preferences = preferences::Preferences::load(data.join("preferences.json"));
+            if let Err(e) = zoom::apply(app.handle(), preferences.get().zoom) {
+                eprintln!("the saved zoom could not be applied: {e}");
+            }
+            app.manage(preferences);
             app.manage(appearance::Themes { dir: data.join("themes") });
             // Makes no Keychain call: each one follows a click in Settings.
             app.manage(legacy_keychain::LegacyKeychain::new(legacy_keychain::system_source()));
@@ -481,6 +508,7 @@ pub fn run() {
             commands::settings::startup_status,
             commands::settings::get_preferences,
             commands::settings::set_preferences,
+            commands::settings::zoom,
             commands::settings::import_ghostty_config,
             commands::settings::storage,
             commands::settings::clean_images,

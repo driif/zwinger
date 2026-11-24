@@ -91,6 +91,7 @@ import { detectEditors, Editors, openInEditor, revealSession } from "./features/
 import { tildePath } from "./shared/paths";
 import { UpdateBanner } from "./features/updates/UpdateBanner";
 import { Appearance, useAppearance } from "./features/appearance/themes";
+import { useZoom } from "./features/appearance/zoom";
 import { clampRail, RailHandle } from "./features/projects/RailHandle";
 import { Notice } from "./shared/Notice";
 import { ShortcutAction, useShortcuts } from "./shared/useShortcuts";
@@ -194,6 +195,7 @@ export default function App() {
   const [updateLater, setUpdateLater] = useState(false);
   const lost = useBackendLost();
   const appearance = useAppearance(prefs);
+  useZoom();
   useEffect(() => {
     if (prefs?.density === "compact") document.documentElement.dataset.density = "compact";
     else delete document.documentElement.dataset.density;

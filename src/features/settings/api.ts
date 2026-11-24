@@ -206,6 +206,9 @@ export const getPreferences = () => call<Prefs>("get_preferences");
 export const setPreferences = (prefs: Prefs) =>
   call<void>("set_preferences", { prefs });
 
+/** Zooms the whole app one step and saves the level. `setPreferences` does not change the zoom. */
+export const zoom = (step: "in" | "out" | "reset") => call<void>("zoom", { step });
+
 /** Sizes in bytes. `null`: unknown. */
 export interface StorageView {
   appData: string;

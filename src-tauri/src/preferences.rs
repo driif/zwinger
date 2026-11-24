@@ -29,6 +29,9 @@ pub struct Prefs {
     pub sidebar_font_size: Option<u32>,
     pub terminal: TerminalPrefs,
     pub editors: EditorPrefs,
+    /// The zoom of the whole app; 1.0 is the actual size. Only
+    /// [`Preferences::set_zoom`] changes it: [`Preferences::set`] keeps it.
+    pub zoom: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +143,7 @@ impl Default for Prefs {
             sidebar_font_size: None,
             terminal: TerminalPrefs::default(),
             editors: EditorPrefs::default(),
+            zoom: 1.0,
         }
     }
 }
@@ -156,6 +160,7 @@ impl Preferences {
         let mut current: Prefs =
             std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
         current.terminal = current.terminal.clamped();
+        current.zoom = crate::zoom::clamped(current.zoom);
         current.sidebar_font_size =
             current.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         Self { path, current: Mutex::new(current) }
@@ -165,12 +170,25 @@ impl Preferences {
         self.current.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Writes a temp file and renames it, so a crash keeps the old file.
+    /// Keeps the zoom: the UI writes all prefs, and its copy of the zoom can
+    /// be old.
     pub fn set(&self, mut prefs: Prefs) -> Result<()> {
         prefs.terminal = prefs.terminal.clamped();
         prefs.sidebar_font_size =
             prefs.sidebar_font_size.map(|size| size.clamp(*SIDEBAR_FONT_SIZE.start(), *SIDEBAR_FONT_SIZE.end()));
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        prefs.zoom = current.zoom;
+        self.write(&mut current, prefs)
+    }
+
+    pub fn set_zoom(&self, level: f64) -> Result<()> {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let prefs = Prefs { zoom: crate::zoom::clamped(level), ..current.clone() };
+        self.write(&mut current, prefs)
+    }
+
+    /// Writes a temp file and renames it, so a crash keeps the old file.
+    fn write(&self, current: &mut Prefs, prefs: Prefs) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -309,6 +327,18 @@ mod tests {
     }
 
     #[test]
+    fn the_zoom_survives_a_restart_and_a_write_of_all_prefs() {
+        let path = path();
+        let prefs = Preferences::load(path.clone());
+        prefs.set_zoom(1.25).unwrap();
+        prefs.set(Prefs { zoom: 1.0, rail_width: 300, ..Prefs::default() }).unwrap();
+        let loaded = Preferences::load(path.clone()).get();
+        assert_eq!((loaded.zoom, loaded.rail_width), (1.25, 300));
+        std::fs::write(&path, br#"{"zoom":9}"#).unwrap();
+        assert_eq!(Preferences::load(path).get().zoom, 2.0);
+    }
+
+    #[test]
     fn sidebar_font_size_is_clamped_on_load_and_set() {
         let path = path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -349,6 +379,7 @@ mod tests {
                     "themeId": null,
                 },
                 "editors": { "enabled": null, "default": null },
+                "zoom": 1.0,
             })
         );
     }

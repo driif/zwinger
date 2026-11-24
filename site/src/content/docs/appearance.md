@@ -1,6 +1,6 @@
 ---
 title: Appearance
-description: Themes, text size, density, sidebar font size, terminal settings, and the app icon.
+description: Themes, zoom, text size, density, sidebar font size, terminal settings, and the app icon.
 ---
 
 Open **Settings > Appearance** (⌘,) to select the look of zwinger.
@@ -44,6 +44,20 @@ background.
 On macOS 26 and later, the app icon follows **Icon & widget style** in **System Settings > Appearance**: **Default**
 shows a light tile, **Dark** shows a dark tile, and **Clear** and **Tinted** show a clear or tinted icon. On macOS 14
 and 15, the app icon is the dark tile in all modes.
+
+## Zoom
+
+Press ⌘+ (or ⌘=) to zoom in, ⌘− to zoom out and ⌘0 to show the actual size. The **View** menu has the same actions.
+The zoom changes the size of the whole window content: text, controls, the rail and the terminals. The steps go from
+50% to 200%. The terminals fit their panes again after each change. The zoom persists after a restart.
+
+The zoom is different from the other size settings:
+
+- **Zoom** scales all of the app by the same amount.
+- **Font size** of a theme, **Density** and **Sidebar font size** change only the text or spacing that they name.
+- The terminal **Font size** changes only the terminal text.
+
+The zoom multiplies these settings. For example, a terminal font size of 13 px at 150% zoom shows like 19.5 px.
 
 ## Text size
 

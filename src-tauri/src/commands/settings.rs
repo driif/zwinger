@@ -33,6 +33,13 @@ pub fn set_preferences(preferences: State<'_, Preferences>, prefs: Prefs) -> Res
     preferences.set(prefs)
 }
 
+/// Zooms the whole app one step. The UI calls it for ⌘+; the View menu has
+/// the other zoom keys.
+#[tauri::command]
+pub fn zoom(app: AppHandle, step: crate::zoom::Step) -> Result<()> {
+    crate::zoom::zoom(&app, step)
+}
+
 /// The settings and colors of the user's Ghostty config.
 #[tauri::command]
 pub async fn import_ghostty_config() -> Result<ghostty::Import> {
