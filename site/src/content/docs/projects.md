@@ -41,6 +41,8 @@ To resize the project list, drag its right edge or press Tab to focus the edge a
 Home sets the minimum width and End sets the maximum. Double-click the edge to restore the default width.
 
 - At the first start, one workspace with the name "Workspace" holds all projects.
+- The bottom of the rail has four icon buttons: **New project**, **New workspace**, **Cages** and **Settings**. Hold
+  the pointer on a button to see its name. All four stay visible at each rail width.
 - **New workspace** at the bottom of the rail adds an empty workspace. Its name is a field at once, so you can type
   the name.
 - To rename a workspace or a session, double-click its row, or use **Rename** in its menu (right-click or the **…**

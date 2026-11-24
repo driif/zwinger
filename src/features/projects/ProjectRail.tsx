@@ -19,7 +19,7 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Box, ChevronRight, Ellipsis, Fence, FolderInput, Hourglass, Pencil, Play, Plus, RotateCw, Settings, Square, Trash2 } from "lucide-react";
+import { Box, ChevronRight, Ellipsis, Fence, FolderInput, FolderPlus, Hourglass, Pencil, Play, Plus, RotateCw, Settings, Square, Trash2 } from "lucide-react";
 import { CSSProperties, KeyboardEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -887,18 +887,14 @@ export function ProjectRail({
         </div>
       </div>
       <div className="row">
-        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={onNew}>
-          New project
-        </Button>
-        <Button variant="ghost" size="sm" iconLeft={<Plus size={14} />} onClick={() => run(() => createWorkspace().then((id) => setEditing(`w|${id}`)))}>
-          New workspace
-        </Button>
-        <Button variant="ghost" size="sm" iconLeft={<Fence size={14} />} onClick={onCages}>
-          Cages
-        </Button>
-        <Button variant="ghost" size="sm" iconLeft={<Settings size={14} />} onClick={onSettings}>
-          Settings <kbd className="muted">⌘,</kbd>
-        </Button>
+        <IconButton icon={<Plus size={14} />} label="New project" onClick={onNew} />
+        <IconButton
+          icon={<FolderPlus size={14} />}
+          label="New workspace"
+          onClick={() => run(() => createWorkspace().then((id) => setEditing(`w|${id}`)))}
+        />
+        <IconButton icon={<Fence size={14} />} label="Cages" onClick={onCages} />
+        <IconButton icon={<Settings size={14} />} label="Settings (⌘,)" aria-keyshortcuts="Meta+Comma" onClick={onSettings} />
       </div>
     </aside>
   );
