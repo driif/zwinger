@@ -10,7 +10,7 @@
   "dependencies": {
     "@astrojs/react": "^7.1.1",
     "@astrojs/starlight": "^0.42.6",
-    "@driif/motiv": "^0.40.0",
+    "@driif/motiv": "^0.41.0",
     "astro": "^7.4.2",
     "parse5": "^8.1.1",
     "react": "^19.3.1",
