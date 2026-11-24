@@ -35,3 +35,4 @@ Go to the user only for a product decision that the code does not answer, or for
 - Use the normal `src-tauri/target` with incremental builds. Do not make a target dir per ticket.
 - Parallel tickets in a worktree share one extra target dir: `CARGO_TARGET_DIR=../zwinger-target`.
 - Do not keep test temp dirs or build copies in `docs/tasks/`.
+- A subagent stops each server or browser that it starts before it reports. Never use port 1420 in a worktree: it blocks `pnpm tauri dev`.
