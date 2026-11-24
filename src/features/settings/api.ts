@@ -4,6 +4,13 @@ import { call, type AgentKind, type HostAgentUse, type Removal } from "../../sha
 export const setHarness = (sessionId: string, harness: string | null) =>
   call<void>("set_harness", { sessionId, harness });
 
+/**
+ * Makes the host folder `folder` with the harness template for `agents` and sets it as the harness. A folder outside
+ * the project folder and the mounts gets a read-write mount. Never overwrites a file. Resolves to the harness path.
+ */
+export const createHarness = (sessionId: string, folder: string, agents: AgentKind[]) =>
+  call<string>("create_harness", { sessionId, folder, agents });
+
 /** `null` lets the project follow the app default editor. */
 export const setProjectEditor = (sessionId: string, editor: string | null) =>
   call<void>("set_project_editor", { sessionId, editor });

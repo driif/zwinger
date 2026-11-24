@@ -10,6 +10,7 @@ mod editor_icons;
 mod error;
 mod external_live;
 mod folder_watch;
+mod harness;
 mod host_agents;
 mod instance;
 mod legacy_keychain;
@@ -421,6 +422,7 @@ pub fn run() {
             commands::terminal::ack_session,
             commands::sessions::resolve_folder,
             commands::sessions::set_harness,
+            commands::sessions::create_harness,
             commands::sessions::set_project_editor,
             commands::sessions::set_project_accent,
             commands::sessions::list_folders,

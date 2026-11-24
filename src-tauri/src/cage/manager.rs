@@ -1194,6 +1194,74 @@ impl<R: SandboxRuntime> Manager<R> {
         self.edit_session(session_id, |s, c| s.set_harness(c.ok_or(Error::NoCage)?, harness))
     }
 
+    /// Makes the host folder `folder` with the harness template for `agents`
+    /// and sets it as the harness of the session. A folder below the project
+    /// folder or a mount needs no new mount; else it gets a read-write mount
+    /// at `/mnt/<name>`, with the checks of [`Self::add_mount`]. Returns the
+    /// stored harness path.
+    pub fn create_harness(&self, session_id: &str, folder: &str, agents: &[AgentKind]) -> Result<String> {
+        let raw = Path::new(folder);
+        if !raw.is_absolute() || raw.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(Error::RelativePath(folder.to_owned()));
+        }
+        if let Some(dir) = cage::reserved_overlap(raw, &self.reserved()) {
+            return Err(Error::AppDataOverlap(folder.to_owned(), dir.display().to_string()));
+        }
+        let existed = raw.exists();
+        std::fs::create_dir_all(raw)?;
+        let placed = self.place_harness(session_id, folder, agents);
+        if placed.is_err() && !existed {
+            // Only an empty folder goes: a template file stays for the next try.
+            let _ = std::fs::remove_dir(raw);
+        }
+        placed
+    }
+
+    fn place_harness(&self, session_id: &str, folder: &str, agents: &[AgentKind]) -> Result<String> {
+        let (host, _) = cage::host_dir_with_id(folder)?;
+        let (cage_id, harness, mount, code) = {
+            let state = lock(&self.state);
+            let Bound { session, cage } = state.bound(session_id)?;
+            if host == session.folder {
+                return Err(Error::HarnessIsProject(folder.to_owned()));
+            }
+            let in_mount = cage
+                .mounts
+                .iter()
+                .filter_map(|m| host.strip_prefix(&m.host).ok().map(|rel| Path::new(&m.guest).join(rel)))
+                .max_by_key(|p| p.as_os_str().len());
+            let (harness, mount) = match (host.strip_prefix(&session.folder), in_mount) {
+                (Ok(rel), _) => (Path::new(WORKSPACE).join(rel).display().to_string(), None),
+                (_, Some(path)) => (path.display().to_string(), None),
+                _ => {
+                    let base = host.file_name().map_or("harness".into(), |n| n.to_string_lossy());
+                    let guest = (1..)
+                        .map(|n| if n == 1 { format!("/mnt/{base}") } else { format!("/mnt/{base}-{n}") })
+                        .find(|g| !cage.mounts.iter().any(|m| &m.guest == g))
+                        .expect("a free guest path");
+                    (guest.clone(), Some(guest))
+                }
+            };
+            let running = match state.vm_of(session_id) {
+                Some((_, Vm::Running { applied, .. })) => task_guest_folder(&applied.0, session_id).map(|(_, f, _)| f),
+                _ => None,
+            };
+            let code = running.unwrap_or_else(|| {
+                let key = cage::vm_key(session, cage);
+                let shared = key.is_some()
+                    && state.sessions_of(&cage.id).iter().any(|s| s.id != session.id && cage::vm_key(s, cage) == key);
+                if shared { format!("{WORKSPACE}/{}", session.slug) } else { WORKSPACE.to_owned() }
+            });
+            (cage.id.clone(), harness, mount, code)
+        };
+        if let Some(guest) = mount {
+            self.add_mount(&cage_id, &host.display().to_string(), &guest, false)?;
+        }
+        crate::harness::write_template(&host, &code, agents)?;
+        self.set_harness(session_id, Some(&harness))?;
+        Ok(harness)
+    }
+
     pub fn set_editor(&self, session_id: &str, editor: Option<&str>) -> Result<()> {
         self.edit_session(session_id, |s, _| s.set_editor(editor))
     }
@@ -1751,6 +1819,27 @@ mod tests {
         manager.set_harness(&id, None).unwrap();
         manager.remove_mount(&id, "/mnt/agent").unwrap();
         assert!(manager.list().cages[0].cage.mounts.is_empty());
+    }
+
+    #[test]
+    fn create_harness_mounts_an_outside_folder_and_sets_it() {
+        let (manager, _, id) = manager();
+        let outside = temp_dir().join("api-harness");
+        let harness = manager.create_harness(&id, outside.to_str().unwrap(), &[AgentKind::Claude]).unwrap();
+        assert_eq!(harness, "/mnt/api-harness");
+        let listing = manager.list();
+        let mount = &listing.cages[0].cage.mounts[0];
+        assert_eq!((mount.guest.as_str(), mount.readonly), ("/mnt/api-harness", false));
+        assert_eq!(listing.sessions[0].session.harness.as_deref(), Some("/mnt/api-harness"));
+        assert!(outside.join("CLAUDE.md").is_file());
+
+        let inside = manager.session_folder(&id).unwrap().join("agent");
+        assert_eq!(manager.create_harness(&id, inside.to_str().unwrap(), &[]).unwrap(), "/workspace/agent");
+        assert_eq!(manager.list().cages[0].cage.mounts.len(), 1);
+        assert!(inside.join("AGENTS.md").is_file());
+
+        let project = manager.session_folder(&id).unwrap();
+        assert!(matches!(manager.create_harness(&id, project.to_str().unwrap(), &[]), Err(Error::HarnessIsProject(_))));
     }
 
     #[tokio::test]

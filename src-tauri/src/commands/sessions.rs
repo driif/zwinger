@@ -78,6 +78,17 @@ pub fn set_harness(manager: Managed<'_>, session_id: String, harness: Option<Str
     manager.set_harness(&session_id, harness.as_deref())
 }
 
+/// Returns the stored harness path.
+#[tauri::command]
+pub fn create_harness(
+    manager: Managed<'_>,
+    session_id: String,
+    folder: String,
+    agents: Vec<crate::agent::AgentKind>,
+) -> Result<String> {
+    manager.create_harness(&session_id, &folder, &agents)
+}
+
 /// `None` lets the session follow the app default editor.
 #[tauri::command]
 pub fn set_project_editor(manager: Managed<'_>, session_id: String, editor: Option<String>) -> Result<()> {

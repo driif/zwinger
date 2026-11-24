@@ -26,6 +26,30 @@ If the agent exits in less than 5 seconds after a continue, with an error or wit
 conversation. zwinger then starts the agent again in the same terminal without the continue option, one time only, and
 the terminal shows "No earlier conversation; started a new one."
 
+## Harness folder
+
+A harness folder holds the instructions, skills and task notes of the agents, separate from the code. To make one,
+click **Create harness…** in **Settings > Harness** of the project:
+
+1. Accept the default folder `<parent of the project folder>/<project name>-harness`, type a different path, or click
+   **Choose parent…**.
+2. Select the agents: Claude Code, Codex, pi and Gemini CLI. By default, pi and the agents of the cage are selected.
+3. Click **Create**.
+
+zwinger writes these files. It never changes a file that exists:
+
+| File | For |
+| --- | --- |
+| `AGENTS.md` | All agents: the guest folder of the code, how to work, and where the task notes go. |
+| `tasks/README.md` | All agents: one note file per task. |
+| `CLAUDE.md` (`@AGENTS.md`) and `.claude/skills/README.md` | Claude Code |
+| `GEMINI.md` (`@./AGENTS.md`) | Gemini CLI |
+| `.agents/skills/README.md` | Codex, pi and Gemini CLI |
+
+Then zwinger sets the folder as the harness. A folder in the project folder or in a mount needs no new mount. A
+different folder becomes a read-write [mount](/cages/) at `/mnt/<folder name>`, with the usual mount checks. The
+project folder itself cannot be the harness.
+
 ## Agents with no cage
 
 A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,

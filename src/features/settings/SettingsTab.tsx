@@ -2,6 +2,7 @@ import { Button, Card, CardBody, CardHeader, FloatingField, RadioGroup, Select, 
 import { Trash2, TriangleAlert } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { setHarness, setProjectAccent, Unreadable } from "./api";
+import { CreateHarness } from "./CreateHarness";
 import { UNREADABLE } from "../projects/followFolders";
 import { Notice } from "../../shared/Notice";
 import { deleteSession, renameSession, setSessionCage } from "../projects/api";
@@ -223,7 +224,8 @@ export function SettingsTab({ session, onProjectEditor, cages, defaultCage, sole
           <CardHeader
             title="Harness"
             titleAs="h2"
-            description="The folder where the pi agent starts. Put its skills and instructions there."
+            description="The folder where the agents start. Put their skills, instructions and task notes there."
+            actions={<CreateHarness session={session} cage={cage} run={run} />}
           />
           <CardBody className="stack">
             {unreadable && (
