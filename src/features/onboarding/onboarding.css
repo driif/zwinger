@@ -12,3 +12,9 @@
   justify-content: center;
   padding: calc(var(--motiv-space) * 3) 0;
 }
+
+/* A folder dragged from Finder is over the window: the folder step shows where it goes. */
+.onboarding [data-folder-drop] {
+  border-color: var(--motiv-color-primary);
+  background: var(--motiv-color-primary-subtle);
+}

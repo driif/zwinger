@@ -108,6 +108,8 @@ export function Onboarding({
   const [editors, setEditors] = useState<Editors>();
   const [editor, setEditor] = useState<string>();
   const [busy, setBusy] = useState(false);
+  /** A drag from Finder is over the window in the folder step. */
+  const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string>();
 
   async function act(action: () => Promise<void>) {
@@ -129,10 +131,11 @@ export function Onboarding({
     setStep(2);
   }
 
-  // Step 2 also takes a folder that is dropped on the window.
+  // Step 2 also takes a folder that is dropped on the window. While a drag is over the window, its card shows the cue.
   useEffect(() => {
     if (step !== 1) return;
     const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+      setDragging(payload.type === "enter" || payload.type === "over");
       if (payload.type === "drop" && payload.paths.length > 0) act(() => create(payload.paths[0]));
     });
     return () => {
@@ -182,7 +185,7 @@ export function Onboarding({
         </Card>
       )}
       {step === 1 && (
-        <Card variant="outlined" padding="md">
+        <Card variant="outlined" padding="md" data-folder-drop={dragging || undefined}>
           <CardHeader
             title="Create your first project"
             titleAs="h2"
