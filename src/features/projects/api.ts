@@ -118,7 +118,9 @@ export const setClaudeToken = (
   source: CredentialSource,
   allow: boolean,
   profile: boolean,
-) => call<void>("set_claude_token", { cageId, value, source, allow, profile });
+  /** The exact expiry that `claude setup-token` printed, in ms since the epoch. Needs a `value`. */
+  expiresAt: number | null = null,
+) => call<void>("set_claude_token", { cageId, value, source, allow, profile, expiresAt });
 
 /** Resolves to the function that stops the listener. */
 export const onGuestLogin = (handler: (vmKey: string) => void) =>

@@ -287,10 +287,21 @@ pub trait Vault: Send + Sync {
     /// Saves `value` with the date of now. An unchanged dated value is not
     /// written, so it keeps its date: the Claude token expiry counts from it.
     fn set(&self, owner: &Owner, name: &str, value: &SecretValue) -> Result<()> {
-        if self.entry(owner, name)?.is_some_and(|prior| prior.value == *value && prior.saved_at.is_some()) {
-            return Ok(());
+        self.set_expiring(owner, name, value, None)
+    }
+    /// [`Vault::set`] that also records an exact expiry. An unchanged dated
+    /// value keeps its date and its expiry; `expires_at` replaces the expiry.
+    fn set_expiring(&self, owner: &Owner, name: &str, value: &SecretValue, expires_at: Option<i64>) -> Result<()> {
+        if let Some(prior) = self.entry(owner, name)?
+            && prior.value == *value
+            && prior.saved_at.is_some()
+        {
+            if expires_at.is_none() || expires_at == prior.expires_at {
+                return Ok(());
+            }
+            return self.put(owner, name, &VaultEntry { expires_at, ..prior });
         }
-        self.put(owner, name, &VaultEntry { value: value.clone(), saved_at: Some(now_ms()) })
+        self.put(owner, name, &VaultEntry { value: value.clone(), saved_at: Some(now_ms()), expires_at })
     }
     #[cfg(test)]
     fn get(&self, owner: &Owner, name: &str) -> Result<Option<SecretValue>> {
@@ -335,6 +346,18 @@ pub enum Inserted {
 pub struct VaultEntry {
     pub value: SecretValue,
     pub saved_at: Option<i64>,
+    /// The exact expiry that the user entered, in ms since the epoch.
+    pub expires_at: Option<i64>,
+}
+
+/// The estimated life of a Claude setup token from its save.
+const TOKEN_LIFE_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+impl VaultEntry {
+    /// The exact expiry if the user entered one, else one year after the save.
+    pub fn token_expiry(&self) -> Option<i64> {
+        self.expires_at.or(self.saved_at.map(|at| at.saturating_add(TOKEN_LIFE_MS)))
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -355,7 +378,13 @@ const FORMAT: u32 = 3;
 #[serde(untagged)]
 enum StoredValue {
     Legacy(String),
-    Dated { value: String, saved_at: i64 },
+    /// An older build ignores `expires_at` and drops it at its next write.
+    Dated {
+        value: String,
+        saved_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+    },
 }
 
 impl StoredValue {
@@ -599,7 +628,9 @@ impl Vault for FileVault {
         let _lock = self.locked();
         let (dir, mut stored) = self.load()?;
         let value = match entry.saved_at {
-            Some(saved_at) => StoredValue::Dated { value: entry.value.expose().to_owned(), saved_at },
+            Some(saved_at) => {
+                StoredValue::Dated { value: entry.value.expose().to_owned(), saved_at, expires_at: entry.expires_at }
+            }
             None => StoredValue::Legacy(entry.value.expose().to_owned()),
         };
         let (map, prefix) = stored.map(owner);
@@ -610,9 +641,11 @@ impl Vault for FileVault {
     fn entry(&self, owner: &Owner, name: &str) -> Result<Option<VaultEntry>> {
         let _lock = self.locked();
         Ok(self.load()?.1.remove(owner, name).map(|stored| match stored {
-            StoredValue::Legacy(value) => VaultEntry { value: SecretValue::new(value), saved_at: None },
-            StoredValue::Dated { value, saved_at } => {
-                VaultEntry { value: SecretValue::new(value), saved_at: Some(saved_at) }
+            StoredValue::Legacy(value) => {
+                VaultEntry { value: SecretValue::new(value), saved_at: None, expires_at: None }
+            }
+            StoredValue::Dated { value, saved_at, expires_at } => {
+                VaultEntry { value: SecretValue::new(value), saved_at: Some(saved_at), expires_at }
             }
         }))
     }
@@ -636,7 +669,7 @@ impl Vault for FileVault {
             None => {}
         }
         let (map, prefix) = stored.map(owner);
-        let entry = StoredValue::Dated { value: value.expose().to_owned(), saved_at: now_ms() };
+        let entry = StoredValue::Dated { value: value.expose().to_owned(), saved_at: now_ms(), expires_at: None };
         map.insert(format!("{prefix}{name}"), entry);
         self.save(dir, stored)?;
         match self.load()?.1.text(owner, name) {
@@ -673,6 +706,7 @@ pub mod fake {
     pub struct MemoryVault {
         pub values: Mutex<HashMap<Account, SecretValue>>,
         pub dates: Mutex<HashMap<Account, Option<i64>>>,
+        pub expiries: Mutex<HashMap<Account, Option<i64>>>,
         /// When set, this many more writes succeed, and the writes after
         /// them fail and keep the values.
         pub writes_left: Mutex<Option<usize>>,
@@ -701,7 +735,8 @@ pub mod fake {
             self.write()?;
             let account = (owner.clone().into_owned(), name.to_owned());
             self.values.lock().unwrap().insert(account.clone(), entry.value.clone());
-            self.dates.lock().unwrap().insert(account, entry.saved_at);
+            self.dates.lock().unwrap().insert(account.clone(), entry.saved_at);
+            self.expiries.lock().unwrap().insert(account, entry.expires_at);
             if self.fail_after_write.swap(false, Ordering::SeqCst) {
                 return Err(Error::Vault("folder sync failed".into()));
             }
@@ -714,6 +749,7 @@ pub mod fake {
             Ok(self.values.lock().unwrap().get(&account).cloned().map(|value| VaultEntry {
                 value,
                 saved_at: self.dates.lock().unwrap().get(&account).copied().flatten(),
+                expires_at: self.expiries.lock().unwrap().get(&account).copied().flatten(),
             }))
         }
 
@@ -722,6 +758,7 @@ pub mod fake {
             let account = (owner.clone().into_owned(), name.to_owned());
             self.values.lock().unwrap().remove(&account);
             self.dates.lock().unwrap().remove(&account);
+            self.expiries.lock().unwrap().remove(&account);
             Ok(())
         }
 
@@ -788,6 +825,19 @@ pub mod tests {
         assert_eq!(json["version"], 3);
         assert_eq!(json["values"]["p/1/KEY"]["value"], pem);
         assert!(json["values"]["p/1/KEY"]["saved_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn the_file_vault_keeps_an_exact_expiry() {
+        let (vault, dir) = file_vault();
+        vault.set(&c("p"), "KEY", &SecretValue::new("v")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(dir.join(VAULT_FILE)).unwrap()).unwrap();
+        assert!(json["values"]["p/KEY"].get("expires_at").is_none());
+        vault.set_expiring(&c("p"), "KEY", &SecretValue::new("v"), Some(7)).unwrap();
+        let entry = vault.entry(&c("p"), "KEY").unwrap().unwrap();
+        assert_eq!((entry.expires_at, entry.token_expiry()), (Some(7), Some(7)));
+        vault.set(&c("p"), "KEY", &SecretValue::new("v")).unwrap();
+        assert_eq!(vault.entry(&c("p"), "KEY").unwrap().unwrap(), entry);
     }
 
     #[test]
@@ -1035,7 +1085,7 @@ pub mod tests {
         assert_eq!(cage_accounts(&again), ["Cage(\"p\")/NEW", "Cage(\"p\")/OLD", "Library/SHARED"]);
         assert_eq!(
             again.entry(&c("p"), "OLD").unwrap().unwrap(),
-            VaultEntry { value: SecretValue::new("old"), saved_at: None }
+            VaultEntry { value: SecretValue::new("old"), saved_at: None, expires_at: None }
         );
         assert_eq!(again.entry(&c("p"), "NEW").unwrap().unwrap().saved_at, Some(5));
         assert!(again.entry(&Owner::Library, "SHARED").unwrap().unwrap().saved_at.is_some());

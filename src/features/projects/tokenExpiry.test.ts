@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expiresSoon } from "./tokenExpiry.ts";
+import { dayStart, expiresSoon, expiryLabel } from "./tokenExpiry.ts";
 
 test("Claude token warns from 30 days before expiry", () => {
   const now = 1_800_000_000_000;
@@ -8,4 +8,15 @@ test("Claude token warns from 30 days before expiry", () => {
   assert.equal(expiresSoon(now + 31 * day, now), false);
   assert.equal(expiresSoon(now + 30 * day, now), true);
   assert.equal(expiresSoon(now + day, now), true);
+});
+
+test("an entered expiry date is the start of that local day", () => {
+  assert.equal(dayStart(""), null);
+  assert.equal(dayStart("2027-11-24"), new Date(2027, 10, 24).getTime());
+});
+
+test("only the estimate says about", () => {
+  const at = new Date(2027, 10, 24).getTime();
+  assert.equal(expiryLabel(at, true), `expires ${new Date(at).toLocaleDateString()}`);
+  assert.equal(expiryLabel(at, false), `expires about ${new Date(at).toLocaleDateString()}`);
 });

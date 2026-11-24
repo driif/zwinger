@@ -559,7 +559,11 @@ mod tests {
         let removal = manager.remove_rule(&id, &a).unwrap();
         let owner = Owner::cage(&id);
         let saved = vault.entry(&owner, "TOKEN").unwrap().unwrap();
-        let again = secrets::VaultEntry { value: saved.value.clone(), saved_at: Some(saved.saved_at.unwrap() + 1) };
+        let again = secrets::VaultEntry {
+            value: saved.value.clone(),
+            saved_at: Some(saved.saved_at.unwrap() + 1),
+            expires_at: None,
+        };
         vault.put(&owner, "TOKEN", &again).unwrap();
 
         assert!(
@@ -628,7 +632,7 @@ mod tests {
     #[test]
     fn a_claude_token_does_not_come_back_without_the_login() {
         let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
-        manager.set_claude_token(&id, value("token"), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, value("token"), Source::Local, true, false, None).unwrap();
         let rule = manager.list().cages[0].cage.network.rules[0].id.clone();
         let removal = manager.remove_rule(&id, &rule).unwrap();
         manager.remove_host_agent(&id, AgentKind::Claude).unwrap();

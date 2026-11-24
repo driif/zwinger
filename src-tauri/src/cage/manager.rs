@@ -316,6 +316,8 @@ pub struct ClaudeTokenView {
     /// The token comes from the credential library.
     pub library: bool,
     pub expires_at: Option<i64>,
+    /// `expires_at` is the date that the user entered, not an estimate.
+    pub exact: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1579,7 +1581,8 @@ fn claude_token(cage: &Cage, vault: &dyn Vault) -> Option<ClaudeTokenView> {
         library: key.source == Source::Library,
         stored: (!login || cage.claude_token_binding().unwrap_or(false))
             && entry.as_ref().is_some_and(|entry| entry.saved_at.is_some()),
-        expires_at: entry.and_then(|entry| entry.saved_at.map(|at| at.saturating_add(365 * 24 * 60 * 60 * 1000))),
+        expires_at: entry.as_ref().and_then(crate::secrets::VaultEntry::token_expiry),
+        exact: entry.is_some_and(|entry| entry.expires_at.is_some()),
     })
 }
 

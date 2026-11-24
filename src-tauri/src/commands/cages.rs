@@ -129,8 +129,9 @@ pub async fn set_claude_token(
     source: Source,
     allow: bool,
     profile: bool,
+    expires_at: Option<i64>,
 ) -> Result<()> {
-    manager.set_claude_token(&cage_id, value, source, allow, profile)?;
+    manager.set_claude_token(&cage_id, value, source, allow, profile, expires_at)?;
     manager.refresh_agents(Some(&cage_id)).await;
     Ok(())
 }

@@ -227,8 +227,9 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let credential = Credential { name: name.to_owned(), inject, source }.normalize()?;
         let key = credential.key();
+        let value = value.map(|v| SecretValue::new(v.expose().trim()));
         check_value(&key, value.as_ref())?;
-        self.bind(id, &key, value, |c| {
+        self.bind(id, &key, value, None, |c| {
             let rule = c.network.rule_mut(rule_id)?;
             Ok(replace(&mut rule.credentials, &credential))
         })
@@ -236,7 +237,9 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Binds the Claude token to an exact Allow rule for api.anthropic.com.
     /// A local token needs `value`; a library token takes none and leaves
-    /// the cage's local account alone.
+    /// the cage's local account alone. `expires_at` is the exact expiry that
+    /// `claude setup-token` printed, for a local `value` only; without it the
+    /// expiry is an estimate from the save date.
     pub fn set_claude_token(
         &self,
         id: &str,
@@ -244,6 +247,7 @@ impl<R: SandboxRuntime> Manager<R> {
         source: Source,
         allow: bool,
         profile: bool,
+        expires_at: Option<i64>,
     ) -> Result<()> {
         const HOST: &str = "api.anthropic.com";
         if self.host.last().agent(AgentKind::Claude).is_none() {
@@ -255,12 +259,15 @@ impl<R: SandboxRuntime> Manager<R> {
             return Err(Error::SecretValueRequired(CLAUDE_TOKEN.into()));
         }
         check_value(&key, value.as_ref())?;
+        if expires_at.is_some() && value.is_none() {
+            return Err(Error::SecretValueRequired(CLAUDE_TOKEN.into()));
+        }
         let credential = Credential {
             name: CLAUDE_TOKEN.into(),
             inject: Inject::Set { header: "authorization".into(), template: "Bearer {secret}".into() },
             source,
         };
-        self.bind(id, &key, value, |cage| {
+        self.bind(id, &key, value, expires_at, |cage| {
             let network = &mut cage.network;
             let exact = network
                 .rules
@@ -295,11 +302,13 @@ impl<R: SandboxRuntime> Manager<R> {
     /// restores the vault. With no `value` the stored value is used: a local
     /// one only if the cage already uses it. `put` returns the keys that it
     /// replaced; their values go if no other credential uses them.
+    /// `expires_at` is saved with a `value`.
     fn bind(
         &self,
         id: &str,
         key: &CredentialRef,
         value: Option<SecretValue>,
+        expires_at: Option<i64>,
         put: impl Fn(&mut Cage) -> Result<Vec<CredentialRef>>,
     ) -> Result<()> {
         let _edit = lock(&self.secret_edit);
@@ -320,7 +329,7 @@ impl<R: SandboxRuntime> Manager<R> {
             Some(value) => {
                 // A failed set can still have changed the value, for example when
                 // the file vault fails after its rename. The restore is safe either way.
-                if let Err(e) = self.vault.set(&owner, &key.name, &value).and_then(|()| save()) {
+                if let Err(e) = self.vault.set_expiring(&owner, &key.name, &value, expires_at).and_then(|()| save()) {
                     self.restore_value(&owner, &key.name, prior.as_ref());
                     return Err(e);
                 }
@@ -381,6 +390,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// the new value from its next request, and a start waits for the save.
     pub fn set_library_credential(&self, name: &str, value: SecretValue, rotate: bool) -> Result<()> {
         let key = CredentialRef::library(&secrets::check_name(name)?);
+        let value = SecretValue::new(value.expose().trim());
         if value.expose().is_empty() {
             return Err(Error::SecretValueRequired(key.name));
         }
@@ -1037,11 +1047,11 @@ mod tests {
     fn claude_token_needs_explicit_allow_under_default_block() {
         let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
         assert!(matches!(
-            manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false),
+            manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false, None),
             Err(Error::InvalidRule(message)) if message == "allow api.anthropic.com first"
         ));
         assert!(vault.get(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
-        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false, None).unwrap();
         let view = manager.list().cages.remove(0);
         assert!(view.claude_token.unwrap().stored);
         assert!(view.cage.host_agent(AgentKind::Claude).unwrap().login);
@@ -1058,7 +1068,7 @@ mod tests {
     fn claude_token_creates_an_exact_allow_rule_under_default_allow() {
         let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
         manager.set_network_default(&id, DefaultAction::Allow).unwrap();
-        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false, None).unwrap();
         assert_eq!(manager.list().cages[0].cage.network.rules[0].label(), "api.anthropic.com");
     }
 
@@ -1068,10 +1078,10 @@ mod tests {
         manager.set_network_default(&id, DefaultAction::Allow).unwrap();
         manager.put_rule(&id, host_rule("api.anthropic.com", Action::Block)).unwrap();
         assert!(matches!(
-            manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false),
+            manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, false, false, None),
             Err(Error::InvalidRule(..))
         ));
-        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false, None).unwrap();
         assert_eq!(manager.list().cages[0].cage.network.rules[0].action, Action::Allow);
     }
 
@@ -1079,12 +1089,12 @@ mod tests {
     async fn claude_login_off_or_agent_removed_drops_the_token() {
         let off = HostAgentUse { kind: AgentKind::Claude, profile: false, login: false };
         let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
-        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false, None).unwrap();
         manager.put_host_agent(&id, off, false).await.unwrap();
         assert!(manager.list().cages[0].cage.network.credentials().is_empty());
         assert!(vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
 
-        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("token")), Source::Local, true, false, None).unwrap();
         manager.remove_host_agent(&id, AgentKind::Claude).unwrap();
         assert!(manager.list().cages[0].cage.network.credentials().is_empty());
         assert!(vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().is_none());
@@ -1103,11 +1113,55 @@ mod tests {
     #[test]
     fn claude_token_rollback_preserves_the_prior_date() {
         let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
-        manager.set_claude_token(&id, Some(SecretValue::new("old")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("old")), Source::Local, true, false, None).unwrap();
         let prior = vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap();
         break_store(&manager);
-        assert!(manager.set_claude_token(&id, Some(SecretValue::new("new")), Source::Local, false, false).is_err());
+        assert!(
+            manager.set_claude_token(&id, Some(SecretValue::new("new")), Source::Local, false, false, None).is_err()
+        );
         assert_eq!(vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap(), prior);
+    }
+
+    #[test]
+    fn claude_token_keeps_the_exact_expiry_that_the_user_entered() {
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        let exact = secrets::now_ms() + 1000;
+        manager.set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false, Some(exact)).unwrap();
+        let view = manager.list().cages.remove(0).claude_token.unwrap();
+        assert_eq!((view.expires_at, view.exact), (Some(exact), true));
+        let saved = vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap();
+        // The same token with whitespace and no date keeps its date and expiry.
+        manager.set_claude_token(&id, Some(SecretValue::new(" t\n")), Source::Local, true, false, None).unwrap();
+        assert_eq!(vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap(), saved);
+        // A new date for the same token keeps the save date.
+        manager
+            .set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false, Some(exact + 1))
+            .unwrap();
+        let again = vault.entry(&Owner::cage(&id), "CLAUDE_CODE_OAUTH_TOKEN").unwrap().unwrap();
+        assert_eq!((again.saved_at, again.expires_at), (saved.saved_at, Some(exact + 1)));
+        // A new token without a date gets the estimate again.
+        manager.set_claude_token(&id, Some(SecretValue::new("u")), Source::Local, true, false, None).unwrap();
+        assert!(!manager.list().cages.remove(0).claude_token.unwrap().exact);
+        // A date needs a pasted token.
+        assert!(manager.set_claude_token(&id, None, Source::Local, true, false, Some(exact)).is_err());
+    }
+
+    #[test]
+    fn a_credential_value_is_trimmed_so_the_same_value_keeps_its_date() {
+        let (manager, _, id, vault) = host_manager(FakeLogins::default(), NOW);
+        let rule = allow(&manager, &id, "api.example.com");
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), Source::Local, value("v")).unwrap();
+        let saved = vault.entry(&Owner::cage(&id), "KEY").unwrap().unwrap();
+        manager.set_rule_credential(&id, &rule, "KEY", bearer(), Source::Local, value(" v\n")).unwrap();
+        assert_eq!(vault.entry(&Owner::cage(&id), "KEY").unwrap().unwrap(), saved);
+        assert!(matches!(
+            manager.set_rule_credential(&id, &rule, "KEY", bearer(), Source::Local, value("  ")),
+            Err(Error::SecretValueRequired(_))
+        ));
+        manager.set_library_credential("LIB", SecretValue::new("w"), false).unwrap();
+        let saved = vault.entry(&Owner::Library, "LIB").unwrap().unwrap();
+        manager.set_library_credential("LIB", SecretValue::new("w \n"), true).unwrap();
+        assert_eq!(vault.entry(&Owner::Library, "LIB").unwrap().unwrap(), saved);
     }
 
     const SHARED: &str = "SHARED_KEY";
@@ -1436,23 +1490,25 @@ mod tests {
         let b = manager.create(temp_dir().to_str().unwrap(), None).unwrap();
         let token = || CredentialRef::library(cage::CLAUDE_TOKEN);
         assert!(matches!(
-            manager.set_claude_token(&a, None, Source::Library, true, false),
+            manager.set_claude_token(&a, None, Source::Library, true, false, None),
             Err(Error::LibraryCredentialNotFound(_))
         ));
         assert!(matches!(
-            manager.set_claude_token(&a, Some(SecretValue::new("x")), Source::Library, true, false),
+            manager.set_claude_token(&a, Some(SecretValue::new("x")), Source::Library, true, false, None),
             Err(Error::InvalidSecret(..))
         ));
         manager.set_library_credential(cage::CLAUDE_TOKEN, SecretValue::new("token-fixture"), false).unwrap();
         let saved_at = vault.entry(&Owner::Library, cage::CLAUDE_TOKEN).unwrap().unwrap().saved_at;
         assert!(matches!(
-            manager.set_claude_token(&a, None, Source::Library, false, false),
+            manager.set_claude_token(&a, None, Source::Library, false, false, None),
             Err(Error::InvalidRule(m)) if m == "allow api.anthropic.com first"
         ));
         // A local token first: the switch to the library removes it.
-        manager.set_claude_token(&a, Some(SecretValue::new("local-fixture")), Source::Local, true, false).unwrap();
+        manager
+            .set_claude_token(&a, Some(SecretValue::new("local-fixture")), Source::Local, true, false, None)
+            .unwrap();
         for id in [&a, &b] {
-            manager.set_claude_token(id, None, Source::Library, true, false).unwrap();
+            manager.set_claude_token(id, None, Source::Library, true, false, None).unwrap();
         }
         assert_eq!(vault.get(&Owner::cage(&a), cage::CLAUDE_TOKEN).unwrap(), None);
         assert_eq!(vault.entry(&Owner::Library, cage::CLAUDE_TOKEN).unwrap().unwrap().saved_at, saved_at);

@@ -293,7 +293,8 @@ export interface CageView {
   /** The guest ports that each VM of the cage publishes on 127.0.0.1 of this Mac. A change applies on the next start. */
   publishedPorts: PublishedPort[];
   /** `library`: the token comes from the credential library. */
-  claudeToken: { stored: boolean; library: boolean; expiresAt: number | null } | null;
+  /** `exact`: `expiresAt` is the date that the user entered, not the estimate. */
+  claudeToken: { stored: boolean; library: boolean; expiresAt: number | null; exact: boolean } | null;
   /** The shared VM, also when it is stopped, then the own VMs that start, run, stop or failed. */
   vms: VmView[];
 }

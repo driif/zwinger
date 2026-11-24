@@ -4,6 +4,7 @@ import {
   CardBody,
   CardHeader,
   CopyField,
+  DatePicker,
   ElasticTabs,
   FloatingField,
   SegmentedControl,
@@ -20,7 +21,7 @@ import {
   removeHostAgent,
 } from "../settings/api";
 import { confirmPaths, setClaudeToken } from "./api";
-import { ESTIMATE, expiresSoon } from "./tokenExpiry";
+import { dayStart, ESTIMATE, expiresSoon, expiryLabel } from "./tokenExpiry";
 import { putRule } from "../network/api";
 import { StartProgress } from "./StartProgress";
 import { useProjectFolders } from "./useProjectFolders";
@@ -86,6 +87,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
   const blocked = host === undefined || !decide(cage.network, host, catalog).allowed;
   const [allow, setAllow] = useState(true);
   const [token, setToken] = useState("");
+  const [expiry, setExpiry] = useState("");
   const [tokenSource, setTokenSource] = useState<CredentialSource>(cage.claudeToken?.library ? "library" : "local");
   const [libraryToken, setLibraryToken] = useState<boolean>();
   const claude = kind === "claude";
@@ -121,7 +123,7 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
         return setClaudeToken(cage.id, null, "library", false, profile).then(onDone);
       }
       if (claude && login && token.trim()) {
-        return setClaudeToken(cage.id, token.trim(), "local", false, profile).then(onDone);
+        return setClaudeToken(cage.id, token.trim(), "local", false, profile, dayStart(expiry)).then(onDone);
       }
       return putHostAgent(cage.id, { kind, profile, login }, !claude && login && blocked && allow).then(onDone);
     });
@@ -183,11 +185,20 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
                 <span className="muted">Run this on your Mac and paste the token below.</span>
                 <CopyField className="mono" value="claude setup-token" />
                 <FloatingField label="Setup token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+                <DatePicker
+                  label="Expires (optional)"
+                  hint="The date that claude setup-token prints. Empty: one year after you save the token."
+                  value={expiry}
+                  onChange={(e) => setExpiry(e.target.value)}
+                />
               </>
             )}
             {cage.claudeToken?.expiresAt && (
-              <span className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"} title={ESTIMATE}>
-                expires about {new Date(cage.claudeToken.expiresAt).toLocaleDateString()}
+              <span
+                className={expiresSoon(cage.claudeToken.expiresAt) ? "warn" : "muted"}
+                title={cage.claudeToken.exact ? undefined : ESTIMATE}
+              >
+                {expiryLabel(cage.claudeToken.expiresAt, cage.claudeToken.exact)}
                 {expiresSoon(cage.claudeToken.expiresAt) && " · run claude setup-token again"}
               </span>
             )}
@@ -224,7 +235,9 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
               login &&
               claude &&
               (needsAllow ||
-                (tokenSource === "library" ? libraryToken !== true : !token.trim() && !tokenReady))
+                (tokenSource === "library"
+                  ? libraryToken !== true
+                  : !token.trim() && (!tokenReady || !!expiry)))
             }
           >
             {current ? "Save" : "Add"}

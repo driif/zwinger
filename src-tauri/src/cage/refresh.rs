@@ -327,7 +327,9 @@ mod tests {
         let (manager, runtime, id, _) = host_manager(FakeLogins::default(), NOW);
         runtimes::fake_install(&manager.data, "claude");
         manager.start(&id).await.unwrap();
-        manager.set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, true).unwrap();
+        manager
+            .set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, true, None)
+            .unwrap();
         manager.refresh_agents(Some(&id)).await;
         let vm = manager.list().cages.remove(0).shared();
         assert!(!vm.pending_restart);
@@ -348,7 +350,9 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
         manager.start(&id).await.unwrap();
         assert!(manager.list().cages[0].shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
-        manager.set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, false).unwrap();
+        manager
+            .set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, false, None)
+            .unwrap();
         manager.refresh_agents(Some(&id)).await;
         let notices = manager.list().cages.remove(0).shared().host_notices;
         assert!(!notices.iter().any(|n| n == NO_CLAUDE_TOKEN || n == EXPIRED_CLAUDE_TOKEN), "{notices:?}");

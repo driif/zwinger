@@ -61,10 +61,11 @@ pub(crate) const EXPIRED_CLAUDE_TOKEN: &str = "The Claude Code token of this cag
 /// The notice for the Claude token `entry` of a bound cage: missing, with
 /// no date or expired. A valid token has none.
 fn claude_token_problem(entry: Option<&secrets::VaultEntry>) -> Option<&'static str> {
-    let Some(saved_at) = entry.and_then(|entry| entry.saved_at) else {
+    let Some(expiry) = entry.filter(|entry| entry.saved_at.is_some()).and_then(secrets::VaultEntry::token_expiry)
+    else {
         return Some(NO_CLAUDE_TOKEN);
     };
-    (saved_at.saturating_add(365 * 24 * 60 * 60 * 1000) <= secrets::now_ms()).then_some(EXPIRED_CLAUDE_TOKEN)
+    (expiry <= secrets::now_ms()).then_some(EXPIRED_CLAUDE_TOKEN)
 }
 
 /// The bytes of a probe's stderr that a notice shows.
@@ -1715,7 +1716,9 @@ mod tests {
     async fn a_host_agent_gets_its_login_and_profile_at_start() {
         let logins = FakeLogins::default();
         let (manager, runtime, id, vault) = host_manager(logins, NOW);
-        manager.set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, true).unwrap();
+        manager
+            .set_claude_token(&id, Some(SecretValue::new("sk-ant-oat-real")), Source::Local, true, true, None)
+            .unwrap();
 
         let cage = manager.list().cages.remove(0).cage;
         let rules: Vec<_> = cage.network.rules.iter().map(|r| (r.target.clone(), r.action)).collect();
@@ -1828,7 +1831,7 @@ mod tests {
         assert_eq!(manager.list().cages[0].shared().status, Status::Running);
         assert!(manager.list().cages[0].shared().host_notices.contains(&NO_CLAUDE_TOKEN.to_owned()));
         manager.stop(&id, None).await.unwrap();
-        manager.set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("t")), Source::Local, true, false, None).unwrap();
         vault
             .put(
                 &Owner::cage(&id),
@@ -1836,6 +1839,7 @@ mod tests {
                 &secrets::VaultEntry {
                     value: SecretValue::new("t"),
                     saved_at: Some(secrets::now_ms() - 365 * 24 * 60 * 60 * 1000),
+                    expires_at: None,
                 },
             )
             .unwrap();
@@ -1861,11 +1865,12 @@ mod tests {
     #[tokio::test]
     async fn an_expired_token_restored_by_settle_starts_the_cage_with_a_notice() {
         let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
-        manager.set_claude_token(&id, Some(SecretValue::new("fresh")), Source::Local, true, false).unwrap();
+        manager.set_claude_token(&id, Some(SecretValue::new("fresh")), Source::Local, true, false, None).unwrap();
         // A failed rollback left the prior, expired entry to restore.
         let expired = secrets::VaultEntry {
             value: SecretValue::new("old"),
             saved_at: Some(secrets::now_ms() - 365 * 24 * 60 * 60 * 1000),
+            expires_at: None,
         };
         lock(&manager.unsettled)
             .insert((Owner::Cage(id.clone().into()), "CLAUDE_CODE_OAUTH_TOKEN".into()), Some(expired));
