@@ -4,7 +4,7 @@ import { putTask } from "./api";
 import { AGENT_NAMES, AgentKind, CageView, SessionView, TaskAgent } from "../../shared/api";
 import { errorMessage } from "../../shared/errorMessage";
 
-const KINDS: AgentKind[] = ["claude", "codex", "pi"];
+const KINDS: AgentKind[] = ["claude", "codex", "pi", "agy"];
 /** Gemini CLI runs only from this Mac. */
 const kinds = (cage: CageView): AgentKind[] =>
   cage.hostAgents.some((a) => a.kind === "gemini") ? [...KINDS, "gemini"] : KINDS;

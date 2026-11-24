@@ -49,7 +49,9 @@ fn link_config(state: &Path, home: &[&str], kind: AgentKind) -> io::Result<()> {
     let terminal = host_agents::open_parts(state, parts)?;
     let dir = host_agents::open_parts(state, &[home, parts].concat())?;
     let login = guest_login::place(kind).map(|(_, name)| name);
-    for name in profile::entries(kind).iter().chain(&login) {
+    // agy has no profile, but its settings select the Gemini API key mode.
+    let settings: &[&str] = if kind == AgentKind::Antigravity { &["settings.json"] } else { &[] };
+    for name in profile::entries(kind).iter().chain(&login).chain(settings) {
         if host_agents::type_at(&terminal, *name)?.is_some() {
             let target = format!("{STATE_DIR}/{}/{name}", parts.join("/"));
             rustix::fs::symlinkat(target.as_str(), &dir, *name)?;
@@ -113,6 +115,18 @@ mod tests {
             Path::new("/opt/zwinger/state/codex/config.toml")
         );
         assert_eq!(guest_root("s1", "fix", "01"), "/opt/zwinger/state/tasks/s1/fix/01");
+    }
+
+    #[test]
+    fn an_agy_home_links_the_settings_of_the_terminal_home() {
+        let state = state();
+        fs::create_dir_all(state.join("agy/.gemini/antigravity-cli")).unwrap();
+        fs::write(state.join("agy/.gemini/antigravity-cli/settings.json"), "{}").unwrap();
+        create(&state, "s1", "fix", "01", &[home("agy", AgentKind::Antigravity)]).unwrap();
+        assert_eq!(
+            fs::read_link(state.join("tasks/s1/fix/01/agy/agy/.gemini/antigravity-cli/settings.json")).unwrap(),
+            Path::new("/opt/zwinger/state/agy/.gemini/antigravity-cli/settings.json")
+        );
     }
 
     #[test]

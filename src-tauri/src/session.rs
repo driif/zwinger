@@ -376,9 +376,6 @@ impl Session {
         let mut agents = draft.agents.clone();
         let mut options = draft.options.clone();
         for agent in agents.iter_mut().chain(options.independent.as_mut()) {
-            if agent.kind == AgentKind::Antigravity {
-                return Err(invalid(format!("{} does not run tasks", agent.kind.label())));
-            }
             agent.model = agent.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
             if let Some(model) = &agent.model
                 && (model.len() > MODEL_LIMIT || !model.bytes().all(|b| b.is_ascii_graphic()))

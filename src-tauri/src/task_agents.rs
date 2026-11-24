@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
+use crate::agent::{AgentKind, Framer, Line, agy, claude, codex, gemini, launch};
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
 use crate::runtimes::Installed;
 use crate::task_participants::Participant;
@@ -198,11 +198,8 @@ pub fn argv(
     home: Option<&str>,
 ) -> Result<Vec<String>, Failure> {
     let model = agent.model.as_deref();
-    if agent.kind == AgentKind::Antigravity {
-        return Err(Failure::Start(format!("{} does not run tasks", agent.kind.label())));
-    }
     let Some(mut argv) = launch::command(agent.kind, found, home) else {
-        return Err(Failure::Start("Gemini CLI is not mounted in the cage".to_owned()));
+        return Err(Failure::Start(format!("{} is not in the cage", agent.kind.label())));
     };
     match agent.kind {
         AgentKind::Claude => {
@@ -245,7 +242,17 @@ pub fn argv(
                 argv.extend(["-m".to_owned(), model.to_owned()]);
             }
         }
-        AgentKind::Antigravity => {}
+        AgentKind::Antigravity => {
+            // `-p=` takes no prompt: the prompt is the `user` line on stdin.
+            argv.extend(["-p=", "--input-format", "stream-json", "--output-format", "stream-json"].map(str::to_owned));
+            // As `--yolo` for Gemini CLI: acceptable only because the agent runs inside the cage.
+            if access == Access::Write {
+                argv.push("--dangerously-skip-permissions".to_owned());
+            }
+            if let Some(model) = model {
+                argv.extend(["--model".to_owned(), model.to_owned()]);
+            }
+        }
         AgentKind::Pi => {
             argv.extend(["--no-session", "--mode", "json"].map(str::to_owned));
             if access == Access::Read {
@@ -436,6 +443,7 @@ enum Mapper {
     Claude(claude::Mapper),
     Codex(codex::Mapper),
     Gemini(gemini::Mapper),
+    Agy(agy::Mapper),
     Pi,
 }
 
@@ -528,8 +536,8 @@ impl<R: SandboxRuntime> Exec<R> {
             AgentKind::Claude => Mapper::Claude(claude::Mapper::default()),
             AgentKind::Codex => Mapper::Codex(codex::Mapper::default()),
             AgentKind::Gemini => Mapper::Gemini(gemini::Mapper::default()),
-            // `argv` refuses it before a process starts.
-            AgentKind::Pi | AgentKind::Antigravity => Mapper::Pi,
+            AgentKind::Antigravity => Mapper::Agy(agy::Mapper::default()),
+            AgentKind::Pi => Mapper::Pi,
         };
         let mut framer = Framer::default();
         let mut result = Result_::default();
@@ -554,6 +562,10 @@ impl<R: SandboxRuntime> Exec<R> {
                         gemini_result(&event, &mut result);
                         m.map(&event)
                     }
+                    Mapper::Agy(m) => {
+                        agy_result(&event, &mut result);
+                        m.map(&event)
+                    }
                     Mapper::Pi => {
                         pi_result(&event, &mut result);
                         vec![event]
@@ -566,7 +578,11 @@ impl<R: SandboxRuntime> Exec<R> {
         };
         let home = self.state.as_ref().map(|state| format!("{state}/{}", agent.id));
         let argv = argv(agent, access, self.found(), home.as_deref())?;
-        let (code, stderr) = self.drive(&argv, prompt.as_bytes(), limits, cancel, on_stdout).await?;
+        let input = match agent.kind {
+            AgentKind::Antigravity => agy::input(prompt),
+            _ => prompt.as_bytes().to_vec(),
+        };
+        let (code, stderr) = self.drive(&argv, &input, limits, cancel, on_stdout).await?;
         if let Some(error) = result.error {
             return Err(Failure::Agent(error));
         }
@@ -818,6 +834,19 @@ fn gemini_result(event: &Value, result: &mut Result_) {
             result.error = Some(text_or(&event["error"]["message"], "Gemini CLI failed"));
         }
         _ => {}
+    }
+}
+
+/// The terminal `result` event of an agy run has its reply in `response`.
+fn agy_result(event: &Value, result: &mut Result_) {
+    if event["event"] != "result" {
+        return;
+    }
+    let event = &event["result"];
+    if event["status"] == "SUCCESS" {
+        result.text = event["response"].as_str().unwrap_or_default().to_owned();
+    } else {
+        result.error = Some(text_or(&event["error"], "Antigravity CLI failed"));
     }
 }
 
@@ -1222,9 +1251,57 @@ PATH=$ORIGINAL_PATH exec git "$@"
             Err(Failure::Start(_))
         ));
 
+        let agy = argv(
+            &agent(AgentKind::Antigravity, Some("gemini-4-hydrogen-high")),
+            Access::Read,
+            found(false, GEMINI),
+            None,
+        )
+        .unwrap();
+        assert_eq!(agy[1], "HOME=/opt/zwinger/state/agy");
+        assert_eq!(
+            agy[2..],
+            [
+                "/opt/zwinger/runtimes/agy/1/agy",
+                "-p=",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--model",
+                "gemini-4-hydrogen-high"
+            ]
+        );
+        let write = argv(&agent(AgentKind::Antigravity, None), Access::Write, found(false, GEMINI), None).unwrap();
+        assert_eq!(write.last().map(String::as_str), Some("--dangerously-skip-permissions"));
+        let none = launch::Found::default();
+        assert!(matches!(
+            argv(&agent(AgentKind::Antigravity, None), Access::Write, none, None),
+            Err(Failure::Start(_))
+        ));
+
         let host_pi = argv(&agent(AgentKind::Pi, None), Access::Write, found(true, GEMINI), None).unwrap();
         assert_eq!(host_pi[2..4], ["node", "/opt/zwinger/host/pi/dist/cli.js"]);
         assert_eq!(pi[..4], ["env", "PI_CODING_AGENT_DIR=/opt/zwinger/state/agent", "node", "/opt/zwinger/pi/cli.js"]);
+    }
+
+    #[test]
+    fn the_agy_reply_is_the_response_of_its_result() {
+        let mut result = Result_::default();
+        let step =
+            json!({ "event": "step_update", "step_update": { "step_type": "agent_response", "text_delta": "x" } });
+        agy_result(&step, &mut result);
+        assert_eq!(result.text, "");
+        agy_result(
+            &json!({ "event": "result", "result": { "status": "SUCCESS", "response": "{\"a\":1}\n" } }),
+            &mut result,
+        );
+        assert_eq!((result.text.as_str(), result.error.as_deref()), ("{\"a\":1}\n", None));
+        agy_result(
+            &json!({ "event": "result", "result": { "status": "ERROR", "response": "", "error": "quota" } }),
+            &mut result,
+        );
+        assert_eq!(result.error.as_deref(), Some("quota"));
     }
 
     #[test]

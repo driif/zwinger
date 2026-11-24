@@ -577,9 +577,9 @@ mod tests {
             bad.agents[1].model = Some("two words".into());
             assert!(matches!(manager.put_task(&id, bad), Err(Error::InvalidTask(..))));
         }
-        // Antigravity CLI runs in agent sessions only.
+        // Antigravity CLI runs tasks too.
         let agy = task_draft(None, "Agy", [AgentKind::Claude, AgentKind::Antigravity]);
-        assert!(matches!(manager.put_task(&id, agy), Err(Error::InvalidTask(..))));
+        manager.put_task(&id, agy).unwrap();
     }
 
     #[tokio::test]

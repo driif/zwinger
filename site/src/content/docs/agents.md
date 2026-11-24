@@ -219,7 +219,6 @@ Limits:
   the real token stays in the cage, where the agent can read and send it. zwinger does not find or remove this login.
 - **No agent from your Mac for a cage.** The Antigravity CLI of your Mac runs only in a project with no cage.
   **Settings > Agents on this Mac** shows it with this limit.
-- **No tasks.** A task cannot use Antigravity CLI.
 - **No status.** See [Agent status](#agent-status).
 - **No self-update in the cage.** The runtime is read-only. A new zwinger version can pin a newer version.
 

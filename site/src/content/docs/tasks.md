@@ -16,10 +16,13 @@ menu of a task (right-click or the **…** button) has **Start run**, **Edit** a
 A task has these fields:
 
 - **Title** and **Request**.
-- Two agents (pi, Claude Code, Codex), each with an optional model. **Agent 1** decides a tiebreak. The two agents can
+- Two agents (pi, Claude Code, Codex, Antigravity CLI), each with an optional model. **Agent 1** decides a tiebreak. The two agents can
   be of the same kind, for example Claude Code with `opus` and Claude Code with `sonnet`. The two models are
   independent: they can also be equal, or empty for the default model of the CLI. Gemini CLI is also available if the
-  cage uses Gemini CLI from the Mac. Antigravity CLI does not run tasks.
+  cage uses Gemini CLI from the Mac. Antigravity CLI runs from its Linux build: install it in **Settings > Runtimes**
+  and give the cage a `GEMINI_API_KEY` credential (see [Antigravity CLI](/agents/#antigravity-cli)). It has no
+  read-only flag, so in a read-only stage only the Git check after the stage finds a change; a stage that can write
+  gets `--dangerously-skip-permissions`.
 - **Gates**: shell lines that check the result, for example `pnpm build`.
 - **Working dir**: `/workspace`, or a folder below it or below a mount. In a VM with more projects, `/workspace` is the
   project's folder `/workspace/<slug>`.
@@ -117,7 +120,7 @@ Each agent of a run has a name. Agents of different kinds use the kind, for exam
 the same kind use `claude-1` and `claude-2` (or `codex-1`, `pi-1` and so on), in the order of the task. The name never
 contains the model. The room shows each agent with the icon of its kind, its kind and its model. If the task gives no
 model, the CLI selects its default model. Claude Code and pi report that model in their output, and the room shows it
-after the first call of the agent. Codex and Gemini CLI do not report it, so the room shows `default model`. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
+after the first call of the agent. Codex, Gemini CLI and Antigravity CLI do not report it, so the room shows `default model`. To select the implementer, use the button with the name of the agent. Only an agent with a plan can be selected.
 
 The room shows the independent reviewer, if the run has one, in its own card with its kind, model, stage and result.
 The exchange stages are the turns that the run started with. A run from an earlier version and a duo round folder
