@@ -291,8 +291,19 @@ export async function openTerminal(el: HTMLElement, onFind: () => void, links: F
   };
 }
 
-/** Opens saved output without any input, link, title or clipboard path. */
-export async function openHistory(el: HTMLElement, bytes: number[]): Promise<() => void> {
+/** Where a closed history view was: its scroll line and its selection, to show again when it opens. */
+export interface HistoryView {
+  /** `null`: at the bottom. */
+  viewportY: number | null;
+  /** The selection in buffer cells, for a terminal with `cols` columns. */
+  selection?: { column: number; row: number; length: number; cols: number };
+}
+
+/**
+ * Opens saved output without any input, link, title or clipboard path, at `view` if given. The returned function
+ * closes it and returns its view.
+ */
+export async function openHistory(el: HTMLElement, bytes: number[], view?: HistoryView): Promise<() => HistoryView> {
   xterm ??= import("./xterm");
   const { Terminal, FitAddon, Unicode11Addon } = await xterm;
   const lookOptions = options(look!);
@@ -320,8 +331,23 @@ export async function openHistory(el: HTMLElement, bytes: number[]): Promise<() 
   const leaveHistory = (event: WheelEvent) => scrollAdjacentRun(term, el.parentElement, event);
   el.addEventListener("wheel", leaveHistory, { capture: true, passive: false });
   term.write(Uint8Array.from(bytes));
-  term.write("\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?25l");
+  term.write("\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?25l", () => {
+    if (view?.viewportY != null) term.scrollToLine(view.viewportY);
+    const selection = view?.selection;
+    if (selection && selection.cols === term.cols) term.select(selection.column, selection.row, selection.length);
+  });
   return () => {
+    const buffer = term.buffer.active;
+    const range = term.getSelectionPosition();
+    const closed: HistoryView = {
+      viewportY: buffer.viewportY >= buffer.baseY ? null : buffer.viewportY,
+      selection: range && {
+        column: range.start.x,
+        row: range.start.y,
+        length: (range.end.y - range.start.y) * term.cols + range.end.x - range.start.x,
+        cols: term.cols,
+      },
+    };
     observer.disconnect();
     el.removeEventListener("wheel", leaveHistory, { capture: true });
     handlers.forEach((handler) => handler.dispose());
@@ -329,5 +355,6 @@ export async function openHistory(el: HTMLElement, bytes: number[]): Promise<() 
     entry.ligatures?.dispose();
     live.delete(entry);
     term.dispose();
+    return closed;
   };
 }

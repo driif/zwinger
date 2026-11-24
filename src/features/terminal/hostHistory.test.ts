@@ -28,12 +28,19 @@ class FakeTerminal {
   }
   buffer = { active: { viewportY: 0, baseY: 0 } };
   rows = 24;
+  cols = 80;
+  selection?: { start: { x: number; y: number }; end: { x: number; y: number } };
+  scrolledTo?: number;
+  selected?: [number, number, number];
 
   writes: (string | Uint8Array)[] = [];
   constructor(options: Record<string, unknown>) { this.options = options; calls.options = options; calls.terminals.push(this); }
   loadAddon() {}
   open() {}
-  write(bytes: string | Uint8Array) { calls.writes.push(bytes); this.writes.push(bytes); }
+  write(bytes: string | Uint8Array, done?: () => void) { calls.writes.push(bytes); this.writes.push(bytes); done?.(); }
+  scrollToLine(line: number) { this.scrolledTo = line; }
+  select(column: number, row: number, length: number) { this.selected = [column, row, length]; }
+  getSelectionPosition() { return this.selection; }
   onData() { calls.input++; }
   onResize() { calls.resize++; }
   registerLinkProvider() { calls.links++; }
@@ -143,4 +150,34 @@ test("restored history keeps at least the configured scrollback", async () => {
   assert.ok(written.startsWith("FIRST-MARKER"));
   assert.ok(written.endsWith("LAST-MARKER\r\n"));
   close();
+});
+
+test("a closed run gives its scroll line and selection, and opens at them again", async () => {
+  const { openHistory } = await import("./engine.ts");
+  const element = {
+    offsetParent: null, style: {}, addEventListener() {}, removeEventListener() {},
+  } as unknown as HTMLElement;
+  const close = await openHistory(element, Array.from(Buffer.from("output")));
+  const first = calls.terminals.at(-1)!;
+  first.buffer.active = { viewportY: 12, baseY: 40 };
+  first.selection = { start: { x: 70, y: 13 }, end: { x: 5, y: 15 } };
+  const view = close();
+  assert.deepEqual(view, { viewportY: 12, selection: { column: 70, row: 13, length: 2 * 80 + 5 - 70, cols: 80 } });
+
+  const again = await openHistory(element, Array.from(Buffer.from("output")), view);
+  const second = calls.terminals.at(-1)!;
+  assert.equal(second.scrolledTo, 12);
+  assert.deepEqual(second.selected, [70, 13, 95]);
+  second.buffer.active = { viewportY: 40, baseY: 40 };
+  second.cols = 100;
+  second.selection = first.selection;
+  const atBottom = again();
+  assert.deepEqual(atBottom, { viewportY: null, selection: { column: 70, row: 13, length: 2 * 100 + 5 - 70, cols: 100 } });
+
+  // A different width drops the selection, and the bottom stays the bottom.
+  const third = await openHistory(element, Array.from(Buffer.from("output")), atBottom);
+  const terminal = calls.terminals.at(-1)!;
+  assert.equal(terminal.scrolledTo, undefined);
+  assert.equal(terminal.selected, undefined);
+  third();
 });
