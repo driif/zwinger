@@ -72,7 +72,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Sends the stored policy to the proxy of each VM of the cage, in one
     /// step with the new `values` of its credentials.
     pub(crate) fn publish(&self, id: &str, values: &[(CredentialRef, SecretValue)]) {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
         let Ok(cage) = state.cage(id) else {
             return;
         };
@@ -83,6 +83,14 @@ impl<R: SandboxRuntime> Manager<R> {
                     held.insert(key.clone(), value.clone());
                 }
             });
+        }
+        // A new credential's placeholder reaches the next agent and login shell.
+        match crate::cage::refresh::rewrite_wrappers(&mut state, &self.data, id, false) {
+            Ok(written) => {
+                drop(state);
+                self.flush_later(written);
+            }
+            Err(e) => eprintln!("the agent commands of {id} could not be written: {e}"),
         }
     }
 
@@ -695,11 +703,15 @@ mod tests {
         assert_eq!(policy.rules[0].target, Target::Host { host: "registry.npmjs.org".into() });
         assert!(!manager.list().cages[0].shared().pending_restart);
 
-        // A new credential name needs its placeholder variable in the guest.
+        // A new credential name gets its placeholder variable in the wrappers and login shells.
         manager
             .set_rule_credential(&id, &rule, "NPM_TOKEN", bearer(), Source::Local, Some(SecretValue::new("t")))
             .unwrap();
-        assert!(manager.list().cages[0].shared().pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        let env = std::fs::read_to_string(manager.bin_dir(&id).join("env.sh")).unwrap();
+        assert!(env.contains("export NPM_TOKEN='$MSB_NPM_TOKEN$'\n"), "{env}");
+        let pi = std::fs::read_to_string(manager.bin_dir(&id).join("pi")).unwrap();
+        assert!(pi.contains(" NPM_TOKEN='$MSB_NPM_TOKEN$' "), "{pi}");
         assert_eq!(live(&manager, &id).snapshot().values[&local("NPM_TOKEN")], SecretValue::new("t"));
         manager.stop(&id, None).await.unwrap();
         assert!(lock(&manager.state).live.is_empty());
@@ -888,10 +900,11 @@ mod tests {
         assert!(!manager.list().cages[0].shared().pending_restart);
         assert_eq!(live(&manager, &id).snapshot().values[&local("KEY")], SecretValue::new("v2"));
 
-        // The guest still has the placeholder variable of a removed name.
+        // A removed name leaves the wrappers; the proxy has no value for its placeholder.
         manager.set_rule_credential(&id, &rule, "KEY", None, Source::Local, None).unwrap();
         assert!(!live(&manager, &id).snapshot().values.contains_key(&local("KEY")));
-        assert!(manager.list().cages[0].shared().pending_restart);
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        assert!(!std::fs::read_to_string(manager.bin_dir(&id).join("env.sh")).unwrap().contains("KEY"));
     }
 
     #[tokio::test]

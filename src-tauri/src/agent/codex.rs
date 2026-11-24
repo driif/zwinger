@@ -4,8 +4,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-/// The installed runtime, mounted read-only.
-pub const DIR: &str = "/opt/zwinger/codex";
 /// Its `CODEX_HOME`, so `~/.codex` is in the project's state and never the
 /// host's. Codex refuses to make its helper binaries below `/tmp`.
 pub const HOME: &str = "/opt/zwinger/state/codex";

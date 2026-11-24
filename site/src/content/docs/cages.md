@@ -97,8 +97,8 @@ them.
 
 A project can run in a VM of its own instead of the shared VM of its cage. Use **Use own VM** in the menu of the
 project row. **Use shared VM** puts it back. The own VM uses the same cage: the same mounts, network policy,
-credentials and agents. A cage edit goes to all VMs of the cage. A network edit reaches each running VM at once, and a
-mount or agent edit waits for the restart of each VM.
+credentials and agents. A cage edit goes to all VMs of the cage. A network edit and a Claude Code or Codex edit reach
+each running VM at once. A mount, pi or Gemini CLI edit waits for the restart of each VM.
 
 - **Names.** The shared VM has the id of its cage as its key. An own VM gets the key `<cage id>-<n>`, with the lowest
   free number from 2. The VM name is `zwinger-<key>`. The network events, the start progress and the guest logins
@@ -178,8 +178,8 @@ The trend stays after you quit zwinger. Each total shows to the millisecond. **C
 shared VM of the cage. If you remove the cage of a project while its VM runs, Settings still shows the last start and
 the trend of that VM.
 
-A start mounts the [agent runtimes](/agents/#runtimes) that are installed at that time. If you install a runtime
-later, restart the cage.
+A start mounts the folder of the [agent runtimes](/agents/#runtimes). A runtime that you install later is in each
+running cage at once, with no restart.
 
 ## Storage
 

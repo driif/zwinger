@@ -110,7 +110,7 @@ impl<R: SandboxRuntime> Manager<R> {
         mut record: RunRecord,
         resume: Option<(&Recovered, &str)>,
     ) -> Result<String> {
-        let (vm, key, folder, scope, host_folder, shared, pi_host, gemini, proxy, unmounted, origin, old) = {
+        let (vm, key, folder, scope, host_folder, shared, host_run, unmounted, origin, old) = {
             let state = lock(&self.state);
             let (member, cage, running, folder, shared) = state.task_cage(id)?;
             let key = state.vm_of(id).map(|(key, _)| key.to_owned()).ok_or(Error::NotRunning)?;
@@ -136,9 +136,13 @@ impl<R: SandboxRuntime> Manager<R> {
                 scope,
                 member.folder.clone(),
                 shared,
-                host.pi_host,
-                host.gemini.clone(),
-                host.proxy.clone(),
+                (
+                    host.pi_host,
+                    host.gemini.clone(),
+                    host.proxy.clone(),
+                    host.installed.clone(),
+                    host.placeholders.clone(),
+                ),
                 unmounted,
                 origin,
                 old,
@@ -183,6 +187,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 writer.event("old_copies", &note);
             }
         }
+        let (pi_host, gemini, proxy, runtimes, placeholders) = host_run;
         let exec = Exec {
             runtime: self.runtime.clone(),
             vm,
@@ -192,6 +197,8 @@ impl<R: SandboxRuntime> Manager<R> {
             pi_host,
             gemini,
             proxy,
+            runtimes,
+            placeholders,
             state: Some(task_state::guest_root(id, &task.slug, &run)),
         };
         let spec = task_runs::Spec {
@@ -321,6 +328,8 @@ impl<R: SandboxRuntime> Manager<R> {
             pi_host: false,
             gemini: None,
             proxy: None,
+            runtimes: Vec::new(),
+            placeholders: Vec::new(),
             state: None,
         };
         // A dropped sender reads as a cancel, so it lives until the diff ends.

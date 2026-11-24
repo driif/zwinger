@@ -964,6 +964,8 @@ mod tests {
             *runtime.binds.lock().unwrap(),
             [
                 Bind { guest: "/opt/zwinger/bin".into(), host: manager.bin_dir(&id) },
+                Bind { guest: runtimes::GUEST_DIR.into(), host: runtimes::root(&manager.data) },
+                Bind { guest: "/opt/zwinger/profile".into(), host: manager.profile_dir(&id) },
                 Bind { guest: launch::CA_DIR.into(), host: Ca::dir(&manager.data) },
             ]
         );
@@ -986,7 +988,7 @@ mod tests {
         ));
         runtimes::fake_install(&manager.data, "claude");
         runtimes::fake_install(&manager.data, "codex");
-        // Installed after the start: the VM has not mounted it.
+        // Installed after the start: the VM has no wrapper yet.
         assert!(matches!(
             manager.open_session(&id, agent(AgentKind::Codex, false), 24, 80).await,
             Err(Error::RuntimeNotMounted(_))
@@ -996,15 +998,16 @@ mod tests {
             Err(Error::NotHostAgent(_))
         ));
 
-        manager.stop(&id, None).await.unwrap();
-        manager.start(&id).await.unwrap();
+        // The end of a download refreshes the running VM: no restart.
+        manager.refresh_agents(None).await;
+        assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count(), 1);
         assert_eq!(
             wrappers(&manager, &id),
             ["claude", "claude-status.json", "codex", "pi", "pi-status.js", "zwinger-agent-status"]
         );
         manager.open_session(&id, agent(AgentKind::Codex, true), 24, 80).await.unwrap();
         assert_eq!(runtime.argvs.lock().unwrap().last().unwrap(), &["/opt/zwinger/bin/codex", "resume", "--last"]);
-        assert_eq!(manager.list().sessions[0].processes[0].kind, agent(AgentKind::Codex, true));
+        assert!(manager.list().sessions[0].processes.iter().any(|p| p.kind == agent(AgentKind::Codex, true)));
     }
 
     fn leaf(terminal: &str) -> Box<PaneNode> {

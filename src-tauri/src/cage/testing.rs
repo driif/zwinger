@@ -160,11 +160,13 @@ pub(crate) fn agent(agent: AgentKind, resume: bool) -> TerminalKind {
     TerminalKind::Agent { agent, resume }
 }
 
+/// The files of the agent commands in the bin dir, without the placeholder file.
 pub(crate) fn wrappers(manager: &Manager<FakeRuntime>, id: &str) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(manager.bin_dir(id))
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "env.sh")
         .collect();
     names.sort();
     names

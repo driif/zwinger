@@ -264,7 +264,7 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
         <CardHeader
           title="Agent runtimes"
           titleAs="h2"
-          description="For all cages. A cage mounts the installed runtimes read-only when it starts."
+          description="For all cages, mounted read-only. A running cage gets a new download at once."
         />
         <CardBody className="stack">
           <LiquidSwitch
@@ -287,9 +287,6 @@ export function CageSettings({ cage, vm, runtimes, run, intent }: Props) {
                 <strong>{AGENT_NAMES[runtime.name]}</strong>
                 <span className="grow muted">
                   {runtime.installed ? `${runtime.version} installed` : `${runtime.version}, not installed`}
-                  {runtime.installed && vm?.status.state === "running" && !vm.runtimes.includes(runtime.name)
-                    ? " · restart the cage to use it"
-                    : ""}
                 </span>
                 {!runtime.installed && <InstallControl runtime={runtime} runtimes={runtimes} />}
               </li>

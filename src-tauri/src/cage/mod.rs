@@ -5,6 +5,7 @@ pub(crate) mod manager;
 pub(crate) mod network;
 pub(crate) mod policy;
 pub(crate) mod progress;
+pub(crate) mod refresh;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod testing;

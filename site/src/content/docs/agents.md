@@ -98,7 +98,9 @@ in a running cage.
 ## Agents from your Mac
 
 zwinger finds the agents that are installed on your Mac. A project can use them in place of its own copy. Turn on one
-agent per kind on the project page. The change applies at the next cage start.
+agent per kind on the project page. A change of Claude Code or Codex, with its profile and login, applies at once,
+also in a running cage. A change of pi or Gemini CLI applies at the next cage start: the cage mounts their package
+from your Mac when it starts, and shows a pending restart until then.
 
 When you use pi from your Mac, the cage checks that its terminal interface starts. It repeats the check if the pi
 installation path, pi version, guest image or VM runtime changes. Gemini CLI uses a version check with the same
@@ -106,7 +108,7 @@ rules. It also repeats the check when its entry point changes. A failed check is
 
 For Claude Code, run `claude setup-token` on your Mac. In **Add agent**, paste the token into the password field and save it. The cage stores the token in its vault. To use one token in more than one cage, save it as `CLAUDE_CODE_OAUTH_TOKEN` in **Settings > Credentials**, then pick **Use library token** in **Add agent**. A rotation in the library reaches each cage that uses it. The guest sees only a placeholder in `CLAUDE_CODE_OAUTH_TOKEN`; the proxy sets `authorization: Bearer <token>` only for `api.anthropic.com`. Under default Block, use **Allow api.anthropic.com** before saving. A Block rule can still override that Allow rule.
 
-A Claude setup token is valid for one year after `claude setup-token` makes it. That command shows the exact expiry. zwinger cannot read the expiry from the token, so it shows an estimate: **expires about** one year after you saved the token. Save the token soon after you make it to keep the estimate close. A save of the same token again, also in the credential editor, keeps the first date. The project warns during the last 30 days of the estimate. Run `claude setup-token` again and replace the stored token before it expires. A cage with Claude host login and no valid token still starts, so you can use the other agents and the shell. The proxy does not send a Claude token, and the cage shows a notice. Save a new token in the cage, then restart the cage. If you turn the Claude login off or remove Claude Code from the cage, zwinger deletes the stored token and its credential. A library token stays in the library and in the other cages; only this cage detaches it.
+A Claude setup token is valid for one year after `claude setup-token` makes it. That command shows the exact expiry. zwinger cannot read the expiry from the token, so it shows an estimate: **expires about** one year after you saved the token. Save the token soon after you make it to keep the estimate close. A save of the same token again, also in the credential editor, keeps the first date. The project warns during the last 30 days of the estimate. Run `claude setup-token` again and replace the stored token before it expires. A cage with Claude host login and no valid token still starts, so you can use the other agents and the shell. The proxy does not send a Claude token, and the cage shows a notice. Save a new token in the cage: a running cage gets it at once, and a new `claude` uses it. If you turn the Claude login off or remove Claude Code from the cage, zwinger deletes the stored token and its credential. A library token stays in the library and in the other cages; only this cage detaches it.
 
 Codex, pi and Gemini CLI use their login files on your Mac. The agent in the cage gets placeholders only, and the proxy adds the real token to provider requests. If a file login expires, open that agent on your Mac once to renew it. A new file login applies without a cage restart.
 
@@ -170,4 +172,4 @@ Limits:
 zwinger includes pi. Install Claude Code, Codex and Antigravity CLI one time in **Settings > Runtimes**, for all
 projects. zwinger downloads a pinned version and checks its hash: the SHA-512 of the npm package for Claude Code and
 Codex, the SHA-256 of the official GitHub release asset for Antigravity CLI. A runtime that you install while a cage
-runs needs a cage restart.
+runs is available in the cage at once, with no restart.

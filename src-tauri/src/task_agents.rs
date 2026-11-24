@@ -13,6 +13,7 @@ use tokio::time::Instant;
 
 use crate::agent::{AgentKind, Framer, Line, claude, codex, gemini, launch};
 use crate::runtime::{PipeEvent, PipeInput, SandboxRuntime};
+use crate::runtimes::Installed;
 use crate::task_participants::Participant;
 
 /// How long a killed process has to exit.
@@ -408,6 +409,10 @@ pub struct Exec<R: SandboxRuntime> {
     pub gemini: Option<String>,
     /// The URL of the cage's proxy.
     pub proxy: Option<String>,
+    /// The downloaded runtimes that the VM runs.
+    pub runtimes: Vec<Installed>,
+    /// The names of the cage's credentials and host logins.
+    pub placeholders: Vec<String>,
     /// The guest folder of the run's agent state: each participant has its
     /// own state root below it. `None` uses the state of the terminals.
     pub state: Option<String>,
@@ -429,7 +434,13 @@ enum Mapper {
 
 impl<R: SandboxRuntime> Exec<R> {
     fn found(&self) -> launch::Found<'_> {
-        launch::Found { pi_host: self.pi_host, gemini: self.gemini.as_deref(), proxy: self.proxy.as_deref() }
+        launch::Found {
+            pi_host: self.pi_host,
+            gemini: self.gemini.as_deref(),
+            proxy: self.proxy.as_deref(),
+            runtimes: &self.runtimes,
+            placeholders: &self.placeholders,
+        }
     }
 
     /// Runs `argv` with `input` on stdin until it exits, is killed by a limit,
@@ -894,6 +905,8 @@ mod tests {
             pi_host: false,
             gemini: None,
             proxy: None,
+            runtimes: crate::runtimes::fake_installed().to_vec(),
+            placeholders: Vec::new(),
             state: None,
         };
         assert_eq!(exec.task_runs(), Some("/s/.zwinger/tasks/fix"));
@@ -1139,7 +1152,7 @@ PATH=$ORIGINAL_PATH exec git "$@"
     }
 
     fn found(pi_host: bool, gemini: Option<&str>) -> launch::Found<'_> {
-        launch::Found { pi_host, gemini, proxy: None }
+        launch::Found { pi_host, gemini, runtimes: crate::runtimes::fake_installed(), ..launch::Found::default() }
     }
 
     #[test]
@@ -1310,6 +1323,8 @@ mod limit_tests {
             pi_host: false,
             gemini: None,
             proxy: None,
+            runtimes: crate::runtimes::fake_installed().to_vec(),
+            placeholders: Vec::new(),
             state: None,
         };
         (exec, kills)

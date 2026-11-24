@@ -120,8 +120,9 @@ pub async fn put_host_agent(
 }
 
 /// `value` is for a local token only; a library token comes from the library.
+/// A running VM of the cage gets the change at once.
 #[tauri::command]
-pub fn set_claude_token(
+pub async fn set_claude_token(
     manager: Managed<'_>,
     cage_id: String,
     value: Option<SecretValue>,
@@ -129,12 +130,16 @@ pub fn set_claude_token(
     allow: bool,
     profile: bool,
 ) -> Result<()> {
-    manager.set_claude_token(&cage_id, value, source, allow, profile)
+    manager.set_claude_token(&cage_id, value, source, allow, profile)?;
+    manager.refresh_agents(Some(&cage_id)).await;
+    Ok(())
 }
 
 #[tauri::command]
-pub fn remove_host_agent(manager: Managed<'_>, cage_id: String, agent: AgentKind) -> Result<()> {
-    manager.remove_host_agent(&cage_id, agent)
+pub async fn remove_host_agent(manager: Managed<'_>, cage_id: String, agent: AgentKind) -> Result<()> {
+    manager.remove_host_agent(&cage_id, agent)?;
+    manager.refresh_agents(Some(&cage_id)).await;
+    Ok(())
 }
 
 #[tauri::command]

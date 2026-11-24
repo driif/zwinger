@@ -111,10 +111,11 @@ pub fn list_runtimes(runtimes: State<'_, Runtimes>) -> Result<Vec<RuntimeView>> 
 }
 
 /// `version` `None` installs the pinned version. An unpinned version needs
-/// `confirm` once.
+/// `confirm` once. Then each running VM gets the runtime at once.
 #[tauri::command]
 pub async fn install_runtime(
     runtimes: State<'_, Runtimes>,
+    manager: Managed<'_>,
     name: String,
     version: Option<String>,
     confirm: bool,
@@ -125,7 +126,9 @@ pub async fn install_runtime(
             // The webview may have closed the channel; the install goes on.
             let _ = on_progress.send(progress);
         })
-        .await
+        .await?;
+    manager.refresh_agents(None).await;
+    Ok(())
 }
 
 #[tauri::command]

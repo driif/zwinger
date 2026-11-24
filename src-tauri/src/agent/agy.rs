@@ -9,8 +9,6 @@ use std::path::Path;
 
 use crate::host_agents;
 
-/// The installed runtime, mounted read-only.
-pub const DIR: &str = "/opt/zwinger/agy";
 /// Its `HOME`, so `~/.gemini/antigravity-cli` is in the project's state and never the host's.
 pub const HOME: &str = "/opt/zwinger/state/agy";
 /// The settings dir below the state dir.

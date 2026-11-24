@@ -210,7 +210,8 @@ shows an error and writes no file.
 ## Credentials
 
 A credential is a named value, for example `GITHUB_TOKEN`, that an Allow rule gives to its hosts. The agent sees only
-a placeholder. The proxy puts the real value into the request.
+a placeholder. The proxy puts the real value into the request. A new credential needs no restart: the next agent and
+the next VM shell get its placeholder variable.
 
 - The value is in the vault file, never in the project file. The app can write the value but cannot show it.
 - The proxy adds a credential only to HTTPS requests.

@@ -203,6 +203,8 @@ async fn fixture_with(name: &str, curl: bool) -> Fixture {
         pi_host: false,
         gemini: None,
         proxy: None,
+        runtimes: crate::runtimes::fake_installed().to_vec(),
+        placeholders: Vec::new(),
         state: None,
     };
     let dir = root.join("round");
@@ -557,6 +559,8 @@ fn clone_exec(exec: &Exec<FakeRuntime>) -> Exec<FakeRuntime> {
         pi_host: false,
         gemini: None,
         proxy: None,
+        runtimes: crate::runtimes::fake_installed().to_vec(),
+        placeholders: Vec::new(),
         state: None,
     }
 }

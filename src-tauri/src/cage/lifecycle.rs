@@ -16,7 +16,7 @@ use crate::cage::history::StartRecord;
 use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
-use crate::cage::{self, Bound, CLAUDE_TOKEN, Cage, Members, WORKSPACE, vm_state};
+use crate::cage::{self, Bound, CLAUDE_TOKEN, Cage, HostAgentUse, Members, WORKSPACE, vm_state};
 use crate::error::{Error, Result};
 use crate::host_agents::login::{self, HostToken};
 use crate::host_agents::{self, HostAgents, profile};
@@ -304,25 +304,13 @@ impl<R: SandboxRuntime> Manager<R> {
         binds.push(Bind { guest: launch::CA_DIR.to_owned(), host: Ca::dir(&self.data) });
         run.proxy = Some(proxy.url());
         let mut env = launch::net_env(&proxy.url());
-        let names = cage.logins.iter().map(|l| l.name.clone());
-        env.extend(names.chain(placeholders(&cage.network)).map(|n| (n.clone(), secrets::placeholder(&n))));
+        env.extend(
+            guest_placeholders(&cage.logins, &cage.network).into_iter().map(|n| (n.clone(), secrets::placeholder(&n))),
+        );
         let net = GuestNet { port: proxy.port, env };
         let installed = runtimes::installed(&self.data, &wanted);
-        for kind in [AgentKind::Claude, AgentKind::Codex] {
-            let Some(version) = wanted.get(kind.name()) else {
-                continue;
-            };
-            let label = kind.label();
-            let used = match installed.iter().find(|r| r.name == kind.name()) {
-                Some(r) if r.version == *version => continue,
-                Some(r) => format!(", so the cage uses {label} {}", r.version),
-                None => String::new(),
-            };
-            run.notices.push(format!(
-                "The Linux build of {label} {version} is not downloaded yet{used}. \
-                 Download it in the Agents settings, then restart the cage."
-            ));
-        }
+        run.notices.extend(download_notices(&wanted, &installed));
+        run.placeholders = guest_placeholders(&cage.logins, &cage.network);
         // The paths and the reserved dirs again right before and after the
         // boot, which binds them: a folder that was swapped or a `~/.zwinger`
         // link that was made meanwhile is refused.
@@ -334,11 +322,12 @@ impl<R: SandboxRuntime> Manager<R> {
         };
         let boot = async {
             recheck()?;
-            self.runtime.start(id, bound, &net, &self.state_dir(id)?, &installed, &binds).await
+            self.runtime.start(id, bound, &net, &self.state_dir(id)?, &binds).await
         };
         let (booted, boot_took) = timed(boot).await;
         timings.add(Phase::Boot, boot_took);
         let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
+        run.installed = installed;
         let result = match booted {
             Ok(vm) => {
                 progress.begin(Phase::Guest);
@@ -851,7 +840,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// native module that `--version` does not. A TUI that still runs after
     /// `TUI_PROBE` has loaded, and is killed. The error is the end of its output.
     pub(crate) async fn probe_tui(&self, vm: &R::Vm, proxy: Option<&str>) -> std::result::Result<(), String> {
-        let found = launch::Found { pi_host: true, gemini: None, proxy };
+        let found = launch::Found { pi_host: true, proxy, ..launch::Found::default() };
         let mut argv = launch::command(AgentKind::Pi, found, None).expect("pi has a program");
         argv.push("--no-session".to_owned());
         let (rows, cols) = TUI_PROBE_SIZE;
@@ -1248,36 +1237,24 @@ pub(crate) fn prepare(
     let mut run = HostRun::default();
 
     let detection = host.last();
-    let home = host.home();
-    let mut binds = vec![Bind { guest: launch::BIN_DIR.to_owned(), host: bin }];
+    // The whole folders, so a runtime download or a profile of a host agent
+    // that the cage gets later is in the running VM at once.
+    let runtimes = runtimes::root(data);
+    std::fs::create_dir_all(&runtimes)?;
+    let snapshots = profiles_dir(data, key);
+    std::fs::create_dir_all(&snapshots)?;
+    let mut binds = vec![
+        Bind { guest: launch::BIN_DIR.to_owned(), host: bin },
+        Bind { guest: runtimes::GUEST_DIR.to_owned(), host: runtimes },
+        Bind { guest: profile::GUEST_DIR.to_owned(), host: snapshots.clone() },
+    ];
     let mut wanted = HashMap::new();
     let mut profiles = Vec::new();
     let mut probes = HostProbes::default();
     for kind in host_agents::KINDS {
         let used = cage.host_agent(kind);
-        let snapshot_dir = data.join("profiles").join(key).join(kind.name());
-        let mut entries = Vec::new();
-        if used.is_some_and(|u| u.profile) {
-            begin(Phase::Profile(kind));
-            let at = Instant::now();
-            let snapshot = profile::snapshot(kind, &home, &snapshot_dir)?;
-            profiles.push((kind, at.elapsed()));
-            begin(Phase::Prepare);
-            if !snapshot.skipped.is_empty() {
-                run.notices.push(format!(
-                    "The {} profile skipped {} entries: links out of their folder, denied names, or files over the size limit.",
-                    kind.label(),
-                    snapshot.skipped.len()
-                ));
-            }
-            binds.push(Bind { guest: profile::guest_dir(kind), host: snapshot_dir });
-            entries = snapshot.entries;
-        } else if let Err(e) = std::fs::remove_dir_all(&snapshot_dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(e.into());
-        }
-        profile::link(kind, &state, &entries)?;
+        let took = apply_profile(host, &snapshots, &state, kind, used, &mut run.notices, begin)?;
+        profiles.extend(took.map(|took| (kind, took)));
         if used.is_none() {
             continue;
         }
@@ -1320,28 +1297,9 @@ pub(crate) fn prepare(
     let now = host.now_ms();
     let mut tokens = Vec::new();
     for secret in &cage.logins {
-        let crate::secrets::Origin::HostLogin { agent } = secret.origin else {
-            continue;
-        };
-        let token = host.token(agent)?;
-        if !secret.hosts.contains(&token.host) {
-            return Err(Error::HostLogin(
-                agent.name().to_owned(),
-                format!("it now uses {}; add the agent to the project again", token.host),
-            ));
+        if let crate::secrets::Origin::HostLogin { agent } = secret.origin {
+            tokens.push(host_login(host, &state, secret, agent, now, &mut run.notices)?);
         }
-        for file in login::guest_files(&token, &secret.placeholder(), now) {
-            let dir = host_agents::open_parts(&state, file.dir)?;
-            host_agents::write_at(&dir, file.name, &file.body)?;
-        }
-        if token.expires.is_none() {
-            run.notices.push(format!(
-                "The {} login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. \
-                 Restart the cage when the agent reports a login error.",
-                agent.label()
-            ));
-        }
-        tokens.push(token);
     }
     // After the host logins: a placeholder that replaced a guest login is not one.
     run.guest_logins = guest_login::found(&state);
@@ -1353,6 +1311,104 @@ pub(crate) fn prepare(
     }
     Ok(Prepared { tokens, binds, wanted, run, profiles, probes })
 }
+
+/// The host folder of the profile snapshots of VM `key`, mounted read-only at [`profile::GUEST_DIR`].
+pub(crate) fn profiles_dir(data: &Path, key: &str) -> std::path::PathBuf {
+    data.join("profiles").join(key)
+}
+
+/// Copies the profile of `kind` into its snapshot in `snapshots` if `used`
+/// asks for it, else removes the snapshot. Then it links the snapshot
+/// entries into the agent's state home. Returns how long the copy took.
+pub(crate) fn apply_profile(
+    host: &HostAgents,
+    snapshots: &Path,
+    state: &Path,
+    kind: AgentKind,
+    used: Option<&HostAgentUse>,
+    notices: &mut Vec<String>,
+    begin: &dyn Fn(Phase),
+) -> Result<Option<Duration>> {
+    let snapshot_dir = snapshots.join(kind.name());
+    let mut entries = Vec::new();
+    let mut took = None;
+    if used.is_some_and(|u| u.profile) {
+        begin(Phase::Profile(kind));
+        let at = Instant::now();
+        let snapshot = profile::snapshot(kind, &host.home(), &snapshot_dir)?;
+        took = Some(at.elapsed());
+        begin(Phase::Prepare);
+        if !snapshot.skipped.is_empty() {
+            notices.push(format!(
+                "The {} profile skipped {} entries: links out of their folder, denied names, or files over the size limit.",
+                kind.label(),
+                snapshot.skipped.len()
+            ));
+        }
+        entries = snapshot.entries;
+    } else if let Err(e) = std::fs::remove_dir_all(&snapshot_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
+    profile::link(kind, state, &entries)?;
+    Ok(took)
+}
+
+/// Reads the host login `secret` of `agent` and writes its guest login
+/// files into the agent state `state`.
+pub(crate) fn host_login(
+    host: &HostAgents,
+    state: &Path,
+    secret: &secrets::Secret,
+    agent: AgentKind,
+    now: i64,
+    notices: &mut Vec<String>,
+) -> Result<HostToken> {
+    let token = host.token(agent)?;
+    if !secret.hosts.contains(&token.host) {
+        return Err(Error::HostLogin(
+            agent.name().to_owned(),
+            format!("it now uses {}; add the agent to the project again", token.host),
+        ));
+    }
+    for file in login::guest_files(&token, &secret.placeholder(), now) {
+        let dir = host_agents::open_parts(state, file.dir)?;
+        host_agents::write_at(&dir, file.name, &file.body)?;
+    }
+    if token.expires.is_none() {
+        notices.push(format!(
+            "The {} login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. \
+             Restart the cage when the agent reports a login error.",
+            agent.label()
+        ));
+    }
+    Ok(token)
+}
+
+/// A notice for each native host agent whose Linux build is not downloaded.
+pub(crate) fn download_notices(
+    wanted: &HashMap<&'static str, String>,
+    installed: &[runtimes::Installed],
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    for kind in [AgentKind::Claude, AgentKind::Codex] {
+        let Some(version) = wanted.get(kind.name()) else {
+            continue;
+        };
+        let label = kind.label();
+        let used = match installed.iter().find(|r| r.name == kind.name()) {
+            Some(r) if r.version == *version => continue,
+            Some(r) => format!(", so the cage uses {label} {}", r.version),
+            None => String::new(),
+        };
+        notices.push(format!("The Linux build of {label} {version} is not downloaded yet{used}. {DOWNLOAD_HINT}"));
+    }
+    notices
+}
+
+/// The end of each notice of [`download_notices`].
+pub(crate) const DOWNLOAD_HINT: &str = "Download it in the Agents settings: a running cage gets it at once.";
 
 /// Runs `work` and measures it.
 async fn timed<T>(work: impl Future<Output = T>) -> (T, Duration) {
@@ -1410,6 +1466,11 @@ impl Probe {
             eprintln!("could not cache the host agent probe: {e}");
         }
     }
+}
+
+/// The names of the placeholder vars: the host logins, then the credentials of `network`.
+pub(crate) fn guest_placeholders(logins: &[secrets::Secret], network: &crate::network::NetworkPolicy) -> Vec<String> {
+    logins.iter().map(|l| l.name.clone()).chain(placeholders(network)).collect()
 }
 
 /// The agents that run in the VM: pi always, the others if their runtime is mounted.
@@ -1652,7 +1713,11 @@ mod tests {
         let ca = Bind { guest: launch::CA_DIR.into(), host: Ca::dir(&manager.data) };
         assert_eq!(
             runtime.binds.lock().unwrap()[1..],
-            [Bind { guest: "/opt/zwinger/profile/claude".into(), host: snapshot.clone() }, ca]
+            [
+                Bind { guest: runtimes::GUEST_DIR.into(), host: runtimes::root(&manager.data) },
+                Bind { guest: "/opt/zwinger/profile".into(), host: manager.profile_dir(&id) },
+                ca
+            ]
         );
         assert!(snapshot.join("skills/review/SKILL.md").is_file());
         assert!(!snapshot.join(".credentials.json").exists());
@@ -1670,13 +1735,16 @@ mod tests {
         );
         assert!(!view.shared().pending_restart);
 
-        // The profile off: its links and its snapshot go at the next start.
-        manager.stop(&id, None).await.unwrap();
+        // The profile off: its links and its snapshot go from the running VM, with no restart.
         manager.put_host_agent(&id, uses(AgentKind::Claude, false, true), false).await.unwrap();
-        manager.start(&id).await.unwrap();
-        assert_eq!(runtime.binds.lock().unwrap().len(), 2, "only the bin dir and the CA");
         assert!(!manager.state_dir(&id).unwrap().join("claude/.claude/skills").exists());
         assert!(!snapshot.exists());
+        assert!(!manager.list().cages[0].shared().pending_restart);
+        // And on again.
+        manager.put_host_agent(&id, uses(AgentKind::Claude, true, true), false).await.unwrap();
+        assert!(snapshot.join("skills/review/SKILL.md").is_file());
+        assert!(manager.state_dir(&id).unwrap().join("claude/.claude/skills").is_symlink());
+        assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count(), 1);
         manager.stop(&id, None).await.unwrap();
         manager.delete(&id).await.unwrap();
         manager.delete_cage(&id).unwrap();
@@ -1713,15 +1781,20 @@ mod tests {
             notices,
             [
                 "The Codex login of this Mac has no expiry that zwinger can read, so the proxy does not read it again. Restart the cage when the agent reports a login error.",
-                "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings, then restart the cage.",
+                "The Linux build of Codex 0.163.0 is not downloaded yet. Download it in the Agents settings: a running cage gets it at once.",
             ]
         );
-        // Installed: no download notice.
-        manager.stop(&id, None).await.unwrap();
+        assert!(!manager.bin_dir(&id).join("codex").exists());
+        // Downloaded while the VM runs: no restart, no download notice, and a wrapper.
         runtimes::fake_install(&manager.data, "codex");
-        manager.start(&id).await.unwrap();
-        assert!(manager.list().cages[0].shared().host_notices.iter().all(|n| !n.contains("not downloaded")));
-        assert_eq!(*runtime.runtimes.lock().unwrap(), ["codex"]);
+        manager.refresh_agents(None).await;
+        let vm = manager.list().cages.remove(0).shared();
+        assert!(vm.host_notices.iter().all(|n| !n.contains("not downloaded")), "{:?}", vm.host_notices);
+        assert_eq!(vm.runtimes, ["codex"]);
+        assert!(!vm.pending_restart);
+        let wrapper = std::fs::read_to_string(manager.bin_dir(&id).join("codex")).unwrap();
+        assert!(wrapper.contains("exec /opt/zwinger/runtimes/codex/0.163.0-linux-"), "{wrapper}");
+        assert_eq!(runtime.log.lock().unwrap().iter().filter(|l| l.starts_with("start")).count(), 1);
     }
 
     #[tokio::test]
@@ -1858,7 +1931,17 @@ mod tests {
         manager.put_host_agent(&id, uses(AgentKind::Gemini, false, false), false).await.unwrap();
         manager.start(&id).await.unwrap();
         let binds: Vec<String> = runtime.binds.lock().unwrap().iter().map(|b| b.guest.clone()).collect();
-        assert_eq!(binds, ["/opt/zwinger/bin", "/opt/zwinger/host/pi", "/opt/zwinger/host/gemini", "/opt/zwinger/ca"]);
+        assert_eq!(
+            binds,
+            [
+                "/opt/zwinger/bin",
+                "/opt/zwinger/runtimes",
+                "/opt/zwinger/profile",
+                "/opt/zwinger/host/pi",
+                "/opt/zwinger/host/gemini",
+                "/opt/zwinger/ca"
+            ]
+        );
         assert!(manager.list().cages[0].shared().runtimes.contains(&"gemini"));
         // The TUI probe: a terminal, with no session file.
         let probe = runtime.argvs.lock().unwrap()[0].clone();
@@ -2273,6 +2356,19 @@ mod tests {
         assert_ne!(run(connect).await.0, 0, "direct egress passed");
         assert_eq!(run("printenv ZWINGER_LIVE").await, (0, "$MSB_ZWINGER_LIVE$".to_owned()));
         assert_eq!(run("bash -lc 'command -v pi'").await, (0, "/opt/zwinger/bin/pi".to_owned()));
+        // A runtime that is downloaded and a credential that is added after the start reach the running VM.
+        runtimes::fake_install(&data, "codex");
+        let codex = runtimes::installed(&data, &std::collections::HashMap::new())
+            .into_iter()
+            .find(|r| r.name == "codex")
+            .unwrap();
+        let bin = data.join(codex.guest.strip_prefix("/opt/zwinger/").unwrap()).join("bin/codex");
+        std::fs::write(&bin, "#!/bin/sh\necho live-codex\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        credential(&manager, &id, "registry.npmjs.org", "ZWINGER_LATER", Some("later-value")).unwrap();
+        manager.refresh_agents(None).await;
+        assert_eq!(run("bash -lc codex").await, (0, "live-codex".to_owned()));
+        assert_eq!(run("bash -lc 'printenv ZWINGER_LATER'").await, (0, "$MSB_ZWINGER_LATER$".to_owned()));
 
         // Node goes through the proxy and trusts the zwinger CA.
         for url in ["https://api.github.com/zen", "https://example.com/"] {

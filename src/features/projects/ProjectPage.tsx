@@ -130,7 +130,11 @@ function AddAgent({ cage, detection, kind, run, onDone, onRefresh }: {
       <CardHeader
         title={`${current ? "Change" : "Add"} ${name} ${agent.version} from this Mac`}
         titleAs="h2"
-        description="The project uses the agent of this Mac. Changes apply on the next start."
+        description={
+          kind === "pi" || kind === "gemini"
+            ? "The project uses the agent of this Mac. Changes apply on the next start."
+            : "The project uses the agent of this Mac. A running cage gets the changes at once."
+        }
       />
       <CardBody className="stack">
         <SpringCheckbox

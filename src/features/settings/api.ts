@@ -130,7 +130,7 @@ export const hostAgents = () => call<Detection>("host_agents");
 
 export const detectHostAgents = () => call<Detection>("detect_host_agents");
 
-/** `allowHosts` also adds an Allow rule for the login's provider host. Applies on the next start. */
+/** `allowHosts` also adds an Allow rule for the login's provider host. A running cage gets a Claude Code or Codex change at once; pi and Gemini CLI apply on the next start. */
 export const putHostAgent = (
   cageId: string,
   agent: HostAgentUse,

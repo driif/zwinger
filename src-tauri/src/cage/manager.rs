@@ -10,8 +10,6 @@ use crate::a2a;
 use crate::agent::{AgentKind, launch};
 use crate::cage::activity::{self, Activity};
 use crate::cage::history::{self, StartHistory, StartRecord};
-use crate::cage::lifecycle::mounted;
-use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, ProgressSink, Timings};
 use crate::cage::undo::Undo;
 use crate::cage::{self, Bound, Cage, HostAgentUse, WORKSPACE, vm_state};
@@ -23,6 +21,7 @@ use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::SandboxRuntime;
+use crate::runtimes::Installed;
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
@@ -78,6 +77,8 @@ pub struct Manager<R: SandboxRuntime> {
     /// agent state. [`Manager::reap_legacy_homes`] reaps them again.
     pub(crate) unreaped_legacy: Mutex<Vec<PathBuf>>,
     pub(crate) reap_gate: tokio::sync::Mutex<()>,
+    /// Serializes the agent refreshes of running VMs ([`Manager::refresh_agents`]).
+    pub(crate) refresh_gate: tokio::sync::Mutex<()>,
     /// Serializes the secret edits, so that a rollback cannot undo a later edit.
     /// The state lock is not held during vault calls.
     pub(crate) secret_edit: Mutex<()>,
@@ -192,11 +193,22 @@ pub(crate) struct HostRun {
     pub(crate) guest_watch: Option<AbortHandle>,
     /// The phase durations of the start.
     pub(crate) timings: Timings,
+    /// The downloaded runtimes that the wrappers run. A runtime that is
+    /// downloaded later, or a host agent change, updates it while the VM runs.
+    pub(crate) installed: Vec<Installed>,
+    /// The names of the cage's credentials and host logins, as the wrappers have them.
+    pub(crate) placeholders: Vec<String>,
 }
 
 impl HostRun {
     pub(crate) fn found(&self) -> launch::Found<'_> {
-        launch::Found { pi_host: self.pi_host, gemini: self.gemini.as_deref(), proxy: self.proxy.as_deref() }
+        launch::Found {
+            pi_host: self.pi_host,
+            gemini: self.gemini.as_deref(),
+            proxy: self.proxy.as_deref(),
+            runtimes: &self.installed,
+            placeholders: &self.placeholders,
+        }
     }
 }
 
@@ -515,6 +527,7 @@ impl<R: SandboxRuntime> Manager<R> {
             migrate_pending: AtomicBool::new(false),
             unreaped_legacy: Mutex::default(),
             reap_gate: tokio::sync::Mutex::new(()),
+            refresh_gate: tokio::sync::Mutex::new(()),
             secret_edit: Mutex::new(()),
             unsettled: Mutex::default(),
             undo: Mutex::default(),
@@ -1204,7 +1217,9 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Adds the host agent to the cage, or changes it: its runtime, and
     /// its profile and host login if `used` asks for them. A login adds the
     /// agent's host-login secret; `allow_hosts` also adds an Allow rule for
-    /// its provider host, which the user confirmed. Applies on the next start.
+    /// its provider host, which the user confirmed. A running VM of the cage
+    /// gets a change of Claude Code or Codex at once ([`Manager::refresh_agents`]);
+    /// a change of pi or Gemini CLI applies on its next start.
     pub async fn put_host_agent(&self, cage_id: &str, used: HostAgentUse, allow_hosts: bool) -> Result<()> {
         let kind = used.kind;
         let host = self.host.clone();
@@ -1223,6 +1238,19 @@ impl<R: SandboxRuntime> Manager<R> {
             }
         };
         let login = login.map(crate::secrets::Secret::normalize).transpose()?;
+        self.put_host_agent_config(cage_id, used, login, allow_hosts)?;
+        self.refresh_agents(Some(cage_id)).await;
+        Ok(())
+    }
+
+    fn put_host_agent_config(
+        &self,
+        cage_id: &str,
+        used: HostAgentUse,
+        login: Option<crate::secrets::Secret>,
+        allow_hosts: bool,
+    ) -> Result<()> {
+        let kind = used.kind;
         let _edit = lock(&self.secret_edit);
         self.edit_cage(cage_id, |c, _| {
             if let Some(secret) = &login
@@ -1247,7 +1275,8 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// Also removes its host-login secret, and for Claude its token
-    /// credential and value. Applies on the next start.
+    /// credential and value. The caller then refreshes the running VMs
+    /// ([`Manager::refresh_agents`]).
     pub fn remove_host_agent(&self, cage_id: &str, kind: AgentKind) -> Result<()> {
         let _edit = lock(&self.secret_edit);
         self.edit_cage(cage_id, |c, _| {
@@ -1267,16 +1296,9 @@ impl<R: SandboxRuntime> Manager<R> {
             c.agents_unprompted = on;
             Ok(())
         })?;
-        // The stored value, not `on`: a later edit may have won the race to the lock.
-        let state = lock(&self.state);
-        let unprompted = state.cage(cage_id)?.agents_unprompted;
-        for (key, vm) in &state.vms {
-            if let Vm::Running { runtimes, host, applied, .. } = vm
-                && applied.1.id == cage_id
-            {
-                launch::write(&self.bin_dir(key), &mounted(runtimes), host.found(), unprompted)?;
-            }
-        }
+        // From the stored value, not `on`: a later edit may have won the race to the lock.
+        let written = crate::cage::refresh::rewrite_wrappers(&mut lock(&self.state), &self.data, cage_id, true)?;
+        self.flush_later(written);
         Ok(())
     }
 
@@ -1479,6 +1501,10 @@ fn session_changed(old: &Session, session: &Session) -> bool {
 }
 
 /// As [`session_changed`]. A new credential name needs its placeholder in the guest env.
+/// A change that a running VM does not have yet. The name, the permission
+/// setting and the network policy with its credential placeholders reach a
+/// running VM at once; [`crate::cage::refresh`] keeps the native host agents
+/// of the applied config up to date.
 fn cage_changed(old: &Cage, cage: &Cage) -> bool {
     Cage {
         name: cage.name.clone(),
@@ -1486,7 +1512,6 @@ fn cage_changed(old: &Cage, cage: &Cage) -> bool {
         network: cage.network.clone(),
         ..old.clone()
     } != *cage
-        || placeholders(&old.network) != placeholders(&cage.network)
 }
 
 pub(crate) fn bin_dir(data: &Path, key: &str) -> PathBuf {

@@ -134,6 +134,10 @@ pub struct Snapshot {
     pub values: Arc<HashMap<CredentialRef, SecretValue>>,
     /// The Allow rules until stop of this VM. They have no credentials.
     pub temporary: Arc<Vec<Rule>>,
+    /// The host logins of the VM's host agents.
+    pub logins: Arc<Vec<Arc<Login>>>,
+    /// The refresh hosts of the host logins.
+    pub refresh: Arc<Vec<&'static str>>,
 }
 
 /// The parts of a VM's proxy that edits change while it runs: the next
@@ -149,7 +153,13 @@ pub struct Live {
 
 impl Live {
     pub fn new(policy: NetworkPolicy, values: HashMap<CredentialRef, SecretValue>) -> Arc<Self> {
-        let snapshot = Snapshot { policy: Arc::new(policy), values: Arc::new(values), temporary: Arc::default() };
+        let snapshot = Snapshot {
+            policy: Arc::new(policy),
+            values: Arc::new(values),
+            temporary: Arc::default(),
+            logins: Arc::default(),
+            refresh: Arc::default(),
+        };
         Arc::new(Self { snapshot: Mutex::new(snapshot), version: watch::channel(0).0, asks: Arc::default() })
     }
 
@@ -165,6 +175,20 @@ impl Live {
             edit(Arc::make_mut(policy), Arc::make_mut(values));
         }
         self.version.send_modify(|v| *v += 1);
+    }
+
+    /// Replaces the host logins and their refresh hosts. The next request uses them.
+    pub fn set_logins(&self, logins: Vec<Arc<Login>>, refresh: Vec<&'static str>) {
+        {
+            let mut snapshot = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+            snapshot.logins = Arc::new(logins);
+            snapshot.refresh = Arc::new(refresh);
+        }
+        self.version.send_modify(|v| *v += 1);
+    }
+
+    pub fn logins(&self) -> Arc<Vec<Arc<Login>>> {
+        self.snapshot().logins
     }
 
     /// Changes at each edit.
@@ -218,6 +242,7 @@ impl Live {
 pub struct Config {
     pub ca: Arc<Ca>,
     pub live: Arc<Live>,
+    /// The first host logins of `live` ([`Live::set_logins`]).
     pub logins: Vec<Arc<Login>>,
     /// The refresh hosts of the host logins.
     pub refresh: Vec<&'static str>,
@@ -240,7 +265,7 @@ pub struct Config {
 pub struct Proxy {
     pub port: u16,
     token: String,
-    logins: Vec<Arc<Login>>,
+    pub live: Arc<Live>,
     task: AbortHandle,
     shutdown: watch::Sender<bool>,
     #[cfg(test)]
@@ -261,8 +286,6 @@ struct Shared {
     expected: Vec<u8>,
     ca: Arc<Ca>,
     live: Arc<Live>,
-    refresh: Vec<&'static str>,
-    logins: Vec<Arc<Login>>,
     sink: Sink,
     upstreams: Arc<Upstreams>,
     /// HTTP/2 or HTTP/1.1 by ALPN.
@@ -286,6 +309,7 @@ impl Proxy {
         let port = listener.local_addr()?.port();
         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
         let (shutdown, shutdown_rx) = watch::channel(false);
+        config.live.set_logins(config.logins, config.refresh);
         let upstreams = Arc::new(Upstreams {
             resolver: config.resolver,
             limits: Limits::project(),
@@ -294,9 +318,7 @@ impl Proxy {
         let shared = Arc::new(Shared {
             expected: format!("{USER}:{token}").into_bytes(),
             ca: config.ca,
-            live: config.live,
-            refresh: config.refresh,
-            logins: config.logins.clone(),
+            live: config.live.clone(),
             sink: config.sink,
             auto: client(
                 upstreams.clone(),
@@ -349,7 +371,7 @@ impl Proxy {
         Ok(Self {
             port,
             token,
-            logins: config.logins,
+            live: config.live,
             task,
             shutdown,
             #[cfg(test)]
@@ -367,7 +389,7 @@ impl Proxy {
 
     /// The earliest expiry of the host logins, as the proxy has them now.
     pub fn login_expires(&self) -> Option<i64> {
-        self.logins.iter().filter_map(|l| l.expires()).min()
+        self.live.logins().iter().filter_map(|l| l.expires()).min()
     }
 
     /// The guest connections, tunnels and WebSockets that hold a permit.
@@ -451,11 +473,11 @@ impl Shared {
     }
 
     fn decide(&self, snapshot: &Snapshot, origin: &Origin, request: Option<(&str, &str)>) -> Decision {
-        let tokeninfo = self.logins.iter().any(|l| l.kind == AgentKind::Gemini);
+        let tokeninfo = snapshot.logins.iter().any(|l| l.kind == AgentKind::Gemini);
         let context = Context {
             policy: &snapshot.policy,
             temporary: &snapshot.temporary,
-            refresh: &self.refresh,
+            refresh: &snapshot.refresh,
             tokeninfo,
             listener: self.port,
         };
@@ -939,7 +961,7 @@ async fn forward(
     if decision == Decision::Ask {
         (decision, snapshot) = held(&shared, &origin, request, tunnel.as_deref()).await;
     }
-    let Snapshot { policy, values, .. } = snapshot;
+    let Snapshot { policy, values, logins, .. } = snapshot;
     match decision {
         Decision::Block(reason) => return shared.block(entry, &reason.to_string()),
         // `held` never returns Ask; fail closed.
@@ -962,7 +984,7 @@ async fn forward(
         .flat_map(|r| &r.credentials)
         .filter_map(|c| values.get(&c.key()).map(|v| (c.clone(), v.clone())))
         .collect();
-    let logins: Vec<&Arc<Login>> = shared.logins.iter().filter(|l| l.hosts.contains(&origin.host)).collect();
+    let logins: Vec<&Arc<Login>> = logins.iter().filter(|l| l.hosts.contains(&origin.host)).collect();
     let mut injected = inject::Injected::default();
     if origin.https {
         injected = inject::apply(&mut parts, &credentials);
@@ -1199,7 +1221,8 @@ async fn tokeninfo(
     started: Instant,
 ) -> Response<ProxyBody> {
     entry.reason = Reason::TokenInfo.to_string();
-    let Some(login) = shared.logins.iter().find(|l| l.kind == AgentKind::Gemini) else {
+    let logins = shared.live.logins();
+    let Some(login) = logins.iter().find(|l| l.kind == AgentKind::Gemini) else {
         return shared.block(entry, &Reason::AlwaysBlocked.to_string());
     };
     let placeholder = login.placeholder();

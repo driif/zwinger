@@ -4,8 +4,11 @@
 //! the registry's `dist.integrity`, which must name the same hash).
 //! Antigravity CLI is an asset of its GitHub release, checked against a
 //! pinned SHA-256. Each one is unpacked into
-//! `<app_data>/runtimes/<name>/<version>/`. A cage start mounts one
-//! installed version of each runtime read-only at `/opt/zwinger/<name>`.
+//! `<app_data>/runtimes/<name>/<version>/`. A VM start mounts the whole
+//! `runtimes` folder read-only at [`GUEST_DIR`], so a runtime that is
+//! installed later is in each running VM at once. The folder holds only the
+//! unpacked runtimes and the confirmed versions: an install works in
+//! [`WORK`], outside it, and renames the complete dir into place.
 //!
 //! A host agent asks for the Linux build of the host's version. A version
 //! with no pinned hash can be installed only after the user confirms it
@@ -75,8 +78,14 @@ const REPORT: u64 = 1 << 20;
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
 /// The longest wait for the next bytes. A slow download goes on.
 const READ_LIMIT: Duration = Duration::from_secs(60);
-/// The prefix of the work dir of an install.
+/// The prefix of the work dir of an install in the runtimes folder of
+/// earlier builds.
 const TMP: &str = ".tmp-";
+/// The folder of the work dirs of the installs, beside the runtimes folder:
+/// a VM never sees an unchecked download.
+const WORK: &str = "runtime-work";
+/// The guest dir of the runtimes folder, bound read-only.
+pub const GUEST_DIR: &str = "/opt/zwinger/runtimes";
 
 /// A file of the package that the runtime needs.
 struct Wanted {
@@ -205,8 +214,13 @@ fn package(name: &str, version: &str) -> Result<Package> {
     }
 }
 
+/// The host folder that a VM mounts at [`GUEST_DIR`].
+pub fn root(data: &Path) -> PathBuf {
+    data.join("runtimes")
+}
+
 fn runtime_dir(data: &Path, package: &Package) -> PathBuf {
-    data.join("runtimes").join(package.name).join(&package.folder)
+    root(data).join(package.name).join(&package.folder)
 }
 
 fn is_installed(dir: &Path, package: &Package) -> bool {
@@ -234,7 +248,8 @@ pub enum Progress {
 pub struct Installed {
     pub name: &'static str,
     pub version: String,
-    pub dir: PathBuf,
+    /// The runtime dir in the guest, below [`GUEST_DIR`].
+    pub guest: String,
 }
 
 /// The Linux build of this version is installed.
@@ -252,7 +267,12 @@ pub fn installed(data: &Path, wanted: &HashMap<&str, String>) -> Vec<Installed> 
             let versions = wanted.get(name).into_iter().cloned().chain([pinned]);
             versions.filter_map(|v| package(name, &v).ok()).find_map(|package| {
                 let dir = runtime_dir(data, &package);
-                is_installed(&dir, &package).then_some(Installed { name: package.name, version: package.version, dir })
+                let guest = format!("{GUEST_DIR}/{}/{}", package.name, package.folder);
+                is_installed(&dir, &package).then_some(Installed {
+                    name: package.name,
+                    version: package.version,
+                    guest,
+                })
             })
         })
         .collect()
@@ -279,6 +299,7 @@ impl Drop for Claim<'_> {
 impl Runtimes {
     /// Removes the work dirs of installs that an earlier app run left.
     pub fn new(data: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(data.join(WORK));
         for name in NAMES {
             let Ok(entries) = std::fs::read_dir(data.join("runtimes").join(name)) else {
                 continue;
@@ -355,9 +376,10 @@ impl Runtimes {
         }
         // Held until the work dir is removed, so a new install waits for that.
         let _claim = Claim { installing: &self.installing, name: package.name };
-        let parent = dest.parent().expect("runtime dir has a parent").to_owned();
-        std::fs::create_dir_all(&parent)?;
-        let tmp = parent.join(format!("{TMP}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dest.parent().expect("runtime dir has a parent"))?;
+        let work = self.data.join(WORK);
+        std::fs::create_dir_all(&work)?;
+        let tmp = work.join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&tmp)?;
         let result = fetch(&package, &tmp, &dest, &progress, &cancel).await;
         let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -576,6 +598,15 @@ fn extract(name: &str, tgz: &Path, files: &[Wanted], root: &Path) -> Result<()> 
     }
 }
 
+/// A runtime of each name at version 1, for the guest paths of a test.
+#[cfg(test)]
+pub fn fake_installed() -> &'static [Installed] {
+    static RUNTIMES: std::sync::LazyLock<Vec<Installed>> = std::sync::LazyLock::new(|| {
+        NAMES.map(|name| Installed { name, version: "1".into(), guest: format!("{GUEST_DIR}/{name}/1") }).to_vec()
+    });
+    &RUNTIMES
+}
+
 /// Puts the required files of the pinned version in place, as an install does.
 #[cfg(test)]
 pub fn fake_install(data: &Path, name: &str) {
@@ -716,8 +747,9 @@ mod tests {
         runtimes.cancel("codex");
         assert!(matches!(install.await.unwrap(), Err(Error::InstallCancelled(_))));
         assert!(runtimes.installing.lock().unwrap().is_empty());
-        let parent = data.join("runtimes/codex");
-        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(data.join("runtimes/codex")).unwrap().count(), 0);
+        // The work dir is outside the folder that a VM mounts, and it is gone.
+        assert_eq!(std::fs::read_dir(data.join("runtime-work")).unwrap().count(), 0);
         // No install: nothing to cancel.
         runtimes.cancel("claude");
     }
@@ -726,11 +758,14 @@ mod tests {
     fn new_removes_stale_work_dirs() {
         let data = temp_dir();
         let stale = data.join("runtimes/claude/.tmp-1234/root");
+        let work = data.join("runtime-work/1234/root");
         let kept = data.join("runtimes/codex/0.163.0-linux-arm64/bin");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::create_dir_all(&kept).unwrap();
+        for dir in [&stale, &work, &kept] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         Runtimes::new(data.clone());
         assert!(!data.join("runtimes/claude/.tmp-1234").exists());
+        assert!(!data.join("runtime-work").exists());
         assert!(kept.exists());
     }
 
@@ -811,7 +846,8 @@ mod tests {
         std::fs::write(dir.join("bin/codex"), "x").unwrap();
         let found = installed(&data, &pinned);
         assert_eq!(found.len(), 1);
-        assert_eq!((found[0].name, &found[0].dir), ("codex", &dir));
+        let guest = format!("{GUEST_DIR}/codex/{}", codex.folder);
+        assert_eq!((found[0].name, &found[0].guest), ("codex", &guest));
         let list = Runtimes::new(data.clone()).list().unwrap();
         assert_eq!(
             list.iter().map(|r| (r.name, r.installed)).collect::<Vec<_>>(),
@@ -824,9 +860,10 @@ mod tests {
         fake_install_version(&data, "codex", "0.170.1");
         assert!(is_cached(&data, "codex", "0.170.1"));
         let found = installed(&data, &host);
+        let folder = package("codex", "0.170.1").unwrap().folder;
         assert_eq!(
-            (found[0].version.as_str(), found[0].dir.clone()),
-            ("0.170.1", runtime_dir(&data, &package("codex", "0.170.1").unwrap()))
+            (found[0].version.as_str(), found[0].guest.clone()),
+            ("0.170.1", format!("{GUEST_DIR}/codex/{folder}"))
         );
     }
 

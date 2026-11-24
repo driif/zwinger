@@ -1471,6 +1471,8 @@ impl<R: SandboxRuntime> Manager<R> {
                 pi_host: false,
                 gemini: None,
                 proxy: host.proxy.clone(),
+                runtimes: Vec::new(),
+                placeholders: Vec::new(),
                 state: None,
             };
             (exec, now, has_github(&cage.network))

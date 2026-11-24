@@ -9,12 +9,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
 
 use crate::agent::pi::{AGENT_DIR, PI_DIR};
-use crate::agent::{AgentKind, RESERVED, STATE_DIR, launch};
+use crate::agent::{AgentKind, STATE_DIR, launch};
 use crate::cage::manager::task_guest_folder;
 use crate::cage::{Members, WORKSPACE};
 use crate::error::{Error, Result};
 use crate::netlog;
-use crate::runtimes::Installed;
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -146,16 +145,14 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
     /// Boots the VM `key` of the cage with each member folder at its guest
     /// folder ([`task_guest_folder`]), with workdir `/workspace`.
     /// The VM reaches only `net.port` on the host. `state` is the host dir
-    /// of the VM's agent state. Each runtime in `runtimes` is mounted
-    /// read-only at `/opt/zwinger/<name>`, and each of `binds` read-only at
-    /// its guest path.
+    /// of the VM's agent state. Each of `binds` is mounted read-only at its
+    /// guest path, such as the agent runtimes and the wrappers.
     fn start(
         &self,
         key: &str,
         members: Members<'_>,
         net: &GuestNet,
         state: &Path,
-        runtimes: &[Installed],
         binds: &[Bind],
     ) -> impl Future<Output = Result<Self::Vm>> + Send;
     fn stop(&self, vm: &Self::Vm) -> impl Future<Output = Result<()>> + Send;
@@ -256,7 +253,6 @@ impl Microsandbox {
         members: Members<'_>,
         net: &GuestNet,
         state: &Path,
-        runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<SandboxBuilder> {
         let policy = sandbox_policy(net.port)?;
@@ -286,9 +282,6 @@ impl Microsandbox {
             .volume(STATE_DIR, |m| m.bind(state))
             .env("PI_CODING_AGENT_DIR", AGENT_DIR)
             .network(|n| n.policy(policy));
-        for runtime in runtimes {
-            builder = builder.volume(format!("{RESERVED}/{}", runtime.name), |m| m.bind(&runtime.dir).readonly());
-        }
         for bind in binds {
             builder = builder.volume(&bind.guest, |m| m.bind(&bind.host).readonly());
         }
@@ -309,10 +302,9 @@ impl SandboxRuntime for Microsandbox {
         members: Members<'_>,
         net: &GuestNet,
         state: &Path,
-        runtimes: &[Installed],
         binds: &[Bind],
     ) -> Result<Sandbox> {
-        Ok(self.sandbox_builder(key, members, net, state, runtimes, binds)?.create().await?)
+        Ok(self.sandbox_builder(key, members, net, state, binds)?.create().await?)
     }
 
     /// A graceful stop has no deadline in microsandbox, so a stuck VM is
@@ -489,8 +481,6 @@ pub mod fake {
         pub kill_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// The guest network of the last start.
         pub net: Arc<Mutex<Option<GuestNet>>>,
-        /// The runtime names of the last start.
-        pub runtimes: Arc<Mutex<Vec<String>>>,
         /// The read-only binds of the last start.
         pub binds: Arc<Mutex<Vec<Bind>>>,
         /// The guest folder and host folder of each member of the last start.
@@ -506,6 +496,8 @@ pub mod fake {
         pub profiles: Arc<Mutex<Vec<Vec<String>>>>,
         /// The count of the root execs that trusted the interception CA.
         pub trusts: Arc<Mutex<usize>>,
+        /// The count of the root execs that flushed the guest's file cache.
+        pub flushes: Arc<Mutex<usize>>,
         /// The trust exec fails as in an image with no system bundle.
         pub trust_fail: Arc<Mutex<bool>>,
         /// The VM names that `reap` removes.
@@ -561,10 +553,8 @@ pub mod fake {
             members: Members<'_>,
             net: &GuestNet,
             _: &Path,
-            runtimes: &[Installed],
             binds: &[Bind],
         ) -> Result<FakeVm> {
-            *self.runtimes.lock().unwrap() = runtimes.iter().map(|r| r.name.to_owned()).collect();
             *self.binds.lock().unwrap() = binds.to_vec();
             let gate = self.start_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
@@ -713,6 +703,11 @@ pub mod fake {
                 let _ = out.try_send(PipeEvent::Exit(0));
                 return Ok(Pipe { input, events });
             }
+            if argv == launch::flush_argv() {
+                *self.flushes.lock().unwrap() += 1;
+                let _ = out.try_send(PipeEvent::Exit(0));
+                return Ok(Pipe { input, events });
+            }
             if argv == launch::trust_argv() {
                 *self.trusts.lock().unwrap() += 1;
                 if *self.trust_fail.lock().unwrap() {
@@ -771,8 +766,7 @@ mod tests {
         cage.resources = Resources::new(4, 2048).unwrap();
         let members = Members { sessions: std::slice::from_ref(&session), cage: &cage };
         let net = GuestNet { port: 41234, env: Vec::new() };
-        let builder =
-            Microsandbox { pi: temp_dir() }.sandbox_builder("c", members, &net, &temp_dir(), &[], &[]).unwrap();
+        let builder = Microsandbox { pi: temp_dir() }.sandbox_builder("c", members, &net, &temp_dir(), &[]).unwrap();
         let config = microsandbox::with_backend(
             std::sync::Arc::new(backend) as std::sync::Arc<dyn microsandbox::Backend>,
             builder.build(),

@@ -7,6 +7,7 @@ use std::path::Path;
 
 use super::{AgentKind, STATE_DIR, agy, claude, codex, gemini, pi};
 use crate::host_agents::detect::HostAgent;
+use crate::runtimes::Installed;
 use crate::terminal::output::AGENT_OSC;
 
 /// The guest dir of the wrappers, bound read-only.
@@ -47,6 +48,20 @@ pub struct Found<'a> {
     /// The URL of the cage's proxy. Each wrapper and headless command sets
     /// [`net_env`] for it, so an agent that clears its env keeps it.
     pub proxy: Option<&'a str>,
+    /// The downloaded runtimes that the VM runs, below
+    /// [`crate::runtimes::GUEST_DIR`]. An agent with no runtime here has no program.
+    pub runtimes: &'a [Installed],
+    /// The names of the cage's credentials and host logins. Each wrapper and
+    /// headless command sets each one to its placeholder, so a credential
+    /// that the cage got after the VM start reaches a new agent process.
+    pub placeholders: &'a [String],
+}
+
+impl Found<'_> {
+    /// The guest dir of the runtime `name`.
+    fn runtime(&self, name: &str) -> Option<&str> {
+        self.runtimes.iter().find(|r| r.name == name).map(|r| r.guest.as_str())
+    }
 }
 
 /// The env of every process in the guest: all traffic goes to the cage's
@@ -77,21 +92,28 @@ pub fn env(kind: AgentKind) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-/// The program and its first arguments. `None` if Gemini CLI does not run in the VM.
+/// The program and its first arguments. `None` if the agent does not run
+/// in the VM: Gemini CLI with no entry point, another agent with no runtime.
 pub fn program(kind: AgentKind, found: Found) -> Option<Vec<String>> {
     Some(match kind {
-        AgentKind::Claude => vec![format!("{}/claude", claude::DIR)],
-        AgentKind::Codex => vec![format!("{}/bin/codex", codex::DIR)],
+        AgentKind::Claude => vec![format!("{}/claude", found.runtime(kind.name())?)],
+        AgentKind::Codex => vec![format!("{}/bin/codex", found.runtime(kind.name())?)],
         AgentKind::Pi => vec!["node".to_owned(), pi::cli(found.pi_host)],
         AgentKind::Gemini => vec!["node".to_owned(), found.gemini?.to_owned()],
-        AgentKind::Antigravity => vec![format!("{}/agy", agy::DIR)],
+        AgentKind::Antigravity => vec![format!("{}/agy", found.runtime(kind.name())?)],
     })
 }
 
-/// The net env of `found`'s proxy, then the state env of `kind`. With
-/// `home`, the state paths are below `home` in place of [`STATE_DIR`].
+/// Each placeholder var of `found`, as `(name, placeholder)`.
+fn placeholder_env(found: Found<'_>) -> impl Iterator<Item = (String, String)> + '_ {
+    found.placeholders.iter().map(|name| (name.clone(), crate::secrets::placeholder(name)))
+}
+
+/// The net env of `found`'s proxy, its placeholders, then the state env of
+/// `kind`. With `home`, the state paths are below `home` in place of [`STATE_DIR`].
 fn all_env(kind: AgentKind, found: Found, home: Option<&str>) -> Vec<(String, String)> {
     let mut all = found.proxy.map(net_env).unwrap_or_default();
+    all.extend(placeholder_env(found));
     all.extend(env(kind).iter().map(|(n, v)| {
         let value = match (home, v.strip_prefix(STATE_DIR)) {
             (Some(home), Some(rest)) => format!("{home}{rest}"),
@@ -206,6 +228,10 @@ const PI_STATUS: &str = "pi-status.js";
 /// Gemini CLI's system defaults: the lowest settings scope, so the user's
 /// own settings win and their hooks are added to these.
 const GEMINI_STATUS: &str = "gemini-status.json";
+/// The placeholder vars of the cage in the wrappers' dir. [`profile`]
+/// sources it, so a login shell gets a credential that the cage got after
+/// the VM start.
+const ENV_FILE: &str = "env.sh";
 /// Codex's system hooks in the guest root fs. Codex runs system hooks
 /// without the trust step of user hooks.
 const CODEX_HOOKS: &str = "/etc/codex/hooks.json";
@@ -618,9 +644,19 @@ pub(crate) fn emitted_osc7(folder: &str) -> [Vec<u8>; 2] {
 /// The script of [`PROFILE`].
 pub fn profile() -> String {
     format!(
-        "case \":${{PATH-}}:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:${{PATH-}} ;; esac\nexport PATH\n{}",
+        "case \":${{PATH-}}:\" in *:{BIN_DIR}:*) ;; *) PATH={BIN_DIR}:${{PATH-}} ;; esac\nexport PATH\n{}\
+         if [ -r {BIN_DIR}/{ENV_FILE} ]; then . {BIN_DIR}/{ENV_FILE}; fi\n",
         OSC7_EMITTER.replace("ZSH_DIR", ZSH_DIR)
     )
+}
+
+/// The script of [`ENV_FILE`]: an export of each placeholder var of `found`.
+fn env_file(found: Found) -> String {
+    let mut script = "# zwinger writes this file at each cage start and cage change.\n".to_owned();
+    for (name, value) in placeholder_env(found) {
+        script.push_str(&format!("export {name}={}\n", quote(&value)));
+    }
+    script
 }
 
 /// The root exec that writes the shell files in the guest's root fs: the
@@ -809,29 +845,46 @@ pub fn trust_argv() -> Vec<String> {
 /// host dir `dir`, which is bound at [`BIN_DIR`]. Each file is written in
 /// place, so the guest sees the new text at once.
 pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let wrappers = kinds.iter().filter_map(|&kind| Some((kind.name(), wrapper(kind, found, unprompted)?)));
     for (name, script) in wrappers {
-        let path = dir.join(name);
-        std::fs::write(&path, script)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        put(dir, name, &script, 0o755)?;
     }
     if kinds.iter().any(|&kind| kind != AgentKind::Pi) {
-        let path = dir.join(STATUS);
-        std::fs::write(&path, status_script())?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        put(dir, STATUS, &status_script(), 0o755)?;
     }
     if kinds.contains(&AgentKind::Claude) {
-        std::fs::write(dir.join(CLAUDE_STATUS), claude_status())?;
+        put(dir, CLAUDE_STATUS, &claude_status(), 0o644)?;
     }
     if kinds.contains(&AgentKind::Gemini) && found.gemini.is_some() {
-        std::fs::write(dir.join(GEMINI_STATUS), gemini_status())?;
+        put(dir, GEMINI_STATUS, &gemini_status(), 0o644)?;
     }
     if kinds.contains(&AgentKind::Pi) {
-        std::fs::write(dir.join(PI_STATUS), pi_status())?;
+        put(dir, PI_STATUS, &pi_status(), 0o644)?;
     }
-    Ok(())
+    put(dir, ENV_FILE, &env_file(found), 0o644)
+}
+
+/// The root exec that makes a running VM read the wrappers again after a
+/// rewrite: the guest keeps the names and sizes of its mounted files for a
+/// few seconds, so it could miss a renamed file until then.
+pub fn flush_argv() -> Vec<String> {
+    ["/bin/sh", "-c", "echo 2 > /proc/sys/vm/drop_caches"].map(str::to_owned).to_vec()
+}
+
+/// Writes a temp file and renames it over `name`. A running VM reads its
+/// mount through a cache of the file sizes, so a rewrite in place can reach
+/// it cut short; a rename gives it the old or the new file whole.
+fn put(dir: &Path, name: &str, text: &str, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = dir.join(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
+    let written = std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -924,8 +977,21 @@ mod tests {
     }
 
     const PROXY: &str = "http://zw:t@host.microsandbox.internal:4000";
-    const HOST: Found =
-        Found { pi_host: true, gemini: Some("/opt/zwinger/host/gemini/bundle/gemini.js"), proxy: Some(PROXY) };
+
+    /// The runtimes and no host agent, no proxy.
+    fn bare() -> Found<'static> {
+        Found { runtimes: crate::runtimes::fake_installed(), ..Found::default() }
+    }
+
+    fn host() -> Found<'static> {
+        Found {
+            pi_host: true,
+            gemini: Some("/opt/zwinger/host/gemini/bundle/gemini.js"),
+            proxy: Some(PROXY),
+            runtimes: crate::runtimes::fake_installed(),
+            placeholders: &[],
+        }
+    }
 
     /// Runs the wrapper with `sh`, with a program that prints its env and arguments.
     fn run_with_tty_check(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool) -> String {
@@ -937,7 +1003,7 @@ mod tests {
     /// as its terminal. Gives the output and what the wrapper wrote to the
     /// terminal.
     fn run_printing(kind: AgentKind, unprompted: bool, args: &[&str], tty: bool, vars: &str) -> (String, String) {
-        let script = wrapper(kind, HOST, unprompted).unwrap();
+        let script = wrapper(kind, host(), unprompted).unwrap();
         let terminal = std::env::temp_dir().join(format!("zwinger-tty-{}", uuid::Uuid::new_v4()));
         // The test process has pipes; substitute the TTY check to exercise the interactive branch.
         let script = if tty {
@@ -945,7 +1011,7 @@ mod tests {
         } else {
             script
         };
-        let program = program(kind, HOST).unwrap().iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
+        let program = program(kind, host()).unwrap().iter().map(|p| quote(p)).collect::<Vec<_>>().join(" ");
         let script = script.replace(&format!("{program} "), &format!("printf '%s\\n' {vars} "));
         let out = std::process::Command::new("/bin/sh")
             .env_clear()
@@ -1013,7 +1079,7 @@ mod tests {
     #[test]
     fn claude_wrapper_sets_its_state_and_skips_permissions() {
         assert_eq!(
-            wrapper(AgentKind::Claude, Found::default(), true).unwrap(),
+            wrapper(AgentKind::Claude, bare(), true).unwrap(),
             "#!/bin/sh\n# zwinger writes this file at each cage start.\n\
              export IS_SANDBOX=1 HOME=/opt/zwinger/state/claude\n\
              first=$1\n\
@@ -1028,12 +1094,12 @@ mod tests {
              [ -n \"$add\" ] && set -- --dangerously-skip-permissions \"$@\"\n\
              if [ -n \"$status\" ]; then\n  \
                trap : INT QUIT\n  \
-               /opt/zwinger/claude/claude \"$@\"\n  \
+               /opt/zwinger/runtimes/claude/1/claude \"$@\"\n  \
                code=$?\n  \
                { printf '\\033]1337;zwinger-agent=%s\\007' none > \"$ZWINGER_TTY\"; } 2>/dev/null || true\n  \
                exit $code\n\
              fi\n\
-             exec /opt/zwinger/claude/claude \"$@\"\n"
+             exec /opt/zwinger/runtimes/claude/1/claude \"$@\"\n"
         );
         assert_eq!(
             run(AgentKind::Claude, true, &["-c"]),
@@ -1046,14 +1112,14 @@ mod tests {
         );
         assert_eq!(run(AgentKind::Claude, true, &["mcp", "list"]), "/opt/zwinger/state/claude\nmcp\nlist\n");
         assert_eq!(run(AgentKind::Claude, false, &["-c"]), "/opt/zwinger/state/claude\n-c\n");
-        assert!(!wrapper(AgentKind::Claude, HOST, false).unwrap().contains("dangerously"));
+        assert!(!wrapper(AgentKind::Claude, host(), false).unwrap().contains("dangerously"));
     }
 
     #[test]
     fn codex_wrapper_bypasses_or_keeps_the_sandbox_off() {
-        let on = wrapper(AgentKind::Codex, HOST, true).unwrap();
+        let on = wrapper(AgentKind::Codex, host(), true).unwrap();
         assert!(on.contains(" CODEX_HOME=/opt/zwinger/state/codex\n"), "{on}");
-        assert!(on.ends_with("exec /opt/zwinger/codex/bin/codex \"$@\"\n"), "{on}");
+        assert!(on.ends_with("exec /opt/zwinger/runtimes/codex/1/bin/codex \"$@\"\n"), "{on}");
         assert_eq!(
             run(AgentKind::Codex, true, &["resume", "--last"]),
             "/opt/zwinger/state/codex\n--dangerously-bypass-approvals-and-sandbox\nresume\n--last\n"
@@ -1075,9 +1141,9 @@ mod tests {
 
     #[test]
     fn agy_wrapper_runs_the_runtime_with_its_state_and_skips_permissions() {
-        let script = wrapper(AgentKind::Antigravity, HOST, true).unwrap();
+        let script = wrapper(AgentKind::Antigravity, host(), true).unwrap();
         assert!(script.contains(" HOME=/opt/zwinger/state/agy\n"), "{script}");
-        assert!(script.ends_with("exec /opt/zwinger/agy/agy \"$@\"\n"), "{script}");
+        assert!(script.ends_with("exec /opt/zwinger/runtimes/agy/1/agy \"$@\"\n"), "{script}");
         assert_eq!(
             run(AgentKind::Antigravity, true, &["-c"]),
             "/opt/zwinger/state/agy\n--dangerously-skip-permissions\n-c\n"
@@ -1088,8 +1154,8 @@ mod tests {
         assert_eq!(run(AgentKind::Antigravity, false, &[]), "/opt/zwinger/state/agy\n");
         assert_eq!(continue_args(AgentKind::Antigravity), ["-c"]);
         assert_eq!(
-            command(AgentKind::Antigravity, Found::default(), None).unwrap().last().unwrap(),
-            "/opt/zwinger/agy/agy"
+            command(AgentKind::Antigravity, bare(), None).unwrap().last().unwrap(),
+            "/opt/zwinger/runtimes/agy/1/agy"
         );
         // Its hooks stay quiet: it has none, so nothing reports a state but the exit.
         let (_, written) = run_printing(AgentKind::Antigravity, true, &[], true, "\"$HOME\"");
@@ -1098,7 +1164,7 @@ mod tests {
 
     #[test]
     fn pi_and_gemini_wrappers_run_the_found_install() {
-        let pi = wrapper(AgentKind::Pi, HOST, true).unwrap();
+        let pi = wrapper(AgentKind::Pi, host(), true).unwrap();
         assert!(pi.contains(" PI_CODING_AGENT_DIR=/opt/zwinger/state/agent\n"), "{pi}");
         assert!(!pi.contains("add="), "{pi}");
         assert!(
@@ -1114,7 +1180,7 @@ mod tests {
             "/opt/zwinger/state/agent\n--session-dir\n/opt/zwinger/state/sessions\n-c\n"
         );
 
-        let gemini = wrapper(AgentKind::Gemini, HOST, true).unwrap();
+        let gemini = wrapper(AgentKind::Gemini, host(), true).unwrap();
         assert!(gemini.contains(" HOME=/opt/zwinger/state/gemini\n"), "{gemini}");
         assert!(gemini.ends_with("exec node /opt/zwinger/host/gemini/bundle/gemini.js \"$@\"\n"), "{gemini}");
         assert_eq!(
@@ -1131,7 +1197,7 @@ mod tests {
 
     #[test]
     fn odd_paths_are_quoted() {
-        let found = Found { pi_host: false, gemini: Some("/opt/zwinger/host/gemini/it's here.js"), proxy: None };
+        let found = Found { gemini: Some("/opt/zwinger/host/gemini/it's here.js"), ..Found::default() };
         let gemini = wrapper(AgentKind::Gemini, found, false).unwrap();
         assert!(gemini.ends_with("exec node '/opt/zwinger/host/gemini/it'\\''s here.js' \"$@\"\n"), "{gemini}");
     }
@@ -1139,10 +1205,10 @@ mod tests {
     #[test]
     fn headless_commands_and_continue_flags() {
         assert_eq!(
-            command(AgentKind::Claude, Found::default(), None).unwrap(),
-            ["env", "IS_SANDBOX=1", "HOME=/opt/zwinger/state/claude", "/opt/zwinger/claude/claude"]
+            command(AgentKind::Claude, bare(), None).unwrap(),
+            ["env", "IS_SANDBOX=1", "HOME=/opt/zwinger/state/claude", "/opt/zwinger/runtimes/claude/1/claude"]
         );
-        let pi = command(AgentKind::Pi, HOST, None).unwrap();
+        let pi = command(AgentKind::Pi, host(), None).unwrap();
         assert_eq!(pi[0], "env");
         assert_eq!(
             pi[pi.len() - 3..],
@@ -1166,7 +1232,7 @@ mod tests {
             (AgentKind::Pi, format!("PI_CODING_AGENT_DIR={root}/agent")),
             (AgentKind::Gemini, format!("HOME={root}/gemini")),
         ] {
-            let argv = command(kind, HOST, Some(root)).unwrap();
+            let argv = command(kind, host(), Some(root)).unwrap();
             assert!(argv.contains(&var), "{var} is not in {argv:?}");
         }
         assert_eq!(continue_args(AgentKind::Codex), ["resume", "--last"]);
@@ -1175,10 +1241,10 @@ mod tests {
 
     #[test]
     fn a_wrapper_sets_the_proxy_in_a_cleared_env() {
-        let script = wrapper(AgentKind::Codex, HOST, false).unwrap();
+        let script = wrapper(AgentKind::Codex, host(), false).unwrap();
         assert!(script.contains(&format!(" HTTPS_PROXY='{PROXY}' ")), "{script}");
         let script = script.replace(
-            "exec /opt/zwinger/codex/bin/codex",
+            "exec /opt/zwinger/runtimes/codex/1/bin/codex",
             "exec printf '%s\\n' \"$HTTPS_PROXY\" \"$NODE_USE_ENV_PROXY\" \"$NODE_EXTRA_CA_CERTS\" \"$NODE_OPTIONS\"",
         );
         let run = |node_options: Option<&str>| {
@@ -2098,10 +2164,10 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        write(&dir, &[AgentKind::Pi, AgentKind::Claude, AgentKind::Gemini], Found::default(), true).unwrap();
+        write(&dir, &[AgentKind::Pi, AgentKind::Claude, AgentKind::Gemini], bare(), true).unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         names.sort();
-        assert_eq!(names, ["claude", "claude-status.json", "pi", "pi-status.js", "zwinger-agent-status"]);
+        assert_eq!(names, ["claude", "claude-status.json", "env.sh", "pi", "pi-status.js", "zwinger-agent-status"]);
         let mode = std::fs::metadata(dir.join("claude")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
         assert_eq!(std::fs::metadata(dir.join(STATUS)).unwrap().permissions().mode() & 0o777, 0o755);
@@ -2110,16 +2176,51 @@ mod tests {
         assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{BIN_DIR}/{STATUS} done"));
         let pi = std::fs::read_to_string(dir.join(PI_STATUS)).unwrap();
         assert!(pi.contains("agent_start") && pi.contains("agent_settled"));
-        write(&dir, &[AgentKind::Claude], Found::default(), false).unwrap();
+        write(&dir, &[AgentKind::Claude], bare(), false).unwrap();
         assert!(!std::fs::read_to_string(dir.join("claude")).unwrap().contains("dangerously"));
         let empty = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&empty).unwrap();
         write(&empty, &[], Found::default(), false).unwrap();
-        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
-        write(&empty, &[AgentKind::Codex, AgentKind::Gemini], HOST, true).unwrap();
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 1);
+        write(&empty, &[AgentKind::Codex, AgentKind::Gemini], host(), true).unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&empty).unwrap().flatten().map(|e| e.file_name()).collect();
         names.sort();
-        assert_eq!(names, ["codex", "gemini", "gemini-status.json", "zwinger-agent-status"]);
+        assert_eq!(names, ["codex", "env.sh", "gemini", "gemini-status.json", "zwinger-agent-status"]);
+    }
+
+    #[test]
+    fn an_agent_with_no_runtime_has_no_program() {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Antigravity] {
+            assert_eq!(program(kind, Found::default()), None, "{kind:?}");
+            assert_eq!(wrapper(kind, Found::default(), true), None, "{kind:?}");
+        }
+        assert_eq!(program(AgentKind::Codex, bare()).unwrap(), ["/opt/zwinger/runtimes/codex/1/bin/codex"]);
+    }
+
+    #[test]
+    fn the_placeholders_reach_the_wrappers_the_headless_commands_and_login_shells() {
+        let names = ["CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "GITHUB_TOKEN".to_owned()];
+        let found = Found { placeholders: &names, ..bare() };
+        let script = wrapper(AgentKind::Claude, found, true).unwrap();
+        assert!(script.contains(" CLAUDE_CODE_OAUTH_TOKEN='$MSB_CLAUDE_CODE_OAUTH_TOKEN$' "), "{script}");
+        let argv = command(AgentKind::Claude, found, None).unwrap();
+        assert!(argv.contains(&"GITHUB_TOKEN=$MSB_GITHUB_TOKEN$".to_owned()), "{argv:?}");
+
+        let dir = std::env::temp_dir().join(format!("zwinger-bin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, &[AgentKind::Pi], found, true).unwrap();
+        let env = dir.join(ENV_FILE).display().to_string();
+        let shell = profile().replace(&format!("{BIN_DIR}/{ENV_FILE}"), &quote(&env));
+        let out = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .arg("-c")
+            .arg(format!("{shell}printf '%s\\n' \"$CLAUDE_CODE_OAUTH_TOKEN\" \"$GITHUB_TOKEN\""))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "$MSB_CLAUDE_CODE_OAUTH_TOKEN$\n$MSB_GITHUB_TOKEN$\n");
+        // A removed credential leaves the file.
+        write(&dir, &[AgentKind::Pi], bare(), true).unwrap();
+        assert!(!std::fs::read_to_string(dir.join(ENV_FILE)).unwrap().contains("MSB_"));
     }
 
     #[test]
