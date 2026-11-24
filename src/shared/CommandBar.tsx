@@ -4,7 +4,7 @@ import {
   setOffline,
 } from "../features/network/api";
 import { setMountReadonly } from "../features/settings/api";
-import { CageView, SessionCage, SessionView } from "./api";
+import { CageView, DefaultAction, SessionCage, SessionView } from "./api";
 import { copyName, duplicateCage } from "../features/cages/api";
 import { restartPending } from "../features/cages/sessionCage";
 import type { Intent, Pane, Run, View } from "../App";
@@ -46,6 +46,13 @@ interface Props {
   onLaunch: (action: LaunchAction) => void;
   run: Run;
 }
+
+/** The network defaults, each with the verb of its command. */
+const DEFAULTS: [DefaultAction, string][] = [
+  ["block", "block"],
+  ["ask", "ask for"],
+  ["allow", "allow"],
+];
 
 export function CommandBar({
   open,
@@ -145,13 +152,15 @@ export function CommandBar({
   }
   if (selected?.cage) {
     const { id, network, mounts } = selected.cage;
-    const other = network.default === "allow" ? "block" : "allow";
+    for (const [value, verb] of DEFAULTS) {
+      if (value === network.default) continue;
+      commands.push({
+        id: `network-default-${value}`,
+        label: `Network: ${verb} everything else`,
+        onSelect: () => run(() => setNetworkDefault(id, value)),
+      });
+    }
     commands.push(
-      {
-        id: "network-default",
-        label: `Network: ${other} everything else`,
-        onSelect: () => run(() => setNetworkDefault(id, other)),
-      },
       {
         id: "network-offline",
         label: network.offline ? "Network: go online" : "Network: go offline",

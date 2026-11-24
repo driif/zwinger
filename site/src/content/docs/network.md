@@ -11,7 +11,9 @@ the outside into the cage are always blocked.
 The network policy belongs to the cage of a project: the projects of one cage share it. Open it with ⌘4, or edit it in
 **Cages > Edit** with no project.
 
-- **Default**: Block, Ask or Allow all hosts that no rule names. See [Ask](#ask).
+- **Default**: Block, Ask or Allow all hosts that no rule names. See [Ask](#ask). ⌘K has **Network: block everything
+  else**, **Network: ask for everything else** and **Network: allow everything else** for the two defaults that are
+  not set now.
 - **Rules**: each rule names a service of the catalog (for example GitHub or npm, with its domains) or a host, and says
   Allow or Block. A host is `a.io`, or `*.a.io` for the domain and its subdomains.
 - **Methods**: an Allow rule can allow only some HTTP methods. See [Method limits](#method-limits).
@@ -50,10 +52,12 @@ the proxy blocks it. You also see a waiting request outside the network page:
 
 Select one answer:
 
-- **Allow once**: allows this request. The later requests of the same HTTPS connection get the same answer.
+- **Allow once**: allows this request. The later requests of the same HTTPS connection get the same answer. Each plain
+  `http://` request asks again, also on a kept connection.
 - **Allow until stop**: adds an Allow rule for the host [until the VM stops](#allow-until-the-vm-stops).
 - **Always allow**: saves an Allow rule for the host in the cage.
-- **Block**: blocks this request, and the later requests of the same HTTPS connection.
+- **Block**: blocks this request, and the later requests of the same HTTPS connection. A plain `http://` request
+  blocks only itself.
 
 The limits:
 

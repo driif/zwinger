@@ -2699,6 +2699,33 @@ mod tests {
         }
     }
 
+    /// Plain HTTP has no tunnel that keeps an answer: each request of a
+    /// kept connection asks again, and gets only its own answer.
+    #[tokio::test]
+    async fn each_plain_http_request_of_a_kept_connection_asks_again() {
+        let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
+        let port = upstream().await;
+        let uri = format!("http://api.test:{port}/");
+        let tcp = TcpStream::connect(("127.0.0.1", f.proxy.port)).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+        tokio::spawn(connection);
+        for answer in [ask::Answer::Allow, ask::Answer::Block, ask::Answer::Allow] {
+            let request = Request::get(&uri).header(PROXY_AUTHORIZATION, f.auth()).body(Empty::<Bytes>::new()).unwrap();
+            let answered = async {
+                let id = pending(&f).await;
+                f.live.asks.answer(&id, answer).unwrap();
+            };
+            let (response, ()) = tokio::join!(sender.send_request(request), answered);
+            let response = response.unwrap();
+            let want = if answer == ask::Answer::Allow { StatusCode::OK } else { StatusCode::FORBIDDEN };
+            assert_eq!(response.status(), want);
+            response.into_body().collect().await.unwrap();
+            assert!(f.live.asks.list().is_empty());
+        }
+        let reasons: Vec<_> = f.entries().iter().map(|e| (e.allowed, e.reason.clone())).collect();
+        assert_eq!(reasons, [(true, "ask".into()), (false, "ask".into()), (true, "ask".into())]);
+    }
+
     #[tokio::test]
     async fn an_unanswered_ask_is_blocked_at_the_deadline() {
         let f = fixture(ask_policy(), Vec::new(), Vec::new()).await;
