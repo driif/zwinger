@@ -28,10 +28,12 @@ export const launchMenu = (actions: LaunchAction[], onLaunch: (action: LaunchAct
     run: () => onLaunch(action),
   }));
 
-/** The launch actions as items of a SplitButton menu. Its items have no reason, so a disabled item shows it in the label. */
+/** The launch actions as items of a SplitButton menu. */
 export const launchItems = (actions: LaunchAction[], onLaunch: (action: LaunchAction) => void): ActionMenuItem[] =>
   actions.map((action) => ({
-    label: action.disabled ? `${action.label} · ${action.disabled}` : action.label,
+    label: action.label,
+    icon: icon(action),
     disabled: !!action.disabled,
+    disabledReason: action.disabled,
     onSelect: () => onLaunch(action),
   }));

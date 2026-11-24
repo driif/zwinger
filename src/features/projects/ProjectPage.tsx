@@ -10,7 +10,7 @@ import {
   SpringCheckbox,
 } from "@driif/motiv";
 import { ActionMenu, SplitButton } from "@driif/motiv/action-menu";
-import { Bot, Info, Laptop, ListChecks, Play, Square, TriangleAlert } from "lucide-react";
+import { Bot, Info, Laptop, ListChecks, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -421,6 +421,7 @@ export function ProjectPage({
                   // Host agents are set up here, next to the agents that they add.
                   ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
                     label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
+                    icon: <Plus size={14} />,
                     onSelect: () => onAdding(agent.kind),
                   })),
                 ]}
@@ -438,7 +439,7 @@ export function ProjectPage({
                     iconLeft={<EditorIcon icon={defaultEditor.editor.icon} />}
                     onClick={onOpenDefaultEditor}
                     menuLabel="Editors"
-                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", icon: <Settings size={14} />, onSelect: onEditorSettings }]}
                   >
                     Open in {defaultEditor.editor.name}
                   </SplitButton>
@@ -448,7 +449,7 @@ export function ProjectPage({
                     size="sm"
                     variant="outline"
                     label="No editor"
-                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                    items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", icon: <Settings size={14} />, onSelect: onEditorSettings }]}
                   />
                 ))}
               <Button

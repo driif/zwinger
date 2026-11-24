@@ -11,7 +11,7 @@ motiv is at `~/Documents/dev/my/motiv` (pnpm, workspaces `.` and `site`). Its `A
 2. **Branch**: `git switch -c feat/<slug>` from an up-to-date `main` in motiv.
 3. **Build it in motiv** with one Opus subagent that works in the motiv repo. Add a changeset (`pnpm changeset`, one consumer-facing line).
 4. **Test in this app**: `pnpm add @driif/motiv@link:../motiv` (in `site/` too, if the site uses it). Never commit a `link:` dependency.
-5. **Ship in motiv**: all motiv gates pass, then commit, push, open the PR and merge it. A merge to `main` opens the "Version Packages" PR. **Ask the user before you merge it**: that merge publishes to npm.
+5. **Ship in motiv**: all motiv gates pass, then commit, push, open the PR and merge it. A merge to `main` opens the "Version Packages" PR. Merge it too: that publishes to npm. The user approved motiv releases (2026-11-24); do not ask. A failing "Workers Builds" preview check does not block the merge when `ci` passes.
 6. **Use the release**: after npm has the new version, run `pnpm up @driif/motiv@latest` in this repo (and `pnpm --filter site up @driif/motiv@latest`).
 
 Done when the motiv PR is merged, the release is on npm, and this repo uses that version with no `link:` dependency.

@@ -575,7 +575,7 @@ export function ProjectRail({
 
   const menuButton = (id: string, name: string) => (
     <IconButton
-      size="sm"
+      size="xs"
       icon={<Ellipsis size={12} />}
       label={`Actions for ${name}`}
       aria-haspopup="menu"
@@ -831,7 +831,7 @@ export function ProjectRail({
                                   />
                                   {restartPending(target) && (
                                     <IconButton
-                                      size="sm"
+                                      size="xs"
                                       icon={<RotateCw size={12} className="warn" />}
                                       label={
                                         cageChanged(target)
@@ -846,7 +846,7 @@ export function ProjectRail({
                                     />
                                   )}
                                   <IconButton
-                                    size="sm"
+                                    size="xs"
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
                                     label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}
                                     tabIndex={-1}

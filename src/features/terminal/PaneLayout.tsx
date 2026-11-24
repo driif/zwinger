@@ -287,10 +287,10 @@ export function PaneLayout({
               )}
             </span>
             <div role="group" className="pane-actions" aria-label={`Actions for ${name}`}>
-              {actions.map((action) => <IconButton key={action.label} size="sm" label={action.label} icon={action.icon} onClick={action.run} />)}
+              {actions.map((action) => <IconButton key={action.label} size="xs" label={action.label} icon={action.icon} onClick={action.run} />)}
             </div>
             <IconButton
-              size="sm"
+              size="xs"
               className="pane-actions-trigger"
               label={`Actions for ${name}`}
               icon={<Ellipsis size={14} />}

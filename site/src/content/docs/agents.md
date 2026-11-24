@@ -55,7 +55,7 @@ project folder itself cannot be the harness.
 A project with no cage opens the agents that are installed on your Mac: **New Claude Code**, **New Codex**, **New pi**,
 **New Gemini CLI**, **New Antigravity CLI** and their **continue last session** actions. zwinger finds Antigravity CLI at
 `~/.local/bin/agy`, where its installer puts it, or as `agy` in a folder of `PATH`. An agent that zwinger did not find on your Mac is
-disabled, with the reason "*agent* is not installed on this Mac". The agent starts in the project folder, through your
+disabled, with the reason "*agent* is not installed on this Mac" below its name. The agent starts in the project folder, through your
 login shell, so it gets the `PATH` of your profile. zwinger uses only an agent binary in an absolute folder of
 `PATH`, so a binary in the project folder never runs. pi, Gemini CLI and the npm install of Codex run with the `node`
 of their npm folder (for example `/opt/homebrew/bin/node` or the nvm version that has the package). If that folder has
