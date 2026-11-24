@@ -235,4 +235,5 @@ an install. Running cages get the new version at once; an agent that runs keeps 
 
 **Settings > Runtimes** also lists the other installed versions, for example an earlier pinned version or the Linux
 build of the version on your Mac. **Delete** removes a version. You cannot delete the pinned version, a version that
-the agents of a running cage use (**in use**), or the Linux build of the agent version on your Mac.
+the agents of a running cage used since its start (**in use**), or the Linux build of the agent version on your Mac.
+While a cage starts, you cannot delete a version: try again when it runs.

@@ -131,7 +131,7 @@ pub async fn delete_runtime(
     name: String,
     version: String,
 ) -> Result<()> {
-    runtimes.remove(&name, &version, &manager.runtimes_in_use()).await
+    manager.remove_runtime(&runtimes, &name, &version).await
 }
 
 /// `version` `None` installs the pinned version. An unpinned version needs

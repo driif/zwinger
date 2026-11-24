@@ -167,6 +167,12 @@ impl HostAgents {
         found
     }
 
+    /// Sets the last detection, as if the agents on the Mac changed.
+    #[cfg(test)]
+    pub fn set_last(&self, detection: Detection) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(detection);
+    }
+
     /// The last detection, else a new one.
     pub fn last(&self) -> Detection {
         let last = self.last.lock().unwrap_or_else(PoisonError::into_inner).clone();

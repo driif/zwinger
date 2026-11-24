@@ -21,7 +21,7 @@ use crate::proxy::ca::Ca;
 use crate::proxy::log::Entry;
 use crate::proxy::{Live, Proxy};
 use crate::runtime::{SandboxRuntime, Usage};
-use crate::runtimes::{self, Installed};
+use crate::runtimes::{self, Installed, Runtimes};
 use crate::secrets::{Account, Owner, Vault, VaultEntry};
 use crate::session::{Pos, Session, Viewport, VmChoice};
 use crate::store::{self, Store};
@@ -196,6 +196,9 @@ pub(crate) struct HostRun {
     /// The downloaded runtimes that the wrappers run. A runtime that is
     /// downloaded later, or a host agent change, updates it while the VM runs.
     pub(crate) installed: Vec<Installed>,
+    /// The runtime dirs that the wrappers ran since the boot: an agent or a
+    /// task that started before a refresh still runs its old version.
+    pub(crate) used: runtimes::InUse,
     /// The names of the cage's credentials and host logins, as the wrappers have them.
     pub(crate) placeholders: Vec<String>,
     /// The ports that the VM publishes on this Mac.
@@ -610,18 +613,38 @@ impl<R: SandboxRuntime> Manager<R> {
     /// VM run, and the cached Linux build of each agent version on this Mac,
     /// which the next start or wrapper refresh picks.
     pub fn runtimes_in_use(&self) -> runtimes::InUse {
+        let host = self.host_runtimes();
+        in_use(&lock(&self.state), host)
+    }
+
+    /// Deletes an installed runtime version that nothing uses. The check and
+    /// the move out of the mounted folder are under the state lock, so no
+    /// start or refresh picks the version in between. While a VM starts, no
+    /// version is deleted: its prepare may have picked it.
+    pub async fn remove_runtime(&self, runtimes: &Runtimes, name: &str, version: &str) -> Result<()> {
+        let host = self.host_runtimes();
+        let gone = {
+            let state = lock(&self.state);
+            if state.vms.values().any(|vm| matches!(vm, Vm::Starting { .. })) {
+                return Err(Error::RuntimeVmStarting(name.to_owned(), version.to_owned()));
+            }
+            runtimes.detach(name, version, &in_use(&state, host))?
+        };
+        if let Some(gone) = gone {
+            tokio::fs::remove_dir_all(&gone).await?;
+        }
+        Ok(())
+    }
+
+    /// The cached Linux build of each agent version on this Mac.
+    fn host_runtimes(&self) -> runtimes::InUse {
         let detection = self.host.last();
-        let host = detection
+        detection
             .agents
             .iter()
             .chain(&detection.antigravity)
-            .filter_map(|agent| runtimes::version_key(agent.kind.name(), &agent.version));
-        let state = lock(&self.state);
-        let running = state.vms.values().flat_map(|vm| match vm {
-            Vm::Running { host, .. } => host.installed.iter().filter_map(|r| runtimes::in_use_key(&r.guest)).collect(),
-            _ => Vec::new(),
-        });
-        host.chain(running).collect()
+            .filter_map(|agent| runtimes::version_key(agent.kind.name(), &agent.version))
+            .collect()
     }
 
     /// The CPU and memory use of each running VM of the cage, by VM key. A
@@ -1540,6 +1563,21 @@ impl<R: SandboxRuntime> Manager<R> {
 }
 
 /// The cage with the state of its VMs.
+/// The runtime dirs of `installed`, as [`runtimes::InUse`] keys.
+pub(crate) fn used_keys(installed: &[Installed]) -> runtimes::InUse {
+    installed.iter().filter_map(|r| runtimes::in_use_key(&r.guest)).collect()
+}
+
+/// `host` and each runtime dir that the wrappers of a running VM ran since
+/// its boot.
+fn in_use<V>(state: &State<V>, host: runtimes::InUse) -> runtimes::InUse {
+    let running = state.vms.values().flat_map(|vm| match vm {
+        Vm::Running { host, .. } => host.used.iter().cloned().collect(),
+        _ => Vec::new(),
+    });
+    host.into_iter().chain(running).collect()
+}
+
 fn cage_view<V>(state: &State<V>, cage: &Cage, vault: &dyn Vault) -> CageView {
     let stored = state.sessions.iter().filter_map(|s| match &s.vm {
         VmChoice::Own { key, cage: of } if *of == cage.id => Some(key),
@@ -1717,6 +1755,22 @@ mod tests {
             .insert(id.clone(), Vm::Starting { cage: id.clone(), members: vec![id.clone()], phase: Phase::Vault });
         assert!(matches!(manager.delete(&id).await, Err(Error::Starting)));
         assert_eq!(manager.list().sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_runtime_is_deleted_while_a_vm_starts() {
+        let (manager, _, id) = manager();
+        let runtimes = runtimes::Runtimes::new(manager.data.clone());
+        runtimes::fake_install_version(&manager.data, "claude", "2.1.99");
+        lock(&manager.state)
+            .vms
+            .insert(id.clone(), Vm::Starting { cage: id.clone(), members: vec![id.clone()], phase: Phase::Vault });
+        let removed = manager.remove_runtime(&runtimes, "claude", "2.1.99").await;
+        assert!(matches!(removed, Err(Error::RuntimeVmStarting(..))), "{removed:?}");
+        assert!(runtimes::root(&manager.data).join("claude/2.1.99").exists());
+        lock(&manager.state).vms.remove(&id);
+        manager.remove_runtime(&runtimes, "claude", "2.1.99").await.unwrap();
+        assert!(!runtimes::root(&manager.data).join("claude/2.1.99").exists());
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use crate::cage::lifecycle::{
     DOWNLOAD_HINT, EXPIRED_CLAUDE_TOKEN, NO_CLAUDE_TOKEN, apply_profile, download_notices, guest_placeholders,
     host_login, mounted, profiles_dir,
 };
-use crate::cage::manager::{Manager, State, Vm, blocking, lock};
+use crate::cage::manager::{Manager, State, Vm, blocking, lock, used_keys};
 use crate::error::Result;
 use crate::host_agents::login;
 use crate::proxy::Live;
@@ -183,6 +183,7 @@ impl<R: SandboxRuntime> Manager<R> {
             }
             live.set_logins(found.logins, login::denied_hosts(&config.logins));
             host.placeholders = guest_placeholders(&config.logins, &network);
+            host.used.extend(used_keys(&found.installed));
             host.installed = found.installed;
             host.guest_logins = found.guest_logins;
             host.notices.retain(|n| !n.ends_with(DOWNLOAD_HINT) && n != NO_CLAUDE_TOKEN && n != EXPIRED_CLAUDE_TOKEN);
@@ -320,6 +321,34 @@ mod tests {
         assert!(!manager.list().cages[0].shared().pending_restart);
         assert!(!std::fs::read_to_string(manager.bin_dir(&id).join("codex")).unwrap().contains("CODEX_HOST_LOGIN"));
         assert_eq!(starts(&runtime), 1);
+    }
+
+    #[tokio::test]
+    async fn a_running_vm_keeps_each_runtime_that_its_wrappers_ran_since_its_start() {
+        let (manager, _, id, _) = host_manager(FakeLogins::default(), NOW);
+        let runtimes = runtimes::Runtimes::new(manager.data.clone());
+        runtimes::fake_install(&manager.data, "claude");
+        runtimes::fake_install_version(&manager.data, "claude", "2.1.310");
+        manager.start(&id).await.unwrap();
+        // The VM runs the Mac's version, then the Mac drops it and the
+        // wrappers go back to the pinned version.
+        manager.put_host_agent(&id, uses(AgentKind::Claude, false, false), true).await.unwrap();
+        let wrapper = || std::fs::read_to_string(manager.bin_dir(&id).join("claude")).unwrap();
+        assert!(wrapper().contains("/opt/zwinger/runtimes/claude/2.1.310/"), "{}", wrapper());
+        let mut detection = manager.host.last();
+        detection.agents.retain(|a| a.kind != AgentKind::Claude);
+        manager.host.set_last(detection);
+        manager.remove_host_agent(&id, AgentKind::Claude).unwrap();
+        manager.refresh_agents(Some(&id)).await;
+        assert!(!wrapper().contains("2.1.310"), "{}", wrapper());
+
+        // An agent that started before the refresh still runs 2.1.310.
+        let removed = manager.remove_runtime(&runtimes, "claude", "2.1.310").await;
+        assert!(matches!(removed, Err(Error::RuntimeInUse(..))), "{removed:?}");
+        assert!(runtimes::root(&manager.data).join("claude/2.1.310").exists());
+        manager.stop(&id, None).await.unwrap();
+        manager.remove_runtime(&runtimes, "claude", "2.1.310").await.unwrap();
+        assert!(!runtimes::root(&manager.data).join("claude/2.1.310").exists());
     }
 
     #[tokio::test]

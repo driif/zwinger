@@ -216,6 +216,8 @@ pub enum Error {
     RuntimeInstalling(String),
     #[error("{0} {1} is in use: a running VM or an agent on this Mac uses it")]
     RuntimeInUse(String, String),
+    #[error("{0} {1} stays while a VM starts; delete it when the VM runs")]
+    RuntimeVmStarting(String, String),
     #[error("{0} {1} is the pinned version; it stays")]
     RuntimePinned(String, String),
     #[error("the install of {0} was cancelled")]

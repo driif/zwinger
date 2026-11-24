@@ -412,10 +412,11 @@ impl Runtimes {
         folder(name, version).is_ok_and(|folder| root(&self.data).join(name).join(folder).join(binary).is_file())
     }
 
-    /// Deletes an installed version that is not the pinned one and that
-    /// nothing in `in_use` uses. The dir moves out of the mounted folder at
-    /// once, then it is removed.
-    pub async fn remove(&self, name: &str, version: &str, in_use: &InUse) -> Result<()> {
+    /// Moves an installed version that is not the pinned one and that
+    /// nothing in `in_use` uses out of the mounted folder. It does not wait,
+    /// so a caller can do the check and the move under its own lock. Returns
+    /// the moved dir, which the caller removes.
+    pub fn detach(&self, name: &str, version: &str, in_use: &InUse) -> Result<Option<PathBuf>> {
         let folder = folder(name, version)?;
         let name = NAMES.iter().copied().find(|n| *n == name).ok_or_else(|| Error::UnknownRuntime(name.to_owned()))?;
         if version == pinned_version(name)? {
@@ -426,14 +427,13 @@ impl Runtimes {
         }
         let dir = root(&self.data).join(name).join(&folder);
         if std::fs::symlink_metadata(&dir).is_err() {
-            return Ok(());
+            return Ok(None);
         }
         let work = self.data.join(WORK);
         std::fs::create_dir_all(&work)?;
         let gone = work.join(uuid::Uuid::new_v4().to_string());
         std::fs::rename(&dir, &gone)?;
-        tokio::fs::remove_dir_all(&gone).await?;
-        Ok(())
+        Ok(Some(gone))
     }
 
     fn confirmed(&self) -> BTreeSet<String> {
@@ -996,16 +996,16 @@ mod tests {
         let others: Vec<_> = view.others.iter().map(|o| (o.version.as_str(), o.in_use)).collect();
         assert_eq!(others, [("9.0.0", false), ("2.1.100", false), ("2.1.99", true)]);
 
-        assert!(matches!(runtimes.remove("claude", "2.1.99", &in_use).await, Err(Error::RuntimeInUse(..))));
-        assert!(matches!(runtimes.remove("claude", CLAUDE_VERSION, &in_use).await, Err(Error::RuntimePinned(..))));
-        assert!(runtimes.remove("claude", "../x", &in_use).await.is_err());
-        runtimes.remove("claude", "2.1.100", &in_use).await.unwrap();
-        runtimes.remove("claude", "9.0.0", &in_use).await.unwrap();
+        assert!(matches!(runtimes.detach("claude", "2.1.99", &in_use), Err(Error::RuntimeInUse(..))));
+        assert!(matches!(runtimes.detach("claude", CLAUDE_VERSION, &in_use), Err(Error::RuntimePinned(..))));
+        assert!(runtimes.detach("claude", "../x", &in_use).is_err());
+        runtimes.detach("claude", "2.1.100", &in_use).unwrap();
+        runtimes.detach("claude", "9.0.0", &in_use).unwrap();
         assert!(!root(&data).join("claude/2.1.100").exists());
         // Only a newer pinned version is an update.
         let view = claude(runtimes.list(&in_use).unwrap());
         assert!(view.update);
-        runtimes.remove("claude", "2.1.99", &InUse::new()).await.unwrap();
+        runtimes.detach("claude", "2.1.99", &InUse::new()).unwrap();
         fake_install_version(&data, "claude", "9.0.0");
         assert!(!claude(runtimes.list(&InUse::new()).unwrap()).update);
         // The pinned version stays installed with its files.

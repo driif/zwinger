@@ -13,7 +13,7 @@ use tokio::task::AbortHandle;
 use crate::agent::{AgentKind, agy, gemini, guest_login, launch, pi};
 use crate::cage::activity::{self, Source};
 use crate::cage::history::StartRecord;
-use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock};
+use crate::cage::manager::{HostRun, Manager, State, Vm, bin_dir, blocking, ids, lock, used_keys};
 use crate::cage::network::placeholders;
 use crate::cage::progress::{Phase, Progress, Timings};
 use crate::cage::{self, Bound, CLAUDE_TOKEN, Cage, HostAgentUse, Members, WORKSPACE, vm_state};
@@ -339,6 +339,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let (booted, boot_took) = timed(boot).await;
         timings.add(Phase::Boot, boot_took);
         let mut names: Vec<&'static str> = installed.iter().map(|r| r.name).collect();
+        run.used = used_keys(&installed);
         run.installed = installed;
         let result = match booted {
             Ok(vm) => {
