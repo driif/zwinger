@@ -190,5 +190,5 @@ export function CommandBar({
     if (other.id !== selected?.session.id)
       commands.push({ id: `project-${other.id}`, label: `Switch to ${other.name}`, onSelect: () => onSelect(other.id) });
 
-  return <CommandMenu open={open} onOpenChange={onOpenChange} className="command-bar" hotkey placeholder="Actions" commands={commands} />;
+  return <CommandMenu open={open} onOpenChange={onOpenChange} size="sm" className="command-bar" hotkey placeholder="Actions" commands={commands} />;
 }

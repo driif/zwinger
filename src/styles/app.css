@@ -25,24 +25,6 @@ p {
   margin: 0;
 }
 
-/* motiv's IconButton has one large size. The app uses it compact. */
-.motiv-icon-button {
-  width: var(--zw-icon-button);
-  height: var(--zw-icon-button);
-  border-radius: var(--motiv-radius-sm);
-}
-
-.motiv-icon-button__icon {
-  width: var(--zw-icon);
-  height: var(--zw-icon);
-}
-
-/* The same for the launcher of motiv's CommandMenu: the command bar and the agent pickers. */
-.motiv-command-menu__launcher {
-  min-height: var(--motiv-control-height);
-  font-size: inherit;
-}
-
 .app {
   position: relative;
   display: grid;

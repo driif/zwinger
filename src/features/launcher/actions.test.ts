@@ -131,12 +131,14 @@ test("a Mac agent stays a Mac agent when the UI shows a cage, so its warning sho
   assert.equal(macAgent({ type: "host" }, false, undefined), undefined);
 });
 
-test("a disabled launch action is a command that shows why and starts nothing", () => {
+test("a disabled launch action is a disabled command that shows why", () => {
   const [, claude] = launchActions(target(null), detection("codex"), undefined);
   const launched: string[] = [];
   const command = launchCommand(claude, claude.label, "⌘N", (a) => launched.push(a.id));
-  command.onSelect();
-  assert.deepEqual([command.label, command.shortcut, launched], ["New Claude Code (Claude Code is not installed on this Mac)", undefined, []]);
+  assert.deepEqual(
+    [command.label, command.disabled, command.disabledReason, command.shortcut],
+    ["New Claude Code", true, "Claude Code is not installed on this Mac", undefined],
+  );
   launchCommand(launchActions(target(null), detection("claude"), undefined)[1], "New Claude Code", undefined, (a) => launched.push(a.id)).onSelect();
   assert.deepEqual(launched, ["agent-claude"]);
 });

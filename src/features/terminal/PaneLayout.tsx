@@ -286,10 +286,11 @@ export function PaneLayout({
                 </span>
               )}
             </span>
-            <IconButtonGroup className="pane-actions" label={`Actions for ${name}`}>
+            <IconButtonGroup size="sm" className="pane-actions" label={`Actions for ${name}`}>
               {actions.map((action) => <IconButton key={action.label} label={action.label} icon={action.icon} onClick={action.run} />)}
             </IconButtonGroup>
             <IconButton
+              size="sm"
               className="pane-actions-trigger"
               label={`Actions for ${name}`}
               icon={<Ellipsis size={14} />}

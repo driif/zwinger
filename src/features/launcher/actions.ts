@@ -169,7 +169,7 @@ export const projectLaunchCommand = (
   onOpenDefault: () => void,
 ): CommandMenuItem => launchCommand(action, label, shortcut, isDefaultEditor(action, editors) ? onOpenDefault : onLaunch);
 
-/** A launch action as a command. The command menu has no disabled item: a disabled action shows why and does nothing. */
+/** A launch action as a command. A disabled action shows why it cannot start. */
 export const launchCommand = (
   action: LaunchAction,
   label: string,
@@ -177,5 +177,5 @@ export const launchCommand = (
   onLaunch: (action: LaunchAction) => void,
 ): CommandMenuItem =>
   action.disabled
-    ? { id: action.id, label: `${label} (${action.disabled})`, onSelect: () => {} }
+    ? { id: action.id, label, disabled: true, disabledReason: action.disabled, onSelect: () => {} }
     : { id: action.id, label, shortcut, onSelect: () => onLaunch(action) };

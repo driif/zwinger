@@ -73,7 +73,7 @@ import { tildePath, truncateMiddle } from "../../shared/paths";
 import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import type { Detection } from "../settings/api";
-import { launchMenu } from "../launcher/SplitLaunch";
+import { launchMenu } from "../launcher/launchMenu";
 import { useTerminalTitles } from "../terminal/titles";
 import { StartProgress } from "./StartProgress";
 import { cageChanged, restartPending } from "../cages/sessionCage";
@@ -261,7 +261,8 @@ function NameField({ name, onDone }: { name: string; onDone: (name: string | und
   return (
     <span className="grow tree-edit" onPointerDown={stop} onClick={stop} onDoubleClick={stop} onContextMenu={stop}>
       <TextField
-        label={<span className="sr-only">Name</span>}
+        label="Name"
+        labelPosition="hidden"
         defaultValue={name}
         maxLength={200}
         autoFocus
@@ -854,6 +855,7 @@ export function ProjectRail({
     return (
       <>
         <IconButton
+          size="sm"
           icon={<Plus size={12} />}
           label={label}
           tabIndex={-1}
@@ -864,6 +866,7 @@ export function ProjectRail({
         />
         {group === "terminals" && (
           <IconButton
+            size="sm"
             icon={<ChevronDown size={12} />}
             label="New terminal"
             aria-haspopup="menu"
@@ -881,6 +884,7 @@ export function ProjectRail({
 
   const menuButton = (id: string, name: string) => (
     <IconButton
+      size="sm"
       icon={<Ellipsis size={12} />}
       label={`Actions for ${name}`}
       aria-haspopup="menu"
@@ -1092,6 +1096,7 @@ export function ProjectRail({
                               row={
                                 <>
                                   <IconButton
+                                    size="sm"
                                     icon={<ChevronRight size={14} className={sessionExpanded ? "tree-chevron open" : "tree-chevron"} />}
                                     label={sessionExpanded ? `Collapse ${session.name}` : `Expand ${session.name}`}
                                     tabIndex={-1}
@@ -1150,6 +1155,7 @@ export function ProjectRail({
                                   />
                                   {restartPending(target) && (
                                     <IconButton
+                                      size="sm"
                                       icon={<RotateCw size={12} className="warn" />}
                                       label={
                                         cageChanged(target)
@@ -1164,6 +1170,7 @@ export function ProjectRail({
                                     />
                                   )}
                                   <IconButton
+                                    size="sm"
                                     icon={running ? <Square size={12} /> : <Play size={12} />}
                                     label={running ? `Stop ${session.name} cage` : `Start ${session.name} cage`}
                                     tabIndex={-1}

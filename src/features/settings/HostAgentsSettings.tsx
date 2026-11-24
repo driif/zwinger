@@ -107,6 +107,7 @@ export function HostAgentsSettings({ detection, sessions, runtimes, run, onRefre
                   </>
                 )}
                 <CommandMenu
+                  size="sm"
                   className="model-picker"
                   menuLabel={`Use ${AGENT_NAMES[agent.kind]} in a cage`}
                   placeholder="Use in projects"

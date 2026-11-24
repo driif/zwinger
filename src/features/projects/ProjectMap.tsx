@@ -165,7 +165,7 @@ function MapControls({ onStart, onView, onFit }: {
     move().then(() => onView(getViewport()));
   };
   return (
-    <IconButtonGroup label="Map view">
+    <IconButtonGroup size="sm" label="Map view">
       <IconButton icon={<Plus size={14} />} label="Zoom in" onClick={() => then(zoomIn)} />
       <IconButton icon={<Minus size={14} />} label="Zoom out" onClick={() => then(zoomOut)} />
       <IconButton icon={<Maximize size={14} />} label="Fit view" onClick={() => then(onFit)} />

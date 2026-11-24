@@ -2,7 +2,7 @@
 import type { StarlightRouteData } from "@astrojs/starlight/route-data";
 import MobileMenuFooter from "@astrojs/starlight/components/MobileMenuFooter.astro";
 import SidebarPersister from "@astrojs/starlight/components/SidebarPersister.astro";
-import DocsNav from "./DocsNav";
+import { GlideNav } from "@driif/motiv";
 
 type Entry = StarlightRouteData["sidebar"][number];
 type Link = Extract<Entry, { type: "link" }>;
@@ -11,12 +11,12 @@ const flatten = (entries: Entry[]): Link[] =>
   entries.flatMap((entry) => (entry.type === "group" ? flatten(entry.entries) : [entry]));
 
 const links = flatten(Astro.locals.starlightRoute.sidebar);
-const items = links.map((link) => ({ id: link.href, href: link.href, label: link.label }));
+const items = links.map((link) => ({ id: link.href, href: link.href, label: link.label, attributes: { "data-astro-prefetch": "" } }));
 const value = links.find((link) => link.isCurrent)?.href ?? "";
 ---
 
 <SidebarPersister>
-  <DocsNav client:idle items={items} value={value} />
+  <GlideNav label="Docs" items={items} value={value} />
 </SidebarPersister>
 
 <div class="md:sl-hidden">

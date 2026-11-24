@@ -225,9 +225,9 @@ export function TerminalView({ processId, exitCode, visible, focused, focusReque
                   ? `${results.resultIndex + 1} of ${count}`
                   : `${count} matches`)}
           </span>
-          <IconButton label="Previous match" icon={<ChevronUp size={14} />} disabled={!query} onClick={() => find(query, true)} />
-          <IconButton label="Next match" icon={<ChevronDown size={14} />} disabled={!query} onClick={() => find(query)} />
-          <IconButton label="Close search" icon={<X size={14} />} onClick={close} />
+          <IconButton size="sm" label="Previous match" icon={<ChevronUp size={14} />} disabled={!query} onClick={() => find(query, true)} />
+          <IconButton size="sm" label="Next match" icon={<ChevronDown size={14} />} disabled={!query} onClick={() => find(query)} />
+          <IconButton size="sm" label="Close search" icon={<X size={14} />} onClick={close} />
         </div>
       )}
     </div>

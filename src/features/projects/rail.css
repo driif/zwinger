@@ -204,22 +204,3 @@
   min-width: 0;
   --motiv-text-field-radius: var(--motiv-radius-md);
 }
-
-/* motiv's TextField keeps a 3rem minimum even at compact density. */
-.tree-edit .motiv-float__control {
-  min-height: 0;
-  height: var(--motiv-row-height);
-  grid-template-rows: minmax(0, 1fr);
-}
-
-.tree-edit .motiv-float__label {
-  position: absolute;
-  margin: 0;
-  padding: 0;
-}
-
-.tree-edit .motiv-float__input {
-  grid-area: 1 / 1;
-  padding: 0 calc(var(--motiv-space) * 1.5);
-  font-size: inherit;
-}

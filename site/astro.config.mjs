@@ -5,8 +5,7 @@ import cspHeaders from "./src/integrations/csp-headers.mjs";
 
 export default defineConfig({
   site: "https://zwinger.fedorchuk.me",
-  // GlideNav cannot pass `data-astro-prefetch` to its links, so prefetch all links.
-  prefetch: { prefetchAll: true, defaultStrategy: "hover" },
+  prefetch: true,
   integrations: [
     react(),
     starlight({

@@ -9,7 +9,8 @@ import {
   SegmentedControl,
   SpringCheckbox,
 } from "@driif/motiv";
-import { Bot, Info, Laptop, Play, Plus, Settings, Square, TriangleAlert } from "lucide-react";
+import { ActionMenu, SplitButton } from "@driif/motiv/action-menu";
+import { Bot, Info, Laptop, Play, Square, TriangleAlert } from "lucide-react";
 import { CSSProperties, lazy, Suspense, useEffect, useState } from "react";
 import { NetEvent } from "../network/api";
 import {
@@ -47,7 +48,7 @@ import { Notice } from "../../shared/Notice";
 import { tildePath } from "../../shared/paths";
 import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
-import { launchMenu, SplitLaunch } from "../launcher/SplitLaunch";
+import { launchItems } from "../launcher/launchMenu";
 import { EditorIcon } from "../launcher/EditorIcon";
 
 // React Flow and the run room are large and not on the first screen of every project.
@@ -407,33 +408,44 @@ export function ProjectPage({
               </p>
               <CopyField className="mono" value={session.folder} display={tildePath(session.folder, home)} title={session.folder} />
             </div>
-            <SplitLaunch
-              label="New terminal"
-              icon={<Laptop size={14} />}
+            <SplitButton
+              size="sm"
+              variant="outline"
+              iconLeft={<Laptop size={14} />}
               onClick={() => onLaunch(newTerminals[0])}
               menuLabel="New terminal"
-              menu={[
-                ...launchMenu(newTerminals, onLaunch),
+              items={[
+                ...launchItems(newTerminals, onLaunch),
                 // Host agents are set up here, next to the agents that they add.
                 ...(cage ? (detection?.agents ?? []) : []).map((agent) => ({
                   label: `${hostAgents.some((a) => a.kind === agent.kind) ? "Change" : "Add"} ${AGENT_NAMES[agent.kind]} from this Mac…`,
-                  icon: <Plus size={14} />,
-                  run: () => onAdding(agent.kind),
+                  onSelect: () => onAdding(agent.kind),
                 })),
               ]}
-            />
-            {editors && (
-              <SplitLaunch
-                label={defaultEditor ? `Open in ${defaultEditor.editor.name}` : "No editor"}
-                icon={<EditorIcon icon={defaultEditor?.editor.icon ?? null} />}
-                onClick={defaultEditor && onOpenDefaultEditor}
-                menuLabel="Editors"
-                menu={[
-                  ...launchMenu(editorActions, onLaunch),
-                  { label: "Editor settings…", icon: <Settings size={14} />, run: onEditorSettings },
-                ]}
-              />
-            )}
+            >
+              New terminal
+            </SplitButton>
+            {editors &&
+              (defaultEditor ? (
+                <SplitButton
+                  size="sm"
+                  variant="outline"
+                  iconLeft={<EditorIcon icon={defaultEditor.editor.icon} />}
+                  onClick={onOpenDefaultEditor}
+                  menuLabel="Editors"
+                  items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                >
+                  Open in {defaultEditor.editor.name}
+                </SplitButton>
+              ) : (
+                // A SplitButton disables its menu with its main action, so with no editor only the menu shows.
+                <ActionMenu
+                  size="sm"
+                  variant="outline"
+                  label="No editor"
+                  items={[...launchItems(editorActions, onLaunch), { label: "Editor settings…", onSelect: onEditorSettings }]}
+                />
+              ))}
             <Button
               size="sm"
               variant={running ? "secondary" : "primary"}
