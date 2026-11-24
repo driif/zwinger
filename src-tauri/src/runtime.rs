@@ -17,8 +17,6 @@ use crate::netlog;
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// The longest run of [`SandboxRuntime::output`].
-pub const OUTPUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
@@ -191,8 +189,10 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
         env: &[(&str, &str)],
     ) -> impl Future<Output = Result<Pipe>> + Send;
     /// Runs the short command `argv` with no stdin and gives its stdout. An
-    /// exit with an error, or a run longer than [`OUTPUT_LIMIT`], is an error.
-    fn output(&self, vm: &Self::Vm, argv: &[String]) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    /// exit with an error, or more stdout than `cap` bytes, is an error, and
+    /// the process is killed. The caller bounds the time: a drop of the
+    /// future before the exit kills the process in the background.
+    fn output(&self, vm: &Self::Vm, argv: &[String], cap: usize) -> impl Future<Output = Result<Vec<u8>>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
     /// Returns the names of the VMs that it removed.
     fn reap(&self) -> impl Future<Output = Result<Vec<String>>> + Send;
@@ -450,12 +450,18 @@ impl SandboxRuntime for Microsandbox {
         Ok(Pty { input, events, pid })
     }
 
-    async fn output(&self, vm: &Sandbox, argv: &[String]) -> Result<Vec<u8>> {
-        let out = vm.exec_with(&argv[0], |e| e.args(&argv[1..]).timeout(OUTPUT_LIMIT)).await?;
-        if !out.status().success {
-            return Err(Error::Io(std::io::Error::other(format!("{} exited with an error", argv[0]))));
+    async fn output(&self, vm: &Sandbox, argv: &[String], cap: usize) -> Result<Vec<u8>> {
+        let mut handle = vm.exec_stream_with(&argv[0], |e| e.args(&argv[1..])).await?;
+        let mut kill = KillOnDrop(Some(handle.control()));
+        let mut stdout = Capped { out: Vec::new(), cap };
+        loop {
+            if let Some(done) = stdout.take(handle.recv().await) {
+                if done.is_ok() {
+                    kill.0 = None;
+                }
+                return done;
+            }
         }
-        Ok(out.stdout_bytes().to_vec())
     }
 
     /// Each process runs in the group wrapper, so a kill also ends its children.
@@ -524,6 +530,45 @@ impl SandboxRuntime for Microsandbox {
         });
 
         Ok(Pipe { input, events })
+    }
+}
+
+/// Kills an exec of [`SandboxRuntime::output`] that is dropped before its
+/// exit, in a task of its own: the caller does not wait for the kill.
+struct KillOnDrop(Option<microsandbox::ExecControl>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let (Some(control), Ok(runtime)) = (self.0.take(), tokio::runtime::Handle::try_current()) {
+            runtime.spawn(async move {
+                let _ = control.kill().await;
+            });
+        }
+    }
+}
+
+/// The stdout of an exec of [`SandboxRuntime::output`], at most `cap` bytes.
+struct Capped {
+    out: Vec<u8>,
+    cap: usize,
+}
+
+impl Capped {
+    /// Takes the next event of the exec. `Some`: the run is over, with its
+    /// stdout, or with an error for an error exit, a failure or more than `cap` bytes.
+    fn take(&mut self, event: Option<ExecEvent>) -> Option<Result<Vec<u8>>> {
+        let failed = |why: &str| Some(Err(Error::Io(std::io::Error::other(why.to_owned()))));
+        match event {
+            Some(ExecEvent::Stdout(bytes)) if self.out.len() + bytes.len() > self.cap => failed("too much output"),
+            Some(ExecEvent::Stdout(bytes)) => {
+                self.out.extend_from_slice(&bytes);
+                None
+            }
+            Some(ExecEvent::Exited { code: 0 }) => Some(Ok(std::mem::take(&mut self.out))),
+            Some(ExecEvent::Exited { .. }) => failed("exited with an error"),
+            Some(ExecEvent::Failed(_)) | None => failed("did not run"),
+            Some(ExecEvent::Started { .. } | ExecEvent::Stderr(_) | ExecEvent::StdinError(_)) => None,
+        }
     }
 }
 
@@ -609,8 +654,13 @@ pub mod fake {
         pub usage: Arc<Mutex<HashMap<String, Usage>>>,
         /// The guest PID of the last PTY; each PTY gets the next one.
         pub last_pid: Arc<std::sync::atomic::AtomicU32>,
-        /// The folder that the folder probe of a PID finds. A PID with none fails.
+        /// The folder that the folder probe of a PID finds. A PID with none
+        /// is gone.
         pub guest_folders: Arc<Mutex<HashMap<u32, String>>>,
+        /// The PIDs of each folder probe.
+        pub probes: Arc<Mutex<Vec<Vec<u32>>>>,
+        /// How long each folder probe takes.
+        pub probe_delay: Arc<Mutex<Duration>>,
     }
 
     pub struct FakePipe {
@@ -792,11 +842,16 @@ pub mod fake {
             Ok(Pty { input, events, pid })
         }
 
-        async fn output(&self, _: &FakeVm, argv: &[String]) -> Result<Vec<u8>> {
+        /// Plays the folder probe of [`crate::terminal::probe::argv`].
+        async fn output(&self, _: &FakeVm, argv: &[String], _: usize) -> Result<Vec<u8>> {
+            let pids: Vec<u32> = argv[5..].iter().map(|pid| pid.parse().unwrap()).collect();
+            assert_eq!(argv, crate::terminal::probe::argv(&pids), "not a folder probe");
+            self.probes.lock().unwrap().push(pids.clone());
+            let delay = *self.probe_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             let folders = self.guest_folders.lock().unwrap();
-            let found = folders.iter().find(|(pid, _)| crate::terminal::probe::argv(**pid) == argv);
-            let (_, folder) = found.ok_or_else(|| Error::Io(std::io::Error::other("no such process")))?;
-            Ok(format!("{folder}\n").into_bytes())
+            let found = pids.iter().filter_map(|pid| Some(format!("{pid}\t{}\0", folders.get(pid)?)));
+            Ok(found.collect::<String>().into_bytes())
         }
 
         async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str, env: &[(&str, &str)]) -> Result<Pipe> {
@@ -1028,5 +1083,23 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the grandchild is still running");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_short_exec_gives_its_stdout_up_to_the_cap_only() {
+        let out = |bytes: &'static [u8]| Some(ExecEvent::Stdout(bytes::Bytes::from_static(bytes)));
+        let mut capped = Capped { out: Vec::new(), cap: 4 };
+        assert!(capped.take(Some(ExecEvent::Started { pid: 7 })).is_none());
+        assert!(capped.take(out(b"ab")).is_none());
+        assert!(capped.take(Some(ExecEvent::Stderr(bytes::Bytes::from_static(b"warning")))).is_none());
+        assert!(capped.take(out(b"cd")).is_none());
+        assert_eq!(capped.take(Some(ExecEvent::Exited { code: 0 })).unwrap().unwrap(), b"abcd");
+
+        let mut capped = Capped { out: Vec::new(), cap: 4 };
+        assert!(capped.take(out(b"abc")).is_none());
+        assert!(capped.take(out(b"de")).unwrap().is_err(), "over the cap");
+        let mut capped = Capped { out: Vec::new(), cap: 4 };
+        assert!(capped.take(Some(ExecEvent::Exited { code: 1 })).unwrap().is_err());
+        assert!(capped.take(None).unwrap().is_err(), "no exit");
     }
 }

@@ -78,7 +78,7 @@ pub async fn reveal_session(manager: Managed<'_>, session_id: String) -> Result<
 /// names a Mac file. Resolves to that file.
 #[tauri::command]
 pub async fn terminal_location(manager: Managed<'_>, process_id: String, path: String) -> Result<PathBuf> {
-    Ok(manager.location(&process_id, &path).await?.1)
+    Ok(manager.location(&process_id, &path, false).await?.1)
 }
 
 /// What a file link opened, so the UI can say when the editor ignored the line.
@@ -135,7 +135,7 @@ pub async fn open_terminal_location(
     if line == 0 || col == Some(0) {
         return Err(Error::LinkZeroPosition);
     }
-    let (session_id, file) = manager.location(&process_id, &path).await?;
+    let (session_id, file) = manager.location(&process_id, &path, true).await?;
     let project = manager.session_editor(&session_id)?;
     let detected = tokio::task::spawn_blocking(detected).await.map_err(|e| Error::Io(std::io::Error::other(e)))?;
     open_location(&preferences.get().editors, &detected, project.as_deref(), file, (line, col), run).await

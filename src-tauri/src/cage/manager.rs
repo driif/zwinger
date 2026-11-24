@@ -99,6 +99,8 @@ pub struct Manager<R: SandboxRuntime> {
     pub(crate) notice_sink: Arc<OnceLock<NoticeSink>>,
     pub(crate) agent_sink: Arc<OnceLock<AgentSink>>,
     pub(crate) folder_sink: Arc<OnceLock<FolderSink>>,
+    /// The folder probe in flight of each process, which later callers share.
+    pub(crate) probes: crate::terminal::Probes,
     pub(crate) runs: Arc<task_runs::Registry>,
     /// The A2A shares of the runs.
     pub(crate) shares: a2a::Shares,
@@ -549,6 +551,7 @@ impl<R: SandboxRuntime> Manager<R> {
             notice_sink: Arc::new(OnceLock::new()),
             agent_sink: Arc::new(OnceLock::new()),
             folder_sink: Arc::new(OnceLock::new()),
+            probes: Mutex::default(),
             runs: Arc::default(),
             shares: a2a::Shares::default(),
             run_start: Mutex::new(()),

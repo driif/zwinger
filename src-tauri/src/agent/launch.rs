@@ -639,13 +639,9 @@ const ZSH_EMITTER: &str = r#"__zw_osc7() {
 /// `enter.zsh` in [`ZSH_DIR`]. An interactive zsh that reads startup files
 /// gets [`ZSH_DIR`] as `ZDOTDIR`, and the user's `ZDOTDIR` goes to
 /// `ZWINGER_ZDOTDIR`. The files of [`zsh_files`] read it after each user
-/// file. A `zsh -f` gets the user's `ZDOTDIR` back. No system file of the
-/// guest reads it.
-const ZSH_ENTER: &str = r#"if [[ ${ZDOTDIR-} == ZSH_DIR ]]; then
-  if [[ ! -o rcs ]]; then
-    if (( ${+ZWINGER_ZDOTDIR} )); then ZDOTDIR=$ZWINGER_ZDOTDIR; unset ZWINGER_ZDOTDIR; else unset ZDOTDIR; fi
-  fi
-elif [[ -o interactive && -o rcs ]] && (( ! ${+functions[__zw_osc7]} )) && [[ -r ZSH_DIR/.zshenv ]]; then
+/// file. No system file of the guest reads it.
+const ZSH_ENTER: &str = r#"if [[ ${ZDOTDIR-} != ZSH_DIR && -o interactive && -o rcs ]] && (( ! ${+functions[__zw_osc7]} )) \
+  && [[ -r ZSH_DIR/.zshenv ]]; then
   if (( ${+ZDOTDIR} )); then
     ZWINGER_ZDOTDIR=$ZDOTDIR
     [[ ${(t)ZDOTDIR} == *export* ]] && export ZWINGER_ZDOTDIR
@@ -1702,9 +1698,11 @@ mod tests {
             format!("{zsh_dir}|{user}\n")
         );
         assert_eq!(run(&["-d"], &[("ZDOTDIR", &user)]), format!("{user}|unset\n"));
-        // zsh -f from a VM bash gets the user's ZDOTDIR back.
-        assert_eq!(run(&["-f", "-i"], &[("ZDOTDIR", &zsh_dir), ("ZWINGER_ZDOTDIR", &user)]), format!("{user}|unset\n"));
-        assert_eq!(run(&["-f", "-i"], &[("ZDOTDIR", &zsh_dir)]), "unset|unset\n");
+        // A zsh that reads no startup files keeps its ZDOTDIR.
+        assert_eq!(
+            run(&["-f", "-i"], &[("ZDOTDIR", &zsh_dir), ("ZWINGER_ZDOTDIR", &user)]),
+            format!("{zsh_dir}|{user}\n")
+        );
     }
 
     #[test]

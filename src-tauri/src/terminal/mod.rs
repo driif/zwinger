@@ -148,12 +148,30 @@ fn folder_source<V>(state: &Mutex<State<V>>, id: &str) -> Result<(String, u64, S
     Ok((process.session_id.clone(), seq, source))
 }
 
-/// The current guest folder of a VM process: `probed` (the folder of its
-/// foreground process, read from the guest), else its last OSC 7, else its
+/// The current guest folder of a VM process: `fresh` (the folder of its
+/// foreground process read from the guest now, or a new OSC 7), else its
+/// kept folder (the last report or read), else its last OSC 7, else its
 /// start folder.
-fn guest_cwd(output: &Mutex<Output>, start: String, probed: Option<String>) -> (u64, String) {
+fn guest_cwd(output: &Mutex<Output>, start: String, fresh: Option<String>) -> (u64, String) {
     let output = lock(output);
-    (output.folder_seq, probed.or_else(|| output.osc.cwd.clone()).unwrap_or(start))
+    let kept = output.folder.as_ref().filter(|f| f.vm).and_then(|f| f.path.to_str()).map(str::to_owned);
+    (output.folder_seq, fresh.or(kept).or_else(|| output.osc.cwd.clone()).unwrap_or(start))
+}
+
+/// The folder probe in flight of each process id. A later caller waits for
+/// its result: `Some` when it is done.
+pub(crate) type Probes = Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Option<String>>>>>;
+
+/// A running VM and its processes to probe, as process ids and guest PIDs.
+type VmProbe<V> = (Arc<V>, Vec<(String, u32)>);
+
+/// Removes the entry of a probe in flight, also when its caller is dropped.
+struct InFlight<'a>(&'a Probes, &'a str);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        lock(self.0).remove(self.1);
+    }
 }
 
 /// Where the live process `id` is now. A Mac process's folder comes from
@@ -164,13 +182,13 @@ fn guest_cwd(output: &Mutex<Output>, start: String, probed: Option<String>) -> (
 pub(crate) fn resolve_folder<V>(
     state: &Mutex<State<V>>,
     id: &str,
-    probed: Option<String>,
+    fresh: Option<String>,
 ) -> Result<(u64, Option<TerminalFolder>)> {
     let (_, seq, source) = folder_source(state, id)?;
     Ok(match source {
         Source::Host(group) => (seq, group.cwd().map(TerminalFolder::host)),
         Source::Guest(output, start, applied) => {
-            let (seq, path) = guest_cwd(&output, start, probed);
+            let (seq, path) = guest_cwd(&output, start, fresh);
             (seq, Some(TerminalFolder::guest(path, &applied)))
         }
         Source::Stopped | Source::Unknown => (seq, None),
@@ -207,12 +225,12 @@ fn guest_join(cwd: &str, raw: &str) -> String {
 /// in its output names. A relative path resolves against the current folder of
 /// the process, never against the project folder. A VM path maps to the Mac
 /// only below a member folder or a mount. The result is a regular file.
-/// `probed` is as in [`guest_cwd`].
+/// `fresh` is as in [`guest_cwd`].
 pub(crate) fn locate<V>(
     state: &Mutex<State<V>>,
     id: &str,
     raw: &str,
-    probed: Option<String>,
+    fresh: Option<String>,
 ) -> Result<(String, PathBuf)> {
     let (session_id, _, source) = folder_source(state, id)?;
     let absolute = raw.starts_with('/');
@@ -231,7 +249,7 @@ pub(crate) fn locate<V>(
             let guest = if absolute {
                 raw.to_owned()
             } else {
-                let cwd = guest_cwd(&output, start, probed).1;
+                let cwd = guest_cwd(&output, start, fresh).1;
                 let cwd =
                     editor::physical_guest_dir(&cwd, members).ok_or_else(|| Error::LinkNotShared(raw.to_owned()))?;
                 guest_join(&cwd, raw)
@@ -688,21 +706,78 @@ impl<R: SandboxRuntime> Manager<R> {
         }
     }
 
-    /// The guest folder of the foreground process of the VM terminal process
-    /// `id`, read from the guest's process tree now ([`probe`]). So a shell
-    /// that reports no OSC 7, such as a nested zsh, has its real folder.
-    /// `None`: a Mac process, no guest PID yet, a stopped VM or a failed read.
-    async fn probe_folder(&self, id: &str) -> Option<String> {
-        let (vm, pid) = {
+    /// The guest folder of the foreground process of each VM terminal
+    /// process of `ids`, read from the guest's process tree now ([`probe`]),
+    /// with one exec per VM. So a shell that reports no OSC 7, such as a
+    /// nested zsh, has its real folder. Each exec has [`probe::LIMIT`]; a
+    /// process of a slow VM, a Mac process, a process with no guest PID yet,
+    /// a stopped VM or a failed read gives no folder.
+    async fn probe_folders(&self, ids: &[String]) -> HashMap<String, String> {
+        let mut vms: Vec<VmProbe<R::Vm>> = Vec::new();
+        {
             let state = lock(&self.state);
-            let process = state.process(id).ok().filter(|t| t.exit_code.is_none() && t.host_group.is_none())?;
-            let pid = *process.pid.get()?;
-            match state.vm_of(&process.session_id) {
-                Some((_, Vm::Running { vm, .. })) => (vm.clone(), pid),
-                _ => return None,
+            for id in ids {
+                let Some(process) = state.process(id).ok().filter(|t| t.exit_code.is_none() && t.host_group.is_none())
+                else {
+                    continue;
+                };
+                let (Some(pid), Some((_, Vm::Running { vm, .. }))) =
+                    (process.pid.get(), state.vm_of(&process.session_id))
+                else {
+                    continue;
+                };
+                match vms.iter_mut().find(|(known, _)| Arc::ptr_eq(known, vm)) {
+                    Some((_, processes)) => processes.push((id.clone(), *pid)),
+                    None => vms.push((vm.clone(), vec![(id.clone(), *pid)])),
+                }
             }
-        };
-        probe::parse(&self.runtime.output(&vm, &probe::argv(pid)).await.ok()?)
+        }
+        let mut found = HashMap::new();
+        for (vm, processes) in vms {
+            let pids: Vec<u32> = processes.iter().map(|(_, pid)| *pid).collect();
+            let argv = probe::argv(&pids);
+            let run = self.runtime.output(&vm, &argv, probe::OUTPUT_CAP);
+            let Ok(Ok(out)) = tokio::time::timeout(probe::LIMIT, run).await else { continue };
+            let mut folders = probe::parse(&out);
+            found.extend(processes.into_iter().filter_map(|(id, pid)| Some((id, folders.remove(&pid)?))));
+        }
+        found
+    }
+
+    /// As [`Manager::probe_folders`] for the one process `id`. A second
+    /// call while a probe of `id` runs waits for that probe.
+    async fn probe_folder(&self, id: &str) -> Option<String> {
+        let running = lock(&self.probes).get(id).cloned();
+        if let Some(mut running) = running
+            && let Ok(done) = running.wait_for(Option::is_some).await
+        {
+            return done.clone().flatten();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        lock(&self.probes).insert(id.to_owned(), rx);
+        let _in_flight = InFlight(&self.probes, id);
+        let found = self.probe_folders(&[id.to_owned()]).await.remove(id);
+        tx.send_replace(Some(found.clone()));
+        found
+    }
+
+    /// Resolves the folder of the live process `id` with `fresh` ([`guest_cwd`])
+    /// and keeps it for the listing, unless a report came after `seq`.
+    fn keep_resolved(&self, id: &str, seq: u64, fresh: Option<String>) -> Option<FolderReport> {
+        let output = self.output(id).ok()?;
+        let (now, folder) = resolve_folder(&self.state, id, fresh).ok()?;
+        // An OSC 7 that came during the probe is newer than the probe.
+        if now != seq {
+            return None;
+        }
+        let (seq, _) = output::keep_folder(&output, &folder, seq)?;
+        Some(FolderReport { seq, folder })
+    }
+
+    /// The `folder_seq` of the output of the process `id`.
+    fn folder_seq(&self, id: &str) -> Option<u64> {
+        let output = self.output(id).ok()?;
+        Some(lock(&output).folder_seq)
     }
 
     /// The host folder that Open in editor opens: the session folder, or the
@@ -724,11 +799,17 @@ impl<R: SandboxRuntime> Manager<R> {
         if !folder.is_dir() {
             return Err(Error::MissingPath(folder.display().to_string()));
         }
-        let probed = match &process {
-            Some(id) => self.probe_folder(id).await,
+        let opens = match &process {
+            Some(id) => {
+                let seq = self.folder_seq(id);
+                let probed = self.probe_folder(id).await;
+                if let (Some(seq), Some(_)) = (seq, &probed) {
+                    self.keep_resolved(id, seq, probed.clone());
+                }
+                resolve_folder(&self.state, id, probed).ok().and_then(|(_, f)| f?.opens)
+            }
             None => None,
         };
-        let opens = process.and_then(|id| resolve_folder(&self.state, &id, probed).ok()?.1?.opens);
         Ok(match opens {
             Some(path) => (path, true),
             None => (folder, terminal_id.is_none()),
@@ -736,35 +817,30 @@ impl<R: SandboxRuntime> Manager<R> {
     }
 
     /// The session of the live process `process_id` and the Mac file that the
-    /// path `raw` in its output names. See [`locate`]. A relative path in a
-    /// VM terminal resolves against the folder of its foreground process.
-    pub async fn location(&self, process_id: &str, raw: &str) -> Result<(String, PathBuf)> {
-        let probed = if raw.starts_with('/') { None } else { self.probe_folder(process_id).await };
+    /// path `raw` in its output names. See [`locate`]. With `probe` (an open
+    /// of the link), a relative path in a VM terminal resolves against the
+    /// folder of its foreground process, read now; without it (a hover), it
+    /// resolves against the kept folder and starts no guest exec.
+    pub async fn location(&self, process_id: &str, raw: &str, probe: bool) -> Result<(String, PathBuf)> {
+        let probed = if probe && !raw.starts_with('/') { self.probe_folder(process_id).await } else { None };
         locate(&self.state, process_id, raw, probed)
     }
 
     /// The current folder of each live process of `ids`, resolved now, with a
-    /// guest [`probe`] for a VM process. An unknown or exited process is left
-    /// out. It opens and changes no process; it updates only the kept folder
-    /// that the listing shows, so a change with no output, or a new mount
-    /// mapping, shows there too. A folder read before a newer report is left
-    /// out: the next call reads it.
+    /// guest [`probe`] for the VM processes (one exec per VM). An unknown or
+    /// exited process is left out. It opens and changes no process; it
+    /// updates only the kept folder that the listing shows, so a change with
+    /// no output, or a new mount mapping, shows there too. A folder read
+    /// before a newer report is left out: the next call reads it.
     pub async fn terminal_folders(&self, ids: &[String]) -> HashMap<String, FolderReport> {
-        let mut found = HashMap::new();
-        for id in ids {
-            let Ok(output) = self.output(id) else { continue };
-            let before = lock(&output).folder_seq;
-            let probed = self.probe_folder(id).await;
-            let Ok((seq, folder)) = resolve_folder(&self.state, id, probed) else { continue };
-            // An OSC 7 that came during the probe is newer than the probe.
-            if seq != before {
-                continue;
-            }
-            if let Some((seq, _)) = output::keep_folder(&output, &folder, seq) {
-                found.insert(id.clone(), FolderReport { seq, folder });
-            }
-        }
-        found
+        let seqs: Vec<(String, u64)> = ids.iter().filter_map(|id| Some((id.clone(), self.folder_seq(id)?))).collect();
+        let mut probed = self.probe_folders(ids).await;
+        seqs.into_iter()
+            .filter_map(|(id, seq)| {
+                let report = self.keep_resolved(&id, seq, probed.remove(&id))?;
+                Some((id, report))
+            })
+            .collect()
     }
 
     pub fn set_pane_layout(&self, session_id: &str, layout: Option<PaneNode>) -> Result<()> {
@@ -1600,24 +1676,79 @@ mod tests {
         let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         let terminal = terminal_ids(&manager)[0].clone();
         let pid = *lock(&manager.state).process(&process).unwrap().pid.get().unwrap();
+        let probes = || lock(&runtime.probes).len();
         // The outer shell reported its folder; a nested shell did a cd with no OSC 7.
         manager.write(&process, b"\x1b]7;file://vm/workspace\x07".to_vec()).unwrap();
-        until_async(async || manager.editor_folder(&id, Some(&terminal)).await.unwrap() == (folder.clone(), true))
-            .await;
+        let output = manager.output(&process).unwrap();
+        until(|| lock(&output).osc.cwd.is_some()).await;
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.clone(), true));
         lock(&runtime.guest_folders).insert(pid, "/workspace/nested".into());
+        // A hover resolves against the kept folder and starts no probe.
+        let before = probes();
+        assert!(matches!(manager.location(&process, "inner.rs", false).await, Err(Error::LinkNotShared(_))));
+        assert_eq!(probes(), before, "a hover probed");
+        // An open of a link probes.
+        assert_eq!(manager.location(&process, "inner.rs", true).await.unwrap().1, folder.join("nested/inner.rs"));
+        assert_eq!(probes(), before + 1);
         assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.join("nested"), true));
         let ids = [process.clone()];
         let report = manager.terminal_folders(&ids).await.remove(&process).unwrap();
         assert_eq!(report.folder, vm("/workspace/nested", Some(&folder.join("nested"))));
         assert_eq!(listed_folder(&manager, &process), report.folder);
-        assert_eq!(manager.location(&process, "inner.rs").await.unwrap().1, folder.join("nested/inner.rs"));
+        // Now a hover uses the kept folder of the last read.
+        assert_eq!(manager.location(&process, "inner.rs", false).await.unwrap().1, folder.join("nested/inner.rs"));
         // A probed folder that is not shared opens the session folder.
         lock(&runtime.guest_folders).insert(pid, "/root".into());
         assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.clone(), false));
-        // With no probe result, the last OSC 7 counts again.
+        // With no probe result, the kept folder counts.
         lock(&runtime.guest_folders).clear();
-        assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.clone(), true));
-        assert_eq!(batch(&manager, &ids).await, [(process.clone(), vm("/workspace", Some(&folder)))]);
+        assert_eq!(manager.terminal_folders(&ids).await[&process].folder, vm("/root", None));
+        // A new OSC 7 replaces it at once.
+        manager.write(&process, b"\x1b]7;file://vm/workspace/nested\x07".to_vec()).unwrap();
+        until(|| listed_folder(&manager, &process) == vm("/workspace/nested", Some(&folder.join("nested")))).await;
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.join("nested"), true));
+    }
+
+    #[tokio::test]
+    async fn a_slow_folder_probe_waits_its_limit_only_and_is_shared() {
+        let (manager, runtime, id) = manager();
+        let folder = manager.list().sessions[0].session.folder.clone().canonicalize().unwrap();
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        manager.start(&id).await.unwrap();
+        let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let terminal = terminal_ids(&manager)[0].clone();
+        let pid = *lock(&manager.state).process(&process).unwrap().pid.get().unwrap();
+        lock(&runtime.guest_folders).insert(pid, "/workspace/nested".into());
+        *lock(&runtime.probe_delay) = Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let (first, second) =
+            tokio::join!(manager.editor_folder(&id, Some(&terminal)), manager.editor_folder(&id, Some(&terminal)));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // The start folder counts, and the second open shared the first probe.
+        assert_eq!((first.unwrap(), second.unwrap()), ((folder.clone(), true), (folder.clone(), true)));
+        assert_eq!(lock(&runtime.probes).len(), 1);
+        assert!(lock(&manager.probes).is_empty());
+        *lock(&runtime.probe_delay) = Duration::ZERO;
+        assert_eq!(manager.editor_folder(&id, Some(&terminal)).await.unwrap(), (folder.join("nested"), true));
+    }
+
+    #[tokio::test]
+    async fn one_folder_poll_probes_each_vm_once() {
+        let (manager, runtime, id) = manager();
+        manager.start(&id).await.unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap());
+        }
+        let pids: Vec<u32> = ids.iter().map(|p| *lock(&manager.state).process(p).unwrap().pid.get().unwrap()).collect();
+        for pid in &pids {
+            lock(&runtime.guest_folders).insert(*pid, format!("/tmp/{pid}"));
+        }
+        let found = manager.terminal_folders(&ids).await;
+        assert_eq!(*lock(&runtime.probes), std::slice::from_ref(&pids));
+        for (process, pid) in ids.iter().zip(&pids) {
+            assert_eq!(found[process].folder, vm(&format!("/tmp/{pid}"), None));
+        }
     }
 
     #[tokio::test]
@@ -1629,7 +1760,7 @@ mod tests {
         std::fs::write(folder.join("top.rs"), "").unwrap();
         std::fs::write(folder.join("sub/inner.rs"), "").unwrap();
         let process = manager.open_session(&id, TerminalKind::Host, 24, 80).await.unwrap();
-        let at = async |raw: &str| manager.location(&process, raw).await;
+        let at = async |raw: &str| manager.location(&process, raw, true).await;
         until_async(async || at("top.rs").await.ok() == Some((id.clone(), folder.join("top.rs")))).await;
         assert!(matches!(at("inner.rs").await, Err(Error::LinkMissing(_))));
         assert!(matches!(at("sub/dir").await, Err(Error::LinkNotFile(_))));
@@ -1653,7 +1784,7 @@ mod tests {
         assert!(matches!(at("top.rs").await, Err(Error::LinkFolderUnknown(_))));
         assert_eq!(at(absolute.to_str().unwrap()).await.unwrap().1, absolute);
         lock(&manager.state).terminals.iter_mut().find(|t| t.id == process).unwrap().host_group = real;
-        assert!(matches!(manager.location("gone", "top.rs").await, Err(Error::ProcessNotFound)));
+        assert!(matches!(manager.location("gone", "top.rs", true).await, Err(Error::ProcessNotFound)));
         manager.delete(&id).await.unwrap();
     }
 
@@ -1669,7 +1800,7 @@ mod tests {
         manager.add_mount(&id, shared.to_str().unwrap(), "/data", false).unwrap();
         manager.start(&id).await.unwrap();
         let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
-        let at = async |raw: &str| manager.location(&process, raw).await;
+        let at = async |raw: &str| manager.location(&process, raw, true).await;
         assert_eq!(at("top.rs").await.unwrap(), (id.clone(), folder.join("top.rs")));
         assert_eq!(at("/workspace/sub/inner.rs").await.unwrap().1, folder.join("sub/inner.rs"));
         assert_eq!(at("/data/data.rs").await.unwrap().1, shared.join("data.rs"));

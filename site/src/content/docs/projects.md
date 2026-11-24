@@ -248,9 +248,10 @@ in Zed (VM folder /etc is not on the Mac)**. zwinger reads the folder again when
 folder room or a different screen covers the terminals, the command menu and ⌘⇧E open the project folder.
 
 A VM shell starts in bash. zwinger reads the folder of the program that runs in the foreground of the terminal from
-the VM, when you open the editor and while the terminal shows. So each shell has its folder: a zsh or fish that you
-start from bash or from a different shell, `/bin/zsh`, `zsh -f`, `sh`, and a program such as `vim` that you start in
-a folder. zwinger changes no file of the VM's system packages and none of your shell config files.
+the VM when you open the editor or a file link, and every 2 seconds while the terminal shows and the window is not
+hidden. So each shell has its folder: a zsh or fish that you start from bash or from a different shell, `/bin/zsh`,
+`zsh -f`, `sh`, and a program such as `vim` that you start in a folder. zwinger changes no file of the VM's system
+packages and none of your shell config files.
 
 A shell also reports its folder at each prompt, so the folder in the pane header changes at once after `cd`:
 

@@ -4,7 +4,10 @@ import { onTerminalFolder } from "../projects/api";
 import { terminalFolders } from "./api";
 import { liveFolder, mergeFolder } from "./folders";
 
-/** How often the folders of the shown processes are read again, for a `cd` that writes no output. */
+/**
+ * How often the folders of the shown processes are read again while the window shows, for a `cd` that writes no
+ * output.
+ */
 const FOLDER_POLL_MS = 2000;
 
 /**
@@ -41,17 +44,25 @@ export function useTerminalFolders(sessions: SessionView[], shown: string[]) {
     if (!ids) return;
     let live = true;
     let timer: ReturnType<typeof setTimeout>;
+    /** Only the newest poll schedules the next one, so a return to the window starts no second loop. */
+    let round = 0;
+    // A hidden window reads no folder: each read of a VM terminal runs a command in the VM.
     const poll = () => {
+      clearTimeout(timer);
+      const current = ++round;
+      if (document.hidden) return;
       inFlight.current = inFlight.current
         .then(() => live && terminalFolders(ids.split(" ")).then((found) => live && keep(found), () => {}))
         .then(() => {
-          if (live) timer = setTimeout(poll, FOLDER_POLL_MS);
+          if (live && current === round) timer = setTimeout(poll, FOLDER_POLL_MS);
         });
     };
     poll();
+    document.addEventListener("visibilitychange", poll);
     return () => {
       live = false;
       clearTimeout(timer);
+      document.removeEventListener("visibilitychange", poll);
     };
   }, [ids]);
 
