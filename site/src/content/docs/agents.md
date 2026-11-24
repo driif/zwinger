@@ -52,8 +52,8 @@ An agent with no cage gets a guard:
 - No proxy and no CA environment variables from zwinger, and no override of the agent's state folder (`HOME`,
   `CODEX_HOME` or `PI_CODING_AGENT_DIR`). Your shell profile can still set proxy variables.
 
-The terminal tab shows a no-cage icon. Point to it to read "No cage: runs on this Mac". The tab shows no
-[agent status](#agent-status) glyph. A cage stop does not end the agent; an app exit ends it, as it ends the Mac shells.
+The terminal tab shows a no-cage icon. Point to it to read "No cage: runs on this Mac". Claude Code, pi and Gemini CLI
+show the [agent status](#agent-status) glyph; Codex and Antigravity CLI show none. A cage stop does not end the agent; an app exit ends it, as it ends the Mac shells.
 
 zwinger checks the project again at each open. If the project gets a cage, the agent with no cage does not open again:
 its tab says "the session has a cage". Open the agent in the cage instead.
@@ -63,7 +63,8 @@ Tasks need a cage. A project with no cage cannot run a task.
 ## Agent status
 
 The terminal tabs and the session and workspace rows show an agent status glyph while an agent runs in a VM terminal. This
-includes an agent that you start in a VM shell:
+includes an agent that you start in a VM shell. An agent with no cage shows it too, see
+[Status of agents with no cage](#status-of-agents-with-no-cage):
 
 - **Active:** the agent is working.
 - **Blocked:** the agent waits for your answer or permission.
@@ -92,8 +93,25 @@ they do not change your agent settings or a read-only agent profile:
   confirm, input or editor) waits for you. A custom extension screen does not show blocked.
 - **Antigravity CLI** reports no status. Its tab shows no glyph.
 
-A headless call, such as `claude -p`, `codex exec`, `gemini -p` or `agy -p`, reports no status. An agent with no cage shows no
-glyph, because zwinger does not install its hooks on your Mac.
+A headless call, such as `claude -p`, `codex exec`, `gemini -p` or `agy -p`, reports no status.
+
+### Status of agents with no cage
+
+zwinger never writes the config of your agents on your Mac (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.pi`). It
+keeps the status hooks in its own app data folder, and each launch of an agent with no cage names them with an
+option or an environment variable. A Mac shell gets no hooks, so an agent that you start in a Mac shell shows no glyph.
+
+- **Claude Code** reports all three states. It starts with `--settings` and the hooks file of zwinger. Claude Code
+  adds these hooks to the hooks of your own settings.
+- **Pi** reports all three states. It starts with `-e` and the status extension of zwinger, in addition to your own
+  extensions.
+- **Gemini CLI** reports all three states. `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` points at the system defaults file of
+  zwinger, so your own Gemini settings win. Gemini CLI runs hooks only in a trusted folder. If your Mac has its own
+  `/Library/Application Support/GeminiCli/system-defaults.json`, zwinger does not replace it, and Gemini CLI reports
+  no status.
+- **Codex** reports no status. Codex runs hooks from a command-line option only after you trust them, or with an
+  option that skips the trust check for all hooks. The guard does not allow that option.
+- **Antigravity CLI** reports no status.
 
 ## Permission prompts
 

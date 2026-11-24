@@ -143,12 +143,13 @@ pub fn continue_args(kind: AgentKind) -> &'static [&'static str] {
 }
 
 /// The argv of the Mac's install of an agent in a session with no cage
-/// (ADR 0008): the binary that detection ran, or `<node> <package>/<entry>`.
-/// Nothing isolates it, so it gets no bypass flag, no zwinger wrapper and
-/// no env: the agent uses the Mac's own config and login. `None` if the
-/// detection has no runnable form, or a relative binary, which would resolve
-/// in the session folder or by `PATH`.
-pub fn host_argv(found: &HostAgent, resume: bool) -> Option<Vec<String>> {
+/// (ADR 0008): the binary that detection ran, or `<node> <package>/<entry>`,
+/// then the flag of its status hooks (`status`). Nothing isolates it, so it
+/// gets no bypass flag, no zwinger wrapper and no state env: the agent uses
+/// the Mac's own config and login. `None` if the detection has no runnable
+/// form, or a relative binary, which would resolve in the session folder or
+/// by `PATH`.
+pub fn host_argv(found: &HostAgent, resume: bool, status: Option<&HostStatus>) -> Option<Vec<String>> {
     let node = found.node.as_ref().map(|node| node.to_string_lossy().into_owned());
     let mut argv = match found.kind {
         AgentKind::Claude | AgentKind::Codex | AgentKind::Antigravity => {
@@ -168,10 +169,67 @@ pub fn host_argv(found: &HostAgent, resume: bool) -> Option<Vec<String>> {
             vec![node, found.package.as_ref()?.join(entry).to_string_lossy().into_owned()]
         }
     };
+    argv.extend(status.iter().flat_map(|status| status.args.iter().cloned()));
     if resume {
         argv.extend(continue_args(found.kind).iter().map(|a| (*a).to_owned()));
     }
     Some(argv)
+}
+
+/// The app-owned dir of the status hooks of agents on the Mac, in the app
+/// data dir. zwinger never writes the agents' own config (`~/.claude` and
+/// the others): each launch names these files with a flag or an env var.
+pub const HOST_STATUS_DIR: &str = "host-status";
+/// Gemini CLI's own system defaults on macOS. Its env var replaces this
+/// path, so an agent on a Mac that has this file gets no status hooks.
+pub const GEMINI_MAC_DEFAULTS: &str = "/Library/Application Support/GeminiCli/system-defaults.json";
+
+/// The status hooks of one launch of an agent on the Mac. The hooks write to
+/// the terminal in [`TTY_ENV`], as in the VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostStatus {
+    /// Go after the program, before the continue flag.
+    args: Vec<String>,
+    /// Set with [`TTY_ENV`].
+    env: Vec<(String, String)>,
+}
+
+impl HostStatus {
+    /// The env of the launch, with `tty` as the terminal of the hooks.
+    pub fn env(&self, tty: &str) -> Vec<(String, String)> {
+        std::iter::once((TTY_ENV.to_owned(), tty.to_owned())).chain(self.env.iter().cloned()).collect()
+    }
+}
+
+/// The status hooks of `kind` on the Mac, from the files that
+/// [`write_host_status`] wrote to `dir`. Each is only a per-launch addition
+/// to the agent's own config: Claude Code `--settings` adds its hooks to
+/// the user's hooks, pi `-e` loads one more extension, and Gemini CLI's
+/// system defaults are its lowest scope. `gemini_defaults`: the Mac has
+/// [`GEMINI_MAC_DEFAULTS`]. `None`: no sure per-launch way. Codex runs hooks
+/// of `-c` only after a trust step or with a bypass flag, and Antigravity
+/// CLI reports no state.
+pub fn host_status(kind: AgentKind, dir: &Path, gemini_defaults: bool) -> Option<HostStatus> {
+    let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    match kind {
+        AgentKind::Claude => Some(HostStatus { args: vec!["--settings".to_owned(), file(CLAUDE_STATUS)], env: vec![] }),
+        AgentKind::Pi => Some(HostStatus { args: vec!["-e".to_owned(), file(PI_STATUS)], env: vec![] }),
+        AgentKind::Gemini if !gemini_defaults => Some(HostStatus {
+            args: vec![],
+            env: vec![("GEMINI_CLI_SYSTEM_DEFAULTS_PATH".to_owned(), file(GEMINI_STATUS))],
+        }),
+        AgentKind::Gemini | AgentKind::Codex | AgentKind::Antigravity => None,
+    }
+}
+
+/// Writes the status hooks of the agents on the Mac to the app-owned `dir`.
+pub fn write_host_status(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let bin = dir.to_string_lossy();
+    put(dir, STATUS, &status_script(), 0o755)?;
+    put(dir, CLAUDE_STATUS, &claude_status(&bin), 0o644)?;
+    put(dir, GEMINI_STATUS, &gemini_status(&bin), 0o644)?;
+    put(dir, PI_STATUS, &pi_status(), 0o644)
 }
 
 /// The flag that a wrapper adds, and the user arguments that keep it out.
@@ -241,7 +299,7 @@ const TTY: &str = "[ -t 0 ] && [ -t 1 ]";
 /// The terminal of an interactive agent, from its wrapper. Codex runs its
 /// hooks in a new session with no `/dev/tty`, so the hooks write here. A
 /// wrapper with no terminal unsets it, so a nested headless agent stays quiet.
-const TTY_ENV: &str = "ZWINGER_TTY";
+pub(crate) const TTY_ENV: &str = "ZWINGER_TTY";
 /// The value of [`TTY_ENV`]. A test replaces it.
 const TTY_NAME: &str = "\"$(tty)\"";
 /// The state value that clears the state: the agent has exited.
@@ -330,14 +388,15 @@ fn report(state: &str) -> String {
     format!("{{ printf '\\033{}%s\\007' {state} > \"${TTY_ENV}\"; }} 2>/dev/null || true", agent_osc())
 }
 
-/// One hook command that reports `state`.
-fn hook(state: &str) -> serde_json::Value {
-    serde_json::json!([{ "type": "command", "command": format!("{BIN_DIR}/{STATUS} {state}") }])
+/// One hook command that runs [`STATUS`] in the dir `bin` and reports `state`.
+fn hook(bin: &str, state: &str) -> serde_json::Value {
+    serde_json::json!([{ "type": "command", "command": format!("{} {state}", quote(&format!("{bin}/{STATUS}"))) }])
 }
 
-/// Claude Code settings with the status hooks only. `--settings` adds them
-/// to the hooks of the user's settings.
-fn claude_status() -> String {
+/// Claude Code settings with the status hooks of the dir `bin` only.
+/// `--settings` adds them to the hooks of the user's settings.
+fn claude_status(bin: &str) -> String {
+    let hook = |state| hook(bin, state);
     let hooks = serde_json::json!({
         "UserPromptSubmit": [{ "hooks": hook("active") }],
         // One hook for all tools: two matching hooks would run in parallel.
@@ -354,6 +413,7 @@ fn claude_status() -> String {
 /// Codex's hooks.json with the status hooks only. Codex 0.163 has these
 /// events. With the approvals bypass, it never asks for a permission.
 fn codex_hooks() -> String {
+    let hook = |state| hook(BIN_DIR, state);
     let hooks = serde_json::json!({
         "UserPromptSubmit": [{ "hooks": hook("active") }],
         "PermissionRequest": [{ "hooks": hook("blocked") }],
@@ -372,7 +432,8 @@ fn codex_hooks() -> String {
 /// Gemini CLI system defaults with the status hooks only. The hooks of all
 /// settings scopes add up. The hook rows in its UI are off; the user's own
 /// settings can turn them on.
-fn gemini_status() -> String {
+fn gemini_status(bin: &str) -> String {
+    let hook = |state| hook(bin, state);
     let hooks = serde_json::json!({
         "BeforeAgent": [{ "hooks": hook("active") }],
         // `ask_user` asks the user questions and waits for the answers.
@@ -879,10 +940,10 @@ pub fn write(dir: &Path, kinds: &[AgentKind], found: Found, unprompted: bool) ->
         put(dir, STATUS, &status_script(), 0o755)?;
     }
     if kinds.contains(&AgentKind::Claude) {
-        put(dir, CLAUDE_STATUS, &claude_status(), 0o644)?;
+        put(dir, CLAUDE_STATUS, &claude_status(BIN_DIR), 0o644)?;
     }
     if kinds.contains(&AgentKind::Gemini) && found.gemini.is_some() {
-        put(dir, GEMINI_STATUS, &gemini_status(), 0o644)?;
+        put(dir, GEMINI_STATUS, &gemini_status(BIN_DIR), 0o644)?;
     }
     if kinds.contains(&AgentKind::Pi) {
         put(dir, PI_STATUS, &pi_status(), 0o644)?;
@@ -980,7 +1041,7 @@ mod tests {
             "--approval-mode",
         ];
         for (agent, resume, expected) in cases {
-            let argv = host_argv(agent, resume).unwrap();
+            let argv = host_argv(agent, resume, None).unwrap();
             assert_eq!(argv, expected, "{:?} resume {resume}", agent.kind);
             for arg in &argv {
                 assert!(!forbidden.iter().any(|f| arg.starts_with(f)), "{arg} in {argv:?}");
@@ -992,14 +1053,104 @@ mod tests {
             }
         }
         // A detection with no runnable form opens nothing.
-        assert_eq!(host_argv(&found(AgentKind::Codex, None, None, None), false), None);
+        assert_eq!(host_argv(&found(AgentKind::Codex, None, None, None), false, None), None);
         let agy = found(AgentKind::Antigravity, None, None, Some("/Users/me/.local/bin/agy"));
-        assert_eq!(host_argv(&agy, true).unwrap(), ["/Users/me/.local/bin/agy", "-c"]);
-        assert_eq!(host_argv(&found(AgentKind::Gemini, Some("/opt/gemini"), None, None), false), None);
+        assert_eq!(host_argv(&agy, true, None).unwrap(), ["/Users/me/.local/bin/agy", "-c"]);
+        assert_eq!(host_argv(&found(AgentKind::Gemini, Some("/opt/gemini"), None, None), false, None), None);
         // A relative binary would run from the session folder or by PATH.
         for bin in ["codex", "./codex", "node_modules/.bin/codex", ""] {
-            assert_eq!(host_argv(&found(AgentKind::Codex, None, None, Some(bin)), false), None, "{bin:?}");
+            assert_eq!(host_argv(&found(AgentKind::Codex, None, None, Some(bin)), false, None), None, "{bin:?}");
         }
+    }
+
+    #[test]
+    fn a_mac_agent_gets_its_status_hooks_only_from_app_owned_files_of_the_launch() {
+        use crate::host_agents::detect::Source;
+        use crate::host_agents::login::LoginState;
+        use std::path::PathBuf;
+
+        let found = |kind, package: Option<&str>, entry: Option<&str>, bin: Option<&str>| HostAgent {
+            kind,
+            version: "1.0.0".into(),
+            path: String::new(),
+            source: Source::Host,
+            pinned: true,
+            profile: true,
+            login: LoginState::None,
+            package: package.map(PathBuf::from),
+            entry: entry.map(str::to_owned),
+            bin: bin.map(PathBuf::from),
+            node: None,
+        };
+        let dir = Path::new("/Users/me/Library/Application Support/zwinger/host-status");
+        let file = |name: &str| format!("{}/{name}", dir.display());
+        let tty = "/dev/ttys004";
+        let claude = found(AgentKind::Claude, None, None, Some("/Users/me/.local/bin/claude"));
+        let pi = found(AgentKind::Pi, Some("/opt/pi"), None, None);
+        let gemini = found(AgentKind::Gemini, Some("/opt/gemini"), Some("bundle/gemini.js"), None);
+        let launch = |agent: &HostAgent, resume: bool| {
+            let status = host_status(agent.kind, dir, false).unwrap();
+            (host_argv(agent, resume, Some(&status)).unwrap(), status.env(tty))
+        };
+        let tty_env = || vec![(TTY_ENV.to_owned(), tty.to_owned())];
+        assert_eq!(
+            launch(&claude, true),
+            (
+                ["/Users/me/.local/bin/claude", "--settings", &file(CLAUDE_STATUS), "-c"].map(str::to_owned).to_vec(),
+                tty_env()
+            )
+        );
+        assert_eq!(
+            launch(&pi, false),
+            (["node", "/opt/pi/dist/cli.js", "-e", &file(PI_STATUS)].map(str::to_owned).to_vec(), tty_env())
+        );
+        let (argv, env) = launch(&gemini, true);
+        assert_eq!(argv, ["node", "/opt/gemini/bundle/gemini.js", "--resume", "latest"]);
+        assert_eq!(env[1], ("GEMINI_CLI_SYSTEM_DEFAULTS_PATH".to_owned(), file(GEMINI_STATUS)));
+        assert_eq!(env.len(), 2);
+        // No sure per-launch way: no status, and the launch stays as before.
+        assert_eq!(host_status(AgentKind::Gemini, dir, true), None);
+        assert_eq!(host_status(AgentKind::Codex, dir, false), None);
+        assert_eq!(host_status(AgentKind::Antigravity, dir, false), None);
+        // The guard of ADR 0008: no bypass flag, no proxy, CA, state or credential env.
+        for kind in [AgentKind::Claude, AgentKind::Pi, AgentKind::Gemini] {
+            let status = host_status(kind, dir, false).unwrap();
+            for arg in &status.args {
+                assert!(!arg.contains("dangerously") && !arg.contains("yolo") && !arg.contains('='), "{arg}");
+            }
+            for (name, value) in status.env(tty) {
+                assert!(name == TTY_ENV || name == "GEMINI_CLI_SYSTEM_DEFAULTS_PATH", "{name}");
+                assert!(value == tty || value.starts_with(&*dir.to_string_lossy()), "{value}");
+            }
+        }
+    }
+
+    #[test]
+    fn write_host_status_puts_working_hooks_in_the_app_owned_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = Temp::new("host status");
+        let dir = root.0.join("Application Support/host-status");
+        write_host_status(&dir).unwrap();
+        // A second write replaces the files.
+        write_host_status(&dir).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names, [CLAUDE_STATUS, GEMINI_STATUS, PI_STATUS, STATUS]);
+        assert_eq!(std::fs::metadata(dir.join(STATUS)).unwrap().permissions().mode() & 0o777, 0o755);
+        let tty = root.path("tty");
+        for name in [CLAUDE_STATUS, GEMINI_STATUS] {
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap();
+            let stop = if name == CLAUDE_STATUS { "Stop" } else { "AfterAgent" };
+            // The path has a space: the hook command quotes it.
+            let command = settings["hooks"][stop][0]["hooks"][0]["command"].as_str().unwrap();
+            let out = std::process::Command::new("/bin/sh").env(TTY_ENV, &tty).arg("-c").arg(command).output().unwrap();
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(&tty).unwrap(), format!("\x1b{}done\x07", agent_osc()), "{name}");
+            std::fs::remove_file(&tty).unwrap();
+        }
+        assert!(std::fs::read_to_string(dir.join(PI_STATUS)).unwrap().contains("agent_settled"));
     }
 
     const PROXY: &str = "http://zw:t@host.microsandbox.internal:4000";
@@ -2126,7 +2277,7 @@ mod tests {
 
     #[test]
     fn claude_status_hooks_give_one_state_per_event() {
-        let settings: serde_json::Value = serde_json::from_str(&claude_status()).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&claude_status(BIN_DIR)).unwrap();
         let hooks = settings["hooks"].as_object().unwrap();
         let command = |event: &str| {
             let groups = hooks[event].as_array().unwrap();
@@ -2267,7 +2418,7 @@ mod tests {
         // Only a question blocks; each other tool runs.
         assert_eq!(codex["PreToolUse"].as_array().unwrap().len(), 1);
         assert_eq!(codex["PreToolUse"][0]["matcher"], "^request_user_input$");
-        let gemini: serde_json::Value = serde_json::from_str(&gemini_status()).unwrap();
+        let gemini: serde_json::Value = serde_json::from_str(&gemini_status(BIN_DIR)).unwrap();
         assert_eq!(gemini["hooksConfig"]["notifications"], false);
         let hooks = &gemini["hooks"];
         for (event, name) in [

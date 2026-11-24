@@ -14,7 +14,7 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::launch::CA_ENV;
+use crate::agent::launch::{CA_ENV, HostStatus, TTY_ENV};
 use crate::error::{Error, Result};
 use crate::runtime::{PTY_QUEUE, Pty, PtyEvent, PtyInput};
 
@@ -84,6 +84,7 @@ fn scrubbed_env(env: impl IntoIterator<Item = String>) -> Vec<String> {
                 || proxy(name)
                 || CA_ENV.contains(&name.as_str())
                 || name == "IS_SANDBOX"
+                || name == TTY_ENV
                 || name.starts_with("MSB_")
         })
         .collect()
@@ -185,8 +186,15 @@ fn fallback_lang(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
 
 /// Starts `argv` in `folder`. Returns the PTY and the process group, so an
 /// app exit can kill it without the async runtime. The env is the app's env
-/// with the terminal names, less [`scrubbed_env`].
-pub(crate) fn open_host_pty(folder: &Path, argv: Vec<String>, rows: u16, cols: u16) -> Result<(Pty, HostGroup)> {
+/// with the terminal names, less [`scrubbed_env`], plus the env of the
+/// agent's status hooks (`status`) with this PTY as their terminal.
+pub(crate) fn open_host_pty(
+    folder: &Path,
+    argv: Vec<String>,
+    status: Option<&HostStatus>,
+    rows: u16,
+    cols: u16,
+) -> Result<(Pty, HostGroup)> {
     let pair =
         native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).map_err(pty_error)?;
     let mut command = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
@@ -199,6 +207,13 @@ pub(crate) fn open_host_pty(folder: &Path, argv: Vec<String>, rows: u16, cols: u
     command.env("TERM_PROGRAM", "zwinger");
     if let Some(lang) = fallback_lang(|name| std::env::var(name).ok()) {
         command.env("LANG", lang);
+    }
+    if let Some(status) = status
+        && let Some(tty) = pair.master.tty_name()
+    {
+        for (name, value) in status.env(&tty.to_string_lossy()) {
+            command.env(name, value);
+        }
     }
     let child = pair.slave.spawn_command(command).map_err(pty_error)?;
     // The reader sees the end only when no process holds the slave side.
@@ -363,7 +378,7 @@ mod tests {
         let dir = temp_dir();
         let (mut pty, _) = {
             host_sh();
-            open_host_pty(&dir, shell_argv(), 24, 80)
+            open_host_pty(&dir, shell_argv(), None, 24, 80)
         }
         .unwrap();
         pty.input.send(PtyInput::Data(b"echo \"in $(pwd) as $TERM_PROGRAM\"; exit 3\n".to_vec())).unwrap();
@@ -377,7 +392,7 @@ mod tests {
         let dir = temp_dir();
         let (mut pty, group) = {
             host_sh();
-            open_host_pty(&dir, shell_argv(), 24, 80)
+            open_host_pty(&dir, shell_argv(), None, 24, 80)
         }
         .unwrap();
         let pgid = group.id().unwrap();
@@ -429,7 +444,13 @@ mod tests {
         let dir = temp_dir();
         let (mut pty, _) = {
             host_sh();
-            open_host_pty(&dir, login_exec(vec!["printf".into(), "%s|".into(), "a b".into(), "$HOME".into()]), 24, 80)
+            open_host_pty(
+                &dir,
+                login_exec(vec!["printf".into(), "%s|".into(), "a b".into(), "$HOME".into()]),
+                None,
+                24,
+                80,
+            )
         }
         .unwrap();
         let (out, code) = read_until_exit(&mut pty).await;
@@ -459,6 +480,7 @@ mod tests {
             "IS_SANDBOX",
             "MSB_PATH",
             "MSB_HOME",
+            "ZWINGER_TTY",
         ];
         let env = cage.iter().chain(&["MY_PROJECT_TOKEN", "PATH", "HOME"]).map(|n| (*n).to_owned());
         assert_eq!(scrubbed_env(env), cage);

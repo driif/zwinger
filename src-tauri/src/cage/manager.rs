@@ -641,7 +641,7 @@ impl<R: SandboxRuntime> Manager<R> {
                                 kind: t.kind,
                                 exit_code: t.exit_code,
                                 terminal_id: t.terminal_id.clone(),
-                                agent: output.osc.agent.filter(|_| live && !t.kind.on_host()),
+                                agent: output.osc.agent.filter(|_| live && t.kind.reports_agent()),
                                 folder: output.folder.clone().filter(|_| live),
                                 folder_seq: output.folder_seq,
                             }

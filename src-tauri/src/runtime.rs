@@ -60,6 +60,12 @@ impl TerminalKind {
         matches!(self, Self::Host | Self::HostAgent { .. })
     }
 
+    /// The agent state of its output shows. A host shell has no zwinger
+    /// hooks; a VM shell can run an agent through its wrapper.
+    pub fn reports_agent(self) -> bool {
+        self != Self::Host
+    }
+
     /// The argv in the VM. `None` for a kind that runs on the Mac.
     pub fn vm_argv(self) -> Option<Vec<String>> {
         match self {
@@ -823,6 +829,9 @@ mod tests {
         assert_eq!((mac.vm_argv(), TerminalKind::Host.vm_argv()), (None, None));
         assert!(mac.on_host() && TerminalKind::Host.on_host());
         assert!(!codex.on_host() && !TerminalKind::Shell.on_host());
+        // Only a host shell has no agent state: it has no zwinger hooks.
+        assert!(mac.reports_agent() && codex.reports_agent() && TerminalKind::Shell.reports_agent());
+        assert!(!TerminalKind::Host.reports_agent());
     }
 
     #[test]

@@ -5,7 +5,7 @@ pub(crate) mod output;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -357,7 +357,7 @@ impl<R: SandboxRuntime> Manager<R> {
         cols: u16,
     ) -> Result<String> {
         let host_argv = match kind {
-            TerminalKind::Host => Some((host::shell_argv(), None)),
+            TerminalKind::Host => Some((host::shell_argv(), None, None)),
             // Checked at each open, so a stale UI or a cage change after the
             // confirm cannot start the agent on the Mac.
             TerminalKind::HostAgent { agent, resume } => {
@@ -365,24 +365,38 @@ impl<R: SandboxRuntime> Manager<R> {
                     return Err(Error::HasCage);
                 }
                 let detection = self.host.clone();
-                let found = blocking(move || Ok(detection.last().agent(agent).cloned())).await?;
+                let dir = self.data.join(launch::HOST_STATUS_DIR);
+                let (found, status) = blocking(move || {
+                    // With no hook files, the agent runs with no status.
+                    let status = launch::write_host_status(&dir)
+                        .inspect_err(|e| eprintln!("the status hooks of agents on the Mac were not written: {e}"))
+                        .ok()
+                        .and_then(|()| {
+                            let defaults = Path::new(launch::GEMINI_MAC_DEFAULTS).exists();
+                            launch::host_status(agent, &dir, defaults)
+                        });
+                    Ok((detection.last().agent(agent).cloned(), status))
+                })
+                .await?;
                 let argv = found
                     .as_ref()
-                    .and_then(|found| launch::host_argv(found, resume))
+                    .and_then(|found| launch::host_argv(found, resume, status.as_ref()))
                     .ok_or_else(|| Error::HostAgentMissing(agent.label().to_owned()))?;
-                let fresh = found.filter(|_| resume).and_then(|found| launch::host_argv(&found, false));
-                Some((host::login_exec(argv), fresh.map(host::login_exec)))
+                let fresh =
+                    found.filter(|_| resume).and_then(|found| launch::host_argv(&found, false, status.as_ref()));
+                Some((host::login_exec(argv), fresh.map(host::login_exec), status))
             }
             TerminalKind::Shell | TerminalKind::Agent { .. } => None,
         };
-        if let Some((argv, fresh_argv)) = host_argv {
+        if let Some((argv, fresh_argv, status)) = host_argv {
             let folder = lock(&self.state).session(session_id)?.folder.clone();
             if !folder.is_dir() {
                 return Err(Error::MissingPath(folder.display().to_string()));
             }
             let start = TerminalFolder::host(folder.clone());
             let fresh = fresh_kind(kind).zip(fresh_argv).map(|(fresh, argv)| {
-                let (state, session, folder) = (self.state.clone(), session_id.to_owned(), folder.clone());
+                let (state, session, folder, status) =
+                    (self.state.clone(), session_id.to_owned(), folder.clone(), status.clone());
                 Box::new(move |id: String| {
                     Box::pin(async move {
                         let mut state = lock(&state);
@@ -390,7 +404,7 @@ impl<R: SandboxRuntime> Manager<R> {
                             return None;
                         }
                         let (rows, cols) = state.process(&id).ok()?.size;
-                        let (pty, group) = host::open_host_pty(&folder, argv, rows, cols).ok()?;
+                        let (pty, group) = host::open_host_pty(&folder, argv, status.as_ref(), rows, cols).ok()?;
                         swap(&mut state, &id, fresh, pty, Some(group))
                     }) as Pin<Box<dyn Future<Output = _> + Send>>
                 }) as FreshStart
@@ -406,7 +420,7 @@ impl<R: SandboxRuntime> Manager<R> {
                     if matches!(kind, TerminalKind::HostAgent { .. }) && state.effective_cage(session_id)?.is_some() {
                         return Err(Error::HasCage);
                     }
-                    let (pty, group) = host::open_host_pty(&folder, argv, rows, cols)?;
+                    let (pty, group) = host::open_host_pty(&folder, argv, status.as_ref(), rows, cols)?;
                     Ok((pty, Some(group)))
                 },
             );
@@ -1276,12 +1290,17 @@ mod tests {
         manager.set_workspace_cage(&workspace, None).unwrap();
         let bin = manager.host.last().agent(AgentKind::Claude).unwrap().bin.clone().unwrap();
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::write(&bin, "#!/bin/sh\necho \"mac-claude $*\"\nexec sleep 1000\n").unwrap();
+        // The fake runs the Stop hook of its `--settings` file, as Claude Code does.
+        let fake =
+            "#!/bin/sh\necho \"mac-claude $*\"\n\"$(dirname \"$2\")/zwinger-agent-status\" done\nexec sleep 1000\n";
+        std::fs::write(&bin, fake).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let process = manager.open_session(&id, claude, 24, 80).await.unwrap();
         let (_, mut rx) = attach(&manager, &process);
         let mut out = String::new();
-        while !out.contains("mac-claude -c") {
+        let settings = manager.data.join(launch::HOST_STATUS_DIR).join("claude-status.json");
+        let expected = format!("mac-claude --settings {} -c", settings.display());
+        while !out.contains(&expected) {
             match next(&mut rx).await {
                 PtyEvent::Output(bytes) => out.push_str(&String::from_utf8_lossy(&bytes)),
                 PtyEvent::Exit(code) => panic!("exit {code}: {out}"),
@@ -1289,7 +1308,13 @@ mod tests {
         }
         let listed = manager.list();
         assert_eq!(listed.sessions[0].session.terminals[0].kind, claude);
-        assert_eq!(listed.sessions[0].processes[0].agent, None, "no hooks, so no status");
+        // The hook wrote its state to the terminal of the agent.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while manager.list().sessions[0].processes[0].agent.is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.list().sessions[0].processes[0].agent, Some(super::AgentState::Done));
+        assert!(!out.contains("zwinger-agent"), "{out}");
 
         // A VM stop does not end it; an app exit does.
         manager.stop(&id, None).await.unwrap();

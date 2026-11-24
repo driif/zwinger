@@ -430,7 +430,7 @@ pub(crate) fn keep_folder(output: &Mutex<Output>, folder: &Option<TerminalFolder
 /// process exits. While the view is full, it does not read, so the process
 /// blocks on its writes. The exit code is recorded before the `Exit` event
 /// is delivered, so a listing done in reaction to it shows the exit. A change
-/// of the agent state of a VM process goes to `agents`; at the exit, the state goes. A VM
+/// of the agent state of a VM process or a Mac agent goes to `agents`; at the exit, the state goes. A VM
 /// process that reports a new folder by OSC 7 sends its change to `folders`.
 /// The pump never asks macOS: a Mac folder comes from the batch call only.
 pub(crate) async fn pump<V>(
@@ -442,8 +442,8 @@ pub(crate) async fn pump<V>(
     agents: Arc<OnceLock<AgentSink>>,
     folders: Arc<OnceLock<FolderSink>>,
 ) {
-    // A VM shell can run an agent through its wrapper too.
     let vm = !kind.on_host();
+    let reports = kind.reports_agent();
     let started = Instant::now();
     let mut frames = Frames::new(events);
     let room = lock(&output).room.clone();
@@ -508,7 +508,7 @@ pub(crate) async fn pump<V>(
             }
             (before, output.osc.agent.filter(|_| exit.is_none()), moved)
         };
-        if vm
+        if reports
             && before != after
             && let Some(sink) = agents.get()
         {
