@@ -16,3 +16,5 @@ Do not make control components or CSS for buttons, inputs, switches or other con
 
 1. Read the motiv exports (`src/index.ts`). Use the existing props first.
 2. If a control, prop, variant or look is missing or wrong, use the `changing-motiv` skill.
+3. Before done, render the screen and compare it with the screens next to it: one control height per row, one left edge, one font scale.
+   A mismatch is fixed in motiv. Use a Vite port in 5170-5199, never 1420, and stop it after.
