@@ -17,6 +17,8 @@ use crate::netlog;
 
 const STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 const KILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest run of [`SandboxRuntime::output`].
+pub const OUTPUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const IMAGE: &str = "node:22-slim";
 /// The queue size of each direction of a pipe. A full queue holds the sender.
 pub const PIPE_QUEUE: usize = 64;
@@ -122,7 +124,13 @@ pub enum PtyEvent {
 pub struct Pty {
     pub input: UnboundedSender<PtyInput>,
     pub events: Receiver<PtyEvent>,
+    /// The guest PID of a VM process, set when the guest starts it. A Mac
+    /// process has none.
+    pub pid: GuestPid,
 }
+
+/// The guest PID of a VM terminal process, once the guest reports its start.
+pub type GuestPid = std::sync::Arc<std::sync::OnceLock<u32>>;
 
 #[derive(Debug)]
 pub enum PipeInput {
@@ -182,6 +190,9 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
         cwd: &str,
         env: &[(&str, &str)],
     ) -> impl Future<Output = Result<Pipe>> + Send;
+    /// Runs the short command `argv` with no stdin and gives its stdout. An
+    /// exit with an error, or a run longer than [`OUTPUT_LIMIT`], is an error.
+    fn output(&self, vm: &Self::Vm, argv: &[String]) -> impl Future<Output = Result<Vec<u8>>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
     /// Returns the names of the VMs that it removed.
     fn reap(&self) -> impl Future<Output = Result<Vec<String>>> + Send;
@@ -394,6 +405,8 @@ impl SandboxRuntime for Microsandbox {
         let sink = handle.take_stdin().ok_or(Error::SessionClosed)?;
         let control = handle.control();
         control.resize(rows, cols).await?;
+        let pid = GuestPid::default();
+        let started = pid.clone();
 
         let (input, mut input_rx) = mpsc::unbounded_channel();
         let (events_tx, events) = mpsc::channel(PTY_QUEUE);
@@ -425,13 +438,24 @@ impl SandboxRuntime for Microsandbox {
                         let _ = events_tx.send(PtyEvent::Output(message.into_bytes())).await;
                         break;
                     }
-                    ExecEvent::Started { .. } | ExecEvent::StdinError(_) => {}
+                    ExecEvent::Started { pid } => {
+                        let _ = started.set(pid);
+                    }
+                    ExecEvent::StdinError(_) => {}
                 }
             }
             let _ = events_tx.send(PtyEvent::Exit(code)).await;
         });
 
-        Ok(Pty { input, events })
+        Ok(Pty { input, events, pid })
+    }
+
+    async fn output(&self, vm: &Sandbox, argv: &[String]) -> Result<Vec<u8>> {
+        let out = vm.exec_with(&argv[0], |e| e.args(&argv[1..]).timeout(OUTPUT_LIMIT)).await?;
+        if !out.status().success {
+            return Err(Error::Io(std::io::Error::other(format!("{} exited with an error", argv[0]))));
+        }
+        Ok(out.stdout_bytes().to_vec())
     }
 
     /// Each process runs in the group wrapper, so a kill also ends its children.
@@ -583,6 +607,10 @@ pub mod fake {
         pub burst_sent: Arc<std::sync::atomic::AtomicUsize>,
         /// The sample of each VM key. A key with none has no sample yet.
         pub usage: Arc<Mutex<HashMap<String, Usage>>>,
+        /// The guest PID of the last PTY; each PTY gets the next one.
+        pub last_pid: Arc<std::sync::atomic::AtomicU32>,
+        /// The folder that the folder probe of a PID finds. A PID with none fails.
+        pub guest_folders: Arc<Mutex<HashMap<u32, String>>>,
     }
 
     pub struct FakePipe {
@@ -711,7 +739,7 @@ pub mod fake {
                 } else {
                     let _ = tx.try_send(PtyEvent::Exit(0));
                 }
-                return Ok(Pty { input, events });
+                return Ok(Pty { input, events, pid: GuestPid::default() });
             }
             let gate = self.pty_gate.lock().unwrap().clone();
             if let Some(gate) = gate {
@@ -759,7 +787,16 @@ pub mod fake {
                     }
                 }
             });
-            Ok(Pty { input, events })
+            let pid = GuestPid::default();
+            let _ = pid.set(self.last_pid.fetch_add(1, Ordering::SeqCst) + 1);
+            Ok(Pty { input, events, pid })
+        }
+
+        async fn output(&self, _: &FakeVm, argv: &[String]) -> Result<Vec<u8>> {
+            let folders = self.guest_folders.lock().unwrap();
+            let found = folders.iter().find(|(pid, _)| crate::terminal::probe::argv(**pid) == argv);
+            let (_, folder) = found.ok_or_else(|| Error::Io(std::io::Error::other("no such process")))?;
+            Ok(format!("{folder}\n").into_bytes())
         }
 
         async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str, env: &[(&str, &str)]) -> Result<Pipe> {

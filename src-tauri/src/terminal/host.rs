@@ -310,7 +310,7 @@ pub(crate) fn open_host_pty(
         let _ = events_tx.blocking_send(PtyEvent::Exit(code));
     });
 
-    Ok((Pty { input, events }, group))
+    Ok((Pty { input, events, pid: Default::default() }, group))
 }
 
 /// Waits until the process `pid` exits, and does not reap it.

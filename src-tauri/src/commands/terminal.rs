@@ -89,5 +89,5 @@ pub fn terminal_history(manager: Managed<'_>, session_id: String, terminal_id: S
 /// exited processes, and it opens no process.
 #[tauri::command]
 pub async fn terminal_folders(manager: Managed<'_>, ids: Vec<String>) -> Result<HashMap<String, FolderReport>> {
-    Ok(manager.terminal_folders(&ids))
+    Ok(manager.terminal_folders(&ids).await)
 }

@@ -212,6 +212,17 @@ pub(crate) async fn until(mut done: impl FnMut() -> bool) {
     .expect("condition not met");
 }
 
+/// As [`until`], with a condition that awaits.
+pub(crate) async fn until_async(mut done: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !done().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("condition not met");
+}
+
 pub(crate) fn terminal_ids(manager: &Manager<FakeRuntime>) -> Vec<String> {
     manager.list().sessions[0].session.terminals.iter().map(|t| t.id.clone()).collect()
 }

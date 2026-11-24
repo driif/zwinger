@@ -577,9 +577,10 @@ pub fn wrapper(kind: AgentKind, found: Found, unprompted: bool) -> Option<String
 /// URL-encoded byte by byte; bash can read a byte as a negative number. A second read adds no second emitter.
 ///
 /// An interactive bash also points `ZDOTDIR` at [`ZSH_DIR`], so a zsh that
-/// starts from it reads the files of [`zsh_files`], also before the system
-/// zshenv has [`ZSH_LINE`]. The user's own `ZDOTDIR` goes to
-/// `ZWINGER_ZDOTDIR`. Without the zsh file, `ZDOTDIR` stays as it is.
+/// starts from it reads the files of [`zsh_files`]. The user's own `ZDOTDIR`
+/// goes to `ZWINGER_ZDOTDIR`. Without the zsh file, `ZDOTDIR` stays as it is.
+/// A shell that reports no OSC 7, such as a zsh started from a zsh, has its
+/// folder from the guest's process tree ([`crate::terminal::probe`]).
 const OSC7_EMITTER: &str = r#"if [ -n "${BASH_VERSION-}" ]; then
   __zw_osc7() {
     local LC_ALL=C path= c n i=0
@@ -637,9 +638,9 @@ const ZSH_EMITTER: &str = r#"__zw_osc7() {
 
 /// `enter.zsh` in [`ZSH_DIR`]. An interactive zsh that reads startup files
 /// gets [`ZSH_DIR`] as `ZDOTDIR`, and the user's `ZDOTDIR` goes to
-/// `ZWINGER_ZDOTDIR`. The system zshenv reads it through [`ZSH_LINE`], and
-/// the files of [`zsh_files`] read it after each user file. A `zsh -f`
-/// gets the user's `ZDOTDIR` back.
+/// `ZWINGER_ZDOTDIR`. The files of [`zsh_files`] read it after each user
+/// file. A `zsh -f` gets the user's `ZDOTDIR` back. No system file of the
+/// guest reads it.
 const ZSH_ENTER: &str = r#"if [[ ${ZDOTDIR-} == ZSH_DIR ]]; then
   if [[ ! -o rcs ]]; then
     if (( ${+ZWINGER_ZDOTDIR} )); then ZDOTDIR=$ZWINGER_ZDOTDIR; unset ZWINGER_ZDOTDIR; else unset ZDOTDIR; fi
@@ -655,15 +656,10 @@ elif [[ -o interactive && -o rcs ]] && (( ! ${+functions[__zw_osc7]} )) && [[ -r
 fi
 "#;
 
-/// The line that the first interactive zsh adds to the system zshenv, so a
-/// zsh that starts from a zsh reads [`ZSH_ENTER`] too.
-const ZSH_LINE: &str = "[[ -r ZSH_DIR/enter.zsh ]] && builtin source ZSH_DIR/enter.zsh";
-
 /// The functions of `.zshenv` in [`ZSH_DIR`]. `__zw_back` gives the user's
 /// `ZDOTDIR` back. `__zw_done` ends the startup: an interactive zsh then
 /// adds the emitter to `precmd_functions` after the user's last file, so a
-/// `precmd_functions=(...)` in the user's `.zshrc` keeps it. It also adds
-/// [`ZSH_LINE`] once to the system zshenv if the file is writable.
+/// `precmd_functions=(...)` in the user's `.zshrc` keeps it.
 const ZSH_HELPERS: &str = r#"  __zw_back() {
     if (( ${+ZWINGER_ZDOTDIR} )); then ZDOTDIR=$ZWINGER_ZDOTDIR; unset ZWINGER_ZDOTDIR; else unset ZDOTDIR; fi
   }
@@ -673,11 +669,6 @@ const ZSH_HELPERS: &str = r#"  __zw_back() {
     [[ -o interactive ]] || return 0
 EMITTER
     (( ${precmd_functions[(Ie)__zw_osc7]} )) || precmd_functions+=(__zw_osc7)
-    local f=/etc/zshenv line='LINE'
-    [[ -d /etc/zsh ]] && f=/etc/zsh/zshenv
-    if [[ -f $f && -w $f && $(<$f) != *"$line"* ]]; then
-      print -rl -- '' "$line" >>$f
-    fi
   }
 "#;
 
@@ -696,7 +687,7 @@ fn zsh_files() -> Vec<(String, String)> {
              [[ ${{ZDOTDIR-}} == ZSH_DIR ]] || __zw_done\nfi\n"
         );
         let emitter: String = ZSH_EMITTER.lines().map(|line| format!("    {line}\n")).collect();
-        let body = body.replace("EMITTER\n", &emitter).replace("LINE", ZSH_LINE);
+        let body = body.replace("EMITTER\n", &emitter);
         (format!("{ZSH_DIR}/{name}"), body.replace("ZSH_DIR", ZSH_DIR))
     };
     vec![
@@ -1628,7 +1619,6 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let folder = folder.to_str().unwrap();
         let encoded = format!("{}/a%20b/%C3%A4%25", temp.0.to_str().unwrap());
-        let line = ZSH_LINE.replace("ZSH_DIR", &zsh_dir);
         for user in [None, Some(temp.path("custom"))] {
             let home = temp.path(if user.is_some() { "home2" } else { "home" });
             let dotdir = user.clone().unwrap_or_else(|| home.clone());
@@ -1666,8 +1656,8 @@ mod tests {
                     files
                 );
             }
-            // The first interactive zsh adds the line once to the system zshenv.
-            assert_eq!(std::fs::read_to_string(&system).unwrap(), format!("# distro\n\n{line}\n"));
+            // No zsh changes the system zshenv.
+            assert_eq!(std::fs::read_to_string(&system).unwrap(), "# distro\n");
             // A noninteractive zsh reads the user's .zshenv, adds no hook and prints nothing else.
             let (out, err) = zsh(
                 &zsh_dir,
@@ -1688,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn the_system_zshenv_line_gives_an_interactive_zsh_the_zwinger_dir() {
+    fn enter_zsh_gives_an_interactive_zsh_the_zwinger_dir() {
         let temp = Temp::new("zsh-enter");
         let zsh_dir = temp.path("zwinger");
         let user = temp.path("user");

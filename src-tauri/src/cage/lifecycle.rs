@@ -2485,4 +2485,42 @@ mod tests {
         // The published port stops with the VM.
         assert!(crate::cage::host_port_free(published));
     }
+
+    /// A VM shell's folder follows a nested shell that reports no OSC 7.
+    /// Needs microsandbox: `cargo test -- --ignored live_`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_vm_shell_folder_follows_the_foreground_process() {
+        use crate::runtime::{Microsandbox, TerminalKind};
+
+        let (folder, pi, data) = (temp_dir(), temp_dir(), temp_dir());
+        std::fs::create_dir(folder.join("nested")).unwrap();
+        let manager = Manager::new(Microsandbox { pi }, Store::new(data.clone()), vault(), data, host()).unwrap();
+        let id = manager.create(folder.to_str().unwrap(), None).unwrap();
+        manager.start(&id).await.unwrap();
+        let process = manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
+        let ids = [process.clone()];
+        let folder_now = async || manager.terminal_folders(&ids).await.get(&process).and_then(|r| r.folder.clone());
+        let mut seen = Vec::new();
+        // bash reports /workspace; the nested dash reports nothing.
+        for (input, want) in
+            [("", "/workspace"), ("exec 2>&1; sh\n", "/workspace"), ("cd nested\n", "/workspace/nested")]
+        {
+            manager.write(&process, input.as_bytes().to_vec()).unwrap();
+            let mut found = None;
+            for _ in 0..50 {
+                found = folder_now().await;
+                if found.as_ref().is_some_and(|f| f.path == std::path::Path::new(want)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            seen.push(found.clone());
+            assert_eq!(found.map(|f| f.path), Some(want.into()), "{seen:?}");
+        }
+        let terminal = manager.list().sessions[0].session.terminals[0].id.clone();
+        let (opened, known) = manager.editor_folder(&id, Some(&terminal)).await.unwrap();
+        assert_eq!((opened, known), (folder.join("nested"), true));
+        manager.stop(&id, None).await.unwrap();
+    }
 }

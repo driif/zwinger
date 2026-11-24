@@ -247,22 +247,22 @@ is not on the Mac or is unknown, it names the project folder and the reason, for
 in Zed (VM folder /etc is not on the Mac)**. zwinger reads the folder again when you open it. While **Cages**, a round
 folder room or a different screen covers the terminals, the command menu and ⌘⇧E open the project folder.
 
-A VM shell starts in bash. When you install zsh or fish in the VM and start it from the VM shell (for example `zsh`
-or `exec fish`), it also reports its folder at each prompt, and Open in editor follows `cd`. The VM does not need
-zsh or fish when the project starts. zwinger does not change your shell config files. It adds files of its own, and
-one line to the system zshenv:
+A VM shell starts in bash. zwinger reads the folder of the program that runs in the foreground of the terminal from
+the VM, when you open the editor and while the terminal shows. So each shell has its folder: a zsh or fish that you
+start from bash or from a different shell, `/bin/zsh`, `zsh -f`, `sh`, and a program such as `vim` that you start in
+a folder. zwinger changes no file of the VM's system packages and none of your shell config files.
 
-- zsh: zsh reads your `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin` as usual, from your `ZDOTDIR` or your home
-  folder. zwinger adds its prompt hook after your last startup file, so a `precmd_functions=(...)` in your `.zshrc`
-  keeps it. To start zsh, the VM shell gives zsh a zwinger folder as `ZDOTDIR`, and zsh then puts your own
-  `ZDOTDIR` back. The first interactive zsh also adds one line to the system zshenv (`/etc/zsh/zshenv`, or
-  `/etc/zshenv` if there is no `/etc/zsh`), so a zsh that you start from a zsh also reports its folder. The line
-  remains in that VM. On Debian and Ubuntu, a zsh upgrade can ask how to handle the changed file. If the file
-  does not exist or you cannot write it, only a zsh that starts from bash reports its folder. `zsh -f` skips your
-  startup files and does not report its folder.
+A shell also reports its folder at each prompt, so the folder in the pane header changes at once after `cd`:
+
+- bash: zwinger adds a prompt hook from `/etc/profile.d`.
+- zsh that starts from the VM shell: zsh reads your `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin` as usual, from
+  your `ZDOTDIR` or your home folder. zwinger adds its prompt hook after your last startup file, so a
+  `precmd_functions=(...)` in your `.zshrc` keeps it. To start zsh, the VM shell gives zsh a zwinger folder as
+  `ZDOTDIR`, and zsh then puts your own `ZDOTDIR` back.
 - fish 3: zwinger adds `/etc/fish/conf.d/zwinger.fish`. fish packages that use `/etc/fish` read it (Debian, Ubuntu,
-  Alpine and others). A fish that you build with a different prefix does not read it. fish 4 reports its folder
-  itself, and zwinger adds no second report.
+  Alpine and others). fish 4 reports its folder itself, and zwinger adds no second report.
+
+A shell with no prompt report, such as a zsh that you start from a zsh, shows its new folder within 2 seconds while the terminal shows.
 
 Your prompt and your own prompt hooks stay as they are.
 

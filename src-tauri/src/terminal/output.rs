@@ -518,7 +518,7 @@ pub(crate) async fn pump<V>(
             return;
         }
         if moved
-            && let Ok((seq, folder)) = resolve_folder(&state, &id)
+            && let Ok((seq, folder)) = resolve_folder(&state, &id, None)
             && let Some((seq, true)) = keep_folder(&output, &folder, seq)
             && let Some(sink) = folders.get()
         {
