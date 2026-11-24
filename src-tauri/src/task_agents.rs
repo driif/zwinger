@@ -398,6 +398,8 @@ pub struct Exec<R: SandboxRuntime> {
     pub runtime: R,
     pub vm: Arc<R::Vm>,
     pub cwd: String,
+    /// The session's guest folder, in [`launch::CODE_ENV`] of each process.
+    pub code: String,
     /// The folder that the git check and the diff cover: the session's guest
     /// folder when `cwd` is in it, else `cwd` in its mount.
     pub scope: String,
@@ -456,8 +458,11 @@ impl<R: SandboxRuntime> Exec<R> {
         if *cancel.borrow() {
             return Err(Failure::Cancelled);
         }
-        let mut pipe =
-            self.runtime.open_pipe(&self.vm, argv, &self.cwd).await.map_err(|e| Failure::Start(e.to_string()))?;
+        let mut pipe = self
+            .runtime
+            .open_pipe(&self.vm, argv, &self.cwd, &[(launch::CODE_ENV, &self.code)])
+            .await
+            .map_err(|e| Failure::Start(e.to_string()))?;
         let _ = pipe.input.send(PipeInput::Data(input.to_vec())).await;
         let _ = pipe.input.send(PipeInput::Close).await;
         let hard = Instant::now() + limits.hard;
@@ -900,6 +905,7 @@ mod tests {
             runtime: crate::runtime::fake::FakeRuntime::default(),
             vm: Arc::new(crate::runtime::fake::FakeVm { key: "s".into() }),
             cwd: "/s".into(),
+            code: "/s".into(),
             scope: "/s".into(),
             artifacts: Some("/s/.zwinger/tasks/fix/02".into()),
             pi_host: false,
@@ -1318,6 +1324,7 @@ mod limit_tests {
             runtime,
             vm: Arc::new(FakeVm { key: "s".into() }),
             cwd: "/workspace".into(),
+            code: "/workspace".into(),
             scope: "/workspace".into(),
             artifacts: None,
             pi_host: false,

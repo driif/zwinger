@@ -37,7 +37,7 @@ export function PublishedPorts({ cage, vm, run }: Props) {
     const guestPort = parsePort(guest);
     const hostPort = host.trim() === "" ? guestPort : parsePort(host);
     if (guestPort === undefined || hostPort === undefined) return setProblem("Use ports from 1 to 65535.");
-    save([...ports, { guest: guestPort, host: hostPort, on: true }], () => {
+    save([...ports, { guest: guestPort, host: hostPort, on: false }], () => {
       setGuest("");
       setHost("");
     });
@@ -53,8 +53,8 @@ export function PublishedPorts({ cage, vm, run }: Props) {
       <CardBody className="stack">
         <Notice icon={<TriangleAlert size={14} />}>
           A published port listens on 127.0.0.1 only: other computers cannot connect. But each app and each user on this
-          Mac can connect, and so can web pages in your browser. Publish only a server that you trust. Turn the port off
-          when you do not use it.
+          Mac can connect, and so can web pages in your browser. A new port is off: turn it on only for a server that you
+          trust. Turn the port off when you do not use it; the port closes when the VM restarts.
         </Notice>
         {ports.length === 0 && <p className="muted">No published ports. Nothing on this Mac can connect to the VM.</p>}
         <ul className="list">
@@ -62,7 +62,9 @@ export function PublishedPorts({ cage, vm, run }: Props) {
             const live = applied.some((p) => p.guest === port.guest && p.host === port.host);
             const url = `http://localhost:${port.host}`;
             const state = live
-              ? "published"
+              ? port.on
+                ? "published"
+                : "still published until the VM restarts"
               : !port.on
                 ? "off"
                 : vm?.status.state === "running"

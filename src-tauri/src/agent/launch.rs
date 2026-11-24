@@ -317,6 +317,10 @@ const TTY: &str = "[ -t 0 ] && [ -t 1 ]";
 /// hooks in a new session with no `/dev/tty`, so the hooks write here. A
 /// wrapper with no terminal unsets it, so a nested headless agent stays quiet.
 pub(crate) const TTY_ENV: &str = "ZWINGER_TTY";
+/// The session's guest folder of the code, in each process that a terminal or
+/// a task starts in a VM. The folder depends on the VM members at the start
+/// (ADR 0007), so the harness template names this var, not a path.
+pub(crate) const CODE_ENV: &str = "ZWINGER_CODE";
 /// The value of [`TTY_ENV`]. A test replaces it.
 const TTY_NAME: &str = "\"$(tty)\"";
 /// The state value that clears the state: the agent has exited.

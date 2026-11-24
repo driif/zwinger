@@ -3,8 +3,9 @@ title: Network
 description: Control the hosts that the agent can reach, and give it credentials.
 ---
 
-All network traffic of a cage goes through the proxy of its project. The VM can reach only the proxy. Connections from
-the outside into the cage are always blocked.
+All network traffic that a cage starts goes through the proxy of its project. The VM can reach only the proxy. Connections from
+the outside into the cage are blocked, except to a [published port](/cages/#published-ports): this Mac can connect to it
+on `127.0.0.1` only. That traffic does not go through the proxy and is not in Activity.
 
 ## Network policy
 

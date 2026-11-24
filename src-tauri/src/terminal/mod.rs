@@ -427,32 +427,34 @@ impl<R: SandboxRuntime> Manager<R> {
             );
         }
         let argv = kind.vm_argv().ok_or(Error::NotRunning)?;
-        let (key, vm, cwd, applied) = {
+        let (key, vm, cwd, code, applied) = {
             let state = lock(&self.state);
             state.session(session_id)?;
             match state.vm_of(session_id) {
                 Some((key, Vm::Running { vm, applied, runtimes, host, .. })) => {
                     let cwd = guest_start(&applied.0, session_id, kind).ok_or(Error::NotRunning)?;
+                    let (_, code, _) = task_guest_folder(&applied.0, session_id).ok_or(Error::NotRunning)?;
                     if let TerminalKind::Agent { agent, .. } = kind
                         && !mounted(runtimes).contains(&agent)
                     {
                         return Err(self.unmounted(agent, host));
                     }
-                    (key.to_owned(), vm.clone(), cwd, applied.clone())
+                    (key.to_owned(), vm.clone(), cwd, code, applied.clone())
                 }
                 _ => return Err(Error::NotRunning),
             }
         };
         let start = TerminalFolder::guest(cwd.clone(), &applied);
-        let pty = self.runtime.open_pty(&vm, &argv, &cwd, rows, cols).await?;
+        let pty = self.runtime.open_pty(&vm, &argv, &cwd, &[(launch::CODE_ENV, &code)], rows, cols).await?;
         let fresh = fresh_kind(kind).and_then(|fresh| {
             let argv = fresh.vm_argv()?;
-            let (state, runtime, vm, key, cwd) =
-                (self.state.clone(), self.runtime.clone(), vm.clone(), key.clone(), cwd.clone());
+            let (state, runtime, vm, key, cwd, code) =
+                (self.state.clone(), self.runtime.clone(), vm.clone(), key.clone(), cwd.clone(), code.clone());
             Some(Box::new(move |id: String| {
                 Box::pin(async move {
                     let (rows, cols) = lock(&state).process(&id).ok()?.size;
-                    let pty = runtime.open_pty(&vm, &argv, &cwd, rows, cols).await.ok()?;
+                    let pty =
+                        runtime.open_pty(&vm, &argv, &cwd, &[(launch::CODE_ENV, &code)], rows, cols).await.ok()?;
                     let mut state = lock(&state);
                     match state.vms.get(&key) {
                         Some(Vm::Running { vm: current, .. }) if Arc::ptr_eq(current, &vm) => {
@@ -1694,6 +1696,8 @@ mod tests {
         manager.open_session(&id, agent(AgentKind::Pi, false), 24, 80).await.unwrap();
         manager.open_session(&id, TerminalKind::Shell, 24, 80).await.unwrap();
         assert_eq!(*runtime.cwds.lock().unwrap(), ["/workspace", "/workspace/agent", "/workspace"]);
+        let code = vec![("ZWINGER_CODE".to_owned(), "/workspace".to_owned())];
+        assert_eq!(*runtime.envs.lock().unwrap(), [code.clone(), code.clone(), code]);
     }
 
     #[tokio::test]

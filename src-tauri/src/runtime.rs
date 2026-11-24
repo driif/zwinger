@@ -164,16 +164,24 @@ pub trait SandboxRuntime: Send + Sync + Clone + 'static {
         binds: &[Bind],
     ) -> impl Future<Output = Result<Self::Vm>> + Send;
     fn stop(&self, vm: &Self::Vm) -> impl Future<Output = Result<()>> + Send;
+    /// Runs `argv` in a terminal, with [`PTY_ENV`] and `env`.
     fn open_pty(
         &self,
         vm: &Self::Vm,
         argv: &[String],
         cwd: &str,
+        env: &[(&str, &str)],
         rows: u16,
         cols: u16,
     ) -> impl Future<Output = Result<Pty>> + Send;
-    /// Runs `argv` with stdin, stdout and stderr as pipes.
-    fn open_pipe(&self, vm: &Self::Vm, argv: &[String], cwd: &str) -> impl Future<Output = Result<Pipe>> + Send;
+    /// Runs `argv` with stdin, stdout and stderr as pipes, with `env`.
+    fn open_pipe(
+        &self,
+        vm: &Self::Vm,
+        argv: &[String],
+        cwd: &str,
+        env: &[(&str, &str)],
+    ) -> impl Future<Output = Result<Pipe>> + Send;
     /// Stops and removes the VMs that an earlier app run left behind.
     /// Returns the names of the VMs that it removed.
     fn reap(&self) -> impl Future<Output = Result<Vec<String>>> + Send;
@@ -345,11 +353,20 @@ impl SandboxRuntime for Microsandbox {
         Ok(netlog::tail(path).await?)
     }
 
-    async fn open_pty(&self, vm: &Sandbox, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
+    async fn open_pty(
+        &self,
+        vm: &Sandbox,
+        argv: &[String],
+        cwd: &str,
+        env: &[(&str, &str)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<Pty> {
         let mut handle = vm
             .exec_stream_with(&argv[0], |e| {
                 PTY_ENV
                     .iter()
+                    .chain(env)
                     .fold(e.args(&argv[1..]).cwd(cwd), |e, (name, value)| e.env(*name, *value))
                     .tty(true)
                     .stdin_pipe()
@@ -399,9 +416,13 @@ impl SandboxRuntime for Microsandbox {
     }
 
     /// Each process runs in the group wrapper, so a kill also ends its children.
-    async fn open_pipe(&self, vm: &Sandbox, argv: &[String], cwd: &str) -> Result<Pipe> {
+    async fn open_pipe(&self, vm: &Sandbox, argv: &[String], cwd: &str, env: &[(&str, &str)]) -> Result<Pipe> {
         let argv = group_argv(argv);
-        let mut handle = vm.exec_stream_with(&argv[0], |e| e.args(&argv[1..]).cwd(cwd).stdin_pipe()).await?;
+        let mut handle = vm
+            .exec_stream_with(&argv[0], |e| {
+                env.iter().fold(e.args(&argv[1..]).cwd(cwd), |e, (name, value)| e.env(*name, *value)).stdin_pipe()
+            })
+            .await?;
         let sink = handle.take_stdin().ok_or(Error::AgentClosed)?;
         let control = handle.control();
 
@@ -488,6 +509,8 @@ pub mod fake {
         pub pty_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         pub cwds: Arc<Mutex<Vec<String>>>,
         pub argvs: Arc<Mutex<Vec<Vec<String>>>>,
+        /// The `env` of each open that `cwds` records, in the same order.
+        pub envs: Arc<Mutex<Vec<Env>>>,
         pub start_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
         /// Holds each stop before it ends.
         pub stop_gate: Arc<Mutex<Option<Arc<PtyGate>>>>,
@@ -552,6 +575,13 @@ pub mod fake {
     pub struct PtyGate {
         pub entered: Notify,
         pub release: Notify,
+    }
+
+    /// The env of one open, as names and values.
+    pub type Env = Vec<(String, String)>;
+
+    fn owned_env(env: &[(&str, &str)]) -> Env {
+        env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()
     }
 
     pub struct FakeVm {
@@ -631,8 +661,17 @@ pub mod fake {
             Ok(rx)
         }
 
-        async fn open_pty(&self, _: &FakeVm, argv: &[String], cwd: &str, rows: u16, cols: u16) -> Result<Pty> {
+        async fn open_pty(
+            &self,
+            _: &FakeVm,
+            argv: &[String],
+            cwd: &str,
+            env: &[(&str, &str)],
+            rows: u16,
+            cols: u16,
+        ) -> Result<Pty> {
             self.cwds.lock().unwrap().push(cwd.to_owned());
+            self.envs.lock().unwrap().push(owned_env(env));
             self.argvs.lock().unwrap().push(argv.to_vec());
             // The TUI probe of the host pi ends at once: with an error, or as if pi had started.
             if argv.last().is_some_and(|a| a == "--no-session") {
@@ -696,7 +735,7 @@ pub mod fake {
             Ok(Pty { input, events })
         }
 
-        async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str) -> Result<Pipe> {
+        async fn open_pipe(&self, _: &FakeVm, argv: &[String], cwd: &str, env: &[(&str, &str)]) -> Result<Pipe> {
             let (input, stdin) = mpsc::channel(PIPE_QUEUE);
             let (out, events) = mpsc::channel(PIPE_QUEUE);
             if (argv == ["node", "--version"] || argv == launch::trust_argv())
@@ -749,6 +788,7 @@ pub mod fake {
                 gate.release.notified().await;
             }
             self.cwds.lock().unwrap().push(cwd.to_owned());
+            self.envs.lock().unwrap().push(owned_env(env));
             self.pipes.lock().unwrap().push(FakePipe { argv: argv.to_vec(), stdin, out });
             Ok(Pipe { input, events })
         }

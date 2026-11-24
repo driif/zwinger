@@ -1201,8 +1201,9 @@ impl<R: SandboxRuntime> Manager<R> {
 
     /// Makes the host folder `folder` with the harness template for `agents`
     /// and sets it as the harness of the session. A folder below the project
-    /// folder or a mount needs no new mount; else it gets a read-write mount
-    /// at `/mnt/<name>`, with the checks of [`Self::add_mount`]. Returns the
+    /// folder or a read-write mount needs no new mount, and a folder in a
+    /// read-only mount is refused; else it gets a read-write mount at
+    /// `/mnt/<name>`, with the checks of [`Self::add_mount`]. Returns the
     /// stored harness path.
     pub fn create_harness(&self, session_id: &str, folder: &str, agents: &[AgentKind]) -> Result<String> {
         let raw = Path::new(folder);
@@ -1224,20 +1225,23 @@ impl<R: SandboxRuntime> Manager<R> {
 
     fn place_harness(&self, session_id: &str, folder: &str, agents: &[AgentKind]) -> Result<String> {
         let (host, _) = cage::host_dir_with_id(folder)?;
-        let (cage_id, harness, mount, code) = {
+        let (cage_id, harness, mount) = {
             let state = lock(&self.state);
             let Bound { session, cage } = state.bound(session_id)?;
             if host == session.folder {
                 return Err(Error::HarnessIsProject(folder.to_owned()));
             }
+            // The deepest mount that holds the folder decides.
             let in_mount = cage
                 .mounts
                 .iter()
-                .filter_map(|m| host.strip_prefix(&m.host).ok().map(|rel| Path::new(&m.guest).join(rel)))
-                .max_by_key(|p| p.as_os_str().len());
+                .filter_map(|m| host.strip_prefix(&m.host).ok().map(|rel| (m.host.as_os_str().len(), m, rel)))
+                .max_by_key(|(len, ..)| *len)
+                .map(|(_, m, rel)| (Path::new(&m.guest).join(rel), m.readonly));
             let (harness, mount) = match (host.strip_prefix(&session.folder), in_mount) {
                 (Ok(rel), _) => (Path::new(WORKSPACE).join(rel).display().to_string(), None),
-                (_, Some(path)) => (path.display().to_string(), None),
+                (_, Some((_, true))) => return Err(Error::HarnessInReadonlyMount),
+                (_, Some((path, false))) => (path.display().to_string(), None),
                 _ => {
                     let base = host.file_name().map_or("harness".into(), |n| n.to_string_lossy());
                     let guest = (1..)
@@ -1247,22 +1251,12 @@ impl<R: SandboxRuntime> Manager<R> {
                     (guest.clone(), Some(guest))
                 }
             };
-            let running = match state.vm_of(session_id) {
-                Some((_, Vm::Running { applied, .. })) => task_guest_folder(&applied.0, session_id).map(|(_, f, _)| f),
-                _ => None,
-            };
-            let code = running.unwrap_or_else(|| {
-                let key = cage::vm_key(session, cage);
-                let shared = key.is_some()
-                    && state.sessions_of(&cage.id).iter().any(|s| s.id != session.id && cage::vm_key(s, cage) == key);
-                if shared { format!("{WORKSPACE}/{}", session.slug) } else { WORKSPACE.to_owned() }
-            });
-            (cage.id.clone(), harness, mount, code)
+            (cage.id.clone(), harness, mount)
         };
         if let Some(guest) = mount {
             self.add_mount(&cage_id, &host.display().to_string(), &guest, false)?;
         }
-        crate::harness::write_template(&host, &code, agents)?;
+        crate::harness::write_template(&host, agents)?;
         self.set_harness(session_id, Some(&harness))?;
         Ok(harness)
     }
@@ -1931,6 +1925,28 @@ mod tests {
         assert!(matches!(manager.create_harness(&id, project.to_str().unwrap(), &[]), Err(Error::HarnessIsProject(_))));
     }
 
+    #[test]
+    fn create_harness_uses_only_a_read_write_mount() {
+        let (manager, _, id) = manager();
+        let (readonly, writable) = (temp_dir(), temp_dir());
+        manager.add_mount(&id, readonly.to_str().unwrap(), "/mnt/ro", true).unwrap();
+        manager.add_mount(&id, writable.to_str().unwrap(), "/mnt/rw", false).unwrap();
+
+        let refused = readonly.join("harness");
+        let error = manager.create_harness(&id, refused.to_str().unwrap(), &[]).unwrap_err();
+        assert!(matches!(error, Error::HarnessInReadonlyMount));
+        assert_eq!(
+            error.message(),
+            "The folder is in a read-only mount; choose another folder or make the mount read-write."
+        );
+        assert!(!refused.exists());
+        assert_eq!(manager.list().sessions[0].session.harness, None);
+
+        let harness = manager.create_harness(&id, writable.join("harness").to_str().unwrap(), &[]).unwrap();
+        assert_eq!(harness, "/mnt/rw/harness");
+        assert_eq!(manager.list().cages[0].cage.mounts.len(), 2);
+    }
+
     #[tokio::test]
     async fn rename_while_running_needs_no_restart() {
         let (manager, _, id) = manager();
@@ -2511,6 +2527,13 @@ mod tests {
         // Each terminal starts in its own session's guest folder.
         manager.open_session(&b, TerminalKind::Shell, 24, 80).await.unwrap();
         assert_eq!(runtime.cwds.lock().unwrap().last(), Some(&format!("{WORKSPACE}/{}", sb.slug)));
+        let code = |folder: &str| vec![("ZWINGER_CODE".to_owned(), folder.to_owned())];
+        assert_eq!(runtime.envs.lock().unwrap().last(), Some(&code(&format!("{WORKSPACE}/{}", sb.slug))));
+        // An agent starts in its harness, and `ZWINGER_CODE` names its code.
+        let pi = TerminalKind::Agent { agent: AgentKind::Pi, resume: false };
+        manager.open_session(&a, pi, 24, 80).await.unwrap();
+        assert_eq!(runtime.cwds.lock().unwrap().last(), Some(&format!("{folder_a}/src")));
+        assert_eq!(runtime.envs.lock().unwrap().last(), Some(&code(&folder_a)));
 
         // A stop or a delete that also ends the other member asks first.
         let Err(Error::StopShared { members, generation, .. }) = manager.stop(&a, None).await else {

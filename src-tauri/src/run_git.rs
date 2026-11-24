@@ -1466,6 +1466,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 runtime: self.runtime.clone(),
                 vm: vm.clone(),
                 cwd: origin.workdir.clone(),
+                code: folder.clone(),
                 scope: origin.scope.clone(),
                 artifacts: Some(guest_artifacts(&folder, &slug, run)),
                 pi_host: false,

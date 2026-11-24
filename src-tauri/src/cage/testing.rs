@@ -332,7 +332,7 @@ pub(crate) fn put_codex_login(manager: &Manager<FakeRuntime>, id: &str) -> PathB
 /// stdout; after a failure also the stderr.
 pub(crate) async fn sh<R: SandboxRuntime>(manager: &Manager<R>, vm: &R::Vm, script: &str) -> (i32, String) {
     let argv = ["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()];
-    let mut pipe = manager.runtime.open_pipe(vm, &argv, WORKSPACE).await.unwrap();
+    let mut pipe = manager.runtime.open_pipe(vm, &argv, WORKSPACE, &[]).await.unwrap();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut code = -1;
     while let Some(event) = pipe.events.recv().await {

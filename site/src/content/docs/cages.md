@@ -173,19 +173,21 @@ Published ports** of a project, or **Cages > Edit**, publishes a guest port on t
 1. Type the **Guest port**, the port where the server listens in the VM. The server must listen on `0.0.0.0` or on
    the VM's address, not only on `127.0.0.1` of the VM.
 2. Optional: type the **Port on this Mac**. Empty means the same port as the guest port.
-3. Click **Publish**, then restart the VM.
-4. Click **Open** to open `http://localhost:<port>` in your browser.
+3. Click **Publish**. The new port is off.
+4. Turn the port on, then restart the VM.
+5. Click **Open** to open `http://localhost:<port>` in your browser.
 
 :::caution
 A published port listens on `127.0.0.1` only, so other computers cannot connect. But each app and each user on this
-Mac can connect, and so can web pages in your browser. Publish only a server that you trust, and turn the port off
-when you do not use it.
+Mac can connect, and so can web pages in your browser. Turn on only a server that you trust, and turn the port off
+when you do not use it. A port that you turn off stays open until the VM restarts.
 :::
 
-- A port is off or on. A new port is on. Off keeps the port in the list.
+- A port is off or on. A new port is off. Off keeps the port in the list.
 - A cage has at most 16 ports. A guest port and a port on this Mac can each occur once in a cage.
 - zwinger refuses to save a port on this Mac that a different program uses.
-- The next start of a VM applies a change. A running VM keeps its ports until it restarts.
+- The next start of a VM applies a change. A running VM keeps its ports until it restarts: a port that you turn off
+  shows "still published until the VM restarts".
 - At the start, zwinger skips a port that is now in use and shows a notice. The VM starts without that port. When
   projects of one cage have their own VMs, only the first VM that starts gets the port.
 - The port closes when the VM stops.

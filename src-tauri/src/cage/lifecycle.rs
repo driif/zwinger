@@ -765,7 +765,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// pi needs a newer Node than some `node:22-slim` images have.
     pub(crate) async fn check_node(&self, vm: &R::Vm) -> Result<()> {
         let argv = ["node".to_owned(), "--version".to_owned()];
-        let mut pipe = self.runtime.open_pipe(vm, &argv, WORKSPACE).await?;
+        let mut pipe = self.runtime.open_pipe(vm, &argv, WORKSPACE, &[]).await?;
         let mut out = Vec::new();
         let read = async {
             while let Some(event) = pipe.events.recv().await {
@@ -836,7 +836,7 @@ impl<R: SandboxRuntime> Manager<R> {
     /// Checks that `argv` runs in the VM and ends with code 0. The error is
     /// the end of its stderr.
     pub(crate) async fn probe(&self, vm: &R::Vm, argv: &[String]) -> std::result::Result<(), String> {
-        let mut pipe = self.runtime.open_pipe(vm, argv, WORKSPACE).await.map_err(|e| e.to_string())?;
+        let mut pipe = self.runtime.open_pipe(vm, argv, WORKSPACE, &[]).await.map_err(|e| e.to_string())?;
         let mut err = Vec::new();
         let read = async {
             while let Some(event) = pipe.events.recv().await {
@@ -866,7 +866,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let mut argv = launch::command(AgentKind::Pi, found, None).expect("pi has a program");
         argv.push("--no-session".to_owned());
         let (rows, cols) = TUI_PROBE_SIZE;
-        let mut pty = self.runtime.open_pty(vm, &argv, WORKSPACE, rows, cols).await.map_err(|e| e.to_string())?;
+        let mut pty = self.runtime.open_pty(vm, &argv, WORKSPACE, &[], rows, cols).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         let read = async {
             while let Some(event) = pty.events.recv().await {

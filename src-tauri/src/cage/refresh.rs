@@ -221,7 +221,7 @@ impl<R: SandboxRuntime> Manager<R> {
         let runtime = self.runtime.clone();
         tauri::async_runtime::spawn(async move {
             for vm in vms {
-                let flushed = runtime.open_pipe(&vm, &launch::flush_argv(), crate::cage::WORKSPACE).await;
+                let flushed = runtime.open_pipe(&vm, &launch::flush_argv(), crate::cage::WORKSPACE, &[]).await;
                 let mut pipe = match flushed {
                     Ok(pipe) => pipe,
                     Err(e) => {

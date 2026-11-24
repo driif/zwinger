@@ -40,15 +40,20 @@ zwinger writes these files. It never changes a file that exists:
 
 | File | For |
 | --- | --- |
-| `AGENTS.md` | All agents: the guest folder of the code, how to work, and where the task notes go. |
+| `AGENTS.md` | All agents: where the code is (`$ZWINGER_CODE`), how to work, and where the task notes go. |
 | `tasks/README.md` | All agents: one note file per task. |
 | `CLAUDE.md` (`@AGENTS.md`) and `.claude/skills/README.md` | Claude Code |
 | `GEMINI.md` (`@./AGENTS.md`) | Gemini CLI |
 | `.agents/skills/README.md` | Codex, pi and Gemini CLI |
 
-Then zwinger sets the folder as the harness. A folder in the project folder or in a mount needs no new mount. A
+Then zwinger sets the folder as the harness. A folder in the project folder or in a read-write mount needs no new
+mount. A folder in a read-only mount cannot be the harness: choose a different folder, or make the mount read-write. A
 different folder becomes a read-write [mount](/cages/) at `/mnt/<folder name>`, with the usual mount checks. The
 project folder itself cannot be the harness.
+
+Each agent, VM shell and task process in the cage has the environment variable `ZWINGER_CODE`: the folder of the code
+in the VM (`/workspace`, or `/workspace/<slug>` in a shared VM). The folder can change when a project joins or leaves a
+shared VM, so `AGENTS.md` names `$ZWINGER_CODE`, not a path.
 
 ## Agents with no cage
 

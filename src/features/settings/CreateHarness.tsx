@@ -58,7 +58,8 @@ export function CreateHarness({ session, cage, run }: Props) {
         <form className="stack" onSubmit={create}>
           <p className="muted">
             zwinger writes AGENTS.md, task notes and skill folders for the agents. It does not change a file that exists.
-            A folder outside the project folder and the mounts becomes a read-write mount.
+            A folder outside the project folder and the mounts becomes a read-write mount. A folder in a read-only mount
+            cannot be the harness.
           </p>
           <div className="row">
             <FloatingField

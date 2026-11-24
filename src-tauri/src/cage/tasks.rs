@@ -192,6 +192,7 @@ impl<R: SandboxRuntime> Manager<R> {
             runtime: self.runtime.clone(),
             vm,
             cwd: task.workdir.clone(),
+            code: folder.clone(),
             scope,
             artifacts: Some(guest_artifacts(&folder, &task.slug, &run)),
             pi_host,
@@ -322,6 +323,7 @@ impl<R: SandboxRuntime> Manager<R> {
             runtime: self.runtime.clone(),
             vm,
             cwd: task.workdir,
+            code: folder.clone(),
             scope,
             artifacts: Some(guest_artifacts(&folder, &task.slug, run)),
             // The diff runs git only.
@@ -917,6 +919,9 @@ mod tests {
         move_workdir(&manager, &id, &task_id);
         manager.run_diff(&id, &task_id, "01").await.unwrap();
         assert_eq!(manager.runtime.cwds.lock().unwrap().last(), Some(&format!("{folder}/sub")));
+        // A task process gets the session's guest folder, not its working dir.
+        let code = vec![("ZWINGER_CODE".to_owned(), folder)];
+        assert_eq!(manager.runtime.envs.lock().unwrap().last(), Some(&code));
     }
 
     #[tokio::test]

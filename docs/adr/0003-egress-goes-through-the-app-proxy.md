@@ -4,7 +4,7 @@ status: accepted
 
 # All shield egress goes through the app proxy
 
-A shield's microVM can reach only one port on the host: zwinger's own proxy for that shield. The proxy decides each request (offline, always-blocked addresses after DNS resolution on the Mac, Block rules, Allow rules, then the default), injects credentials, and logs every request. microsandbox's own network policy is kept only as the outer wall that allows that one port. This gives complete request logs, credentials that the guest never sees (also headers the agent does not send), host-login renewal without a restart, and one simple model for the user: a default plus Allow/Block exceptions, where Block always wins. The cost: a tool that ignores `HTTPS_PROXY` has no network (it fails closed), and the proxy is now security-critical code that zwinger owns.
+A shield's microVM can reach only one port on the host: zwinger's own proxy for that shield. The proxy decides each request (offline, always-blocked addresses after DNS resolution on the Mac, Block rules, Allow rules, then the default), injects credentials, and logs every request. microsandbox's own network policy is kept only as the outer wall that allows that one port. ADR 0010 amends this: the outer wall also allows ingress from the Mac's loopback to the published ports of a cage, not through the proxy. This gives complete request logs, credentials that the guest never sees (also headers the agent does not send), host-login renewal without a restart, and one simple model for the user: a default plus Allow/Block exceptions, where Block always wins. The cost: a tool that ignores `HTTPS_PROXY` has no network (it fails closed), and the proxy is now security-critical code that zwinger owns.
 
 ## Considered Options
 

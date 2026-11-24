@@ -39,6 +39,8 @@ pub enum Error {
     HarnessMount(String, String),
     #[error("{0} is the project folder; choose a different folder for the harness")]
     HarnessIsProject(String),
+    #[error("The folder is in a read-only mount; choose another folder or make the mount read-write")]
+    HarnessInReadonlyMount,
     #[error("{0} is not below /workspace or a mount")]
     GuestDirTarget(String),
     #[error("task {0} runs in {1}, which is not below /workspace or a mount")]

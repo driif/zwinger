@@ -446,7 +446,7 @@ impl<R: SandboxRuntime> Manager<R> {
                 .ok_or(Error::NotRunning)?
         };
         let argv = ["node", "-e", NET_TEST, host.as_str()].map(str::to_owned);
-        let mut pipe = self.runtime.open_pipe(&vm, &argv, WORKSPACE).await?;
+        let mut pipe = self.runtime.open_pipe(&vm, &argv, WORKSPACE, &[]).await?;
         let mut out = Vec::new();
         let read = async {
             while let Some(event) = pipe.events.recv().await {
