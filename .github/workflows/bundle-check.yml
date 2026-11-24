@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       actool_only:
-        description: Run only the actool probe on the adaptive icon (no app build)
+        description: Check only the adaptive icon (actool probe and a bundle of a stub binary, no Rust build)
         type: boolean
         default: false
       runner:
@@ -48,10 +48,8 @@ jobs:
           cat "$work/out/assetcatalog_generated_info.plist" || true
           test -f "$work/out/Assets.car"
           assetutil --info "$work/out/Assets.car" | head -60
-      - if: ${{ !inputs.actool_only }}
-        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
-      - if: ${{ !inputs.actool_only }}
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: pnpm
@@ -63,14 +61,21 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
-      - if: ${{ !inputs.actool_only }}
-        run: pnpm install --frozen-lockfile
-      - if: ${{ !inputs.actool_only }}
-        run: bash scripts/fetch-pi.sh
+      - run: pnpm install --frozen-lockfile
+      - run: bash scripts/fetch-pi.sh
+      # Bundles a stub binary, so tauri-bundler runs actool exactly as in a release, without the Rust build.
+      - name: tauri bundle with a stub binary
+        if: ${{ inputs.actool_only }}
+        run: |
+          mkdir -p src-tauri/target/release
+          echo 'int main(void) { return 0; }' | clang -x c - -o src-tauri/target/release/zwinger
+          pnpm tauri bundle --bundles app -vv
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - if: ${{ !inputs.actool_only }}
         run: pnpm tauri build --bundles app
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      - if: ${{ !inputs.actool_only }}
-        run: bash scripts/check-adaptive-icon.sh src-tauri/target/release/bundle/macos/zwinger.app
+      - run: bash scripts/check-adaptive-icon.sh src-tauri/target/release/bundle/macos/zwinger.app
