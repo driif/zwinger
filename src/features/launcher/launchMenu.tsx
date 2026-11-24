@@ -1,7 +1,6 @@
 import type { ActionMenuItem } from "@driif/motiv/action-menu";
 import { Box, Copy, FolderOpen, History, Laptop, ShieldOff } from "lucide-react";
 import { AGENT_ICONS } from "../tasks/roomParts";
-import type { MenuAction } from "../../shared/ActionMenu";
 import type { LaunchAction } from "./actions";
 import { EditorIcon } from "./EditorIcon";
 
@@ -19,16 +18,6 @@ function icon(action: LaunchAction) {
 }
 
 /** The launch actions as menu items. */
-export const launchMenu = (actions: LaunchAction[], onLaunch: (action: LaunchAction) => void): MenuAction[] =>
-  actions.map((action) => ({
-    label: action.label,
-    icon: icon(action),
-    disabled: !!action.disabled,
-    reason: action.disabled,
-    run: () => onLaunch(action),
-  }));
-
-/** The launch actions as items of a SplitButton menu. */
 export const launchItems = (actions: LaunchAction[], onLaunch: (action: LaunchAction) => void): ActionMenuItem[] =>
   actions.map((action) => ({
     label: action.label,

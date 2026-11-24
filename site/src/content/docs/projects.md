@@ -56,7 +56,8 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
   button). The name becomes a field in the row. Press Enter or click outside the field to save the name. Press Escape
   to cancel. An empty name gives a workspace the name "Workspace" again.
 - A menu closes when you select its **…** or chevron button again, press Escape, click outside it, or move the focus
-  out of it, for example with Tab. Escape and the button put the focus back on the row or button that opened the menu.
+  out of it, for example with Tab. Escape puts the focus back on the row or button that opened the menu. An action
+  that asks first shows a dialog. **Cancel** or Escape closes it and puts the focus back there too.
 - **Copy path** in a session menu, a launch menu or the command menu copies the project folder. The folder field below
   the project name shows the folder (point to it to read a long folder in full). Its **Copy** button does the same. A short message
   names the project and the path, and goes away after two seconds. If the copy fails, the error shows instead. A new
@@ -73,7 +74,8 @@ Home sets the minimum width and End sets the maximum. Double-click the edge to r
 - Drag a workspace to change the order of the workspaces. Drag a session to change its place or to move it to a
   different workspace. You can also drop a session on a collapsed or empty workspace. The workspace then expands.
   While you drag with the pointer, a copy of the row follows the pointer and the row stays dim at its place.
-- **Move to** in the menu of a session shows the other workspaces. Select one to move the session to the end of that
+- **Move to** in the menu of a session opens a submenu of the other workspaces (point to it, or press the Right arrow
+  key). Select one to move the session to the end of that
   workspace. The workspace then expands, and the session row keeps the keyboard focus.
 - A session that inherits its cage gets the default cage of its new workspace. If its VM runs in a different cage,
   a dialog asks: **Restart now** stops the VM and starts the new cage, **At next start** keeps the VM until it stops,

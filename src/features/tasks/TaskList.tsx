@@ -64,42 +64,33 @@ export function TaskList({ session, cageRunning, runs, run, onView, onRunsChange
                   {task.title}
                 </Button>
                 {badge && <span className={latest?.state === "done" && !latest.ship ? "danger" : "muted"}>{badge}</span>}
-                <IconButton
-                  size="sm"
-                  icon={<Ellipsis size={12} />}
-                  label={`Actions for ${task.title}`}
-                  aria-haspopup="menu"
-                  aria-expanded={menu === task.id}
-                  onClick={() => setMenu(menu === task.id ? undefined : task.id)}
+                <ActionMenu
+                  open={menu === task.id}
+                  onOpenChange={(open) => setMenu(open ? task.id : undefined)}
+                  trigger={<IconButton size="sm" icon={<Ellipsis size={12} />} label={`Actions for ${task.title}`} />}
+                  actions={[
+                    {
+                      label: "Start run",
+                      icon: <Play size={14} />,
+                      disabled: !cageRunning || live,
+                      disabledReason: session.effectiveCage ? undefined : NO_CAGE_TASKS,
+                      onSelect: () =>
+                        run(async () => {
+                          const next = await startTaskRun(sid, task.id);
+                          onView({ kind: "task", taskId: task.id, run: next });
+                          onRunsChange();
+                        }),
+                    },
+                    { label: "Edit", icon: <Pencil size={14} />, onSelect: () => onView({ kind: "taskEdit", taskId: task.id }) },
+                    {
+                      label: "Delete",
+                      icon: <Trash2 size={14} />,
+                      disabled: live,
+                      confirm: `Delete the task ${task.title} and its runs?`,
+                      onSelect: () => run(() => removeTask(sid, task.id).then(onRunsChange)),
+                    },
+                  ]}
                 />
-                {menu === task.id && (
-                  <ActionMenu
-                    label={`Actions for ${task.title}`}
-                    onClose={() => setMenu(undefined)}
-                    actions={[
-                      {
-                        label: "Start run",
-                        icon: <Play size={14} />,
-                        disabled: !cageRunning || live,
-                        reason: session.effectiveCage ? undefined : NO_CAGE_TASKS,
-                        run: () =>
-                          run(async () => {
-                            const next = await startTaskRun(sid, task.id);
-                            onView({ kind: "task", taskId: task.id, run: next });
-                            onRunsChange();
-                          }),
-                      },
-                      { label: "Edit", icon: <Pencil size={14} />, run: () => onView({ kind: "taskEdit", taskId: task.id }) },
-                      {
-                        label: "Delete",
-                        icon: <Trash2 size={14} />,
-                        disabled: live,
-                        confirm: `Delete the task ${task.title} and its runs?`,
-                        run: () => run(() => removeTask(sid, task.id).then(onRunsChange)),
-                      },
-                    ]}
-                  />
-                )}
               </li>
             );
           })}

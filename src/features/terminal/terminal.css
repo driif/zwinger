@@ -64,10 +64,6 @@
   vertical-align: middle;
 }
 
-.terminal-tab-item .action-menu {
-  top: 100%;
-  z-index: 5;
-}
 
 .terminal-tab-item.dragging {
   z-index: 1;

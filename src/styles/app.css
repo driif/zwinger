@@ -333,14 +333,6 @@ p {
   padding: 0;
 }
 
-.task-list > li {
-  position: relative;
-}
-
-.task-list .action-menu {
-  top: 100%;
-}
-
 .facts {
   margin: 0;
   display: flex;

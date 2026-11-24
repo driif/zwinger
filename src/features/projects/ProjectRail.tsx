@@ -38,7 +38,7 @@ import { tildePath, truncateMiddle } from "../../shared/paths";
 import { LaunchAction, launchActions, projectEditors } from "../launcher/actions";
 import { Editors } from "../launcher/api";
 import type { Detection } from "../settings/api";
-import { launchMenu } from "../launcher/launchMenu";
+import { launchItems } from "../launcher/launchMenu";
 import { AgentStatusGlyph } from "../terminal/labels";
 import { StartProgress } from "./StartProgress";
 import { cageChanged, restartPending } from "../cages/sessionCage";
@@ -380,13 +380,6 @@ export function ProjectRail({
     }
   }
 
-  function closeMenu(refocus: boolean) {
-    if (refocus && menu) focusRow(menu);
-    setMenu(undefined);
-  }
-
-  const toggleMenu = (id: string) => (menu === id ? closeMenu(true) : setMenu(id));
-
   /** The name input of row `id`. A changed name is saved; a blank one goes to the backend, which applies its rules. */
   function nameField(id: string, name: string, save: (name: string) => Promise<unknown>) {
     return (
@@ -401,7 +394,7 @@ export function ProjectRail({
     );
   }
 
-  const renameAction = (id: string): MenuAction => ({ label: "Rename", icon: <Pencil size={14} />, run: () => setEditing(id) });
+  const renameAction = (id: string): MenuAction => ({ label: "Rename", icon: <Pencil size={14} />, onSelect: () => setEditing(id) });
 
   // With the keyboard, a session or a workspace moves one step per arrow key in the draft. The drag itself stays where
   // it is: the rows move in the DOM.
@@ -530,7 +523,7 @@ export function ProjectRail({
     const remove = () => deleteWorkspace(workspace.id);
     return [
       renameAction(`w|${workspace.id}`),
-      { label: "Default cage…", icon: <Fence size={14} />, run: () => setPicking(workspace.id) },
+      { label: "Default cage…", icon: <Fence size={14} />, onSelect: () => setPicking(workspace.id) },
       {
         label: "Delete workspace",
         icon: <Trash2 size={14} />,
@@ -540,7 +533,7 @@ export function ProjectRail({
             ? `Delete ${workspace.name}? Its ${workspace.sessions.length} sessions move to ${heir.name}.` +
               (heir.defaultCage === workspace.defaultCage ? "" : " A session that inherits its cage gets the cage of its new workspace at its next start.")
             : undefined,
-        run: () =>
+        onSelect: () =>
           workspace.sessions.length > 0
             ? save(
                 workspaces.map((w) =>
@@ -563,7 +556,7 @@ export function ProjectRail({
         submenu: others.map((w) => ({
           label: w.name,
           icon: <ChevronRight size={14} />,
-          run: () => {
+          onSelect: () => {
             moved.current = `s|${session.id}`;
             expand(`w|${w.id}`);
             drop(moveSession(workspaces, session.id, w.id), session.id);
@@ -573,18 +566,22 @@ export function ProjectRail({
     ];
   }
 
-  const menuButton = (id: string, name: string) => (
-    <IconButton
-      size="xs"
-      icon={<Ellipsis size={12} />}
-      label={`Actions for ${name}`}
-      aria-haspopup="menu"
-      aria-expanded={menu === id}
-      tabIndex={-1}
-      onClick={(e) => {
-        e.stopPropagation();
-        toggleMenu(id);
-      }}
+  // The row keeps the keyboard focus: its menu button is not a tab stop.
+  const menuButton = (id: string, name: string, actions: MenuAction[]) => (
+    <ActionMenu
+      open={menu === id}
+      onOpenChange={(open) => setMenu(open ? id : undefined)}
+      returnFocus={() => focusRow(id)}
+      trigger={
+        <IconButton
+          size="xs"
+          icon={<Ellipsis size={12} />}
+          label={`Actions for ${name}`}
+          tabIndex={-1}
+          onClick={(e) => e.stopPropagation()}
+        />
+      }
+      actions={actions}
     />
   );
 
@@ -739,17 +736,10 @@ export function ProjectRail({
                       <AgentStatusGlyph
                         state={mostUrgent(sessions.flatMap(({ session }) => session.processes.filter((p) => p.exitCode === null).map((p) => p.agent)))}
                       />
-                      {menuButton(workspaceRow, workspace.name)}
+                      {menuButton(workspaceRow, workspace.name, workspaceMenu(workspace))}
                     </>
                   }
                 >
-                  {menu === workspaceRow && (
-                    <ActionMenu
-                      label={`Actions for ${workspace.name}`}
-                      actions={workspaceMenu(workspace)}
-                      onClose={closeMenu}
-                    />
-                  )}
                   {workspaceOpen && (
                     <ul role="group">
                       <SortableContext items={sessions.map((s) => s.sessionRow)} strategy={verticalListSortingStrategy}>
@@ -856,28 +846,21 @@ export function ProjectRail({
                                       onToggle(target);
                                     }}
                                   />
-                                  {menuButton(sessionRow, session.name)}
-                                </>
-                              }
-                            >
-                              {menu === sessionRow && (
-                                <ActionMenu
-                                  label={`Actions for ${session.name}`}
-                                  actions={[
-                                    ...launchMenu(launch, (action) => onLaunch(session.id, action)),
+                                  {menuButton(sessionRow, session.name, [
+                                    ...launchItems(launch, (action) => onLaunch(session.id, action)),
                                     renameAction(sessionRow),
                                     ...moveMenu(session, workspace),
                                     ...(effective
                                       ? [
                                           session.vm.kind === "own"
-                                            ? { label: "Use shared VM", icon: <Fence size={14} />, run: () => run(() => vm.setOwn(session.id, false)) }
-                                            : { label: "Use own VM", icon: <Box size={14} />, run: () => run(() => vm.setOwn(session.id, true)) },
+                                            ? { label: "Use shared VM", icon: <Fence size={14} />, onSelect: () => run(() => vm.setOwn(session.id, false)) }
+                                            : { label: "Use own VM", icon: <Box size={14} />, onSelect: () => run(() => vm.setOwn(session.id, true)) },
                                         ]
                                       : []),
-                                  ]}
-                                  onClose={closeMenu}
-                                />
-                              )}
+                                  ])}
+                                </>
+                              }
+                            >
                             </TreeRow>
                           );
                         })}

@@ -57,18 +57,18 @@ export function TerminalTabs({ session, panes, selected, newItems, onShow, onReo
               const liveName = (pane.processId && titles[pane.processId]) || name;
               const agent = kind.type === "agent" || kind.type === "hostAgent";
               const actions: MenuAction[] = [
-                ...(state ? [{ label: "Open", icon: <Play size={14} />, run: () => onReopen(pane) }] : []),
+                ...(state ? [{ label: "Open", icon: <Play size={14} />, onSelect: () => onReopen(pane) }] : []),
                 ...(agent
-                  ? [{ label: "Continue last session", icon: <History size={14} />, run: () => onNewSession({ ...kind, resume: true }) }]
+                  ? [{ label: "Continue last session", icon: <History size={14} />, onSelect: () => onNewSession({ ...kind, resume: true }) }]
                   : []),
-                { label: "Move left", icon: <ArrowLeft size={14} />, disabled: index === 0, run: () => move(pane.key, index - 1) },
+                { label: "Move left", icon: <ArrowLeft size={14} />, disabled: index === 0, onSelect: () => move(pane.key, index - 1) },
                 {
                   label: "Move right",
                   icon: <ArrowRight size={14} />,
                   disabled: index === panes.length - 1,
-                  run: () => move(pane.key, index + 1),
+                  onSelect: () => move(pane.key, index + 1),
                 },
-                { label: "Close", icon: <X size={14} />, run: () => onClose(pane.key) },
+                { label: "Close", icon: <X size={14} />, onSelect: () => onClose(pane.key) },
               ];
               return (
                 <SortableTab
@@ -89,16 +89,12 @@ export function TerminalTabs({ session, panes, selected, newItems, onShow, onReo
                     {hasCage && <span className="danger"> · the session has a cage</span>}
                   </Button>
                   <AgentStatusGlyph state={process?.exitCode === null ? process.agent : null} />
-                  <IconButton
-                    size="sm"
-                    className="terminal-tab-menu"
-                    icon={<Ellipsis size={12} />}
-                    label={`Actions for ${name}`}
-                    aria-haspopup="menu"
-                    aria-expanded={menu === pane.key}
-                    onClick={() => setMenu(menu === pane.key ? undefined : pane.key)}
+                  <ActionMenu
+                    open={menu === pane.key}
+                    onOpenChange={(open) => setMenu(open ? pane.key : undefined)}
+                    trigger={<IconButton size="sm" className="terminal-tab-menu" icon={<Ellipsis size={12} />} label={`Actions for ${name}`} />}
+                    actions={actions}
                   />
-                  {menu === pane.key && <ActionMenu label={`Actions for ${name}`} actions={actions} onClose={() => setMenu(undefined)} />}
                 </SortableTab>
               );
             })}
