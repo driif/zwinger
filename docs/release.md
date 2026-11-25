@@ -17,6 +17,8 @@ of the project; the app has the public key in `src-tauri/tauri.conf.json` and re
 3. The `Release` workflow (`.github/workflows/release.yml`) builds on a `macos-26` (arm64) runner and makes a
    **draft** release with the `.dmg`, the updater archive (`.app.tar.gz` and its `.sig`) and `latest.json`.
    The runner must be macOS 26: the actool of Xcode 26 compiles the adaptive icon only on a macOS 26 host.
+   `scripts/compile-adaptive-icon.sh` compiles the icon to `Assets.car` before the Rust build, and the build gets it
+   with `--config`. The actool run of tauri-bundler at the end of a full build fails on the runner.
    To test the bundle without a tag, run the `Bundle check` workflow (`actool_only` compiles only the icon).
 4. Check the draft, then publish it. Apps see the update only after you publish: `releases/latest` ignores drafts.
 

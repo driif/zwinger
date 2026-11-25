@@ -35,6 +35,9 @@ jobs:
           xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
           test -n "$xcode"
           echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+      # In a full build, the actool run of tauri-bundler fails; compiled before the build, it works (#98).
+      - name: Compile the adaptive icon
+        run: echo "ICON_CONFIG=$(bash scripts/compile-adaptive-icon.sh)" >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,4 +58,5 @@ jobs:
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
+          args: --config ${{ env.ICON_CONFIG }}
       - run: bash scripts/check-adaptive-icon.sh src-tauri/target/release/bundle/macos/zwinger.app
