@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       actool_only:
-        description: Check only the adaptive icon (actool probe and a bundle of a stub binary, no Rust build)
+        description: Check only the adaptive icon (bundle a stub binary, no Rust build)
         type: boolean
         default: false
       runner:
@@ -27,29 +27,11 @@ jobs:
           xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
           test -n "$xcode"
           echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
-      # Compiles the .icon with the same actool arguments as tauri-bundler (crates/tauri-bundler/src/bundle/macos/icon.rs).
-      # Only in actool_only mode: release.yml does not run it, so the full check must not either.
-      - name: actool probe
-        if: ${{ inputs.actool_only }}
-        run: |
-          xcodebuild -version
+          DEVELOPER_DIR="$xcode/Contents/Developer" xcodebuild -version
           sw_vers
-          actool --version --output-format human-readable-text
-          # tauri-bundler compiles in a tempfile dir, which is hidden (.tmpXXXXXX).
-          work=$(mktemp -d "${RUNNER_TEMP}/.tmpXXXXXX")
-          cp -R src-tauri/icons/zwinger.icon "$work/Icon.icon"
-          mkdir "$work/out"
-          set +e
-          MACOSX_DEPLOYMENT_TARGET=14.0 actool "$work/Icon.icon" --compile "$work/out" --output-format human-readable-text --notices --warnings \
-            --output-partial-info-plist "$work/out/assetcatalog_generated_info.plist" --app-icon Icon \
-            --include-all-app-icons --accent-color AccentColor --enable-on-demand-resources NO \
-            --development-region en --target-device mac --minimum-deployment-target 26.0 --platform macosx
-          echo "actool exit: $?"
-          set -e
-          ls -la "$work/out"
-          cat "$work/out/assetcatalog_generated_info.plist" || true
-          test -f "$work/out/Assets.car"
-          assetutil --info "$work/out/Assets.car" | head -60
+      # Same steps as release.yml: compile the adaptive icon before the Rust build.
+      - name: Compile the adaptive icon
+        run: echo "ICON_CONFIG=$(bash scripts/compile-adaptive-icon.sh)" >> "$GITHUB_ENV"
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -65,18 +47,18 @@ jobs:
           workspaces: src-tauri
       - run: pnpm install --frozen-lockfile
       - run: bash scripts/fetch-pi.sh
-      # Bundles a stub binary, so tauri-bundler runs actool exactly as in a release, without the Rust build.
+      # Bundles a stub binary, so tauri-bundler handles the icon as in a release, without the Rust build.
       - name: tauri bundle with a stub binary
         if: ${{ inputs.actool_only }}
         run: |
           mkdir -p src-tauri/target/release
           echo 'int main(void) { return 0; }' | clang -x c - -o src-tauri/target/release/zwinger
-          pnpm tauri bundle --bundles app -vv
+          pnpm tauri bundle --bundles app -v --config "$ICON_CONFIG"
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       - if: ${{ !inputs.actool_only }}
-        run: pnpm tauri build --bundles app -v
+        run: pnpm tauri build --bundles app -v --config "$ICON_CONFIG"
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
